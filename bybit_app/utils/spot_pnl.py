@@ -1,30 +1,43 @@
 
 from __future__ import annotations
 from pathlib import Path
+from typing import Optional, Union
 import json, time
 from .paths import DATA_DIR
 
 LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
 
-def spot_inventory_and_pnl():
+
+def _resolve_ledger_path(ledger_path: Optional[Union[str, Path]]) -> Path:
+    if ledger_path is None:
+        return LEDGER
+    return Path(ledger_path)
+
+
+def spot_inventory_and_pnl(ledger_path: Optional[Union[str, Path]] = None):
     """Считает среднюю цену и реализованный PnL по споту на базе леджера исполнений.
     Метод: средняя стоимость (moving average). Комиссию учитываем в цене покупки/продажи.
     Возвращает dict: {symbol: {position_qty, avg_cost, realized_pnl}}.
     """
     inv = {}
-    if not LEDGER.exists():
+    path = _resolve_ledger_path(ledger_path)
+    if not path.exists():
         return inv
-    with LEDGER.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
-            if not line.strip(): continue
-            ev = json.loads(line)
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if (ev.get("category") or "spot").lower() != "spot":
                 continue
             sym = ev.get("symbol"); side = (ev.get("side") or "").lower()
             px = float(ev.get("execPrice") or 0.0)
             qty = float(ev.get("execQty") or 0.0)
             fee = abs(float(ev.get("execFee") or 0.0))
-            if not sym or qty <= 0 or px <= 0: 
+            if not sym or qty <= 0 or px <= 0:
                 continue
             # инициализация
             if sym not in inv:
@@ -37,9 +50,12 @@ def spot_inventory_and_pnl():
                 rec["avg_cost"] = total_cost / max(rec["position_qty"], 1e-12)
             elif side == "sell":
                 # комиссия вычитаем из выручки и считаем реал.прибыль по средней цене
-                proceeds = px*qty - fee
-                cost = rec["avg_cost"]*qty
-                rec["position_qty"] -= qty
+                qty_to_close = min(qty, max(rec["position_qty"], 0.0))
+                if qty_to_close <= 0:
+                    continue
+                proceeds = px*qty_to_close - fee
+                cost = rec["avg_cost"]*qty_to_close
+                rec["position_qty"] -= qty_to_close
                 rec["realized_pnl"] += (proceeds - cost)
                 if rec["position_qty"] <= 1e-12:
                     rec["position_qty"] = 0.0
