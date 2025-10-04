@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, numpy as np
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.impact import estimate_vwap_from_orderbook
 from utils.ai.costs import expected_value_dynamic
 from utils.cache_helpers import cached_fee_rate
@@ -10,7 +9,7 @@ from utils.cache_helpers import cached_fee_rate
 st.title("🧪 AI Lab — EV по VWAP/Impact (Spot)")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 
 symbol = st.text_input("Символ", value="BTCUSDT").upper().strip()
 side = st.selectbox("Сторона", ["Buy","Sell"])

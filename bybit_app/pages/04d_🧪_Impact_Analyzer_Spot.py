@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.impact import estimate_vwap_from_orderbook
 
 st.title("🧪 Impact-Cost Анализатор (Spot)")
@@ -15,7 +14,7 @@ with st.form("impact"):
     limit = st.number_input("Глубина стакана (уровней)", 50, 1000, 200)
     run = st.form_submit_button("▶️ Оценить")
 if run:
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = get_api_client()
     ob = api.orderbook(category="spot", symbol=symbol, limit=int(limit))
     est = estimate_vwap_from_orderbook(ob, side=side, qty_base=float(qty))
     st.json(est)

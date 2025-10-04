@@ -1,13 +1,12 @@
 
 from __future__ import annotations
 import streamlit as st, json
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 
 st.title("🔁 Обновление правил спота (инструменты)")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 symbols = st.text_input("Символы (через запятую)", value=s.ai_symbols or "BTCUSDT")
 if st.button("🔄 Обновить / сохранить спецификацию"):
     out = {}

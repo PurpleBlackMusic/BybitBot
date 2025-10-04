@@ -3,6 +3,11 @@ import time, hmac, hashlib, json
 from dataclasses import dataclass
 from urllib.parse import urlencode
 import requests
+from functools import lru_cache
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .envs import Settings
 
 API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
@@ -143,6 +148,61 @@ class BybitAPI:
 
         payload = {"category": category, "request": orders}
         return self._safe_req("POST", "/v5/order/create-batch", body=payload, signed=True)
+
+
+@lru_cache(maxsize=16)
+def _build_api(key: str, secret: str, testnet: bool, recv_window: int, timeout: int, verify_ssl: bool) -> BybitAPI:
+    creds = BybitCreds(key=key, secret=secret, testnet=testnet)
+    return BybitAPI(creds, recv_window=recv_window, timeout=timeout, verify_ssl=verify_ssl)
+
+
+def get_api(
+    creds: BybitCreds,
+    recv_window: int = 5000,
+    timeout: int = 10000,
+    verify_ssl: bool = True,
+) -> BybitAPI:
+    """Return a cached ``BybitAPI`` instance for the given credentials.
+
+    Reusing the underlying :class:`requests.Session` keeps connection pools warm
+    and avoids the overhead of creating short-lived clients on every call.
+    """
+
+    return _build_api(
+        creds.key or "",
+        creds.secret or "",
+        bool(creds.testnet),
+        int(recv_window),
+        int(timeout),
+        bool(verify_ssl),
+    )
+
+
+def clear_api_cache() -> None:
+    """Reset the cached API clients (useful in tests)."""
+
+    _build_api.cache_clear()
+
+
+def creds_from_settings(settings: "Settings") -> BybitCreds:
+    """Build :class:`BybitCreds` from a ``Settings`` instance."""
+
+    return BybitCreds(
+        key=getattr(settings, "api_key", "") or "",
+        secret=getattr(settings, "api_secret", "") or "",
+        testnet=bool(getattr(settings, "testnet", True)),
+    )
+
+
+def api_from_settings(settings: "Settings") -> BybitAPI:
+    """Shortcut that returns a cached API client using settings defaults."""
+
+    return get_api(
+        creds_from_settings(settings),
+        recv_window=int(getattr(settings, "recv_window_ms", 5000)),
+        timeout=int(getattr(settings, "http_timeout_ms", 10000)),
+        verify_ssl=bool(getattr(settings, "verify_ssl", True)),
+    )
 
 # --- metadata used by KillSwitch & API Nanny ---
 API_CALLS = {

@@ -1,14 +1,13 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd, numpy as np, time
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.impact import estimate_vwap_from_orderbook
 
 st.title("🌊 Ликвидность (Sampler) — Spot")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 symbol = st.text_input("Символ", value="BTCUSDT").upper().strip()
 side = st.selectbox("Сторона", ["Buy","Sell"])
 qtys = st.text_input("Объёмы (через запятую, base)", value="0.001,0.003,0.005,0.01")

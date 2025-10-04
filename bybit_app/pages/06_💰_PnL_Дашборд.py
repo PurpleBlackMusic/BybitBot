@@ -1,15 +1,14 @@
 
 from __future__ import annotations
 import streamlit as st, json
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.paths import DATA_DIR
 
 st.set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
 st.title("💰 PnL Дашборд")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key or "", s.api_secret or "", s.testnet), timeout=s.http_timeout_ms, recv_window=s.recv_window_ms)
+api = get_api_client()
 
 colA, colB, colC = st.columns(3)
 try:

@@ -7,8 +7,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 
-from ..envs import get_settings
-from ..bybit_api import BybitAPI, BybitCreds
+from ..envs import get_api_client, get_settings
 from ..helpers import ensure_link_id
 from ..paths import DATA_DIR
 try:
@@ -35,8 +34,7 @@ class AIRunner:
         self.s = get_settings()
         self._lock = threading.Lock()
         self.state = RunnerState()
-        creds = BybitCreds(key=self.s.api_key or "", secret=self.s.api_secret or "", testnet=self.s.testnet)
-        self.api = BybitAPI(creds, timeout=self.s.http_timeout_ms, recv_window=self.s.recv_window_ms)
+        self.api = get_api_client()
         self._thr: Optional[threading.Thread] = None
 
     # ---- status helpers ----

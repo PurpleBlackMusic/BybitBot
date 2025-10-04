@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.envs import get_settings, update_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings, update_settings
 from utils.ai.engine import AIPipeline
 from utils.ai.live import AIRunner
 from utils.paths import DATA_DIR
@@ -82,7 +81,7 @@ st.divider()
 st.subheader("Обучение модели")
 sym = st.text_input("Символ для обучения", value=(s.ai_symbols.split(",")[0].strip() if s.ai_symbols else "BTCUSDT"))
 if st.button("🧪 Обучить сейчас"):
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = get_api_client()
     pipe = AIPipeline(DATA_DIR / "ai")
     try:
         meta = pipe.train(api, s.ai_category, sym.strip().upper(), s.ai_interval, int(s.ai_horizon_bars or 12), (DATA_DIR / "ai" / f"model_{s.ai_category}_{sym.strip().upper()}_{s.ai_interval}.json"))

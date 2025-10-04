@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 
 st.title("📈 Скринер — объём и волатильность (spot)")
 
@@ -11,7 +10,7 @@ if not (s.api_key and s.api_secret):
     st.warning("Укажите API-ключи на странице «Подключение и состояние».")
     st.stop()
 
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 q = st.text_input("Фильтр по подстроке тикера", value="USDT")
 top_n = st.slider("Сколько пар показать (по 24h объёму)", 5, 100, 20)
 try:

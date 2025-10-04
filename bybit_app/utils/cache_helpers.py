@@ -1,26 +1,26 @@
 
 from __future__ import annotations
 import streamlit as st
-from .bybit_api import BybitAPI, BybitCreds
+from .bybit_api import api_from_settings
 from .envs import get_settings
 
 @st.cache_data(ttl=30)
 def cached_tickers(category: str = "spot", symbol: str | None = None):
     s = get_settings()
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = api_from_settings(s)
     return api.tickers(category=category, symbol=symbol)
 
 @st.cache_data(ttl=300)
 def cached_instruments(category: str = "spot", symbol: str | None = None):
     s = get_settings()
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = api_from_settings(s)
     return api.instruments_info(category=category, symbol=symbol)
 
 
 @st.cache_data(ttl=900)
 def cached_fee_rate(category: str = "spot", symbol: str | None = None, baseCoin: str | None = None):
     s = get_settings()
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = api_from_settings(s)
     try:
         return api.fee_rate(category=category, symbol=symbol, baseCoin=baseCoin)
     except Exception as e:
@@ -41,7 +41,7 @@ def refresh_instruments_cache(symbols_csv: str, max_age_sec: int = 6*3600):
         except Exception:
             pass
     s = get_settings()
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = api_from_settings(s)
     out = {"_ts": time.time()}
     for sym in [x.strip().upper() for x in (symbols_csv or '').split(',') if x.strip()]:
         try:

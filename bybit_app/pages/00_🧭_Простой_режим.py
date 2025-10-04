@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, json, time
-from utils.envs import get_settings, update_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings, update_settings
 from utils.coach import market_health, build_autopilot_settings
 from utils.scheduler import start_background_loop
 from utils.reporter import send_daily_report, summarize_today, send_test_message
@@ -20,7 +19,7 @@ s = get_settings()
 # ##__TG_DEFAULTS__ ensure variables exist before buttons use them
 tg_trd = bool(getattr(s, 'tg_trade_notifs', False))
 tg_min = float(getattr(s, 'tg_trade_notifs_min_notional', 50.0))
-api = BybitAPI(BybitCreds(s.api_key or "", s.api_secret or "", s.testnet), timeout=s.http_timeout_ms, recv_window=s.recv_window_ms)
+api = get_api_client()
 # фоновая автоматика
 start_background_loop()
 

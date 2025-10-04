@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.twap_spot import twap_spot
 
 st.title("🧩 TWAP Исполнитель (Spot)")
@@ -23,24 +22,18 @@ with st.form("twap"):
     run = st.form_submit_button("▶️ Запустить TWAP")
 
 if run:
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
-    try:
-        r = twap_spot(api, symbol, side, float(qty), int(slices), int(child_secs), float(agg_bps))
-        st.success(f"Запущено. Дочерних ордеров: {len(r)}")
-        for i, x in enumerate(r):
-            st.json({"child": i, "resp": x})
-    except Exception as e:
-        st.error(f"Ошибка: {e}")
-
-
-if run:
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = get_api_client()
     try:
         if batch:
             from utils.twap_spot_batch import twap_spot_batch
-            r = twap_spot_batch(api, symbol, side, float(qty), int(slices), float(agg_bps))
+
+            result = twap_spot_batch(api, symbol, side, float(qty), int(slices), float(agg_bps))
+            st.success("TWAP (batch) запущен.")
+            st.json(result)
         else:
-            r = twap_spot(api, symbol, side, float(qty), int(slices), int(child_secs), float(agg_bps))
-        st.success("TWAP запущен."); st.json(r)
+            result = twap_spot(api, symbol, side, float(qty), int(slices), int(child_secs), float(agg_bps))
+            st.success(f"Запущено. Дочерних ордеров: {len(result)}")
+            for idx, payload in enumerate(result):
+                st.json({"child": idx, "resp": payload})
     except Exception as e:
         st.error(f"Ошибка: {e}")

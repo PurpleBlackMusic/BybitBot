@@ -1,14 +1,13 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
-from utils.envs import get_settings, update_settings
+from utils.envs import get_api_client, get_settings, update_settings
 from utils.universe import build_universe, load_universe, apply_universe_to_settings
-from utils.bybit_api import BybitAPI, BybitCreds
 
 st.title("🌐 Universe Builder (Spot) — топ по обороту 24h")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 
 size = st.number_input("Размер юниверса", 1, 50, int(getattr(s, "ai_universe_size", 8) or 8))
 min_turn = st.number_input("Мин. оборот 24h (USD)", 0.0, 1e12, float(getattr(s, "ai_universe_min_turnover_usd", 2_000_000.0) or 2_000_000.0))
