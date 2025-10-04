@@ -4,7 +4,8 @@ import streamlit as st, pandas as pd, json
 from utils.pnl import daily_pnl, read_ledger
 from utils.paths import DATA_DIR
 
-st.title("💰 PnL Дашборд (Beta)")
+st.set_page_config(page_title="PnL Мониторинг (Beta)", page_icon="💰", layout="wide")
+st.title("💰 PnL Мониторинг (Beta)")
 
 col1, col2 = st.columns(2)
 if col1.button("🔄 Пересчитать дневной PnL"):
