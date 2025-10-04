@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Union
 import json
@@ -10,6 +11,7 @@ import time
 
 from .envs import Settings, get_settings
 from .paths import DATA_DIR
+from .trade_analytics import aggregate_execution_metrics, load_executions
 from .spot_pnl import spot_inventory_and_pnl
 
 
@@ -136,6 +138,49 @@ class GuardianBot:
         if minutes < 5:
             return f"Данные обновлены {minutes} мин назад."
         return "Данные не поступали более пяти минут — убедитесь, что соединение с ботом активно."
+
+    @staticmethod
+    def _format_timestamp(value: object) -> str:
+        """Convert diverse timestamp values to a short human string."""
+
+        if value in (None, ""):
+            return "—"
+
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+        # heuristics: timestamps may come in seconds, milliseconds or nanoseconds
+        if numeric > 1e18:
+            numeric /= 1e9
+        elif numeric > 1e12:
+            numeric /= 1e3
+
+        try:
+            dt = datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return "—"
+        return dt.strftime("%d.%m %H:%M")
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 60:
+            return "менее минуты"
+        minutes = int(seconds // 60)
+        if minutes < 60:
+            return f"{minutes} мин"
+        hours = minutes // 60
+        minutes = minutes % 60
+        if hours < 24:
+            if minutes == 0:
+                return f"{hours} ч"
+            return f"{hours} ч {minutes} мин"
+        days = hours // 24
+        hours = hours % 24
+        if hours == 0:
+            return f"{days} дн"
+        return f"{days} дн {hours} ч"
 
     # ------------------------------------------------------------------
     # public analytics helpers
@@ -304,6 +349,219 @@ class GuardianBot:
         else:
             notes.insert(0, "Работаем с реальными средствами — подтверждайте только понятные сделки.")
         return notes
+
+    def signal_scorecard(self, brief: Optional[GuardianBrief] = None) -> Dict[str, object]:
+        brief = brief or self.generate_brief()
+        status = self._last_status if isinstance(self._last_status, dict) else {}
+        probability = float(status.get("probability") or 0.0)
+        ev_bps = float(status.get("ev_bps") or 0.0)
+        return {
+            "symbol": brief.symbol,
+            "mode": brief.mode,
+            "probability_pct": round(self._clamp_probability(probability) * 100.0, 2),
+            "ev_bps": round(ev_bps, 2),
+            "buy_threshold": float(self.settings.ai_buy_threshold or 0.0) * 100.0,
+            "sell_threshold": float(self.settings.ai_sell_threshold or 0.0) * 100.0,
+            "min_ev_bps": float(self.settings.ai_min_ev_bps or 0.0),
+            "last_update": brief.updated_text,
+        }
+
+    def _normalise_watchlist_entry(self, symbol: str, payload: object) -> Dict[str, object]:
+        if isinstance(payload, dict):
+            score = payload.get("score") or payload.get("probability") or payload.get("ev")
+            trend = payload.get("trend") or payload.get("direction") or payload.get("side")
+            note = payload.get("note") or payload.get("comment") or payload.get("reason")
+        else:
+            score = payload
+            trend = None
+            note = None
+
+        entry = {
+            "symbol": symbol.upper(),
+            "score": round(float(score), 2) if isinstance(score, (int, float, str)) and str(score).strip() else None,
+            "trend": str(trend) if trend not in (None, "") else None,
+            "note": str(note) if note not in (None, "") else None,
+        }
+        return entry
+
+    def market_watchlist(self) -> List[Dict[str, object]]:
+        status = self._last_status if isinstance(self._last_status, dict) else self._load_status()
+        candidates = (
+            status.get("watchlist")
+            or status.get("heatmap")
+            or status.get("opportunities")
+            or status.get("signals")
+        )
+        entries: List[Dict[str, object]] = []
+
+        if isinstance(candidates, dict):
+            for symbol, payload in candidates.items():
+                entries.append(self._normalise_watchlist_entry(str(symbol), payload))
+        elif isinstance(candidates, list):
+            for item in candidates:
+                if isinstance(item, dict):
+                    symbol = item.get("symbol") or item.get("ticker") or "?"
+                    entries.append(self._normalise_watchlist_entry(str(symbol), item))
+                elif isinstance(item, (list, tuple)) and item:
+                    symbol = str(item[0])
+                    payload = item[1] if len(item) > 1 else None
+                    entries.append(self._normalise_watchlist_entry(symbol, payload))
+                elif isinstance(item, str):
+                    entries.append(self._normalise_watchlist_entry(item, None))
+
+        # remove empty rows
+        filtered = []
+        for entry in entries:
+            if any(entry.values()):
+                filtered.append(entry)
+        return filtered
+
+    def recent_trades(self, limit: int = 10) -> List[Dict[str, object]]:
+        path = self._ledger_path()
+        if not path.exists():
+            return []
+
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+
+        records: List[Dict[str, object]] = []
+        for line in reversed(lines):
+            if len(records) >= limit:
+                break
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            category = str(event.get("category") or "").lower()
+            if category and category != "spot":
+                continue
+
+            symbol = str(event.get("symbol") or event.get("ticker") or "?")
+            side = str(event.get("side") or event.get("direction") or "").capitalize()
+            qty = float(event.get("execQty") or event.get("qty") or event.get("size") or 0.0)
+            price = float(event.get("execPrice") or event.get("price") or 0.0)
+            fee = float(event.get("execFee") or event.get("fee") or 0.0)
+
+            ts = (
+                event.get("execTime")
+                or event.get("execTimeNs")
+                or event.get("transactTime")
+                or event.get("created_at")
+                or event.get("tradeTime")
+            )
+
+            records.append(
+                {
+                    "symbol": symbol.upper(),
+                    "side": side or "—",
+                    "price": round(price, 6) if price else None,
+                    "qty": round(qty, 6) if qty else None,
+                    "fee": round(fee, 6) if fee else None,
+                    "when": self._format_timestamp(ts),
+                }
+            )
+
+        return records
+
+    def trade_statistics(self, limit: Optional[int] = None) -> Dict[str, object]:
+        """Return aggregated execution metrics for dashboards."""
+
+        path = self._ledger_path()
+        records = load_executions(path, limit=limit)
+        return aggregate_execution_metrics(records)
+
+    def data_health(self) -> Dict[str, Dict[str, object]]:
+        """High level diagnostics for the UI to highlight stale inputs."""
+
+        status = self._last_status if isinstance(self._last_status, dict) else {}
+        if not status:
+            status = self._load_status()
+        age = status.get("age_seconds") if isinstance(status, dict) else None
+
+        if status:
+            if age is None or age < 300:
+                ai_ok = True
+                ai_message = "AI сигнал обновился менее 5 минут назад."
+            elif age < 900:
+                ai_ok = True
+                ai_message = f"AI сигнал обновился {self._format_duration(age)} назад."
+            else:
+                ai_ok = False
+                ai_message = (
+                    "AI сигнал не обновлялся более 15 минут — проверьте воркер или соединение."
+                )
+            symbol = str(status.get("symbol") or "?").upper()
+            probability = float(status.get("probability") or 0.0) * 100.0
+            ai_details = f"Текущий символ: {symbol}, уверенность {probability:.1f}%."
+        else:
+            ai_ok = False
+            ai_message = "AI сигнал ещё не поступал — запустите Guardian Bot или загрузите демо-данные."
+            ai_details = "Файл ai/status.json не найден."
+
+        stats = self.trade_statistics()
+        trades = int(stats.get("trades", 0) or 0)
+        last_trade_ts = stats.get("last_trade_ts")
+        if trades == 0 or not last_trade_ts:
+            exec_ok = False
+            exec_message = "Журнал исполнений пуст — бот ещё не записывал сделки."
+            exec_details = "Добавьте записи в pnl/executions.jsonl для проверки."
+        else:
+            last_trade_dt = datetime.fromtimestamp(float(last_trade_ts), tz=timezone.utc)
+            exec_age = (datetime.now(timezone.utc) - last_trade_dt).total_seconds()
+            if exec_age < 900:
+                exec_ok = True
+                exec_message = "Журнал сделок обновлялся менее 15 минут назад."
+            elif exec_age < 3600:
+                exec_ok = True
+                exec_message = f"Журнал сделок обновлялся {self._format_duration(exec_age)} назад."
+            else:
+                exec_ok = False
+                exec_message = (
+                    "Журнал сделок не обновлялся более часа — проверьте исполнение ордеров и соединение."
+                )
+            exec_details = (
+                f"Записей: {trades}, последняя сделка: {stats.get('last_trade_at', '—')}"
+            )
+
+        settings = self.settings
+        has_keys = bool(settings.api_key and settings.api_secret)
+        if has_keys:
+            api_message = "API ключи подключены — можно переходить в боевой режим."
+        else:
+            api_message = "API ключи не заданы — бот работает в учебном режиме."
+        api_details = (
+            f"Сеть: {'Testnet' if settings.testnet else 'Mainnet'} · "
+            f"Режим: {'DRY-RUN' if settings.dry_run else 'Live'}"
+        )
+
+        return {
+            "ai_signal": {
+                "title": "AI сигнал",
+                "ok": ai_ok,
+                "message": ai_message,
+                "details": ai_details,
+                "age_seconds": age,
+            },
+            "executions": {
+                "title": "Журнал исполнений",
+                "ok": exec_ok,
+                "message": exec_message,
+                "details": exec_details,
+                "trades": trades,
+                "last_trade_at": stats.get("last_trade_at"),
+            },
+            "api_keys": {
+                "title": "Подключение API",
+                "ok": has_keys,
+                "message": api_message,
+                "details": api_details,
+            },
+        }
 
     # ------------------------------------------------------------------
     # conversation helpers
