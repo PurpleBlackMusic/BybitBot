@@ -109,6 +109,25 @@ class BybitAPI:
             params["symbol"] = symbol
         return self._safe_req("GET", "/v5/order/realtime", params=params, signed=True)
 
+    def fee_rate(
+        self,
+        category: str = "spot",
+        symbol: str | None = None,
+        baseCoin: str | None = None,
+    ):
+        """Fetch taker/maker fee rates for the given instrument.
+
+        Mirrors the ``GET /v5/account/fee-rate`` endpoint documented by Bybit.
+        The endpoint is private and therefore requires an authenticated request.
+        """
+
+        params = {"category": category}
+        if symbol:
+            params["symbol"] = symbol
+        if baseCoin:
+            params["baseCoin"] = baseCoin
+        return self._safe_req("GET", "/v5/account/fee-rate", params=params, signed=True)
+
     def place_order(self, **kwargs):
         # required: category, symbol, side, orderType, qty or (notional), [price for Limit]
         return self._safe_req("POST", "/v5/order/create", body=kwargs, signed=True)
@@ -118,6 +137,12 @@ class BybitAPI:
 
     def cancel_batch(self, **kwargs):
         return self._safe_req("POST", "/v5/order/cancel-batch", body=kwargs, signed=True)
+
+    def batch_place(self, category: str, orders: list[dict]):
+        """Place up to 10 orders in a single request via the batch endpoint."""
+
+        payload = {"category": category, "request": orders}
+        return self._safe_req("POST", "/v5/order/create-batch", body=payload, signed=True)
 
 # --- metadata used by KillSwitch & API Nanny ---
 API_CALLS = {
@@ -131,4 +156,6 @@ API_CALLS = {
     "place_order": {"method": "POST", "path": "/v5/order/create"},
     "cancel_order": {"method": "POST", "path": "/v5/order/cancel"},
     "cancel_batch": {"method": "POST", "path": "/v5/order/cancel-batch"},
+    "fee_rate": {"method": "GET", "path": "/v5/account/fee-rate"},
+    "batch_place": {"method": "POST", "path": "/v5/order/create-batch"},
 }
