@@ -6,6 +6,7 @@
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env  # заполните ключи или используйте интерфейс приложения
 streamlit run app.py
 ```
 
