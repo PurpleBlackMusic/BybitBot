@@ -49,6 +49,23 @@ class AIRunner:
             for k, v in updates.items():
                 setattr(self.state, k, v)
 
+    @property
+    def running(self) -> bool:
+        """Thread-safe flag exposing the runner state.
+
+        The scheduler relies on this property to decide whether the
+        background AI loop should be (re)started or stopped.  The original
+        build accessed ``runner.running`` directly, but :class:`AIRunner`
+        only kept the flag inside :attr:`state`.  As a result, the scheduler
+        raised :class:`AttributeError` once it tried to evaluate the
+        property, breaking the automation loop.  Providing the attribute via
+        a property keeps the encapsulation of :attr:`state` while restoring
+        backwards-compatible access.
+        """
+
+        with self._lock:
+            return bool(self.state.running)
+
     def _write_status(self):
         try:
             obj = {
