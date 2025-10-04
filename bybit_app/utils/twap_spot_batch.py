@@ -31,14 +31,24 @@ def _normalise_book_levels(levels: Iterable[Tuple[str, str]]) -> List[Tuple[Deci
     return normalised
 
 
-def _aggressive_price(best_bid: Decimal, best_ask: Decimal, side: str, aggressiveness_bps: float) -> Decimal:
+def _normalise_side(side: str) -> str:
     side_lower = side.lower()
+    if side_lower not in {"buy", "sell"}:
+        raise ValueError(f"Unsupported side: {side}")
+    return "Buy" if side_lower == "buy" else "Sell"
+
+
+def _aggressive_price(
+    best_bid: Decimal,
+    best_ask: Decimal,
+    side: str,
+    aggressiveness_bps: float,
+) -> Decimal:
+    side_normalised = _normalise_side(side)
     spread_bps = Decimal(str(aggressiveness_bps)) / _BPS_DIVISOR
-    if side_lower == "buy":
+    if side_normalised == "Buy":
         return best_ask * (Decimal("1") + spread_bps)
-    if side_lower == "sell":
-        return best_bid * (Decimal("1") - spread_bps)
-    raise ValueError(f"Unsupported side: {side}")
+    return best_bid * (Decimal("1") - spread_bps)
 
 
 def twap_spot_batch(
@@ -63,20 +73,25 @@ def twap_spot_batch(
     if not bids or not asks:
         return {"error": "empty orderbook"}
 
+    total_qty_dec = Decimal(str(total_qty))
+    if total_qty_dec <= 0:
+        return {"error": "non-positive quantity"}
+
     slices = max(int(slices), 1)
-    qty_per_slice = max(float(total_qty) / slices, 0.0)
-    if qty_per_slice <= 0.0:
+    qty_per_slice = _quantize((total_qty_dec / slices).quantize(_TEN_DECIMALS, rounding=ROUND_HALF_UP))
+    if qty_per_slice <= 0:
         return {"error": "non-positive quantity"}
 
     best_bid, best_ask = bids[0][0], asks[0][0]
     px = _quantize(_aggressive_price(best_bid, best_ask, side, aggressiveness_bps))
-    qty = _quantize(Decimal(str(qty_per_slice)))
+    qty = qty_per_slice
+    side_cased = _normalise_side(side)
 
     timestamp_ms = int(time.time() * 1000)
     orders = [
         {
             "symbol": symbol,
-            "side": side,
+            "side": side_cased,
             "orderType": "Limit",
             "qty": str(qty),
             "price": str(px),
@@ -87,5 +102,5 @@ def twap_spot_batch(
     ]
 
     response = api.batch_place(category="spot", orders=orders)
-    log("twap.batch", symbol=symbol, side=side, slices=slices, resp=response)
+    log("twap.batch", symbol=symbol, side=side_cased, slices=slices, resp=response)
     return response
