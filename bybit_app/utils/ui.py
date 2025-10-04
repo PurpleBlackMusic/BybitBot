@@ -33,6 +33,7 @@ def _load_get_script_run_ctx() -> Callable[[], Any]:
 get_script_run_ctx = _load_get_script_run_ctx()
 
 import streamlit as st
+from collections.abc import Iterable, Mapping
 
 
 def _patch_responsive_dataframe() -> None:
@@ -54,6 +55,64 @@ def _patch_responsive_dataframe() -> None:
 
 
 _patch_responsive_dataframe()
+
+
+def rerun() -> None:
+    """Trigger a Streamlit rerun across supported versions."""
+
+    for candidate in (getattr(st, "rerun", None), getattr(st, "experimental_rerun", None)):
+        if callable(candidate):
+            candidate()
+            return
+
+
+def _normalise_query_params(params: Mapping[str, Iterable[str] | str]) -> dict[str, list[str]]:
+    normalised: dict[str, list[str]] = {}
+    for key, value in params.items():
+        if isinstance(value, str):
+            normalised[key] = [value]
+        else:
+            normalised[key] = [str(item) for item in value]
+    return normalised
+
+
+def get_query_params() -> dict[str, list[str]]:
+    """Return query parameters regardless of the Streamlit version."""
+
+    query_params = getattr(st, "query_params", None)
+    if query_params is not None:
+        try:
+            items = dict(query_params)  # type: ignore[arg-type]
+        except TypeError:
+            items = getattr(query_params, "to_dict", lambda: {})()
+        if isinstance(items, Mapping):
+            return _normalise_query_params(items)
+
+    getter = getattr(st, "experimental_get_query_params", None)
+    if callable(getter):
+        try:
+            items = getter()
+        except TypeError:
+            items = {}
+        if isinstance(items, Mapping):
+            return _normalise_query_params(items)
+
+    return {}
+
+
+def set_query_params(params: Mapping[str, Iterable[str] | str]) -> None:
+    """Set query parameters using whichever API is available."""
+
+    query_params = getattr(st, "query_params", None)
+    if query_params is not None and hasattr(query_params, "from_dict"):
+        query_params.from_dict(params)
+        return
+
+    setter = getattr(st, "experimental_set_query_params", None)
+    if callable(setter):
+        normalised = _normalise_query_params(params)
+        setter(**normalised)
+
 
 def safe_set_page_config(**kwargs):
     key = "_page_configured"
@@ -187,11 +246,11 @@ def navigation_link(page: str, *, label: str, icon: str | None = None, key: str 
     button_key = key or f"nav_{slug.replace(' ', '_')}"
 
     if st.button(f"{icon_part}{label}", key=button_key):
-        query_params = st.experimental_get_query_params()
+        query_params = get_query_params()
         query_params = {k: v for k, v in query_params.items() if v}
-        query_params["page"] = slug
-        st.experimental_set_query_params(**query_params)
-        st.experimental_rerun()
+        query_params["page"] = [slug]
+        set_query_params(query_params)
+        rerun()
 
     hint_key = "_bybit_nav_hint_shown"
     if not st.session_state.get(hint_key):

@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 
 from utils.guardian_bot import GuardianBot
+from utils.ui import rerun
 
 
 st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
@@ -26,7 +27,7 @@ st.caption(
 refresh = st.button("🔄 Обновить данные", use_container_width=True)
 if refresh:
     bot.refresh()
-    st.experimental_rerun()
+    rerun()
 
 summary = bot.status_summary()
 brief = bot.generate_brief()
@@ -155,4 +156,4 @@ for message in st.session_state["guardian_chat"]:
 if prompt := st.chat_input("Спросите о рисках, прибыли или плане…"):
     st.session_state["guardian_chat"].append({"role": "user", "content": prompt})
     st.session_state["guardian_chat"].append({"role": "assistant", "content": bot.answer(prompt)})
-    st.experimental_rerun()
+    rerun()

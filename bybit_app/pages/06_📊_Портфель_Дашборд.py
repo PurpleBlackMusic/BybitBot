@@ -1,6 +1,9 @@
 
 from __future__ import annotations
+
+import pandas as pd
 import streamlit as st
+
 from utils.envs import get_api_client, get_settings
 
 st.title("📊 Портфель — Дашборд")
@@ -13,8 +16,23 @@ if not (s.api_key and s.api_secret):
 api = get_api_client()
 try:
     wb = api.wallet_balance()
-    coins = (((wb.get("result") or {}).get("list") or [{}])[0].get("coin") or [])
+    raw_list = ((wb.get("result") or {}).get("list") or [{}])
+    first_entry = raw_list[0] if raw_list else {}
+    coins_raw = first_entry.get("coin") or []
+
+    if isinstance(coins_raw, dict):
+        coins_iterable = list(coins_raw.values())
+    elif isinstance(coins_raw, list):
+        coins_iterable = coins_raw
+    else:
+        coins_iterable = []
+
+    table = pd.DataFrame.from_records(coins_iterable)
+
     st.caption("Unified Wallet — доступные активы")
-    st.dataframe(coins, use_container_width=True)
+    if table.empty:
+        st.info("Баланс не содержит монет для отображения.")
+    else:
+        st.dataframe(table, use_container_width=True, hide_index=True)
 except Exception as e:
     st.error(f"Ошибка чтения баланса: {e}")
