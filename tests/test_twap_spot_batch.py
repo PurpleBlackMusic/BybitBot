@@ -57,3 +57,13 @@ def test_twap_spot_batch_handles_empty_orderbook(monkeypatch):
     result = mod.twap_spot_batch(api, "BTCUSDT", "Buy", 1, slices=1)
     assert result == {"error": "empty orderbook"}
     assert api.batch_calls == []
+
+
+def test_twap_spot_batch_validates_quantity(monkeypatch):
+    api = DummyAPI({"result": {"b": [["100", "5"]], "a": [["101", "5"]]}})
+    monkeypatch.setattr(mod, "log", lambda *args, **kwargs: None)
+
+    result = mod.twap_spot_batch(api, "BTCUSDT", "Buy", 0, slices=2)
+
+    assert result == {"error": "non-positive quantity"}
+    assert api.batch_calls == []
