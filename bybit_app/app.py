@@ -12,13 +12,14 @@ if __package__ in (None, ""):
         sys.path.insert(0, str(project_root))
 
 from bybit_app.utils.ui import (
+    build_pill,
     build_status_card,
     inject_css,
     navigation_link,
     safe_set_page_config,
 )
 from bybit_app.utils.envs import get_settings
-from bybit_app.utils.guardian_bot import GuardianBot
+from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
 
@@ -27,13 +28,11 @@ MINIMAL_CSS = """
 .block-container { max-width: 900px; padding-top: 1.5rem; }
 .bybit-card { border-radius: 18px; border: 1px solid rgba(148, 163, 184, 0.2); padding: 1.2rem 1.4rem; background: rgba(15, 23, 42, 0.35); }
 .bybit-card h3 { margin-bottom: 0.6rem; }
-.shortcut-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; margin-top: 0.8rem; }
-.shortcut { display: block; border-radius: 14px; padding: 0.85rem 1rem; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.28); font-weight: 600; text-align: left; }
-.shortcut small { display: block; font-weight: 400; opacity: 0.75; margin-top: 0.2rem; }
 .stButton>button { width: 100%; border-radius: 14px; padding: 0.7rem 1rem; font-weight: 600; }
 .stMetric { border-radius: 12px; padding: 0.4rem 0.6rem; }
 .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
 .pill-row span { background: rgba(148, 163, 184, 0.22); border-radius: 999px; padding: 0.3rem 0.75rem; font-size: 0.85rem; font-weight: 600; }
+[data-testid="stTabs"] { margin-top: 0.6rem; }
 [data-testid="stPageLinkContainer"] { margin-top: 0.35rem; }
 [data-testid="stPageLinkContainer"] a, .bybit-shortcut {
     display: block;
@@ -52,9 +51,46 @@ MINIMAL_CSS = """
 [data-testid="stPageLinkContainer"] a:focus, .bybit-shortcut:focus {
     outline: 2px solid rgba(16, 185, 129, 0.6);
 }
+.signal-card { display: flex; flex-direction: column; gap: 0.55rem; }
+.signal-card__badge { display: flex; gap: 0.45rem; align-items: center; }
+.signal-card__symbol { font-weight: 600; opacity: 0.8; }
+.signal-card__headline { font-size: 1.05rem; font-weight: 700; }
+.signal-card__body { font-size: 0.95rem; line-height: 1.45; opacity: 0.92; }
+.signal-card__footer { display: flex; flex-wrap: wrap; gap: 0.6rem; font-size: 0.85rem; opacity: 0.75; }
+.checklist { list-style: decimal; padding-left: 1.15rem; line-height: 1.5; }
+.checklist li { margin-bottom: 0.35rem; }
+.safety-list { list-style: disc; padding-left: 1.1rem; line-height: 1.5; }
+.safety-list li { margin-bottom: 0.3rem; }
 """
 
 inject_css(MINIMAL_CSS)
+
+
+@st.cache_resource(show_spinner=False)
+def _load_guardian_bot() -> GuardianBot:
+    return GuardianBot()
+
+
+def get_bot() -> GuardianBot:
+    """Return a cached GuardianBot instance."""
+
+    return _load_guardian_bot()
+
+
+def render_navigation_grid(shortcuts: list[tuple[str, str, str]], *, columns: int = 2) -> None:
+    """Render navigation links in a compact grid layout."""
+
+    if not shortcuts:
+        return
+
+    for idx in range(0, len(shortcuts), columns):
+        row = shortcuts[idx : idx + columns]
+        cols = st.columns(len(row))
+        for column, shortcut in zip(cols, row):
+            label, page, description = shortcut
+            with column:
+                navigation_link(page, label=label)
+                st.caption(description)
 
 
 def render_header() -> None:
@@ -83,17 +119,99 @@ def render_status(settings) -> None:
         tone="success" if ok else "warning",
     )
     with st.container(border=True):
-        st.markdown(status, unsafe_allow_html=True)
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Сеть", "Testnet" if settings.testnet else "Mainnet")
-        col_b.metric("Режим", "DRY-RUN" if settings.dry_run else "Live")
-        cap_guard = getattr(settings, "spot_cash_reserve_pct", 10.0)
-        col_c.metric("Резерв кэша", f"{cap_guard:.0f}%")
+        status_col, metrics_col = st.columns([2, 1])
+        with status_col:
+            st.markdown(status, unsafe_allow_html=True)
+        with metrics_col:
+            st.metric("Сеть", "Testnet" if settings.testnet else "Mainnet")
+            st.metric("Режим", "DRY-RUN" if settings.dry_run else "Live")
+            reserve = getattr(settings, "spot_cash_reserve_pct", 10.0)
+            st.metric("Резерв кэша", f"{reserve:.0f}%")
+
         updated_at = getattr(settings, "updated_at", None)
         last_update = updated_at.strftime("%d.%m.%Y %H:%M") if updated_at else "—"
         st.caption(
             f"API key: {'✅' if settings.api_key else '❌'} · Secret: {'✅' if settings.api_secret else '❌'} · Настройки обновлены: {last_update}"
         )
+
+        if not ok:
+            st.warning(
+                "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
+            )
+
+
+def _mode_meta(mode: str) -> tuple[str, str, str]:
+    mapping: dict[str, tuple[str, str, str]] = {
+        "buy": ("Покупка", "🟢", "success"),
+        "sell": ("Продажа", "🔴", "warning"),
+        "wait": ("Наблюдаем", "⏸", "neutral"),
+    }
+    return mapping.get(mode, ("Наблюдаем", "⏸", "neutral"))
+
+
+def render_signal_brief(bot: GuardianBot) -> GuardianBrief:
+    brief = bot.generate_brief()
+    score = bot.signal_scorecard(brief)
+    settings = bot.settings
+    mode_label, mode_icon, tone = _mode_meta(brief.mode)
+
+    st.subheader("Сводка сигнала")
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div class="signal-card__badge">
+                {pill}<span class="signal-card__symbol">· {symbol}</span>
+            </div>
+            """.format(
+                pill=build_pill(mode_label, icon=mode_icon, tone=tone),
+                symbol=brief.symbol,
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='signal-card__headline'>{brief.headline}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='signal-card__body'>{brief.analysis}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='signal-card__body'>{brief.action_text}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='signal-card__body'>{brief.confidence_text}</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='signal-card__body'>{brief.ev_text}</div>",
+            unsafe_allow_html=True,
+        )
+
+        metric_cols = st.columns(3)
+        metric_cols[0].metric(
+            "Вероятность",
+            f"{score['probability_pct']:.1f}%",
+            f"Порог {score['buy_threshold']:.0f}%",
+        )
+        metric_cols[1].metric(
+            "Потенциал",
+            f"{score['ev_bps']:.1f} б.п.",
+            f"Мин. {score['min_ev_bps']:.1f} б.п.",
+        )
+        trade_mode = "DRY-RUN" if settings.dry_run else "Live"
+        metric_cols[2].metric("Тактика", mode_label, trade_mode)
+        st.caption(f"Обновление: {score['last_update']}")
+
+    if brief.caution:
+        st.warning(brief.caution)
+    if brief.status_age and brief.status_age > 300:
+        st.error(
+            "Сигнал не обновлялся более пяти минут — проверьте соединение с данными или перезапустите источник."
+        )
+
+    return brief
 
 
 def render_onboarding() -> None:
@@ -128,16 +246,10 @@ def render_shortcuts() -> None:
         ),
     ]
 
-    columns = st.columns(len(shortcuts))
-    for column, shortcut in zip(columns, shortcuts):
-        label, page, description = shortcut
-        with column:
-            navigation_link(page, label=label)
-            st.caption(description)
+    render_navigation_grid(shortcuts, columns=3)
 
 
-def render_data_health() -> None:
-    bot = GuardianBot()
+def render_data_health(bot: GuardianBot) -> None:
     health = bot.data_health()
 
     with st.container(border=True):
@@ -145,17 +257,39 @@ def render_data_health() -> None:
         st.caption(
             "Следим за свежестью сигнала, журналом исполнений и подключением API, чтобы не пропускать проблемы."
         )
+        cards: list[tuple[str, str, str, str]] = []
         for key in ("ai_signal", "executions", "api_keys"):
             info = health.get(key, {})
             if not info:
                 continue
+            tone = "success" if info.get("ok") else "warning"
             icon = "✅" if info.get("ok") else "⚠️"
             title = info.get("title", key)
             message = info.get("message", "")
-            st.markdown(f"{icon} **{title}** — {message}")
-            details = info.get("details")
-            if details:
-                st.caption(details)
+            cards.append((title, message, icon, tone))
+
+        if not cards:
+            st.caption("Пока нет диагностических данных.")
+            return
+
+        cols = st.columns(min(3, len(cards)))
+        for column, (title, message, icon, tone) in zip(cols, cards):
+            with column:
+                st.markdown(
+                    build_status_card(title, message, icon=icon, tone=tone),
+                    unsafe_allow_html=True,
+                )
+
+
+def render_market_watchlist(bot: GuardianBot) -> None:
+    st.subheader("Наблюдаемые активы")
+    items = bot.market_watchlist()
+
+    if not items:
+        st.caption("Пока нет тикеров в списке наблюдения — бот ждёт новый сигнал.")
+        return
+
+    st.dataframe(items, hide_index=True, use_container_width=True)
 
 
 def render_hidden_tools() -> None:
@@ -232,19 +366,47 @@ def render_hidden_tools() -> None:
             ),
         ]
 
-        for title, items in groups:
-            st.markdown(f"#### {title}")
-            for idx in range(0, len(items), 3):
-                row = items[idx : idx + 3]
-                cols = st.columns(len(row))
-                for column, shortcut in zip(cols, row):
-                    label, page, description = shortcut
-                    with column:
-                        navigation_link(page, label=label)
-                        st.caption(description)
+        tab_titles = [title for title, _ in groups]
+        tabs = st.tabs(tab_titles)
+
+        for tab, (_, items) in zip(tabs, groups):
+            with tab:
+                render_navigation_grid(items)
 
 
-def render_tips(settings) -> None:
+def render_action_plan(bot: GuardianBot, brief: GuardianBrief) -> None:
+    steps = bot.plan_steps(brief)
+    notes = bot.safety_notes()
+
+    plan_html = "".join(f"<li>{step}</li>" for step in steps)
+    safety_html = "".join(f"<li>{note}</li>" for note in notes)
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("#### Что делаем дальше")
+        st.markdown(f"<ol class='checklist'>{plan_html}</ol>", unsafe_allow_html=True)
+
+    with cols[1]:
+        st.markdown("#### Памятка безопасности")
+        st.markdown(f"<ul class='safety-list'>{safety_html}</ul>", unsafe_allow_html=True)
+        st.caption(bot.risk_summary().replace("\n", "  \n"))
+
+
+def render_guides(settings, bot: GuardianBot, brief: GuardianBrief) -> None:
+    st.subheader("Поддержка и советы")
+    plan_tab, onboarding_tab, tips_tab = st.tabs(["План действий", "Первые шаги", "Подсказки"])
+
+    with plan_tab:
+        render_action_plan(bot, brief)
+
+    with onboarding_tab:
+        render_onboarding()
+
+    with tips_tab:
+        render_tips(settings, brief)
+
+
+def render_tips(settings, brief: GuardianBrief) -> None:
     with st.container(border=True):
         st.markdown("### Быстрые подсказки")
         st.markdown(
@@ -259,24 +421,31 @@ def render_tips(settings) -> None:
             st.info("DRY-RUN активен: безопасно тестируйте стратегии перед реальной торговлей.")
         else:
             st.warning("DRY-RUN выключен. Проверьте лимиты риска перед запуском торговых сценариев.")
+        if brief.status_age and brief.status_age > 300:
+            st.error("Данные сигнала устарели. Проверьте, что пайплайн сигналов работает корректно.")
+        if not (settings.api_key and settings.api_secret):
+            st.warning("API ключи не добавлены: без них торговля невозможна.")
 
 
 def main() -> None:
     settings = get_settings()
+    bot = get_bot()
 
     render_header()
     st.divider()
     render_status(settings)
     st.divider()
-    render_onboarding()
+    brief = render_signal_brief(bot)
     st.divider()
     render_shortcuts()
     st.divider()
-    render_data_health()
+    render_data_health(bot)
+    st.divider()
+    render_market_watchlist(bot)
+    st.divider()
+    render_guides(settings, bot, brief)
     st.divider()
     render_hidden_tools()
-    st.divider()
-    render_tips(settings)
 
 
 if __name__ == "__main__":
