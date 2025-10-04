@@ -1,12 +1,20 @@
-
 from __future__ import annotations
-import time, json
+
+import json
+import time
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict
 
 
 class TTLKV:
+    """Thread-safe key/value store with optional TTL semantics.
+
+    The store keeps its state in a JSON file on disk. The file is lazily
+    reloaded when it changes and writes are done atomically to minimise the
+    risk of corruption when several processes touch the cache simultaneously.
+    """
+
     def __init__(self, path: Path):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -17,28 +25,51 @@ class TTLKV:
 
     # --- internal helpers -------------------------------------------------
     def _load_from_disk(self) -> None:
+        """Load state from disk if the JSON file exists and is valid."""
+
         try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             self._data = {}
-            self.path.write_text(json.dumps({}), encoding="utf-8")
-        except Exception:
-            self._data = {}
+            self._mtime = None
+            return
+
+        if not raw.strip():
+            data: Dict[str, Dict[str, Any]] = {}
+        else:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {}
+            else:
+                data = parsed if isinstance(parsed, dict) else {}
+
+        self._data = data
         try:
             self._mtime = self.path.stat().st_mtime
         except FileNotFoundError:
             self._mtime = None
 
     def _ensure_fresh(self) -> None:
+        """Reload file contents when the on-disk version changes."""
+
         try:
             mtime = self.path.stat().st_mtime
         except FileNotFoundError:
             mtime = None
+
         if mtime != self._mtime:
             self._load_from_disk()
 
     def _flush(self) -> None:
-        self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        """Persist the in-memory state atomically."""
+
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(self.path)
         try:
             self._mtime = self.path.stat().st_mtime
         except FileNotFoundError:
@@ -51,12 +82,16 @@ class TTLKV:
             rec = self._data.get(key)
             if not rec:
                 return default
+
+            value = rec.get("val", default)
             if ttl_sec is None:
-                return rec.get("val", default)
-            ts = rec.get("ts", 0)
-            if time.time() - ts > ttl_sec:
+                return value
+
+            ts = float(rec.get("ts", 0.0))
+            now = time.time()
+            if now - ts > ttl_sec:
                 return default
-            return rec.get("val", default)
+            return value
 
     def set(self, key: str, val: Any):
         with self._lock:
