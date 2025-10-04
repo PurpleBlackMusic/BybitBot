@@ -2,7 +2,6 @@
 from __future__ import annotations
 from .helpers import ensure_link_id
 from .bybit_api import BybitAPI
-from .validators import validate_spot_rules
 from .log import log
 
 def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float, price: float, tp: float | None, sl: float | None, tp_order_type: str = "Market", sl_order_type: str = "Market", tp_limit: float | None = None, sl_limit: float | None = None, link_id: str | None = None, tif: str = "PostOnly"):
@@ -33,6 +32,6 @@ def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float
         if sl_order_type == "Limit":
             assert sl_limit is not None, "sl_limit required for Limit sl"
             body["slLimitPrice"] = f"{sl_limit:.10f}"
-    r = api._req("POST", "/v5/order/create", json=body)
+    r = api.place_order(**body)
     log("spot.tpsl.create", symbol=symbol, side=side, body=body, resp=r)
     return r

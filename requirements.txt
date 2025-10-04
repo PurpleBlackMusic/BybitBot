@@ -5,3 +5,5 @@ websocket-client>=1.6.0
 python-dateutil>=2.9.0.post0
 numpy>=1.23.0
 scikit-learn>=1.4.0
+python-dotenv>=1.0.0
+pydantic>=1.10.0

@@ -165,6 +165,20 @@ class WSManager:
             log("ws.private.start.error", err=str(e))
             return False
 
+    def start(self, subs: Iterable[str] | None = None, include_private: bool = True) -> bool:
+        """Start public and (optionally) private WebSocket channels."""
+        subs_to_use: Iterable[str]
+        if subs is None:
+            subs_to_use = self._pub_subs or ("tickers.BTCUSDT",)
+        else:
+            subs_to_use = subs
+
+        ok_public = self.start_public(subs_to_use)
+        ok_private = True
+        if include_private:
+            ok_private = self.start_private()
+        return bool(ok_public and ok_private)
+
     def stop_private(self):
         try:
             if self._priv:
@@ -188,19 +202,14 @@ manager = WSManager()
 
 
 # --- Backward‑compat helpers for legacy pages ---
-def start(self):
-    """Стартуем публичный и приватный каналы по умолчанию."""
-    try:
-        self.start_public(self._pub_subs or ("tickers.BTCUSDT",))
-    except Exception:
-        pass
-    try:
-        self.start_private()
-    except Exception:
-        pass
-    return True
+def start(subs: Iterable[str] | None = None, include_private: bool = True) -> bool:
+    """Module-level proxy mirroring :meth:`WSManager.start`."""
+    return manager.start(subs=subs, include_private=include_private)
 
-def stop(self):
-    """Остановить оба канала (совместимость)."""
-    self.stop_all()
+
+def stop(include_private: bool = True) -> bool:
+    """Stop WebSocket channels started via :func:`start`."""
+    manager.stop_public()
+    if include_private:
+        manager.stop_private()
     return True
