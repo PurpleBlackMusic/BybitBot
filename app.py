@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 # Re-export helpers for compatibility with older imports.
 from bybit_app.app import *  # noqa: F401,F403
+from bybit_app.utils.ui import get_script_run_ctx
 
 _PAGES_DIR = PROJECT_ROOT / "bybit_app" / "pages"
 
@@ -28,12 +29,35 @@ def _iter_page_files() -> Iterable[Path]:
     return sorted(path for path in _PAGES_DIR.glob("*.py") if path.is_file())
 
 
+def _resolve_page_path(script_path: Path) -> str:
+    """Return a path usable by ``st.Page`` in both wrapper and package modes."""
+
+    resolved = script_path.resolve()
+    ctx = get_script_run_ctx()
+    if ctx is not None:
+        main_dir = Path(ctx.main_script_path).resolve().parent
+        try:
+            return str(resolved.relative_to(main_dir))
+        except ValueError:
+            pass
+
+    try:
+        return str(resolved.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def _build_navigation() -> list[st.Page]:
     pages: list[st.Page] = [
-        st.Page(Path("bybit_app") / "app.py", title="Bybit Spot Guardian", icon="🧠", default=True)
+        st.Page(
+            _resolve_page_path(PROJECT_ROOT / "bybit_app" / "app.py"),
+            title="Bybit Spot Guardian",
+            icon="🧠",
+            default=True,
+        )
     ]
     for page_path in _iter_page_files():
-        pages.append(st.Page(Path("bybit_app") / "pages" / page_path.name))
+        pages.append(st.Page(_resolve_page_path(page_path)))
     return pages
 
 
