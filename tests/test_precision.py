@@ -16,3 +16,6 @@ def test_ceil_qty_to_min_notional_respects_step():
     assert ceil_qty_to_min_notional(0.1, 100, 15, 0.1) == "0.2"
 
 
+def test_ceil_qty_to_min_notional_snap_even_when_already_above_min():
+    # Quantity already clears min notional but violates step precision
+    assert ceil_qty_to_min_notional(0.15, 100, 10, 0.1) == "0.2"
