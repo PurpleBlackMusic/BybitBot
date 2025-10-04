@@ -1,12 +1,46 @@
 
 from __future__ import annotations
-import streamlit as st, json, time
+
+import json
+import time
+from typing import Any
+
+import streamlit as st
+
 from utils.envs import get_api_client, get_settings, update_settings
 from utils.coach import market_health, build_autopilot_settings
 from utils.scheduler import start_background_loop, _load_state_file, _save_state_file
 from utils.reporter import send_daily_report, summarize_today, send_test_message
 from utils.ai.live import AIRunner
 from utils.paths import DATA_DIR
+
+
+@st.cache_resource(show_spinner=False)
+def _get_cached_api_client():
+    """Reuse a single API client instance between reruns.
+
+    Streamlit re-executes the script on each interaction which used to create a
+    fresh REST client every time.  The connection set-up is relatively expensive
+    and also introduced unnecessary load on the Bybit API.  Caching the client
+    keeps the behaviour identical while avoiding redundant handshakes.
+    """
+
+    return get_api_client()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_market_health_cached() -> dict[str, Any]:
+    """Fetch and cache market health hints for the briefing block."""
+
+    api = _get_cached_api_client()
+    return market_health(api, category="spot")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_today_summary_cached() -> dict[str, Any]:
+    """Cache the daily summary to avoid touching the log files on each rerun."""
+
+    return summarize_today()
 
 st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
 st.title("🧭 Простой режим")
@@ -19,14 +53,27 @@ s = get_settings()
 # ##__TG_DEFAULTS__ ensure variables exist before buttons use them
 tg_trd = bool(getattr(s, 'tg_trade_notifs', False))
 tg_min = float(getattr(s, 'tg_trade_notifs_min_notional', 50.0))
-api = get_api_client()
+
+
+def _persist_settings(**kwargs: Any) -> None:
+    """Update settings while keeping Telegram defaults in sync."""
+
+    payload = dict(kwargs)
+    payload.setdefault("tg_trade_notifs", bool(tg_trd))
+    payload.setdefault("tg_trade_notifs_min_notional", float(tg_min))
+    update_settings(**payload)
+
+
+api = _get_cached_api_client()
 # фоновая автоматика
 start_background_loop()
 
 # --- Daily briefing ---
 st.subheader("Сегодняшний брифинг")
+if st.button("🔄 Обновить брифинг", key="refresh_briefing"):
+    _load_market_health_cached.clear()
 try:
-    info = market_health(api, category="spot")
+    info = _load_market_health_cached()
     light = info.get("light")
     reason = info.get("reason","")
     cols = st.columns([1,6])
@@ -57,7 +104,7 @@ with left:
     if st.button("🤖 Автоподбор и запуск"):
         try:
             pack = build_autopilot_settings(s, api)
-            update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), **pack["settings"])
+            _persist_settings(**pack["settings"])
             runner.start()
             st.success(f"Бот запущен. Прогнозная подготовка: ~{pack['eta_minutes']} мин.")
         except Exception as e:
@@ -92,7 +139,7 @@ with left:
     dry = st.toggle("Демо-режим (без реальных ордеров)", value=getattr(s, 'dry_run', True),
                     help="В демо-запуске бот **не отправляет** реальные заявки.")
     if dry != getattr(s, 'dry_run', True):
-        update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), dry_run=bool(dry))
+        _persist_settings(dry_run=bool(dry))
         st.rerun()
 
 with right:
@@ -138,9 +185,9 @@ with st.expander("Расписание: автозапуск/автостоп б
         prof = st.number_input("Дневная цель прибыли (%)", value=float(getattr(s, "ai_daily_profit_target_pct", 0.0)), step=0.1)
 
     if st.button("💾 Сохранить расписание"):
-        update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), auto_trade_enabled=bool(en), auto_start_time=start_t, auto_stop_time=stop_t, auto_dry_run=bool(auto_dry),
-                        daily_report_enabled=bool(rep), daily_report_time=rep_t,
-                        ai_daily_loss_limit_pct=float(loss), ai_daily_profit_target_pct=float(prof))
+        _persist_settings(auto_trade_enabled=bool(en), auto_start_time=start_t, auto_stop_time=stop_t, auto_dry_run=bool(auto_dry),
+                          daily_report_enabled=bool(rep), daily_report_time=rep_t,
+                          ai_daily_loss_limit_pct=float(loss), ai_daily_profit_target_pct=float(prof))
         st.success("Расписание сохранено. Фоновая автоматика уже работает.")
 
 
@@ -153,7 +200,7 @@ with st.expander("Фильтрация монет (для автоподбора
     man = st.text_input("Я сам задам монеты (перечисли через запятую)", value=str(getattr(s, 'ai_symbols_manual', '')),
                         help="Если указано — автоподбор возьмёт именно эти монеты.")
     if st.button("💾 Сохранить списки монет"):
-        update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), ai_symbols_whitelist=wl, ai_symbols_blacklist=bl, ai_symbols_manual=man)
+        _persist_settings(ai_symbols_whitelist=wl, ai_symbols_blacklist=bl, ai_symbols_manual=man)
         st.success("Списки сохранены.")
 
 st.subheader("🗂 Экспорт/импорт настроек")
@@ -175,8 +222,7 @@ with coly:
         try:
             import json
             payload = json.loads(up.read().decode("utf-8"))
-            from utils.envs import update_settings
-            update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), **payload)
+            _persist_settings(**payload)
             st.success("Настройки импортированы.")
         except Exception as e:
             st.error(f"Ошибка импорта: {e}")
@@ -191,7 +237,7 @@ with st.expander("Настройки Telegram (для уведомлений и 
     en = st.toggle("Включить уведомления", value=bool(getattr(s, "telegram_notify", False)),
                    help="Когда включено — приложение будет присылать короткие уведомления о старте/остановке и заявках.")
     if st.button("✅ Сохранить Telegram-настройки"):
-        update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), telegram_token=tok, telegram_chat_id=chat, telegram_notify=bool(en))
+        _persist_settings(telegram_token=tok, telegram_chat_id=chat, telegram_notify=bool(en))
         st.success("Сохранено.")
     if st.button("🧪 Отправить тестовое сообщение"):
         r = send_test_message("Привет! Telegram настроен ✅")
@@ -200,13 +246,24 @@ with st.expander("Настройки Telegram (для уведомлений и 
 
 st.divider()
 st.subheader("Отчёт за сегодня")
+if st.button("🔄 Обновить сводку", key="refresh_summary"):
+    _load_today_summary_cached.clear()
+summary: dict[str, Any] | None = None
 try:
-    summary = summarize_today()
-    st.write(f"Событий: **{summary.get('events',0)}**, сигналов: **{summary.get('signals',0)}**, заявок: **{summary.get('orders',0)}**, ошибок: **{summary.get('errors',0)}**.")
-except Exception as e:
+    summary = _load_today_summary_cached()
+except Exception:
+    summary = None
+
+if summary:
+    st.write(
+        f"Событий: **{summary.get('events', 0)}**, сигналов: **{summary.get('signals', 0)}**, "
+        f"заявок: **{summary.get('orders', 0)}**, ошибок: **{summary.get('errors', 0)}**."
+    )
+else:
     st.write("Пока нет данных за сегодня.")
 if st.button("📤 Отправить отчёт в Telegram"):
     r = send_daily_report()
+    _load_today_summary_cached.clear()
     st.success(f"Отчёт отправлен: {r}")
 
 if st.button("🔓 Снять ‘стоп-день’ до завтра"):
@@ -264,7 +321,7 @@ with st.expander("Фильтры автоподбора монет"):
         max_spread_bps = st.number_input("Макс. спред (бпс)", value=float(getattr(s, "ai_max_spread_bps", 25.0)), step=1.0)
         min_turnover_usd = st.number_input("Мин. оборот (USD)", value=float(getattr(s, "ai_min_turnover_usd", 2_000_000.0)), step=100000.0)
     if st.button("💾 Сохранить пресет"):
-        update_settings(tg_trade_notifs=bool(tg_trd), tg_trade_notifs_min_notional=float(tg_min), ai_universe_preset=preset, ai_max_spread_bps=float(max_spread_bps), ai_min_turnover_usd=float(min_turnover_usd))
+        _persist_settings(ai_universe_preset=preset, ai_max_spread_bps=float(max_spread_bps), ai_min_turnover_usd=float(min_turnover_usd))
         st.success("Сохранено. Автоподбор будет учитывать фильтры.")
 
 
@@ -276,7 +333,7 @@ with colw1:
 with colw2:
     wd_max = st.number_input("Макс. задержка heartbeat (сек)", value=int(getattr(s, "ws_watchdog_max_age_sec", 90)), step=10)
 if st.button("💾 Сохранить Watchdog"):
-    update_settings(ws_watchdog_enabled=bool(wd_on), ws_watchdog_max_age_sec=int(wd_max))
+    _persist_settings(ws_watchdog_enabled=bool(wd_on), ws_watchdog_max_age_sec=int(wd_max))
     st.success("Сохранено.")
 
 
