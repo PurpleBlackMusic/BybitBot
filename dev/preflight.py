@@ -27,7 +27,6 @@ def import_scan():
         "bybit_app.utils.validators",
         "bybit_app.utils.ws_orderbook",
         "bybit_app.utils.ws_orderbook_v5",
-        "bybit_app.utils.ai.live",
         "bybit_app.utils.pnl",
     ]
     bad = []

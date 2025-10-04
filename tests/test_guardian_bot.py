@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Dict, List
 
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
@@ -148,6 +149,7 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
         "watchlist": {
             "ETHUSDT": {"score": 0.7, "trend": "buy", "note": "объём растёт"},
             "XRPUSDT": 0.4,
+            "DOGEUSDT": {"score": "n/a", "trend": "wait"},
         },
     }
     status_path = tmp_path / "ai" / "status.json"
@@ -158,8 +160,10 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     brief = bot.generate_brief()
 
     watchlist = bot.market_watchlist()
-    assert any(item["symbol"] == "ETHUSDT" for item in watchlist)
-    assert any(item["symbol"] == "XRPUSDT" for item in watchlist)
+    assert [item["symbol"] for item in watchlist] == ["ETHUSDT", "XRPUSDT", "DOGEUSDT"]
+    assert watchlist[0]["score"] == 0.7
+    assert watchlist[1]["score"] == 0.4
+    assert watchlist[2]["score"] is None
 
     scorecard = bot.signal_scorecard(brief)
     assert scorecard["symbol"] == "BTCUSDT"
@@ -186,6 +190,104 @@ def test_guardian_recent_trades(tmp_path: Path) -> None:
     assert trades[0]["when"] != "—"
 
 
+def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.75,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "extra": "ignored",
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="ETHUSDT",
+        ai_buy_threshold=0.7,
+        ai_sell_threshold=0.4,
+        ai_min_ev_bps=10.0,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+    assert summary["symbol"] == "ETHUSDT"
+    assert summary["probability_pct"] == 75.0
+    assert summary["actionable"] is True
+    assert summary["actionable_reasons"] == []
+    assert summary["thresholds"]["buy_probability_pct"] == 70.0
+    assert summary["fallback_used"] is False
+    assert summary["status_source"] == "live"
+    assert summary["staleness"]["state"] == "fresh"
+    assert "extra" in summary["raw_keys"]
+
+    # ensure copies are returned
+    summary["symbol"] = "CHANGED"
+    assert bot.status_summary()["symbol"] == "ETHUSDT"
+
+    report = bot.unified_report()
+    assert report["status"]["symbol"] == "ETHUSDT"
+    assert report["status"]["actionable"] is True
+    assert report["status"]["status_source"] == "live"
+    assert report["status"]["actionable_reasons"] == []
+    assert report["status"]["staleness"]["state"] == "fresh"
+    report["status"]["symbol"] = "MUTATED"
+    assert bot.unified_report()["status"]["symbol"] == "ETHUSDT"
+
+
+def test_guardian_status_fallback_when_file_missing(tmp_path: Path) -> None:
+    status_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.64,
+        "ev_bps": 16.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    live_summary = bot.status_summary()
+    assert live_summary["status_source"] == "live"
+
+    status_path.unlink()
+
+    fallback_summary = bot.status_summary()
+    assert fallback_summary["fallback_used"] is True
+    assert fallback_summary["status_source"] == "cached"
+    assert fallback_summary["symbol"] == "BTCUSDT"
+
+    health = bot.data_health()
+    assert health["ai_signal"]["ok"] is False
+    assert "сохран" in health["ai_signal"]["message"].lower()
+
+
+def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.82,
+        "ev_bps": 24.0,
+        "side": "buy",
+        "last_tick_ts": time.time() - 3600,
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path, Settings(ai_buy_threshold=0.6, ai_min_ev_bps=10.0))
+    summary = bot.status_summary()
+
+    assert summary["actionable"] is False
+    assert summary["staleness"]["state"] == "stale"
+    assert any("устар" in reason.lower() for reason in summary["actionable_reasons"])
+
+    health = bot.data_health()
+    assert health["ai_signal"]["ok"] is False
+    assert "15 минут" in health["ai_signal"]["message"] or "статус" in health["ai_signal"]["message"].lower()
+
+
 def test_guardian_trade_statistics(tmp_path: Path) -> None:
     ledger_path = tmp_path / "pnl" / "executions.jsonl"
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +307,35 @@ def test_guardian_trade_statistics(tmp_path: Path) -> None:
     assert "BTCUSDT" in stats["symbols"]
     assert stats["gross_volume"] > 0
     assert stats["per_symbol"]
+
+
+def test_guardian_unified_report_is_serialisable(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.62,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(
+        json.dumps({"category": "spot", "symbol": "BTCUSDT", "execPrice": 20000, "execQty": 0.1})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bot = _make_bot(tmp_path)
+    report = bot.unified_report()
+
+    assert isinstance(report["brief"], dict)
+    assert report["brief"]["symbol"] == "BTCUSDT"
+    assert isinstance(bot.brief_payload(), dict)
+    assert report["brief"]["mode"] in {"buy", "wait", "sell"}
 
 
 def test_guardian_data_health(tmp_path: Path) -> None:
@@ -244,3 +375,118 @@ def test_guardian_data_health(tmp_path: Path) -> None:
     assert health["executions"]["trades"] == 1
     assert health["executions"]["ok"] is True
     assert health["api_keys"]["ok"] is True
+
+
+def test_guardian_unified_report(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.65,
+        "ev_bps": 14.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "watchlist": {"ETHUSDT": {"score": 0.6, "trend": "buy"}},
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "execPrice": 27000,
+                "execQty": 0.01,
+                "execTime": time.time(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bot = _make_bot(tmp_path, Settings(api_key="k", api_secret="s"))
+    report = bot.unified_report()
+
+    assert report["brief"]["symbol"] == "BTCUSDT"
+    assert isinstance(report["portfolio"], dict)
+    assert report["statistics"]["trades"] == 1
+    assert report["health"]["api_keys"]["ok"] is True
+    assert report["watchlist"]
+    assert report["generated_at"] <= time.time()
+
+
+def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
+    class CountingGuardianBot(GuardianBot):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.load_calls = 0
+            self.portfolio_calls = 0
+            self.recent_calls = 0
+
+        def _load_ledger_events(self) -> List[Dict[str, object]]:  # type: ignore[override]
+            self.load_calls += 1
+            return super()._load_ledger_events()
+
+        def _build_portfolio(self, spot_events: List[Dict[str, object]]) -> Dict[str, object]:  # type: ignore[override]
+            self.portfolio_calls += 1
+            return super()._build_portfolio(spot_events)
+
+        def _build_recent_trades(
+            self, spot_events: List[Dict[str, object]], limit: int = 50
+        ) -> List[Dict[str, object]]:  # type: ignore[override]
+            self.recent_calls += 1
+            return super()._build_recent_trades(spot_events, limit)
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.6,
+        "ev_bps": 12.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "execPrice": 25000,
+                "execQty": 0.01,
+                "execTime": time.time(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bot = CountingGuardianBot(data_dir=tmp_path)
+    first_report = bot.unified_report()
+    assert first_report["statistics"]["trades"] == 1
+    assert bot.load_calls == 1
+    assert bot.portfolio_calls == 1
+    assert bot.recent_calls == 1
+
+    time.sleep(1.1)
+    status_payload["probability"] = 0.4
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    second_report = bot.unified_report()
+    assert second_report["brief"]["mode"] in {"wait", "sell"}
+    assert bot.load_calls == 1
+    assert bot.portfolio_calls == 1
+    assert bot.recent_calls == 1
+
+    reply = bot.answer("сколько сейчас прибыли?")
+    assert "USDT" in reply
+    assert bot.load_calls == 1
+    assert bot.portfolio_calls == 1
+    assert bot.recent_calls == 1
