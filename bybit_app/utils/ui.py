@@ -1,13 +1,36 @@
 
 from __future__ import annotations
 
+from importlib import import_module, util
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable
 
-from streamlit.runtime.scriptrunner_utils.script_run_context import (
-    get_script_run_ctx,
-)
+
+def _load_get_script_run_ctx() -> Callable[[], Any]:
+    """Return ``get_script_run_ctx`` compatible with different Streamlit versions."""
+
+    module_names = [
+        "streamlit.runtime.scriptrunner.script_run_context",
+        "streamlit.runtime.scriptrunner_utils.script_run_context",
+    ]
+
+    for module_name in module_names:
+        if util.find_spec(module_name) is None:
+            continue
+
+        module = import_module(module_name)
+        get_ctx = getattr(module, "get_script_run_ctx", None)
+        if callable(get_ctx):
+            return get_ctx
+
+    def _missing_ctx() -> None:
+        return None
+
+    return _missing_ctx
+
+
+get_script_run_ctx = _load_get_script_run_ctx()
 
 import streamlit as st
 
