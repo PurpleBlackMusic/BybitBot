@@ -1,7 +1,11 @@
-
 from __future__ import annotations
 import math
 import pandas as pd
+
+
+def _safe_div(num: pd.Series, den: pd.Series) -> pd.Series:
+    """Vectorised division that avoids division by zero."""
+    return num / (den.replace(0, math.nan).fillna(method="ffill").fillna(method="bfill") + 1e-9)
 
 def rsi(series: pd.Series, period: int = 14):
     delta = series.diff()
@@ -19,17 +23,49 @@ def atr(df: pd.DataFrame, period: int = 14):
 
 def make_features(df: pd.DataFrame):
     df = df.copy()
+
+    # Price dynamics
     df['ret1'] = df['close'].pct_change()
+    df['ret5'] = df['close'].pct_change(5)
+    df['ret20'] = df['close'].pct_change(20)
+    df['vol20'] = df['ret1'].rolling(20).std()
+    df['vol5'] = df['ret1'].rolling(5).std()
+    df['slope20'] = df['close'].rolling(20).apply(lambda x: (x[-1] - x[0]) / max(1e-9, abs(x[0])), raw=False)
+
+    # Trend indicators
     df['sma20'] = df['close'].rolling(20).mean()
     df['sma50'] = df['close'].rolling(50).mean()
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+
+    # Momentum & oscillators
     df['rsi14'] = rsi(df['close'], 14)
-    df['atr14'] = atr(df[['high','low','close']].rename(columns={'high':'high','low':'low','close':'close'}), 14)
-    df['adx14'] = adx(df[['high','low','close']].rename(columns={'high':'high','low':'low','close':'close'}), 14)
+    df['atr14'] = atr(df[['high', 'low', 'close']].rename(columns={'high': 'high', 'low': 'low', 'close': 'close'}), 14)
+    df['adx14'] = adx(df[['high', 'low', 'close']].rename(columns={'high': 'high', 'low': 'low', 'close': 'close'}), 14)
+    low_min = df['low'].rolling(14).min()
+    high_max = df['high'].rolling(14).max()
+    stoch_k = 100 * _safe_div(df['close'] - low_min, high_max - low_min)
+    df['stoch_k'] = stoch_k
+    df['stoch_d'] = stoch_k.rolling(3).mean()
+
+    # Volatility bands
+    ma20 = df['close'].rolling(20).mean()
+    sd20 = df['close'].rolling(20).std()
+    df['bb_upper'] = ma20 + 2 * sd20
+    df['bb_lower'] = ma20 - 2 * sd20
+    df['bb_width'] = _safe_div(df['bb_upper'] - df['bb_lower'], ma20)
+    df['price_bb_pos'] = _safe_div(df['close'] - df['bb_lower'], df['bb_upper'] - df['bb_lower'])
+
+    # Volume structure
+    df['volume_ma20'] = df['volume'].rolling(20).mean()
+    df['volume_z'] = zscore(df['volume'], 20)
+    df['turnover_z'] = zscore(df.get('turnover', df['close'] * df['volume']), 20)
+
     df['z20'] = zscore(df['close'], 20)
-    df['vol20'] = df['ret1'].rolling(20).std()
-    df['slope20'] = df['close'].rolling(20).apply(lambda x: (x[-1]-x[0])/max(1e-9,abs(x[0])), raw=False)
+
     df = df.dropna().reset_index(drop=True)
     return df
 
