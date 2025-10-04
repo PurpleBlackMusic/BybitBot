@@ -12,7 +12,7 @@ if not (s.api_key and s.api_secret):
 
 api = get_api_client()
 q = st.text_input("Фильтр по подстроке тикера", value="USDT")
-top_n = st.slider("Сколько пар показать (по 24h объёму)", 5, 100, 20)
+top_n = int(st.slider("Сколько пар показать (по 24h объёму)", 5, 100, 20))
 try:
     tk = api.tickers(category="spot")
     rows = (tk.get("result") or {}).get("list") or []

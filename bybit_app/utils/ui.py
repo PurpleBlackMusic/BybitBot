@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import inspect
 from importlib import import_module, util
 from pathlib import Path
 from textwrap import dedent
@@ -44,10 +45,43 @@ def _patch_responsive_dataframe() -> None:
 
     original: Callable[..., Any] = st.dataframe
 
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        signature = None
+    supports_use_container_width = (
+        signature is not None and "use_container_width" in signature.parameters
+    )
+
+    fallback_error_types: list[type[Exception]] = [TypeError, ValueError]
+    try:  # pragma: no cover - older Streamlit versions may miss this class
+        from streamlit.errors import StreamlitAPIException  # type: ignore
+    except Exception:  # pragma: no cover - fall back to the default tuple
+        StreamlitAPIException = None  # type: ignore[assignment]
+    else:  # pragma: no cover - depends on Streamlit version
+        fallback_error_types.append(StreamlitAPIException)  # type: ignore[arg-type]
+    fallback_errors = tuple(fallback_error_types)
+
     def patched(*args: Any, **kwargs: Any):  # type: ignore[override]
         use_container = kwargs.pop("use_container_width", None)
-        if use_container:
-            kwargs.setdefault("width", "stretch")
+        if use_container and "width" not in kwargs:
+            if supports_use_container_width:
+                kwargs["use_container_width"] = use_container
+                return original(*args, **kwargs)
+
+            last_error: Exception | None = None
+            for candidate in ("stretch", "auto", 0):
+                try:
+                    return original(*args, width=candidate, **kwargs)
+                except fallback_errors as exc:
+                    last_error = exc
+                except Exception:
+                    raise
+            if last_error is not None:
+                try:
+                    return original(*args, **kwargs)
+                except Exception as final_exc:  # pragma: no cover - defensive
+                    raise last_error from final_exc
         return original(*args, **kwargs)
 
     st.dataframe = patched  # type: ignore[assignment]
