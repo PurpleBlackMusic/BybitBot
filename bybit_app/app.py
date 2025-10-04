@@ -1,64 +1,117 @@
 
 from __future__ import annotations
+
+from textwrap import dedent
+
 import streamlit as st
-from bybit_app.utils.ui import safe_set_page_config, inject_css
+
+from bybit_app.utils.ui import (
+    safe_set_page_config,
+    inject_css,
+    build_pill,
+    build_status_card,
+)
 from bybit_app.utils.paths import APP_ROOT
 from bybit_app.utils.envs import get_settings
 
 safe_set_page_config(page_title="Bybit Smart OCO — PRO", page_icon="🧠", layout="wide")
-inject_css(
-    """
-    .bybit-hero {
-        background: linear-gradient(135deg, rgba(30,41,59,0.92), rgba(15,118,110,0.88));
-        color: white;
-        padding: 1.5rem 1.75rem;
-        border-radius: 20px;
-        box-shadow: 0 18px 48px rgba(15, 118, 110, 0.28);
-        margin-bottom: 1.25rem;
-    }
-    .bybit-hero h1, .bybit-hero h2, .bybit-hero p { color: inherit; }
-    .bybit-hero .hero-sub { opacity: 0.9; font-size: 1.05rem; }
-    .stMetric { background: rgba(15,118,110,0.12); border-radius: 16px; padding: 0.75rem 1rem; }
-    .status-pill {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.4rem;
-        padding: 0.35rem 0.75rem;
-        border-radius: 999px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        background: rgba(255,255,255,0.14);
-    }
-    .status-pill.negative { background: rgba(220,38,38,0.16); }
-    .status-card {
-        border-radius: 16px;
-        padding: 1rem 1.1rem;
-        background: rgba(148, 163, 184, 0.12);
-        border: 1px solid rgba(148, 163, 184, 0.25);
-    }
-    .status-card.ok { background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.3); }
-    .status-card.warn { background: rgba(250, 204, 21, 0.12); border-color: rgba(250, 204, 21, 0.35); }
-    .status-card__title { font-size: 1rem; font-weight: 600; margin-bottom: 0.35rem; display: flex; gap: 0.4rem; align-items: center; }
-    .status-card p { margin: 0; font-size: 0.9rem; opacity: 0.85; }
-    """
-)
 
-with st.container():
-    st.markdown(
-        """
+GLOBAL_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');
+
+:root { color-scheme: dark; }
+html, body, [class*="css"] { font-family: 'Manrope', sans-serif; }
+.block-container { padding: 1.6rem 2.4rem 3rem; max-width: 1240px; }
+[data-testid="stSidebar"] > div:first-child { background: linear-gradient(180deg, rgba(15,23,42,0.95), rgba(15,118,110,0.75)); }
+[data-testid="stSidebar"] nav { padding-top: 0.5rem; }
+.stButton>button {
+    border-radius: 14px;
+    padding: 0.75rem 1.1rem;
+    font-weight: 600;
+    background: linear-gradient(120deg, rgba(16,185,129,0.9), rgba(45,212,191,0.85));
+    border: none;
+    color: white;
+    box-shadow: 0 12px 30px rgba(45,212,191,0.28);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+.stButton>button:hover { transform: translateY(-2px); box-shadow: 0 18px 40px rgba(45,212,191,0.32); }
+.stTabs [role="tablist"] { gap: 0.6rem; }
+.stTabs [role="tab"] {
+    padding: 0.6rem 1.35rem;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.12);
+    color: rgba(226, 232, 240, 0.9);
+    border: 1px solid transparent;
+    transition: background 0.2s ease, color 0.2s ease, border 0.2s ease;
+}
+.stTabs [role="tab"][aria-selected="true"] {
+    background: linear-gradient(120deg, rgba(16,185,129,0.95), rgba(45,212,191,0.85));
+    color: white;
+    border-color: rgba(16,185,129,0.55);
+    box-shadow: 0 14px 32px rgba(16,185,129,0.25);
+}
+.stMetric {
+    background: rgba(15,118,110,0.12);
+    border-radius: 18px;
+    padding: 0.9rem 1.1rem;
+    border: 1px solid rgba(45,212,191,0.35);
+}
+.metric-subtitle { font-size: 0.8rem; opacity: 0.65; margin-top: 0.2rem; }
+.bybit-hero {
+    background: linear-gradient(135deg, rgba(30,41,59,0.92), rgba(15,118,110,0.88));
+    color: white;
+    padding: 1.6rem 1.9rem;
+    border-radius: 22px;
+    box-shadow: 0 20px 52px rgba(15, 118, 110, 0.28);
+    margin-bottom: 1.5rem;
+    position: relative;
+    overflow: hidden;
+}
+.bybit-hero::after {
+    content: "";
+    position: absolute;
+    inset: -40% 40% auto auto;
+    width: 260px;
+    height: 260px;
+    background: radial-gradient(circle, rgba(56,189,248,0.45) 0%, rgba(15,118,110,0) 70%);
+    opacity: 0.7;
+}
+.bybit-hero h1 { margin-bottom: 0.4rem; font-size: 2.4rem; }
+.bybit-hero__sub { opacity: 0.9; font-size: 1.05rem; max-width: 760px; }
+.hero-grid { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.85rem; position: relative; z-index: 1; }
+.hero-grid .bybit-pill { background: rgba(255,255,255,0.18); color: white; }
+.hero-grid .bybit-pill.bybit-pill--success { background: rgba(45,212,191,0.28); color: #0f172a; }
+.hero-grid .bybit-pill.bybit-pill--warning { background: rgba(250,204,21,0.3); color: #0f172a; }
+.hero-grid .bybit-pill.bybit-pill--danger { background: rgba(248,113,113,0.3); color: #0f172a; }
+.quick-actions__desc { font-size: 0.85rem; opacity: 0.75; margin-top: 0.45rem; }
+@media (max-width: 900px) {
+    .block-container { padding: 1.2rem 1.2rem 2.4rem; }
+    .bybit-hero { padding: 1.35rem 1.4rem; }
+    .bybit-hero h1 { font-size: 2rem; }
+}
+"""
+
+inject_css(GLOBAL_CSS)
+
+hero_badges = [
+    build_pill("Реакция < 1s", icon="⚡"),
+    build_pill("AI OCO & TWAP", icon="🧠"),
+    build_pill("Risk Guards", icon="🛡", tone="success"),
+    build_pill("Telegram Ping", icon="🔔"),
+]
+
+st.markdown(
+    dedent(
+        f"""
         <div class="bybit-hero">
             <h1>Bybit Smart OCO — PRO</h1>
-            <p class="hero-sub">Умные торговые сценарии, прозрачные статусы и контроль рисков для трейдера, который ценит скорость принятия решений.</p>
-            <div style="margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem;">
-                <span class="status-pill">⚡ Реакция &lt; 1s</span>
-                <span class="status-pill">🧠 AI OCO &amp; TWAP</span>
-                <span class="status-pill">🛡 Risk Guards</span>
-                <span class="status-pill">🔔 Telegram Ping</span>
-            </div>
+            <p class="bybit-hero__sub">Умные торговые сценарии, прозрачные статусы и контроль рисков для трейдера, который ценит скорость принятия решений.</p>
+            <div class="hero-grid">{''.join(hero_badges)}</div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """
+    ),
+    unsafe_allow_html=True,
+)
 
 st.caption("Улучшенная 3Commas: умный OCO, понятный интерфейс, живые статусы.")
 
@@ -78,20 +131,16 @@ ok = bool(s.api_key and s.api_secret)
 with st.container(border=True):
     st.markdown("#### ⚙️ Технический статус профиля")
     col_a, col_b = st.columns([1.2, 1])
+    status_title = "Все ключи подключены" if ok else "Требуется подключение API"
+    status_hint = "Готовы к торговле и автоматическим стратегиям." if ok else "Добавьте API ключ и секрет, чтобы активировать торговлю."
+    status_html = build_status_card(
+        status_title,
+        status_hint,
+        icon="🔐" if ok else "⚠️",
+        tone="success" if ok else "warning",
+    )
     with col_a:
-        status = "Все ключи подключены" if ok else "Требуется подключение API"
-        status_hint = "Готовы к торговле и автоматическим стратегиям." if ok else "Добавьте API ключ и секрет, чтобы активировать торговлю."
-        status_class = "ok" if ok else "warn"
-        status_icon = "🔐" if ok else "⚠️"
-        st.markdown(
-            f"""
-            <div class=\"status-card {status_class}\">
-                <div class=\"status-card__title\">{status_icon} {status}</div>
-                <p>{status_hint}</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown(status_html, unsafe_allow_html=True)
     with col_b:
         st.metric("Режим", "Testnet" if s.testnet else "Mainnet", help="Переключите сеть в настройках окружения.")
         st.metric("DRY-RUN", "ON" if s.dry_run else "OFF", help="Включите DRY-RUN, чтобы проверять стратегию без реальных ордеров.")
@@ -103,21 +152,33 @@ with st.container(border=True):
 st.subheader("🛡 Контроль капитала")
 cap_guard = 100 - float(getattr(s, 'spot_cash_reserve_pct', 10.0) or 0.0)
 risk_cols = st.columns(3)
-risk_cols[0].metric(
-    "Риск на сделку",
-    f"{getattr(s, 'ai_risk_per_trade_pct', 0.25):.2f}%",
-    help="Максимальная доля капитала, которую бот рискует в одной сделке.",
-)
-risk_cols[1].metric(
-    "Дневной лимит убытка",
-    f"{getattr(s, 'ai_daily_loss_limit_pct', 3.0):.2f}%",
-    help="При достижении порога торговля ставится на паузу.",
-)
-risk_cols[2].metric(
-    "Задействованный капитал",
-    f"≤ {cap_guard:.0f}%",
-    help="Часть средств зарезервирована, чтобы портфель не уходил в минус.",
-)
+risk_metrics = [
+    {
+        "label": "Риск на сделку",
+        "value": f"{getattr(s, 'ai_risk_per_trade_pct', 0.25):.2f}%",
+        "help": "Максимальная доля капитала, которую бот рискует в одной сделке.",
+        "hint": "Рекомендуется ≤ 0.50% для спокойной торговли.",
+    },
+    {
+        "label": "Дневной лимит убытка",
+        "value": f"{getattr(s, 'ai_daily_loss_limit_pct', 3.0):.2f}%",
+        "help": "При достижении порога торговля ставится на паузу.",
+        "hint": "После паузы проверьте рынок и скорректируйте риск.",
+    },
+    {
+        "label": "Задействованный капитал",
+        "value": f"≤ {cap_guard:.0f}%",
+        "help": "Часть средств зарезервирована, чтобы портфель не уходил в минус.",
+        "hint": "Резерв помогает пережить повышенную волатильность.",
+    },
+]
+
+for column, metric in zip(risk_cols, risk_metrics):
+    column.metric(metric["label"], metric["value"], help=metric["help"])
+    column.markdown(
+        f"<div class='metric-subtitle'>{metric['hint']}</div>",
+        unsafe_allow_html=True,
+    )
 
 st.caption(
     "Настройки защиты можно изменить в разделах 🧠 AI-Трейдер и 🧭 Простой режим. Включённая опция DRY-RUN гарантирует демонстрационный режим без реальных ордеров."
@@ -127,19 +188,50 @@ st.divider()
 
 with st.container(border=True):
     st.markdown("#### 🚀 Быстрые действия")
-    quick_cols = st.columns(2)
     quick_actions = [
-        ("🔌 Подключение и состояние", "pages/00_✅_Подключение_и_Состояние.py"),
-        ("📈 AI-скринер рынка", "pages/01_📈_Скринер.py"),
-        ("🎯 Смарт сделки OCO", "pages/04_🎯_Смарт_Сделки_OCO.py"),
-        ("🧮 Управление риском портфеля", "pages/05_🧮_Portfolio_Risk_Spot.py"),
-        ("📊 Портфельный дашборд", "pages/06_📊_Портфель_Дашборд.py"),
-        ("🪵 Логи и уведомления", "pages/07_🪵_Логи.py"),
+        {
+            "label": "🔌 Подключение и состояние",
+            "page": "pages/00_✅_Подключение_и_Состояние.py",
+            "description": "Проверьте API-ключи, синхронизацию времени и доступ к бирже.",
+        },
+        {
+            "label": "📈 AI-скринер рынка",
+            "page": "pages/01_📈_Скринер.py",
+            "description": "Получите свежие сигналы и тепловые карты волатильности.",
+        },
+        {
+            "label": "🎯 Смарт сделки OCO",
+            "page": "pages/04_🎯_Смарт_Сделки_OCO.py",
+            "description": "Запускайте умные OCO-сценарии и проверяйте качество исполнения.",
+        },
+        {
+            "label": "🧮 Управление риском портфеля",
+            "page": "pages/05_🧮_Portfolio_Risk_Spot.py",
+            "description": "Выравнивайте позиции и лимиты риска по выбранной методике.",
+        },
+        {
+            "label": "📊 Портфельный дашборд",
+            "page": "pages/06_📊_Портфель_Дашборд.py",
+            "description": "Следите за PnL, распределением активов и динамикой портфеля.",
+        },
+        {
+            "label": "🪵 Логи и уведомления",
+            "page": "pages/07_🪵_Логи.py",
+            "description": "Проверьте историю действий, алертов и уведомлений Telegram.",
+        },
     ]
-    for col, actions in zip(quick_cols, (quick_actions[:3], quick_actions[3:])):
-        for label, page in actions:
-            if col.button(label, use_container_width=True, key=f"quick_{page}"):
-                st.switch_page(page)
+
+    quick_cols = st.columns(3, gap="large")
+    for idx, action in enumerate(quick_actions):
+        column = quick_cols[idx % len(quick_cols)]
+        with column.container(border=True):
+            if st.button(action["label"], use_container_width=True, key=f"quick_{action['page']}"):
+                st.switch_page(action["page"])
+            st.markdown(
+                f"<div class='quick-actions__desc'>{action['description']}</div>",
+                unsafe_allow_html=True,
+            )
+
     st.caption("Самые частые шаги вынесены сюда, чтобы вы быстрее переходили к анализу и действиям.")
 
 st.divider()
