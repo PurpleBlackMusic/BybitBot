@@ -82,9 +82,18 @@ def twap_spot_batch(
     if qty_per_slice <= 0:
         return {"error": "non-positive quantity"}
 
+    if slices == 1:
+        qtys = [qty_per_slice]
+    else:
+        qtys = [qty_per_slice] * slices
+        remaining_qty = total_qty_dec - qty_per_slice * (slices - 1)
+        last_qty = _quantize(remaining_qty)
+        if last_qty <= 0:
+            return {"error": "non-positive quantity"}
+        qtys[-1] = last_qty
+
     best_bid, best_ask = bids[0][0], asks[0][0]
     px = _quantize(_aggressive_price(best_bid, best_ask, side, aggressiveness_bps))
-    qty = qty_per_slice
     side_cased = _normalise_side(side)
 
     timestamp_ms = int(time.time() * 1000)
@@ -93,7 +102,7 @@ def twap_spot_batch(
             "symbol": symbol,
             "side": side_cased,
             "orderType": "Limit",
-            "qty": str(qty),
+            "qty": str(qtys[i]),
             "price": str(px),
             "timeInForce": "IOC",
             "orderLinkId": ensure_link_id(f"TWAPB-{timestamp_ms}-{i}"),

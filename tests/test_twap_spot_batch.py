@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from bybit_app.utils import twap_spot_batch as mod
 
 
@@ -67,3 +69,19 @@ def test_twap_spot_batch_validates_quantity(monkeypatch):
 
     assert result == {"error": "non-positive quantity"}
     assert api.batch_calls == []
+
+
+def test_twap_spot_batch_preserves_total_quantity(monkeypatch):
+    api = DummyAPI({"result": {"b": [["100", "5"]], "a": [["101", "5"]]}})
+
+    monkeypatch.setattr(mod, "log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mod.time, "time", lambda: 1234.567)
+
+    result = mod.twap_spot_batch(api, "BTCUSDT", "Buy", 1, slices=3, aggressiveness_bps=2)
+
+    orders = result["orders"]
+    qtys = [Decimal(order["qty"]) for order in orders]
+
+    assert sum(qtys) == Decimal("1")
+    assert qtys[-1] != qtys[0]
+    assert len({order["orderLinkId"] for order in orders}) == 3
