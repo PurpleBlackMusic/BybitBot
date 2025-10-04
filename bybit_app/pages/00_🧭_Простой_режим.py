@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st, json, time
 from utils.envs import get_api_client, get_settings, update_settings
 from utils.coach import market_health, build_autopilot_settings
-from utils.scheduler import start_background_loop
+from utils.scheduler import start_background_loop, _load_state_file, _save_state_file
 from utils.reporter import send_daily_report, summarize_today, send_test_message
 from utils.ai.live import AIRunner
 from utils.paths import DATA_DIR
@@ -71,19 +71,24 @@ with left:
         except Exception as e:
             st.error(f"Ошибка остановки: {e}")
     if colB.button("🛑 Паник-стоп (до завтра)"):
+        stop_err: Exception | None = None
         try:
             runner.stop()
-            from utils.scheduler import _load_state_file, _save_state_file
+        except Exception as e:
+            stop_err = e
+            st.error(f"Ошибка остановки: {e}")
+        try:
             stf = _load_state_file() or {}
             stf['stop_day_locked'] = True
             stf['stop_day_reason'] = 'panic'
             stf['stop_day_date'] = time.strftime('%Y-%m-%d')
-            _save_state_file(stf)
-            st.warning("Паник-стоп активирован: автозапуск заблокирован до завтра.")
+            if not _save_state_file(stf):
+                raise RuntimeError('state not saved')
         except Exception as e:
             st.error(f"Не удалось активировать паник-стоп: {e}")
-        except Exception as e:
-            st.error(f"Ошибка остановки: {e}")
+        else:
+            if stop_err is None:
+                st.warning("Паник-стоп активирован: автозапуск заблокирован до завтра.")
     dry = st.toggle("Демо-режим (без реальных ордеров)", value=getattr(s, 'dry_run', True),
                     help="В демо-запуске бот **не отправляет** реальные заявки.")
     if dry != getattr(s, 'dry_run', True):
@@ -204,13 +209,14 @@ if st.button("📤 Отправить отчёт в Telegram"):
     r = send_daily_report()
     st.success(f"Отчёт отправлен: {r}")
 
-from utils.scheduler import _load_state_file, _save_state_file
 if st.button("🔓 Снять ‘стоп-день’ до завтра"):
     stf = _load_state_file() or {}
     stf['stop_day_locked'] = False
     stf['stop_day_reason'] = ''
-    _save_state_file(stf)
-    st.success('Ограничение снято до следующего срабатывания.')
+    if _save_state_file(stf):
+        st.success('Ограничение снято до следующего срабатывания.')
+    else:
+        st.error('Не удалось обновить состояние стоп-дня.')
 
 st.divider()
 st.subheader("🔎 Предпросмотр заявки")
