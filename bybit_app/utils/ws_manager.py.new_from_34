@@ -1,0 +1,37 @@
+from __future__ import annotations
+import threading, time
+
+class WSManager:
+    def __init__(self):
+        self._running = False
+        self._thr = None
+        self.last_beat = None
+
+    def start(self):
+        if self._running:
+            return True
+        self._running = True
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+        return True
+
+    def _loop(self):
+        while self._running:
+            self.last_beat = time.time()
+            time.sleep(1.0)
+
+    def stop(self):
+        self._running = False
+        return True
+
+    def status(self):
+        return {'running': self._running, 'last_beat': self.last_beat}
+
+manager = WSManager()
+
+def start_public(self, subs=None):
+    return self.start(kind='public', subs=subs or [])
+
+
+def start_private(self):
+    return self.start(kind='private')

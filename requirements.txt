@@ -1,0 +1,7 @@
+streamlit>=1.36.0
+requests>=2.31.0
+pandas>=2.2.0
+websocket-client>=1.6.0
+python-dateutil>=2.9.0.post0
+numpy>=1.23.0
+scikit-learn>=1.4.0

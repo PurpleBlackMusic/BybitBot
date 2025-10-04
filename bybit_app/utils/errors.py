@@ -1,0 +1,3 @@
+
+class BybitAPIError(Exception):
+    pass

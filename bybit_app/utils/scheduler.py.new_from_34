@@ -1,0 +1,48 @@
+from __future__ import annotations
+import threading, time, json
+from pathlib import Path
+from .paths import DATA_DIR
+
+# Simple state file used by the Simple Mode page (panic-stop etc.)
+STATE_FILE = DATA_DIR / "simple_mode_state.json"
+HEARTBEAT_FILE = DATA_DIR / "simple_mode_heartbeat.json"
+
+_bg_started = False
+_bg_thread: threading.Thread | None = None
+
+def _load_state_file() -> dict | None:
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_state_file(obj: dict) -> bool:
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+def _loop():
+    # very lightweight heartbeat so UI can know we're alive
+    while _bg_started:
+        try:
+            HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            HEARTBEAT_FILE.write_text(json.dumps({"ts": int(time.time())}), encoding="utf-8")
+        except Exception:
+            pass
+        time.sleep(30)
+
+def start_background_loop():
+    """Idempotent background heartbeat loop.
+    Safe no-op if already started. Used by Simple Mode page.
+    """
+    global _bg_started, _bg_thread
+    if _bg_started:
+        return
+    _bg_started = True
+    _bg_thread = threading.Thread(target=_loop, daemon=True)
+    _bg_thread.start()

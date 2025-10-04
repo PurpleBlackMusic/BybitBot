@@ -1,0 +1,31 @@
+
+from __future__ import annotations
+import streamlit as st
+from utils.envs import get_settings
+from utils.bybit_api import BybitAPI, BybitCreds
+
+st.title("📈 Скринер — объём и волатильность (spot)")
+
+s = get_settings()
+if not (s.api_key and s.api_secret):
+    st.warning("Укажите API-ключи на странице «Подключение и состояние».")
+    st.stop()
+
+api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+q = st.text_input("Фильтр по подстроке тикера", value="USDT")
+top_n = st.slider("Сколько пар показать (по 24h объёму)", 5, 100, 20)
+try:
+    tk = api.tickers(category="spot")
+    rows = (tk.get("result") or {}).get("list") or []
+    # простая фильтрация и сортировка по turnover24h
+    def as_float(x, default=0.0):
+        try: return float(x)
+        except: return default
+    rows = [r for r in rows if q.upper() in str(r.get("symbol","")).upper()]
+    rows.sort(key=lambda r: as_float(r.get("turnover24h",0)), reverse=True)
+    if rows:
+        st.dataframe(rows[:top_n], use_container_width=True)
+    else:
+        st.info("Нет данных под текущий фильтр.")
+except Exception as e:
+    st.error(f"Ошибка загрузки тикеров: {e}")
