@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 from .paths import DATA_DIR
 from .file_io import tail_lines
@@ -72,6 +72,36 @@ def _normalise_side(value: object) -> str:
     return ""
 
 
+def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[ExecutionRecord]:
+    """Convert a raw ledger payload into an :class:`ExecutionRecord`."""
+
+    side = _normalise_side(payload.get("side") or payload.get("direction"))
+    qty = _to_float(payload.get("execQty") or payload.get("qty") or payload.get("size"))
+    price = _to_float(payload.get("execPrice") or payload.get("price"), default=0.0)
+    if price <= 0:
+        return None
+
+    symbol = str(payload.get("symbol") or payload.get("ticker") or "").upper()
+    if not symbol:
+        return None
+
+    return ExecutionRecord(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        price=price,
+        fee=_to_float(payload.get("execFee") or payload.get("fee")),
+        is_maker=payload.get("isMaker") if isinstance(payload.get("isMaker"), bool) else None,
+        timestamp=_parse_timestamp(
+            payload.get("execTime")
+            or payload.get("execTimeNs")
+            or payload.get("transactTime")
+            or payload.get("tradeTime")
+            or payload.get("created_at")
+        ),
+    )
+
+
 def load_executions(path: Optional[Path | str] = None, limit: Optional[int] = None) -> List[ExecutionRecord]:
     """Load executions from a JSONL ledger file."""
 
@@ -90,30 +120,9 @@ def load_executions(path: Optional[Path | str] = None, limit: Optional[int] = No
         except json.JSONDecodeError:
             continue
 
-        side = _normalise_side(payload.get("side") or payload.get("direction"))
-        qty = _to_float(payload.get("execQty") or payload.get("qty") or payload.get("size"))
-        price = _to_float(payload.get("execPrice") or payload.get("price"), default=0.0)
-        if price <= 0:
+        record = normalise_execution_payload(payload)
+        if record is None:
             continue
-        symbol = str(payload.get("symbol") or payload.get("ticker") or "").upper()
-        if not symbol:
-            continue
-
-        record = ExecutionRecord(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            price=price,
-            fee=_to_float(payload.get("execFee") or payload.get("fee")),
-            is_maker=payload.get("isMaker") if isinstance(payload.get("isMaker"), bool) else None,
-            timestamp=_parse_timestamp(
-                payload.get("execTime")
-                or payload.get("execTimeNs")
-                or payload.get("transactTime")
-                or payload.get("tradeTime")
-                or payload.get("created_at")
-            ),
-        )
         records.append(record)
     return records
 
@@ -225,5 +234,6 @@ def aggregate_execution_metrics(records: Sequence[ExecutionRecord]) -> dict:
 __all__ = [
     "ExecutionRecord",
     "aggregate_execution_metrics",
+    "normalise_execution_payload",
     "load_executions",
 ]

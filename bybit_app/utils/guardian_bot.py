@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 import json
 import time
 
 from .envs import Settings, get_settings
 from .paths import DATA_DIR
-from .trade_analytics import aggregate_execution_metrics, load_executions
+from .trade_analytics import (
+    ExecutionRecord,
+    aggregate_execution_metrics,
+    normalise_execution_payload,
+)
 from .spot_pnl import spot_inventory_and_pnl
 
 
@@ -30,6 +35,39 @@ class GuardianBrief:
     analysis: str
     status_age: Optional[float]
 
+    def to_dict(self) -> Dict[str, object]:
+        """Convert the brief to a JSON-serialisable payload."""
+
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class GuardianLedgerView:
+    """Cached aggregation of ledger-derived analytics."""
+
+    portfolio: Dict[str, object]
+    recent_trades: Tuple[Dict[str, object], ...]
+    trade_stats: Dict[str, object]
+    executions: Tuple[ExecutionRecord, ...]
+
+
+@dataclass(frozen=True)
+class GuardianSnapshot:
+    """Aggregated view of bot state, built from disk once and reused."""
+
+    status: Dict[str, object]
+    brief: GuardianBrief
+    status_summary: Dict[str, object]
+    status_from_cache: bool
+    portfolio: Dict[str, object]
+    watchlist: List[Dict[str, object]]
+    recent_trades: List[Dict[str, object]]
+    trade_stats: Dict[str, object]
+    executions: Tuple[ExecutionRecord, ...]
+    generated_at: float
+    status_signature: float
+    ledger_signature: float
+
 
 class GuardianBot:
     """Transforms raw AI outputs into safe, beginner-friendly explanations."""
@@ -44,6 +82,10 @@ class GuardianBot:
         self._settings = settings
         self._custom_settings = settings is not None
         self._last_status: Dict[str, object] = {}
+        self._snapshot: Optional[GuardianSnapshot] = None
+        self._ledger_signature: Optional[float] = None
+        self._ledger_view: Optional[GuardianLedgerView] = None
+        self._status_fallback_used: bool = False
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -59,30 +101,54 @@ class GuardianBot:
 
     @property
     def settings(self) -> Settings:
-        if self._settings is None:
-            self._settings = get_settings()
-        return self._settings
+        if self._custom_settings:
+            if self._settings is None:
+                self._settings = Settings()
+            return self._settings
+
+        settings = get_settings()
+        self._settings = settings
+        return settings
 
     def reload_settings(self) -> None:
         if not self._custom_settings:
             self._settings = get_settings(force_reload=True)
+        self._snapshot = None
+        self._ledger_signature = None
+        self._ledger_view = None
 
     def _load_status(self) -> Dict[str, object]:
         path = self._status_path()
-        if not path.exists():
-            return {}
+        fallback_used = False
 
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        raw: Dict[str, object] = {}
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+
+            if content.strip():
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict):
+                        raw = parsed
+                except Exception:
+                    raw = {}
+
+        if not raw and self._last_status:
+            raw = copy.deepcopy(self._last_status)
+            fallback_used = True
 
         status = dict(raw)
-        try:
-            ts = float(status.get("last_tick_ts") or 0.0)
-        except Exception:
-            ts = 0.0
-        status["age_seconds"] = time.time() - ts if ts > 0 else None
+        if status:
+            try:
+                ts = float(status.get("last_tick_ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            status["age_seconds"] = time.time() - ts if ts > 0 else None
+
+        self._status_fallback_used = fallback_used
         return status
 
     @staticmethod
@@ -182,13 +248,376 @@ class GuardianBot:
             return f"{days} дн"
         return f"{days} дн {hours} ч"
 
-    # ------------------------------------------------------------------
-    # public analytics helpers
-    def generate_brief(self) -> GuardianBrief:
+    def _status_staleness(self, age: Optional[float]) -> Tuple[str, str]:
+        """Categorise the freshness of the AI status file."""
+
+        if age is None:
+            return "fresh", "AI сигнал обновился только что."
+        if age < 60:
+            return "fresh", "AI сигнал обновился менее минуты назад."
+        if age < 300:
+            return "fresh", f"AI сигнал обновился {int(age // 60)} мин назад."
+        if age < 900:
+            return (
+                "warning",
+                f"AI сигнал обновлялся {self._format_duration(age)} назад — дождитесь скорого обновления.",
+            )
+        return (
+            "stale",
+            "AI сигнал не обновлялся более 15 минут — убедитесь, что сервис записи status.json активен.",
+        )
+
+    # snapshot helpers -------------------------------------------------
+    def _snapshot_signature(self) -> Tuple[float, float]:
+        status_path = self._status_path()
+        ledger_path = self._ledger_path()
+        try:
+            status_mtime = status_path.stat().st_mtime
+        except FileNotFoundError:
+            status_mtime = 0.0
+        try:
+            ledger_mtime = ledger_path.stat().st_mtime
+        except FileNotFoundError:
+            ledger_mtime = 0.0
+        return status_mtime, ledger_mtime
+
+    def _load_ledger_events(self) -> List[Dict[str, object]]:
+        path = self._ledger_path()
+        if not path.exists():
+            return []
+
+        events: List[Dict[str, object]] = []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        events.append(payload)
+        except OSError:
+            return []
+        return events
+
+    @staticmethod
+    def _spot_events(events: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
+        spot: List[Dict[str, object]] = []
+        for event in events:
+            category = str(event.get("category") or "spot").lower()
+            if category == "spot":
+                spot.append(event)
+        return spot
+
+    def _ledger_view_for_signature(self, signature: float) -> GuardianLedgerView:
+        cached_signature = self._ledger_signature
+        cached_view = self._ledger_view
+        if cached_signature == signature and cached_view is not None:
+            return cached_view
+
+        events = self._load_ledger_events()
+        spot_events = self._spot_events(events)
+        portfolio = self._build_portfolio(spot_events)
+        recent_trades = tuple(self._build_recent_trades(spot_events))
+        executions = self._build_execution_records(events)
+        trade_stats = aggregate_execution_metrics(executions)
+
+        view = GuardianLedgerView(
+            portfolio=portfolio,
+            recent_trades=recent_trades,
+            trade_stats=trade_stats,
+            executions=executions,
+        )
+
+        self._ledger_signature = signature
+        self._ledger_view = view
+        return view
+
+    def _build_portfolio(self, spot_events: List[Dict[str, object]]) -> Dict[str, object]:
+        inventory = spot_inventory_and_pnl(events=spot_events)
+        positions: List[Dict[str, object]] = []
+        total_realized = 0.0
+        total_notional = 0.0
+        open_positions = 0
+
+        for symbol in sorted(inventory.keys()):
+            rec = inventory[symbol]
+            qty = float(rec.get("position_qty") or 0.0)
+            avg_cost = float(rec.get("avg_cost") or 0.0)
+            realized = float(rec.get("realized_pnl") or 0.0)
+            notional = qty * avg_cost
+
+            total_realized += realized
+            total_notional += notional
+            if qty > 0:
+                open_positions += 1
+
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "avg_cost": avg_cost,
+                    "notional": notional,
+                    "realized_pnl": realized,
+                }
+            )
+
+        human_totals = {
+            "realized": f"{total_realized:.2f} USDT",
+            "open_notional": f"{total_notional:.2f} USDT",
+            "open_positions": f"{open_positions}",
+        }
+
+        return {
+            "positions": positions,
+            "totals": {
+                "realized_pnl": total_realized,
+                "open_notional": total_notional,
+                "open_positions": open_positions,
+            },
+            "human_totals": human_totals,
+        }
+
+    def _build_recent_trades(
+        self, spot_events: List[Dict[str, object]], limit: int = 50
+    ) -> List[Dict[str, object]]:
+        records: List[Dict[str, object]] = []
+        for event in reversed(spot_events):
+            if len(records) >= limit:
+                break
+            symbol = str(event.get("symbol") or event.get("ticker") or "?")
+            if not symbol:
+                continue
+            side = str(event.get("side") or event.get("direction") or "").capitalize()
+            qty = float(event.get("execQty") or event.get("qty") or event.get("size") or 0.0)
+            price = float(event.get("execPrice") or event.get("price") or 0.0)
+            fee = float(event.get("execFee") or event.get("fee") or 0.0)
+            ts = (
+                event.get("execTime")
+                or event.get("execTimeNs")
+                or event.get("transactTime")
+                or event.get("created_at")
+                or event.get("tradeTime")
+            )
+
+            records.append(
+                {
+                    "symbol": symbol.upper(),
+                    "side": side or "—",
+                    "price": round(price, 6) if price else None,
+                    "qty": round(qty, 6) if qty else None,
+                    "fee": round(fee, 6) if fee else None,
+                    "when": self._format_timestamp(ts),
+                }
+            )
+        return records
+
+    @staticmethod
+    def _build_execution_records(
+        events: Iterable[Dict[str, object]]
+    ) -> Tuple[ExecutionRecord, ...]:
+        records: List[ExecutionRecord] = []
+        for event in events:
+            record = normalise_execution_payload(event)
+            if record is not None:
+                records.append(record)
+        return tuple(records)
+
+    def _build_watchlist(self, status: Dict[str, object]) -> List[Dict[str, object]]:
+        candidates = (
+            status.get("watchlist")
+            or status.get("heatmap")
+            or status.get("opportunities")
+            or status.get("signals")
+        )
+        entries: List[Dict[str, object]] = []
+
+        if isinstance(candidates, dict):
+            for symbol, payload in candidates.items():
+                entries.append(self._normalise_watchlist_entry(str(symbol), payload))
+        elif isinstance(candidates, list):
+            for item in candidates:
+                if isinstance(item, dict):
+                    symbol = item.get("symbol") or item.get("ticker") or "?"
+                    entries.append(self._normalise_watchlist_entry(str(symbol), item))
+                elif isinstance(item, (list, tuple)) and item:
+                    symbol = str(item[0])
+                    payload = item[1] if len(item) > 1 else None
+                    entries.append(self._normalise_watchlist_entry(symbol, payload))
+                elif isinstance(item, str):
+                    entries.append(self._normalise_watchlist_entry(item, None))
+
+        filtered = [entry for entry in entries if any(entry.values())]
+
+        def sort_key(item: Dict[str, object]) -> tuple:
+            score = item.get("score")
+            if isinstance(score, (int, float)):
+                return (0, -float(score), item["symbol"])
+            return (1, item["symbol"])
+
+        filtered.sort(key=sort_key)
+        return filtered
+
+    def _build_snapshot(self, signature: Tuple[float, float]) -> GuardianSnapshot:
         status = self._load_status()
         self._last_status = status
         settings = self.settings
+        brief = self._brief_from_status(status, settings)
+        status_summary = self._build_status_summary(
+            status, brief, settings, self._status_fallback_used
+        )
 
+        ledger_view = self._ledger_view_for_signature(signature[1])
+        portfolio = ledger_view.portfolio
+        watchlist = self._build_watchlist(status)
+        recent_trades = list(ledger_view.recent_trades)
+        execution_records = ledger_view.executions
+        trade_stats = ledger_view.trade_stats
+
+        return GuardianSnapshot(
+            status=status,
+            brief=brief,
+            status_summary=status_summary,
+            status_from_cache=self._status_fallback_used,
+            portfolio=portfolio,
+            watchlist=watchlist,
+            recent_trades=recent_trades,
+            trade_stats=trade_stats,
+            executions=execution_records,
+            generated_at=time.time(),
+            status_signature=signature[0],
+            ledger_signature=signature[1],
+        )
+
+    @staticmethod
+    def _copy_dict(payload: Dict[str, object]) -> Dict[str, object]:
+        return copy.deepcopy(payload)
+
+    @staticmethod
+    def _copy_list(payload: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        return copy.deepcopy(payload)
+
+    def _get_snapshot(self, force: bool = False) -> GuardianSnapshot:
+        signature = self._snapshot_signature()
+        snapshot = self._snapshot
+        if (
+            force
+            or snapshot is None
+            or snapshot.status_signature != signature[0]
+            or snapshot.ledger_signature != signature[1]
+        ):
+            snapshot = self._build_snapshot(signature)
+            self._snapshot = snapshot
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # public analytics helpers
+    def _build_status_summary(
+        self,
+        status: Dict[str, object],
+        brief: GuardianBrief,
+        settings: Settings,
+        fallback_used: bool,
+    ) -> Dict[str, object]:
+        probability = self._clamp_probability(float(status.get("probability") or 0.0))
+        ev_bps = float(status.get("ev_bps") or 0.0)
+        last_tick = status.get("last_tick_ts") or status.get("timestamp")
+
+        buy_threshold = float(settings.ai_buy_threshold or 0.0)
+        sell_threshold = float(settings.ai_sell_threshold or 0.0)
+        min_ev = float(settings.ai_min_ev_bps or 0.0)
+
+        staleness_state, staleness_message = self._status_staleness(brief.status_age)
+        actionable, reasons = self._evaluate_actionability(
+            brief.mode,
+            probability,
+            ev_bps,
+            buy_threshold,
+            sell_threshold,
+            min_ev,
+            staleness_state,
+        )
+
+        summary = {
+            "symbol": brief.symbol,
+            "mode": brief.mode,
+            "headline": brief.headline,
+            "probability": probability,
+            "probability_pct": round(probability * 100.0, 2),
+            "ev_bps": round(ev_bps, 2),
+            "ev_text": brief.ev_text,
+            "action_text": brief.action_text,
+            "confidence_text": brief.confidence_text,
+            "caution": brief.caution,
+            "analysis": brief.analysis,
+            "updated_text": brief.updated_text,
+            "age_seconds": brief.status_age,
+            "last_update": self._format_timestamp(last_tick),
+            "actionable": actionable,
+            "actionable_reasons": reasons,
+            "thresholds": {
+                "buy_probability_pct": round(buy_threshold * 100.0, 2),
+                "sell_probability_pct": round(sell_threshold * 100.0, 2),
+                "min_ev_bps": round(min_ev, 2),
+            },
+            "has_status": bool(status),
+            "fallback_used": bool(fallback_used),
+            "status_source": "cached" if fallback_used else "live",
+            "staleness": {
+                "state": staleness_state,
+                "message": staleness_message,
+            },
+        }
+
+        if status:
+            summary["raw_keys"] = sorted(status.keys())
+
+        return summary
+
+    def _evaluate_actionability(
+        self,
+        mode: str,
+        probability: float,
+        ev_bps: float,
+        buy_threshold: float,
+        sell_threshold: float,
+        min_ev: float,
+        staleness_state: str,
+    ) -> Tuple[bool, List[str]]:
+        reasons: List[str] = []
+
+        if staleness_state == "stale":
+            reasons.append(
+                "Сигнал устарел — обновите status.json перед тем, как открывать сделки."
+            )
+
+        if mode == "buy":
+            if probability < max(buy_threshold, 0.0):
+                reasons.append(
+                    "Уверенность модели ниже порога покупки — дождитесь более сильного сигнала."
+                )
+            if ev_bps < min_ev:
+                reasons.append(
+                    "Ожидаемая выгода ниже безопасного минимума — риск/прибыль не в нашу пользу."
+                )
+        elif mode == "sell":
+            if probability < max(sell_threshold, 0.0):
+                reasons.append(
+                    "Уверенность продажи ниже заданного порога — можно не спешить с фиксацией."
+                )
+            if ev_bps < min_ev:
+                reasons.append(
+                    "Ожидаемая выгода по продаже ниже минимума — сделка может быть невыгодной."
+                )
+        else:
+            reasons.append("Нет активного сигнала — бот предпочитает выжидать.")
+
+        actionable = len(reasons) == 0
+        return actionable, reasons
+
+    def _brief_from_status(self, status: Dict[str, object], settings: Settings) -> GuardianBrief:
         symbols = (settings.ai_symbols or "BTCUSDT").split(",")
         symbol = symbols[0].strip().upper() or "BTCUSDT"
 
@@ -257,50 +686,13 @@ class GuardianBot:
             status_age=status.get("age_seconds"),
         )
 
+    def generate_brief(self) -> GuardianBrief:
+        snapshot = self._get_snapshot()
+        return snapshot.brief
+
     def portfolio_overview(self) -> Dict[str, object]:
-        inventory = spot_inventory_and_pnl(ledger_path=self._ledger_path())
-        positions: List[Dict[str, object]] = []
-        total_realized = 0.0
-        total_notional = 0.0
-        open_positions = 0
-
-        for symbol in sorted(inventory.keys()):
-            rec = inventory[symbol]
-            qty = float(rec.get("position_qty") or 0.0)
-            avg_cost = float(rec.get("avg_cost") or 0.0)
-            realized = float(rec.get("realized_pnl") or 0.0)
-            notional = qty * avg_cost
-
-            total_realized += realized
-            total_notional += notional
-            if qty > 0:
-                open_positions += 1
-
-            positions.append(
-                {
-                    "symbol": symbol,
-                    "qty": qty,
-                    "avg_cost": avg_cost,
-                    "notional": notional,
-                    "realized_pnl": realized,
-                }
-            )
-
-        human_totals = {
-            "realized": f"{total_realized:.2f} USDT",
-            "open_notional": f"{total_notional:.2f} USDT",
-            "open_positions": f"{open_positions}",
-        }
-
-        return {
-            "positions": positions,
-            "totals": {
-                "realized_pnl": total_realized,
-                "open_notional": total_notional,
-                "open_positions": open_positions,
-            },
-            "human_totals": human_totals,
-        }
+        snapshot = self._get_snapshot()
+        return self._copy_dict(snapshot.portfolio)
 
     def risk_summary(self) -> str:
         s = self.settings
@@ -351,8 +743,9 @@ class GuardianBot:
         return notes
 
     def signal_scorecard(self, brief: Optional[GuardianBrief] = None) -> Dict[str, object]:
-        brief = brief or self.generate_brief()
-        status = self._last_status if isinstance(self._last_status, dict) else {}
+        snapshot = self._get_snapshot()
+        brief = brief or snapshot.brief
+        status = snapshot.status
         probability = float(status.get("probability") or 0.0)
         ev_bps = float(status.get("ev_bps") or 0.0)
         return {
@@ -376,125 +769,69 @@ class GuardianBot:
             trend = None
             note = None
 
+        numeric_score: Optional[float] = None
+        if isinstance(score, (int, float)):
+            numeric_score = round(float(score), 2)
+        elif isinstance(score, str):
+            stripped = score.strip()
+            if stripped:
+                try:
+                    numeric_score = round(float(stripped), 2)
+                except ValueError:
+                    numeric_score = None
+
         entry = {
             "symbol": symbol.upper(),
-            "score": round(float(score), 2) if isinstance(score, (int, float, str)) and str(score).strip() else None,
+            "score": numeric_score,
             "trend": str(trend) if trend not in (None, "") else None,
             "note": str(note) if note not in (None, "") else None,
         }
         return entry
 
     def market_watchlist(self) -> List[Dict[str, object]]:
-        status = self._last_status if isinstance(self._last_status, dict) else self._load_status()
-        candidates = (
-            status.get("watchlist")
-            or status.get("heatmap")
-            or status.get("opportunities")
-            or status.get("signals")
-        )
-        entries: List[Dict[str, object]] = []
-
-        if isinstance(candidates, dict):
-            for symbol, payload in candidates.items():
-                entries.append(self._normalise_watchlist_entry(str(symbol), payload))
-        elif isinstance(candidates, list):
-            for item in candidates:
-                if isinstance(item, dict):
-                    symbol = item.get("symbol") or item.get("ticker") or "?"
-                    entries.append(self._normalise_watchlist_entry(str(symbol), item))
-                elif isinstance(item, (list, tuple)) and item:
-                    symbol = str(item[0])
-                    payload = item[1] if len(item) > 1 else None
-                    entries.append(self._normalise_watchlist_entry(symbol, payload))
-                elif isinstance(item, str):
-                    entries.append(self._normalise_watchlist_entry(item, None))
-
-        # remove empty rows
-        filtered = []
-        for entry in entries:
-            if any(entry.values()):
-                filtered.append(entry)
-        return filtered
+        snapshot = self._get_snapshot()
+        return self._copy_list(snapshot.watchlist)
 
     def recent_trades(self, limit: int = 10) -> List[Dict[str, object]]:
-        path = self._ledger_path()
-        if not path.exists():
-            return []
-
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            return []
-
-        records: List[Dict[str, object]] = []
-        for line in reversed(lines):
-            if len(records) >= limit:
-                break
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            category = str(event.get("category") or "").lower()
-            if category and category != "spot":
-                continue
-
-            symbol = str(event.get("symbol") or event.get("ticker") or "?")
-            side = str(event.get("side") or event.get("direction") or "").capitalize()
-            qty = float(event.get("execQty") or event.get("qty") or event.get("size") or 0.0)
-            price = float(event.get("execPrice") or event.get("price") or 0.0)
-            fee = float(event.get("execFee") or event.get("fee") or 0.0)
-
-            ts = (
-                event.get("execTime")
-                or event.get("execTimeNs")
-                or event.get("transactTime")
-                or event.get("created_at")
-                or event.get("tradeTime")
-            )
-
-            records.append(
-                {
-                    "symbol": symbol.upper(),
-                    "side": side or "—",
-                    "price": round(price, 6) if price else None,
-                    "qty": round(qty, 6) if qty else None,
-                    "fee": round(fee, 6) if fee else None,
-                    "when": self._format_timestamp(ts),
-                }
-            )
-
-        return records
+        snapshot = self._get_snapshot()
+        trades = snapshot.recent_trades[:limit] if limit else snapshot.recent_trades
+        return self._copy_list(list(trades))
 
     def trade_statistics(self, limit: Optional[int] = None) -> Dict[str, object]:
         """Return aggregated execution metrics for dashboards."""
 
-        path = self._ledger_path()
-        records = load_executions(path, limit=limit)
+        snapshot = self._get_snapshot()
+        if limit is None or limit <= 0:
+            return copy.deepcopy(snapshot.trade_stats)
+
+        records: Tuple[ExecutionRecord, ...] = snapshot.executions[-limit:]
         return aggregate_execution_metrics(records)
 
     def data_health(self) -> Dict[str, Dict[str, object]]:
         """High level diagnostics for the UI to highlight stale inputs."""
 
-        status = self._last_status if isinstance(self._last_status, dict) else {}
-        if not status:
-            status = self._load_status()
-        age = status.get("age_seconds") if isinstance(status, dict) else None
+        snapshot = self._get_snapshot()
+        status = snapshot.status
+        summary = snapshot.status_summary
+        age = snapshot.brief.status_age
 
-        if status:
-            if age is None or age < 300:
-                ai_ok = True
-                ai_message = "AI сигнал обновился менее 5 минут назад."
-            elif age < 900:
-                ai_ok = True
-                ai_message = f"AI сигнал обновился {self._format_duration(age)} назад."
-            else:
+        staleness_state, staleness_message = self._status_staleness(age)
+
+        if snapshot.status_from_cache:
+            ai_ok = False
+            ai_message = (
+                "Используем сохранённый сигнал — не удалось прочитать актуальный status.json."
+            )
+            ai_details = (
+                f"Последнее обновление: {summary.get('last_update', '—')}. "
+                "Проверьте сервис, который пишет файл ai/status.json."
+            )
+        elif status:
+            if staleness_state == "stale":
                 ai_ok = False
-                ai_message = (
-                    "AI сигнал не обновлялся более 15 минут — проверьте воркер или соединение."
-                )
+            else:
+                ai_ok = True
+            ai_message = staleness_message
             symbol = str(status.get("symbol") or "?").upper()
             probability = float(status.get("probability") or 0.0) * 100.0
             ai_details = f"Текущий символ: {symbol}, уверенность {probability:.1f}%."
@@ -503,7 +840,7 @@ class GuardianBot:
             ai_message = "AI сигнал ещё не поступал — запустите Guardian Bot или загрузите демо-данные."
             ai_details = "Файл ai/status.json не найден."
 
-        stats = self.trade_statistics()
+        stats = snapshot.trade_stats
         trades = int(stats.get("trades", 0) or 0)
         last_trade_ts = stats.get("last_trade_ts")
         if trades == 0 or not last_trade_ts:
@@ -562,6 +899,41 @@ class GuardianBot:
                 "details": api_details,
             },
         }
+
+    def refresh(self) -> GuardianSnapshot:
+        """Drop cached aggregates and rebuild them on next access."""
+
+        self._snapshot = None
+        self._ledger_signature = None
+        self._ledger_view = None
+        return self._get_snapshot(force=True)
+
+    def unified_report(self) -> Dict[str, object]:
+        """Return a merged view of spot, risk and execution data."""
+
+        snapshot = self._get_snapshot()
+        return {
+            "generated_at": snapshot.generated_at,
+            "status": self._copy_dict(snapshot.status_summary),
+            "brief": snapshot.brief.to_dict(),
+            "portfolio": self._copy_dict(snapshot.portfolio),
+            "watchlist": self._copy_list(snapshot.watchlist),
+            "recent_trades": self._copy_list(snapshot.recent_trades),
+            "statistics": copy.deepcopy(snapshot.trade_stats),
+            "health": self.data_health(),
+        }
+
+    def brief_payload(self) -> Dict[str, object]:
+        """Return the cached brief as a serialisable dict."""
+
+        snapshot = self._get_snapshot()
+        return snapshot.brief.to_dict()
+
+    def status_summary(self) -> Dict[str, object]:
+        """Return a user-friendly dictionary of the latest signal."""
+
+        snapshot = self._get_snapshot()
+        return self._copy_dict(snapshot.status_summary)
 
     # ------------------------------------------------------------------
     # conversation helpers
@@ -622,7 +994,6 @@ class GuardianBot:
         return "\n\n".join(message_parts)
 
     def answer(self, question: str) -> str:
-        self.reload_settings()
         prompt = (question or "").strip()
         if not prompt:
             return "Спросите меня о прибыли, риске или плане действий, и я объясню простыми словами."
@@ -661,10 +1032,9 @@ class GuardianBot:
         return self._default_response(brief, portfolio)
 
     def market_story(self, brief: Optional[GuardianBrief] = None) -> str:
-        brief = brief or self.generate_brief()
-        status = self._last_status if isinstance(self._last_status, dict) else {}
-        if not status:
-            status = {}
+        snapshot = self._get_snapshot()
+        brief = brief or snapshot.brief
+        status = snapshot.status
         narrative = self._narrative_from_status(status, brief.mode, brief.symbol)
         staleness = self.staleness_alert(brief)
         if staleness:
