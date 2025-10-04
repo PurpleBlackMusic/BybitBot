@@ -1,15 +1,48 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from textwrap import dedent
+from typing import Any, Callable
 
 import streamlit as st
+
+
+def _patch_responsive_dataframe() -> None:
+    """Remap deprecated ``use_container_width`` to the new API once."""
+
+    if getattr(st, "_bybit_dataframe_patched", False):
+        return
+
+    original: Callable[..., Any] = st.dataframe
+
+    def patched(*args: Any, **kwargs: Any):  # type: ignore[override]
+        use_container = kwargs.pop("use_container_width", None)
+        if use_container:
+            kwargs.setdefault("width", "stretch")
+        return original(*args, **kwargs)
+
+    st.dataframe = patched  # type: ignore[assignment]
+    setattr(st, "_bybit_dataframe_patched", True)
+
+
+_patch_responsive_dataframe()
 
 def safe_set_page_config(**kwargs):
     key = "_page_configured"
     if not st.session_state.get(key, False):
         st.set_page_config(**kwargs)
         st.session_state[key] = True
+
+
+def page_slug_from_path(page: str) -> str:
+    """Derive the query parameter slug Streamlit uses for a page path."""
+
+    path = Path(page)
+    stem = path.stem
+    parts = stem.split("_", 1)
+    slug = parts[1] if len(parts) == 2 else stem
+    return slug.replace("_", " ").strip()
 
 def section(title: str, help: str | None = None):
     st.markdown(f"### {title}")
@@ -81,3 +114,33 @@ def build_status_card(title: str, description: str, *, icon: str | None = None, 
         </div>
         """
     ).strip()
+
+
+def navigation_link(page: str, *, label: str, icon: str | None = None, key: str | None = None) -> None:
+    """Render a navigation shortcut that works across Streamlit versions."""
+
+    page_link = getattr(st, "page_link", None)
+    if callable(page_link):
+        kwargs: dict[str, Any] = {"label": label}
+        if icon is not None:
+            kwargs["icon"] = icon
+        if key is not None:
+            kwargs["key"] = key
+        page_link(page, **kwargs)
+        return
+
+    slug = page_slug_from_path(page)
+    icon_part = f"{icon} " if icon else ""
+    button_key = key or f"nav_{slug.replace(' ', '_')}"
+
+    if st.button(f"{icon_part}{label}", key=button_key):
+        query_params = st.experimental_get_query_params()
+        query_params = {k: v for k, v in query_params.items() if v}
+        query_params["page"] = slug
+        st.experimental_set_query_params(**query_params)
+        st.experimental_rerun()
+
+    hint_key = "_bybit_nav_hint_shown"
+    if not st.session_state.get(hint_key):
+        st.caption("Обновите Streamlit до 1.25+, чтобы получить родные кнопки навигации.")
+        st.session_state[hint_key] = True

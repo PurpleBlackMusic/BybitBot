@@ -1,4 +1,4 @@
-"""Streamlit entry point for Bybit Smart OCO — PRO.
+"""Streamlit entry point for Bybit Spot Guardian.
 
 This thin wrapper allows running the application via ``streamlit run app.py``
 while keeping the actual implementation in ``bybit_app/app.py``.
