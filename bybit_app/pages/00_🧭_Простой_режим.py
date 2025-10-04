@@ -1,29 +1,39 @@
-
 from __future__ import annotations
 
 import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 import streamlit as st
 
-from utils.envs import get_api_client, get_settings, update_settings
-from utils.coach import market_health, build_autopilot_settings
-from utils.scheduler import start_background_loop, _load_state_file, _save_state_file
-from utils.reporter import send_daily_report, summarize_today, send_test_message
 from utils.ai.live import AIRunner
+from utils.coach import build_autopilot_settings, market_health
+from utils.envs import get_api_client, get_settings, update_settings
 from utils.paths import DATA_DIR
+from utils.reporter import send_daily_report, send_test_message, summarize_today
+from utils.scheduler import (
+    _load_state_file,
+    _save_state_file,
+    start_background_loop,
+)
+
+
+def _settings_attr(settings: Any, name: str, default: Any) -> Any:
+    """Return a settings attribute with a convenient default."""
+
+    return getattr(settings, name, default)
+
+
+def _with_spinner(label: str, callback: Callable[[], Any]) -> Any:
+    """Run ``callback`` while showing a spinner and surface exceptions."""
+
+    with st.spinner(label):
+        return callback()
 
 
 @st.cache_resource(show_spinner=False)
 def _get_cached_api_client():
-    """Reuse a single API client instance between reruns.
-
-    Streamlit re-executes the script on each interaction which used to create a
-    fresh REST client every time.  The connection set-up is relatively expensive
-    and also introduced unnecessary load on the Bybit API.  Caching the client
-    keeps the behaviour identical while avoiding redundant handshakes.
-    """
+    """Reuse a single API client instance between reruns."""
 
     return get_api_client()
 
@@ -42,313 +52,569 @@ def _load_today_summary_cached() -> dict[str, Any]:
 
     return summarize_today()
 
+
 st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
 st.title("🧭 Простой режим")
 
-st.caption("Эта страница для тех, кто НЕ хочет разбираться в крипте и настройках. "
-           "Здесь — краткая подсказка на сегодня и **одна кнопка**, чтобы запустить умного бота.")
+st.caption(
+    "Эта страница для тех, кто НЕ хочет разбираться в крипте и настройках. "
+    "Здесь — краткая подсказка на сегодня и **одна кнопка**, чтобы запустить умного бота."
+)
 
 s = get_settings()
-
-# ##__TG_DEFAULTS__ ensure variables exist before buttons use them
-tg_trd = bool(getattr(s, 'tg_trade_notifs', False))
-tg_min = float(getattr(s, 'tg_trade_notifs_min_notional', 50.0))
 
 
 def _persist_settings(**kwargs: Any) -> None:
     """Update settings while keeping Telegram defaults in sync."""
 
+    current = get_settings()
     payload = dict(kwargs)
-    payload.setdefault("tg_trade_notifs", bool(tg_trd))
-    payload.setdefault("tg_trade_notifs_min_notional", float(tg_min))
+    payload.setdefault(
+        "tg_trade_notifs",
+        bool(_settings_attr(current, "tg_trade_notifs", False)),
+    )
+    payload.setdefault(
+        "tg_trade_notifs_min_notional",
+        float(_settings_attr(current, "tg_trade_notifs_min_notional", 50.0)),
+    )
     update_settings(**payload)
+
+
+def _persist_with_feedback(message: str, **kwargs: Any) -> None:
+    """Persist settings while showing success/error feedback."""
+
+    try:
+        _persist_settings(**kwargs)
+    except Exception as exc:  # pragma: no cover - defensive UI feedback
+        st.error(f"Не удалось сохранить настройки: {exc}")
+    else:
+        st.success(message)
 
 
 api = _get_cached_api_client()
 # фоновая автоматика
 start_background_loop()
 
-# --- Daily briefing ---
-st.subheader("Сегодняшний брифинг")
-if st.button("🔄 Обновить брифинг", key="refresh_briefing"):
-    _load_market_health_cached.clear()
-try:
-    info = _load_market_health_cached()
+
+def _render_briefing() -> None:
+    st.subheader("Сегодняшний брифинг")
+    refresh = st.button("🔄 Обновить брифинг", key="refresh_briefing")
+    try:
+        if refresh:
+            _load_market_health_cached.clear()
+            info = _with_spinner("Обновляем брифинг...", _load_market_health_cached)
+        else:
+            info = _load_market_health_cached()
+    except Exception as exc:  # pragma: no cover - defensive UI feedback
+        st.warning(f"Не удалось получить рыночные подсказки: {exc}")
+        return
+
     light = info.get("light")
-    reason = info.get("reason","")
-    cols = st.columns([1,6])
+    reason = info.get("reason", "")
+    cols = st.columns([1, 6])
     with cols[0]:
-        st.metric("Статус рынка", {"green":"✅ ОК","yellow":"⚠️ Риск","red":"⛔ Стоп"}.get(light,"—"))
+        st.metric(
+            "Статус рынка",
+            {"green": "✅ ОК", "yellow": "⚠️ Риск", "red": "⛔ Стоп"}.get(light, "—"),
+        )
     with cols[1]:
         st.write(reason)
+
     st.caption("✅ ОК — можно торговать • ⚠️ Риск — аккуратно • ⛔ Стоп — лучше не торговать")
-    with st.expander("Рекомендованные монеты на сегодня"):
-        st.table({"symbol":[x["symbol"] for x in info.get("top", [])],
-                  "turnover24h":[x["turnover24h"] for x in info.get("top", [])],
-                  "spread (bps)":[x["spread_bps"] for x in info.get("top", [])]})
-except Exception as e:
-    st.warning(f"Не удалось получить рыночные подсказки: {e}")
 
-st.divider()
-
-# --- One-click autopilot ---
-st.subheader("Авто-бот (одной кнопкой)")
-left, right = st.columns([2,1])
-with left:
-    st.write("Бот **сам подберёт монеты и параметры**, включит защиту капитала и TWAP, "
-             "и запустится в фоне. Вы увидите статус и отчёты в разделе «Логи».")
-    if "ai_runner" not in st.session_state:
-        st.session_state["ai_runner"] = AIRunner()
-    runner: AIRunner = st.session_state["ai_runner"]
-
-    if st.button("🤖 Автоподбор и запуск"):
-        try:
-            pack = build_autopilot_settings(s, api)
-            _persist_settings(**pack["settings"])
-            runner.start()
-            st.success(f"Бот запущен. Прогнозная подготовка: ~{pack['eta_minutes']} мин.")
-        except Exception as e:
-            st.error(f"Не удалось запустить: {e}")
-
-    colA, colB = st.columns(2)
-    if colA.button("⏹ Остановить бота"):
-        try:
-            runner.stop()
-            st.info("Бот остановлен.")
-        except Exception as e:
-            st.error(f"Ошибка остановки: {e}")
-    if colB.button("🛑 Паник-стоп (до завтра)"):
-        stop_err: Exception | None = None
-        try:
-            runner.stop()
-        except Exception as e:
-            stop_err = e
-            st.error(f"Ошибка остановки: {e}")
-        try:
-            stf = _load_state_file() or {}
-            stf['stop_day_locked'] = True
-            stf['stop_day_reason'] = 'panic'
-            stf['stop_day_date'] = time.strftime('%Y-%m-%d')
-            if not _save_state_file(stf):
-                raise RuntimeError('state not saved')
-        except Exception as e:
-            st.error(f"Не удалось активировать паник-стоп: {e}")
+    top = info.get("top") or []
+    with st.expander("Рекомендованные монеты на сегодня", expanded=False):
+        if top:
+            table = {
+                "symbol": [row.get("symbol", "—") for row in top],
+                "turnover24h": [row.get("turnover24h") for row in top],
+                "spread (bps)": [row.get("spread_bps") for row in top],
+            }
+            st.dataframe(table, use_container_width=True, hide_index=True)
         else:
-            if stop_err is None:
-                st.warning("Паник-стоп активирован: автозапуск заблокирован до завтра.")
-    dry = st.toggle("Демо-режим (без реальных ордеров)", value=getattr(s, 'dry_run', True),
-                    help="В демо-запуске бот **не отправляет** реальные заявки.")
-    if dry != getattr(s, 'dry_run', True):
-        _persist_settings(dry_run=bool(dry))
-        st.rerun()
-
-with right:
-    st.write("**Статус бота**")
-    try:
-        p = DATA_DIR / "ai" / "status.json"
-        if p.exists():
-            st.json(json.loads(p.read_text(encoding="utf-8")))
-        else:
-            st.info("Пока статуса нет. Нажмите «Автоподбор и запуск».")
-    except Exception as e:
-        st.warning(f"Статус недоступен: {e}")
-
-st.divider()
-st.subheader("Что сегодня делает бот? (человеческим языком)")
-st.markdown(
-"""
-- Выбирает **самые ликвидные** пары с узким спредом.
-- На каждой итерации смотрит **ленту цен/спред** и принимает **простое решение** купить/продать/подождать.
-- Риск на сделку ограничен, включены **ограничения на заём средств**, лимиты на символ и сделку.
-- **DRY RUN** выключается только когда вы снимете тумблер «Демо». 
-- Все действия видно в **🪵 Логи** (ищите записи `ai.*`).
-"""
-)
+            st.info("Подходящих монет пока нет — попробуйте обновить позже.")
 
 
+def _render_autopilot(settings: Any, api_client: Any) -> None:
+    st.subheader("Авто-бот (одной кнопкой)")
+    left, right = st.columns([2, 1])
 
-st.divider()
+    with left:
+        st.write(
+            "Бот **сам подберёт монеты и параметры**, включит защиту капитала и TWAP, "
+            "и запустится в фоне. Вы увидите статус и отчёты в разделе «Логи».",
+        )
+        runner: AIRunner = st.session_state.setdefault("ai_runner", AIRunner())
 
-st.divider()
-st.subheader("📅 Автоматизация")
-with st.expander("Расписание: автозапуск/автостоп бота и дневной отчёт"):
-    col1, col2 = st.columns(2)
-    with col1:
-        en = st.toggle("Включить авто-торговлю по расписанию", value=bool(getattr(s, "auto_trade_enabled", False)))
-        start_t = st.text_input("Время авто-старта (чч:мм)", value=str(getattr(s, "auto_start_time", "09:00")))
-        stop_t  = st.text_input("Время авто-стопа (чч:мм)", value=str(getattr(s, "auto_stop_time", "21:00")))
-        auto_dry = st.toggle("Торговать в демо-режиме при автозапуске", value=bool(getattr(s, "auto_dry_run", True)))
-    with col2:
-        rep = st.toggle("Ежедневный отчёт в Telegram", value=bool(getattr(s, "daily_report_enabled", False)))
-        rep_t = st.text_input("Время отправки отчёта (чч:мм)", value=str(getattr(s, "daily_report_time", "20:00")))
-        loss = st.number_input("Дневной лимит убытка (%)", value=float(getattr(s, "ai_daily_loss_limit_pct", 1.0)), step=0.1)
-        prof = st.number_input("Дневная цель прибыли (%)", value=float(getattr(s, "ai_daily_profit_target_pct", 0.0)), step=0.1)
-
-    if st.button("💾 Сохранить расписание"):
-        _persist_settings(auto_trade_enabled=bool(en), auto_start_time=start_t, auto_stop_time=stop_t, auto_dry_run=bool(auto_dry),
-                          daily_report_enabled=bool(rep), daily_report_time=rep_t,
-                          ai_daily_loss_limit_pct=float(loss), ai_daily_profit_target_pct=float(prof))
-        st.success("Расписание сохранено. Фоновая автоматика уже работает.")
-
-
-st.subheader("⚙️ Доп. настройки универсума")
-with st.expander("Фильтрация монет (для автоподбора)"):
-    wl = st.text_input("Белый список монет (через запятую, опционально)", value=str(getattr(s, 'ai_symbols_whitelist', '')),
-                       help="Если заполнено — автоподбор берёт монеты только из этого списка.")
-    bl = st.text_input("Чёрный список монет (через запятую, опционально)", value=str(getattr(s, 'ai_symbols_blacklist', '')),
-                       help="Эти монеты исключаются из автоподбора.")
-    man = st.text_input("Я сам задам монеты (перечисли через запятую)", value=str(getattr(s, 'ai_symbols_manual', '')),
-                        help="Если указано — автоподбор возьмёт именно эти монеты.")
-    if st.button("💾 Сохранить списки монет"):
-        _persist_settings(ai_symbols_whitelist=wl, ai_symbols_blacklist=bl, ai_symbols_manual=man)
-        st.success("Списки сохранены.")
-
-st.subheader("🗂 Экспорт/импорт настроек")
-colx, coly = st.columns(2)
-with colx:
-    if st.button("⬇️ Экспорт настроек в JSON"):
-        from utils.envs import get_settings
-        s = get_settings()
-        try:
-            data = s.dict() if hasattr(s, "dict") else (s.__dict__ if hasattr(s, "__dict__") else {})
-        except Exception:
-            data = {}
-        import io, json
-        buf = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-        st.download_button("Скачать settings.json", data=buf.getvalue(), file_name="settings.json", mime="application/json")
-with coly:
-    up = st.file_uploader("Загрузить settings.json", type=["json"])
-    if up is not None:
-        try:
-            import json
-            payload = json.loads(up.read().decode("utf-8"))
-            _persist_settings(**payload)
-            st.success("Настройки импортированы.")
-        except Exception as e:
-            st.error(f"Ошибка импорта: {e}")
-
-st.subheader("🔔 Telegram-отчёты")
-tg_trd = st.checkbox("Уведомления о сделках в Telegram", value=bool(getattr(s, "tg_trade_notifs", False)))
-tg_min = st.number_input("Минимальный объём сделки для уведомлений (USDT)", value=float(getattr(s, "tg_trade_notifs_min_notional", 50.0)), step=10.0)
-
-with st.expander("Настройки Telegram (для уведомлений и отчётов)"):
-    tok = st.text_input("Bot Token", type="password", value=str(getattr(s, "telegram_token", "")))
-    chat = st.text_input("Chat ID", value=str(getattr(s, "telegram_chat_id", "")))
-    en = st.toggle("Включить уведомления", value=bool(getattr(s, "telegram_notify", False)),
-                   help="Когда включено — приложение будет присылать короткие уведомления о старте/остановке и заявках.")
-    if st.button("✅ Сохранить Telegram-настройки"):
-        _persist_settings(telegram_token=tok, telegram_chat_id=chat, telegram_notify=bool(en))
-        st.success("Сохранено.")
-    if st.button("🧪 Отправить тестовое сообщение"):
-        r = send_test_message("Привет! Telegram настроен ✅")
-        st.write(f"Ответ: {r}")
-
-
-st.divider()
-st.subheader("Отчёт за сегодня")
-if st.button("🔄 Обновить сводку", key="refresh_summary"):
-    _load_today_summary_cached.clear()
-summary: dict[str, Any] | None = None
-try:
-    summary = _load_today_summary_cached()
-except Exception:
-    summary = None
-
-if summary:
-    st.write(
-        f"Событий: **{summary.get('events', 0)}**, сигналов: **{summary.get('signals', 0)}**, "
-        f"заявок: **{summary.get('orders', 0)}**, ошибок: **{summary.get('errors', 0)}**."
-    )
-else:
-    st.write("Пока нет данных за сегодня.")
-if st.button("📤 Отправить отчёт в Telegram"):
-    r = send_daily_report()
-    _load_today_summary_cached.clear()
-    st.success(f"Отчёт отправлен: {r}")
-
-if st.button("🔓 Снять ‘стоп-день’ до завтра"):
-    stf = _load_state_file() or {}
-    stf['stop_day_locked'] = False
-    stf['stop_day_reason'] = ''
-    if _save_state_file(stf):
-        st.success('Ограничение снято до следующего срабатывания.')
-    else:
-        st.error('Не удалось обновить состояние стоп-дня.')
-
-st.divider()
-st.subheader("🔎 Предпросмотр заявки")
-with st.expander("Проверить, как биржа скорректирует параметры"):
-    from utils.safety import guard_order
-    ps1, ps2, ps3 = st.columns(3)
-    with ps1:
-        sym_prev = st.text_input("Символ", value=(getattr(s, "ai_symbols_manual", "") or "BTCUSDT").split(",")[0].strip())
-    with ps2:
-        side_prev = st.selectbox("Сторона", ["BUY","SELL"], index=0)
-    with ps3:
-        cat_prev = st.selectbox("Категория", ["spot"], index=0)
-    colp, colq = st.columns(2)
-    with colp:
-        price_prev = st.text_input("Цена (опционально, для лимитной)", value="")
-    with colq:
-        qty_prev = st.text_input("Кол-во", value="10")
-    if st.button("Проверить"):
-        try:
-            pr = float(price_prev) if price_prev else None
-            qv = float(qty_prev)
-            res = guard_order(api, category=cat_prev, symbol=sym_prev.upper(), side=side_prev, orderType="Limit" if pr else "Market", qty=qv, price=pr)
-            st.json(res)
-            if res.get("decision") == "ok":
-                st.success("OK — параметры соответствуют требованиям биржи.")
-            elif res.get("decision") == "adjusted":
-                st.warning("Биржа потребует коррекцию — ниже показаны корректные значения.")
+        if st.button("🤖 Автоподбор и запуск", use_container_width=True):
+            try:
+                pack = _with_spinner(
+                    "Подбираем монеты и параметры...",
+                    lambda: build_autopilot_settings(get_settings(), api_client),
+                )
+                _persist_settings(**pack["settings"])
+                runner.start()
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Не удалось запустить: {exc}")
             else:
-                st.error(f"Заявка будет отклонена: {res.get('reason')}")
-        except Exception as e:
-            st.error(f"Ошибка проверки: {e}")
+                st.success(
+                    "Бот запущен. Прогнозная подготовка: ~"
+                    f"{pack.get('eta_minutes', '—')} мин.",
+                )
 
-st.divider()
-st.subheader("🗺️ Пресеты универсума")
-with st.expander("Фильтры автоподбора монет"):
-    preset = st.selectbox("Пресет", ["Консервативный","Стандарт","Агрессивный"], index={"Консервативный":0,"Стандарт":1,"Агрессивный":2}[str(getattr(s, "ai_universe_preset", "Стандарт")) if hasattr(s, "ai_universe_preset") else "Стандарт"])
-    # spread threshold in bps and min daily turnover USD (heuristic, based on tickers endpoint)
-    if preset == "Консервативный":
-        max_spread_bps = st.number_input("Макс. спред (бпс)", value=float(getattr(s, "ai_max_spread_bps", 10.0)), step=1.0)
-        min_turnover_usd = st.number_input("Мин. оборот (USD)", value=float(getattr(s, "ai_min_turnover_usd", 5_000_000.0)), step=100000.0)
-    elif preset == "Агрессивный":
-        max_spread_bps = st.number_input("Макс. спред (бпс)", value=float(getattr(s, "ai_max_spread_bps", 50.0)), step=1.0)
-        min_turnover_usd = st.number_input("Мин. оборот (USD)", value=float(getattr(s, "ai_min_turnover_usd", 500_000.0)), step=50000.0)
-    else:
-        max_spread_bps = st.number_input("Макс. спред (бпс)", value=float(getattr(s, "ai_max_spread_bps", 25.0)), step=1.0)
-        min_turnover_usd = st.number_input("Мин. оборот (USD)", value=float(getattr(s, "ai_min_turnover_usd", 2_000_000.0)), step=100000.0)
-    if st.button("💾 Сохранить пресет"):
-        _persist_settings(ai_universe_preset=preset, ai_max_spread_bps=float(max_spread_bps), ai_min_turnover_usd=float(min_turnover_usd))
-        st.success("Сохранено. Автоподбор будет учитывать фильтры.")
+        col_stop, col_panic = st.columns(2)
+        if col_stop.button("⏹ Остановить бота"):
+            try:
+                runner.stop()
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Ошибка остановки: {exc}")
+            else:
+                st.info("Бот остановлен.")
+
+        if col_panic.button("🛑 Паник-стоп (до завтра)"):
+            stop_error: Exception | None = None
+            try:
+                runner.stop()
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                stop_error = exc
+                st.error(f"Ошибка остановки: {exc}")
+
+            def _activate_panic() -> None:
+                state = _load_state_file() or {}
+                state["stop_day_locked"] = True
+                state["stop_day_reason"] = "panic"
+                state["stop_day_date"] = time.strftime("%Y-%m-%d")
+                if not _save_state_file(state):
+                    raise RuntimeError("state not saved")
+
+            try:
+                _activate_panic()
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Не удалось активировать паник-стоп: {exc}")
+            else:
+                if stop_error is None:
+                    st.warning("Паник-стоп активирован: автозапуск заблокирован до завтра.")
+
+        dry_default = bool(_settings_attr(settings, "dry_run", True))
+        dry = st.toggle(
+            "Демо-режим (без реальных ордеров)",
+            value=dry_default,
+            help="В демо-запуске бот **не отправляет** реальные заявки.",
+        )
+        if dry != dry_default:
+            _persist_settings(dry_run=bool(dry))
+            st.rerun()
+
+    with right:
+        st.write("**Статус бота**")
+        status_path = DATA_DIR / "ai" / "status.json"
+        try:
+            if status_path.exists():
+                st.json(json.loads(status_path.read_text(encoding="utf-8")))
+            else:
+                st.info("Пока статуса нет. Нажмите «Автоподбор и запуск».")
+        except Exception as exc:  # pragma: no cover - defensive UI feedback
+            st.warning(f"Статус недоступен: {exc}")
+
+    st.subheader("Что сегодня делает бот? (человеческим языком)")
+    st.markdown(
+        """
+        - Выбирает **самые ликвидные** пары с узким спредом.
+        - На каждой итерации смотрит **ленту цен/спред** и принимает **простое решение** купить/продать/подождать.
+        - Риск на сделку ограничен, включены **ограничения на заём средств**, лимиты на символ и сделку.
+        - **DRY RUN** выключается только когда вы снимете тумблер «Демо».
+        - Все действия видно в **🪵 Логи** (ищите записи `ai.*`).
+        """
+    )
 
 
-st.divider()
-st.subheader("⚡ WS Watchdog")
-colw1, colw2 = st.columns(2)
-with colw1:
-    wd_on = st.checkbox("Включить авто-перезапуск WS", value=bool(getattr(s, "ws_watchdog_enabled", True)))
-with colw2:
-    wd_max = st.number_input("Макс. задержка heartbeat (сек)", value=int(getattr(s, "ws_watchdog_max_age_sec", 90)), step=10)
-if st.button("💾 Сохранить Watchdog"):
-    _persist_settings(ws_watchdog_enabled=bool(wd_on), ws_watchdog_max_age_sec=int(wd_max))
-    st.success("Сохранено.")
+def _render_automation(settings: Any) -> None:
+    st.subheader("📅 Автоматизация")
+    with st.expander("Расписание: автозапуск/автостоп бота и дневной отчёт"):
+        with st.form("auto_schedule_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                auto_enabled = st.toggle(
+                    "Включить авто-торговлю по расписанию",
+                    value=bool(_settings_attr(settings, "auto_trade_enabled", False)),
+                )
+                start_time = st.text_input(
+                    "Время авто-старта (чч:мм)",
+                    value=str(_settings_attr(settings, "auto_start_time", "09:00")),
+                )
+                stop_time = st.text_input(
+                    "Время авто-стопа (чч:мм)",
+                    value=str(_settings_attr(settings, "auto_stop_time", "21:00")),
+                )
+                auto_dry = st.toggle(
+                    "Торговать в демо-режиме при автозапуске",
+                    value=bool(_settings_attr(settings, "auto_dry_run", True)),
+                )
+            with col2:
+                report_enabled = st.toggle(
+                    "Ежедневный отчёт в Telegram",
+                    value=bool(_settings_attr(settings, "daily_report_enabled", False)),
+                )
+                report_time = st.text_input(
+                    "Время отправки отчёта (чч:мм)",
+                    value=str(_settings_attr(settings, "daily_report_time", "20:00")),
+                )
+                loss_limit = st.number_input(
+                    "Дневной лимит убытка (%)",
+                    value=float(_settings_attr(settings, "ai_daily_loss_limit_pct", 1.0)),
+                    step=0.1,
+                )
+                profit_target = st.number_input(
+                    "Дневная цель прибыли (%)",
+                    value=float(_settings_attr(settings, "ai_daily_profit_target_pct", 0.0)),
+                    step=0.1,
+                )
+
+            if st.form_submit_button("💾 Сохранить расписание"):
+                _persist_with_feedback(
+                    "Расписание сохранено. Фоновая автоматика уже работает.",
+                    auto_trade_enabled=bool(auto_enabled),
+                    auto_start_time=start_time,
+                    auto_stop_time=stop_time,
+                    auto_dry_run=bool(auto_dry),
+                    daily_report_enabled=bool(report_enabled),
+                    daily_report_time=report_time,
+                    ai_daily_loss_limit_pct=float(loss_limit),
+                    ai_daily_profit_target_pct=float(profit_target),
+                )
 
 
-st.divider()
-st.subheader("🧪 Смоделировать следующий тик (превью)")
-with st.expander("Показать, что бот потенциально отправит дальше (оценка)"):
+def _render_universe_filters(settings: Any) -> None:
+    st.subheader("⚙️ Доп. настройки универсума")
+    with st.expander("Фильтрация монет (для автоподбора)"):
+        with st.form("universe_filters_form"):
+            whitelist = st.text_input(
+                "Белый список монет (через запятую, опционально)",
+                value=str(_settings_attr(settings, "ai_symbols_whitelist", "")),
+                help="Если заполнено — автоподбор берёт монеты только из этого списка.",
+            )
+            blacklist = st.text_input(
+                "Чёрный список монет (через запятую, опционально)",
+                value=str(_settings_attr(settings, "ai_symbols_blacklist", "")),
+                help="Эти монеты исключаются из автоподбора.",
+            )
+            manual = st.text_input(
+                "Я сам задам монеты (перечисли через запятую)",
+                value=str(_settings_attr(settings, "ai_symbols_manual", "")),
+                help="Если указано — автоподбор возьмёт именно эти монеты.",
+            )
+
+            if st.form_submit_button("💾 Сохранить списки монет"):
+                _persist_with_feedback(
+                    "Списки сохранены.",
+                    ai_symbols_whitelist=whitelist,
+                    ai_symbols_blacklist=blacklist,
+                    ai_symbols_manual=manual,
+                )
+
+
+def _render_export_import(_: Any) -> None:
+    st.subheader("🗂 Экспорт/импорт настроек")
+    col_export, col_import = st.columns(2)
+
+    with col_export:
+        st.caption("Скачайте текущую конфигурацию (подходит для резервной копии).")
+
+        def _prepare_dump() -> bytes:
+            data_obj = get_settings()
+            try:
+                data = data_obj.dict() if hasattr(data_obj, "dict") else data_obj.__dict__
+            except Exception:  # pragma: no cover - defensive
+                data = {}
+            return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+        if st.button("⬇️ Подготовить JSON"):
+            blob = _with_spinner("Готовим файл...", _prepare_dump)
+            st.download_button(
+                "Скачать settings.json",
+                data=blob,
+                file_name="settings.json",
+                mime="application/json",
+            )
+
+    with col_import:
+        st.caption("Загрузите ранее сохранённый файл.")
+        uploaded = st.file_uploader("Загрузить settings.json", type=["json"])
+        if uploaded is not None:
+            try:
+                payload = json.loads(uploaded.read().decode("utf-8"))
+                _persist_settings(**payload)
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Ошибка импорта: {exc}")
+            else:
+                st.success("Настройки импортированы.")
+
+
+def _render_telegram(settings: Any) -> None:
+    st.subheader("🔔 Telegram-отчёты")
+    with st.form("telegram_trade_notifs"):
+        trade_notifs = st.checkbox(
+            "Уведомления о сделках в Telegram",
+            value=bool(_settings_attr(settings, "tg_trade_notifs", False)),
+        )
+        min_notional = st.number_input(
+            "Минимальный объём сделки для уведомлений (USDT)",
+            value=float(_settings_attr(settings, "tg_trade_notifs_min_notional", 50.0)),
+            step=10.0,
+        )
+        if st.form_submit_button("💾 Сохранить уведомления"):
+            _persist_with_feedback(
+                "Настройки уведомлений сохранены.",
+                tg_trade_notifs=bool(trade_notifs),
+                tg_trade_notifs_min_notional=float(min_notional),
+            )
+
+    with st.expander("Настройки Telegram (для уведомлений и отчётов)"):
+        with st.form("telegram_credentials_form"):
+            token = st.text_input(
+                "Bot Token",
+                type="password",
+                value=str(_settings_attr(settings, "telegram_token", "")),
+            )
+            chat_id = st.text_input(
+                "Chat ID",
+                value=str(_settings_attr(settings, "telegram_chat_id", "")),
+            )
+            notify = st.toggle(
+                "Включить уведомления",
+                value=bool(_settings_attr(settings, "telegram_notify", False)),
+                help="Когда включено — приложение будет присылать короткие уведомления о старте/остановке и заявках.",
+            )
+            submitted = st.form_submit_button("✅ Сохранить Telegram-настройки")
+            if submitted:
+                _persist_with_feedback(
+                    "Сохранено.",
+                    telegram_token=token,
+                    telegram_chat_id=chat_id,
+                    telegram_notify=bool(notify),
+                )
+
+        if st.button("🧪 Отправить тестовое сообщение"):
+            try:
+                response = _with_spinner(
+                    "Отправляем сообщение...",
+                    lambda: send_test_message("Привет! Telegram настроен ✅"),
+                )
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Не удалось отправить сообщение: {exc}")
+            else:
+                st.write(f"Ответ: {response}")
+
+
+def _render_daily_report() -> None:
+    st.subheader("Отчёт за сегодня")
+    if st.button("🔄 Обновить сводку", key="refresh_summary"):
+        _load_today_summary_cached.clear()
+
     try:
-        from utils.preview import next_tick_preview
-        pr = next_tick_preview(api)
-        st.json(pr)
-        if pr.get("decision") == "skip":
-            st.warning("Сейчас заявка была бы отклонена фильтрами биржи. Отрегулируйте параметры/пресет.")
-        elif pr.get("decision") == "adjusted":
-            st.info("Заявка потребует коррекции: см. итоговые qty/price в блоке preview.")
+        summary = _load_today_summary_cached()
+    except Exception as exc:  # pragma: no cover - defensive UI feedback
+        st.error(f"Не удалось получить сводку: {exc}")
+        summary = None
+
+    if summary:
+        st.write(
+            "Событий: **{events}**, сигналов: **{signals}**, заявок: **{orders}**, ошибок: **{errors}**.".format(
+                events=summary.get("events", 0),
+                signals=summary.get("signals", 0),
+                orders=summary.get("orders", 0),
+                errors=summary.get("errors", 0),
+            )
+        )
+    else:
+        st.info("Пока нет данных за сегодня.")
+
+    col_report, col_unlock = st.columns(2)
+    if col_report.button("📤 Отправить отчёт в Telegram"):
+        try:
+            result = _with_spinner("Отправляем отчёт...", send_daily_report)
+        except Exception as exc:  # pragma: no cover - defensive UI feedback
+            st.error(f"Не удалось отправить отчёт: {exc}")
         else:
-            st.success("Оценка в норме. Реальный AI может принять иное решение — это только превью.")
-    except Exception as e:
-        st.error(f"Не удалось получить превью: {e}")
+            _load_today_summary_cached.clear()
+            st.success(f"Отчёт отправлен: {result}")
+
+    if col_unlock.button("🔓 Снять ‘стоп-день’ до завтра"):
+        def _unlock() -> None:
+            state = _load_state_file() or {}
+            state["stop_day_locked"] = False
+            state["stop_day_reason"] = ""
+            if not _save_state_file(state):
+                raise RuntimeError("state not saved")
+
+        try:
+            _unlock()
+        except Exception as exc:  # pragma: no cover - defensive UI feedback
+            st.error(f"Не удалось обновить состояние стоп-дня: {exc}")
+        else:
+            st.success("Ограничение снято до следующего срабатывания.")
+
+
+def _render_order_preview(settings: Any, api_client: Any) -> None:
+    st.subheader("🔎 Предпросмотр заявки")
+    with st.expander("Проверить, как биржа скорректирует параметры"):
+        from utils.safety import guard_order
+
+        with st.form("preview_order_form"):
+            col_symbol, col_side, col_category = st.columns(3)
+            with col_symbol:
+                default_symbol = (
+                    str(_settings_attr(settings, "ai_symbols_manual", "")) or "BTCUSDT"
+                ).split(",")[0].strip()
+                symbol = st.text_input("Символ", value=default_symbol)
+            with col_side:
+                side = st.selectbox("Сторона", ["BUY", "SELL"], index=0)
+            with col_category:
+                category = st.selectbox("Категория", ["spot"], index=0)
+
+            col_price, col_qty = st.columns(2)
+            with col_price:
+                price_str = st.text_input("Цена (опционально, для лимитной)", value="")
+            with col_qty:
+                qty_str = st.text_input("Кол-во", value="10")
+
+            if st.form_submit_button("Проверить"):
+                try:
+                    price = float(price_str) if price_str else None
+                    qty = float(qty_str)
+                    response = guard_order(
+                        api_client,
+                        category=category,
+                        symbol=symbol.upper(),
+                        side=side,
+                        orderType="Limit" if price else "Market",
+                        qty=qty,
+                        price=price,
+                    )
+                except ValueError:
+                    st.error("Введите корректные числовые значения цены и количества.")
+                except Exception as exc:  # pragma: no cover - defensive UI feedback
+                    st.error(f"Ошибка проверки: {exc}")
+                else:
+                    st.json(response)
+                    decision = response.get("decision")
+                    if decision == "ok":
+                        st.success("OK — параметры соответствуют требованиям биржи.")
+                    elif decision == "adjusted":
+                        st.warning("Биржа потребует коррекцию — ниже показаны корректные значения.")
+                    else:
+                        st.error(f"Заявка будет отклонена: {response.get('reason')}")
+
+
+def _render_universe_presets(settings: Any) -> None:
+    st.subheader("🗺️ Пресеты универсума")
+    with st.expander("Фильтры автоподбора монет"):
+        options = ["Консервативный", "Стандарт", "Агрессивный"]
+        default = str(_settings_attr(settings, "ai_universe_preset", "Стандарт"))
+        index = options.index(default) if default in options else 1
+        preset = st.selectbox("Пресет", options, index=index)
+
+        if preset == "Консервативный":
+            max_spread_default = float(_settings_attr(settings, "ai_max_spread_bps", 10.0))
+            min_turnover_default = float(_settings_attr(settings, "ai_min_turnover_usd", 5_000_000.0))
+        elif preset == "Агрессивный":
+            max_spread_default = float(_settings_attr(settings, "ai_max_spread_bps", 50.0))
+            min_turnover_default = float(_settings_attr(settings, "ai_min_turnover_usd", 500_000.0))
+        else:
+            max_spread_default = float(_settings_attr(settings, "ai_max_spread_bps", 25.0))
+            min_turnover_default = float(_settings_attr(settings, "ai_min_turnover_usd", 2_000_000.0))
+
+        max_spread = st.number_input("Макс. спред (бпс)", value=max_spread_default, step=1.0)
+        min_turnover = st.number_input("Мин. оборот (USD)", value=min_turnover_default, step=100000.0)
+
+        if st.button("💾 Сохранить пресет"):
+            _persist_with_feedback(
+                "Сохранено. Автоподбор будет учитывать фильтры.",
+                ai_universe_preset=preset,
+                ai_max_spread_bps=float(max_spread),
+                ai_min_turnover_usd=float(min_turnover),
+            )
+
+
+def _render_watchdog(settings: Any) -> None:
+    st.subheader("⚡ WS Watchdog")
+    with st.form("watchdog_form"):
+        wd_enabled = st.checkbox(
+            "Включить авто-перезапуск WS",
+            value=bool(_settings_attr(settings, "ws_watchdog_enabled", True)),
+        )
+        wd_max_age = st.number_input(
+            "Макс. задержка heartbeat (сек)",
+            value=int(_settings_attr(settings, "ws_watchdog_max_age_sec", 90)),
+            step=10,
+        )
+        if st.form_submit_button("💾 Сохранить Watchdog"):
+            _persist_with_feedback(
+                "Сохранено.",
+                ws_watchdog_enabled=bool(wd_enabled),
+                ws_watchdog_max_age_sec=int(wd_max_age),
+            )
+
+
+def _render_tick_preview(api_client: Any) -> None:
+    st.subheader("🧪 Смоделировать следующий тик (превью)")
+    with st.expander("Показать, что бот потенциально отправит дальше (оценка)"):
+        try:
+            from utils.preview import next_tick_preview
+        except Exception as exc:  # pragma: no cover - defensive UI feedback
+            st.error(f"Модуль превью недоступен: {exc}")
+            return
+
+        if st.button("🔍 Обновить превью"):
+            try:
+                preview = _with_spinner(
+                    "Получаем оценку...", lambda: next_tick_preview(api_client)
+                )
+            except Exception as exc:  # pragma: no cover - defensive UI feedback
+                st.error(f"Не удалось получить превью: {exc}")
+                return
+
+            st.json(preview)
+            decision = preview.get("decision")
+            if decision == "skip":
+                st.warning(
+                    "Сейчас заявка была бы отклонена фильтрами биржи. Отрегулируйте параметры/пресет.",
+                )
+            elif decision == "adjusted":
+                st.info("Заявка потребует коррекции: см. итоговые qty/price в блоке preview.")
+            else:
+                st.success("Оценка в норме. Реальный AI может принять иное решение — это только превью.")
+
+
+st.divider()
+_render_briefing()
+
+st.divider()
+_render_autopilot(s, api)
+
+st.divider()
+_render_automation(s)
+
+st.divider()
+_render_universe_filters(s)
+
+st.divider()
+_render_export_import(s)
+
+st.divider()
+_render_telegram(s)
+
+st.divider()
+_render_daily_report()
+
+st.divider()
+_render_order_preview(s, api)
+
+st.divider()
+_render_universe_presets(s)
+
+st.divider()
+_render_watchdog(s)
+
+st.divider()
+_render_tick_preview(api)
