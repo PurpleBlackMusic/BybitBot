@@ -59,10 +59,17 @@ class BybitAPI:
         # signed
         ts = str(int(time.time() * 1000))
         if method.upper() == "GET":
-            q = urlencode(sorted((params or {}).items()))
+            ordered_params = sorted((params or {}).items())
+            q = urlencode(ordered_params)
             sign = self._sign(ts, q)
             headers = self._headers(ts, sign)
-            r = self.session.get(url, params=params, headers=headers, timeout=self.timeout, verify=self.verify_ssl)
+            r = self.session.get(
+                url,
+                params=ordered_params,
+                headers=headers,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+            )
         else:
             q = json.dumps(body or {}, separators=(',', ':'), ensure_ascii=False, sort_keys=True)
             sign = self._sign(ts, q)
