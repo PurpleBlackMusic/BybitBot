@@ -40,3 +40,11 @@ def test_estimate_vwap_with_empty_book():
         "best": None,
         "mid": None,
     }
+
+
+def test_estimate_vwap_requires_single_mode(sample_orderbook):
+    with pytest.raises(ValueError):
+        estimate_vwap_from_orderbook(sample_orderbook, "Buy")
+
+    with pytest.raises(ValueError):
+        estimate_vwap_from_orderbook(sample_orderbook, "Buy", qty_base=1.0, notional_quote=1.0)
