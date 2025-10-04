@@ -6,12 +6,24 @@ from .paths import DATA_DIR
 
 LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
 
-def spot_fifo_pnl():
-    """FIFO учёт по каждой монете. Возвращает {symbol: {realized_pnl, position_qty, layers:[(qty, cost)]}}"""
+def spot_fifo_pnl(ledger_path: Path | None = None):
+    """FIFO учёт по каждой монете.
+
+    Parameters
+    ----------
+    ledger_path: Path | None
+        Позволяет указать альтернативный путь к журналу исполнений (упрощает тестирование).
+
+    Returns
+    -------
+    dict
+        ``{symbol: {realized_pnl, position_qty, layers:[(qty, cost)]}}``
+    """
+    ledger = ledger_path or LEDGER
     out = {}
-    if not LEDGER.exists():
+    if not ledger.exists():
         return out
-    with LEDGER.open("r", encoding="utf-8") as f:
+    with ledger.open("r", encoding="utf-8") as f:
         for line in f:
             if not line.strip(): continue
             ev = json.loads(line)
