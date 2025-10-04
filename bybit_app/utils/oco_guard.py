@@ -5,8 +5,7 @@ import json, time, threading
 from pathlib import Path
 from .paths import DATA_DIR
 from .log import log
-from .envs import get_settings
-from .bybit_api import BybitAPI, BybitCreds
+from .envs import get_api_client
 from .telegram_notify import send_telegram
 
 STORE = DATA_DIR / "oco_groups.json"
@@ -44,8 +43,7 @@ def mark_closed(group: str):
             _save(db)
 
 def _api():
-    s = get_settings()
-    return BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    return get_api_client()
 
 def _amend_qty(symbol: str, category: str, link: str, qty: float):
     try:

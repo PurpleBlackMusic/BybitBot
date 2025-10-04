@@ -1,13 +1,12 @@
 
 from __future__ import annotations
 import time
-from .bybit_api import BybitAPI, BybitCreds
-from .envs import get_settings
+from .envs import get_api_client, get_settings
 from .log import log
 
 def check_time_drift_seconds() -> float:
     s = get_settings()
-    api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+    api = get_api_client()
     try:
         r = api._req("GET", "/v5/market/time")
         server_ms = int(((r or {}).get("result") or {}).get("timeNano",0))//1_000_000

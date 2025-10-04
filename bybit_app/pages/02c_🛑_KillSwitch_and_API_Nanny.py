@@ -2,14 +2,13 @@
 from __future__ import annotations
 import streamlit as st, time, json
 
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 
 st.title("🛑 KillSwitch and API Nanny")
 
 # Build API client from settings
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key or "", s.api_secret or "", s.testnet), timeout=s.http_timeout_ms, recv_window=s.recv_window_ms)
+api = get_api_client()
 
 st.subheader("Быстрые отмены (Spot)")
 

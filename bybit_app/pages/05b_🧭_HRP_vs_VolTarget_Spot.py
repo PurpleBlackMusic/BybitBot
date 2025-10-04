@@ -1,15 +1,14 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.portfolio import corr_matrix, estimate_portfolio_allocation, load_corr
 from utils.hrp import hrp_weights
 
 st.title("🧭 HRP vs Vol‑Target — сравнение аллокаций")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 symbols = [x.strip().upper() for x in (s.ai_symbols or "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if x.strip()]
 
 if st.button("🔄 Посчитать матрицу (30д, 1h)"):

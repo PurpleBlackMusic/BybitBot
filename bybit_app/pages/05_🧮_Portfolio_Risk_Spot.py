@@ -1,14 +1,13 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.portfolio import corr_matrix, save_corr, load_corr, estimate_portfolio_allocation
 
 st.title("🧮 Portfolio Risk (Spot) — корреляции и лимиты")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 
 symbols = [x.strip().upper() for x in (s.ai_symbols or "BTCUSDT,ETHUSDT,SOLUSDT").split(',') if x.strip()]
 if st.button("🔄 Пересчитать корреляции (30д, 1h)"):

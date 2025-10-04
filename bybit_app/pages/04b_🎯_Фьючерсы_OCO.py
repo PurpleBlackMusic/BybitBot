@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.oco_futures import place_linear_oco
 from utils.quant import clamp_qty, gte_min_notional
 from utils.log import log
@@ -14,7 +13,7 @@ if not (s.api_key and s.api_secret):
     st.warning("Сначала укажите API ключи на странице «Подключение и состояние».")
     st.stop()
 
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 
 with st.form("foco"):
     c1, c2, c3 = st.columns(3)

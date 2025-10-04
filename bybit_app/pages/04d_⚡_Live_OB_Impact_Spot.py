@@ -1,14 +1,13 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.bybit_api import BybitAPI, BybitCreds
-from utils.envs import get_settings
+from utils.envs import get_api_client, get_settings
 from utils.ws_orderbook import LiveOrderbook
 
 st.title("⚡ Live Orderbook Impact (Spot) — VWAP оценка")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 lob = LiveOrderbook(api, category="spot")
 
 sym = st.text_input("Символ", value="BTCUSDT")

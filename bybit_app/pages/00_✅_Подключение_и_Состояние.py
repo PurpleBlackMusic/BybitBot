@@ -1,9 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.ui import section
-from utils.envs import get_settings, update_settings, creds_ok
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings, update_settings, creds_ok
 from utils.log import log
 
 st.title("✅ Подключение и состояние")
@@ -23,8 +21,7 @@ with st.form("creds"):
 st.divider()
 st.subheader("Проверка соединения")
 if creds_ok():
-    creds = BybitCreds(s.api_key, s.api_secret, s.testnet)
-    api = BybitAPI(creds)
+    api = get_api_client()
     try:
         t = api.server_time()
         st.success(f"Связь с API есть. Серверное время: {t.get('result',{}).get('timeSecond', '—')}")

@@ -1,8 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
-from utils.envs import get_settings
-from utils.bybit_api import BybitAPI, BybitCreds
+from utils.envs import get_api_client, get_settings
 from utils.ai.engine import AIPipeline
 from utils.ai.backtest import walk_forward
 from utils.paths import DATA_DIR
@@ -10,7 +9,7 @@ from utils.paths import DATA_DIR
 st.title("🧪 AI Lab — Walk-Forward Backtest")
 
 s = get_settings()
-api = BybitAPI(BybitCreds(s.api_key, s.api_secret, s.testnet))
+api = get_api_client()
 
 col1, col2, col3 = st.columns(3)
 with col1:
