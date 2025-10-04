@@ -5,6 +5,10 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Callable
 
+from streamlit.runtime.scriptrunner_utils.script_run_context import (
+    get_script_run_ctx,
+)
+
 import streamlit as st
 
 
@@ -116,17 +120,43 @@ def build_status_card(title: str, description: str, *, icon: str | None = None, 
     ).strip()
 
 
+def _resolve_page_location(page: str) -> str:
+    """Resolve a page path so it works both from the package root and wrappers."""
+
+    ctx = get_script_run_ctx()
+    if not ctx:
+        return page
+
+    main_dir = Path(ctx.main_script_path).parent
+    candidate = (main_dir / page).resolve()
+    if candidate.exists():
+        return page
+
+    package_root = Path(__file__).resolve().parents[1]
+    alt_candidate = (package_root / page).resolve()
+    if alt_candidate.exists():
+        try:
+            return str(alt_candidate.relative_to(main_dir))
+        except ValueError:
+            return str(alt_candidate)
+
+    return page
+
+
 def navigation_link(page: str, *, label: str, icon: str | None = None, key: str | None = None) -> None:
     """Render a navigation shortcut that works across Streamlit versions."""
 
     page_link = getattr(st, "page_link", None)
     if callable(page_link):
+        page_arg: Any = page
+        if isinstance(page, str):
+            page_arg = _resolve_page_location(page)
         kwargs: dict[str, Any] = {"label": label}
         if icon is not None:
             kwargs["icon"] = icon
         if key is not None:
             kwargs["key"] = key
-        page_link(page, **kwargs)
+        page_link(page_arg, **kwargs)
         return
 
     slug = page_slug_from_path(page)
