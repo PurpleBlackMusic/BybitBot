@@ -17,7 +17,7 @@ pause = st.number_input("Пауза между сэмплами, сек", 0, 60,
 if st.button("▶️ Замерить"):
     qs = [float(x.strip()) for x in qtys.split(",") if x.strip()]
     rows = []
-    for i in range(samples):
+    for i in range(int(samples)):
         ob = api.orderbook(category="spot", symbol=symbol, limit=200)
         for q in qs:
             est = estimate_vwap_from_orderbook(ob, side=side, qty_base=q)
