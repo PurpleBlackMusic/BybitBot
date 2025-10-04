@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from .paths import DATA_DIR
+from .file_io import tail_lines
 
 
 @dataclass(frozen=True)
@@ -79,11 +80,7 @@ def load_executions(path: Optional[Path | str] = None, limit: Optional[int] = No
         return []
 
     records: List[ExecutionRecord] = []
-    with ledger_path.open("r", encoding="utf-8") as handle:
-        lines = handle.readlines()
-
-    if limit is not None and limit > 0:
-        lines = lines[-limit:]
+    lines = tail_lines(ledger_path, limit, drop_blank=True)
 
     for line in lines:
         if not line.strip():
