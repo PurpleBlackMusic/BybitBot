@@ -18,6 +18,7 @@ from .trade_analytics import (
     normalise_execution_payload,
 )
 from .spot_pnl import spot_inventory_and_pnl
+from .live_checks import bybit_realtime_status
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1098,8 @@ class GuardianBot:
             f"Режим: {'DRY-RUN' if settings.dry_run else 'Live'}"
         )
 
+        realtime = bybit_realtime_status(settings)
+
         return {
             "ai_signal": {
                 "title": "AI сигнал",
@@ -1119,6 +1122,7 @@ class GuardianBot:
                 "message": api_message,
                 "details": api_details,
             },
+            "realtime_trading": realtime,
         }
 
     def refresh(self) -> GuardianSnapshot:

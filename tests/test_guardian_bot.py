@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+import bybit_app.utils.guardian_bot as guardian_bot_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
 
@@ -447,7 +448,7 @@ def test_guardian_unified_report_is_serialisable(tmp_path: Path) -> None:
     assert report["brief"]["mode"] in {"buy", "wait", "sell"}
 
 
-def test_guardian_data_health(tmp_path: Path) -> None:
+def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
     status = {
         "symbol": "BTCUSDT",
         "probability": 0.7,
@@ -475,6 +476,17 @@ def test_guardian_data_health(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "bybit_realtime_status",
+        lambda _settings: {
+            "title": "RT",
+            "ok": True,
+            "message": "Биржа отвечает",
+            "details": "stub",
+        },
+    )
+
     bot = _make_bot(tmp_path, Settings(api_key="k", api_secret="s"))
     bot.generate_brief()
     health = bot.data_health()
@@ -484,6 +496,8 @@ def test_guardian_data_health(tmp_path: Path) -> None:
     assert health["executions"]["trades"] == 1
     assert health["executions"]["ok"] is True
     assert health["api_keys"]["ok"] is True
+    assert health["realtime_trading"]["ok"] is True
+    assert health["realtime_trading"]["title"] == "RT"
 
 
 def test_guardian_unified_report(tmp_path: Path) -> None:
