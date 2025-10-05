@@ -47,6 +47,115 @@ def test_guardian_brief_buy_signal(tmp_path: Path) -> None:
     assert "интерес" in brief.analysis.lower()
 
 
+def test_guardian_brief_prefers_status_symbol(tmp_path: Path) -> None:
+    status = {
+        "symbol": "SOLUSDT",
+        "probability": 0.7,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path, Settings(ai_symbols=""))
+    brief = bot.generate_brief()
+
+    assert brief.symbol == "SOLUSDT"
+    summary = bot.status_summary()
+    assert summary["symbol"] == "SOLUSDT"
+
+
+def test_guardian_brief_respects_explicit_mode_hint(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.72,
+        "ev_bps": 22.0,
+        "mode": "wait",
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    brief = bot.generate_brief()
+
+    assert brief.mode == "wait"
+    assert "спокойный режим" in brief.headline.lower()
+
+    summary = bot.status_summary()
+    assert summary["mode"] == "wait"
+    assert summary["mode_hint"] == "wait"
+    assert summary["mode_hint_source"] == "mode"
+    assert any("Нет активного сигнала" in reason for reason in summary["actionable_reasons"])
+
+
+def test_guardian_brief_handles_sell_mode_hint(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.4,
+        "ev_bps": 12.0,
+        "mode": "sell",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    brief = bot.generate_brief()
+
+    assert brief.mode == "sell"
+    assert "прод" in brief.action_text.lower()
+
+    summary = bot.status_summary()
+    assert summary["mode"] == "sell"
+    assert summary["mode_hint"] == "sell"
+    assert summary["mode_hint_source"] == "mode"
+    assert any("уверенность" in reason.lower() for reason in summary["actionable_reasons"])
+
+
+def test_guardian_brief_understands_russian_buy_hint(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.8,
+        "ev_bps": 30.0,
+        "mode": "Покупаем аккуратно",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    brief = bot.generate_brief()
+
+    assert brief.mode == "buy"
+    assert "покуп" in brief.action_text.lower()
+
+
+def test_guardian_brief_wait_hint_from_russian_phrase(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.52,
+        "ev_bps": 8.0,
+        "mode": "ничего не делаем, ждём",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    brief = bot.generate_brief()
+
+    assert brief.mode == "wait"
+    assert "спокойный режим" in brief.headline.lower()
+
+
 def test_guardian_plan_and_risk_summary(tmp_path: Path) -> None:
     settings = Settings(
         dry_run=False,

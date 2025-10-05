@@ -159,6 +159,194 @@ class GuardianBot:
                 return value.strip()
         return None
 
+    @staticmethod
+    def _normalise_mode_hint(value: object) -> Optional[str]:
+        """Convert heterogeneous directional hints into canonical modes."""
+
+        if value is None:
+            return None
+
+        if isinstance(value, bool):
+            return "buy" if value else "sell"
+
+        if isinstance(value, (int, float)):
+            if value > 0:
+                return "buy"
+            if value < 0:
+                return "sell"
+            return "wait"
+
+        if not isinstance(value, str):
+            return None
+
+        cleaned = value.strip().lower()
+        if not cleaned:
+            return None
+
+        # Normalise delimiters and remove apostrophes for "don't" like phrases.
+        cleaned = cleaned.replace("-", " ").replace("_", " ").replace("'", "")
+
+        # Try to interpret numeric or boolean-looking strings early.
+        if cleaned in {"true", "yes"}:
+            return "buy"
+        if cleaned in {"false", "no"}:
+            return "sell"
+        try:
+            numeric = float(cleaned)
+        except ValueError:
+            numeric = None
+        if numeric is not None:
+            if numeric > 0:
+                return "buy"
+            if numeric < 0:
+                return "sell"
+            return "wait"
+
+        tokens = [token for token in cleaned.split() if token]
+        joined = " ".join(tokens)
+
+        phrase_map = {
+            "no trade": "wait",
+            "do not trade": "wait",
+            "dont trade": "wait",
+            "no signal": "wait",
+            "stand aside": "wait",
+            "stay aside": "wait",
+            "не торгуй": "wait",
+            "не торгуем": "wait",
+            "не торговать": "wait",
+            "ничего не делаем": "wait",
+            "без сделки": "wait",
+            "take profit": "sell",
+            "take profits": "sell",
+            "trim position": "sell",
+            "фиксиру": "sell",
+            "зафиксиру": "sell",
+        }
+        for phrase, mode in phrase_map.items():
+            if phrase in joined:
+                return mode
+
+        buy_tokens = {
+            "buy",
+            "long",
+            "bull",
+            "bullish",
+            "accumulate",
+            "accumulation",
+            "bid",
+            "покупай",
+            "покупаем",
+            "покупка",
+            "покупать",
+            "лонг",
+        }
+        sell_tokens = {
+            "sell",
+            "short",
+            "bear",
+            "bearish",
+            "distribute",
+            "distribution",
+            "exit",
+            "reduce",
+            "trim",
+            "продавай",
+            "продаем",
+            "продаём",
+            "продажа",
+            "продавать",
+            "фиксиру",
+            "зафиксиру",
+            "сократи",
+            "сокращаем",
+        }
+        wait_tokens = {
+            "wait",
+            "hold",
+            "holding",
+            "flat",
+            "neutral",
+            "idle",
+            "none",
+            "stay",
+            "pause",
+            "observe",
+            "sideline",
+            "watch",
+            "ждать",
+            "ждём",
+            "ждем",
+            "ждите",
+            "ждемс",
+            "ожидаем",
+            "ожидай",
+            "держим",
+            "держи",
+            "держать",
+            "пауза",
+            "паузы",
+            "ничего",
+            "сидим",
+            "выжидаем",
+        }
+
+        for token in tokens:
+            if token in buy_tokens:
+                return "buy"
+            if token in sell_tokens:
+                return "sell"
+            if token in wait_tokens:
+                return "wait"
+
+        prefixes = {
+            "buy": "buy",
+            "long": "buy",
+            "bull": "buy",
+            "accum": "buy",
+            "покуп": "buy",
+            "лонг": "buy",
+            "sell": "sell",
+            "short": "sell",
+            "bear": "sell",
+            "distrib": "sell",
+            "exit": "sell",
+            "trim": "sell",
+            "прода": "sell",
+            "фикс": "sell",
+            "сократ": "sell",
+            "reduc": "sell",
+            "wait": "wait",
+            "hold": "wait",
+            "flat": "wait",
+            "neutral": "wait",
+            "pause": "wait",
+            "idle": "wait",
+            "stay": "wait",
+            "watch": "wait",
+            "side": "wait",
+            "жд": "wait",
+            "ожид": "wait",
+            "держ": "wait",
+            "пауз": "wait",
+            "ничег": "wait",
+            "сид": "wait",
+            "выжид": "wait",
+        }
+        for token in tokens:
+            for prefix, mode in prefixes.items():
+                if token.startswith(prefix):
+                    return mode
+
+        if tokens:
+            first = tokens[0]
+            if first in {"up", "increase", "add"}:
+                return "buy"
+            if first in {"down", "decrease", "cut"}:
+                return "sell"
+
+        return None
+
     def _narrative_from_status(self, status: Dict[str, object], mode: str, symbol: str) -> str:
         narrative = self._extract_text(
             status,
@@ -574,6 +762,13 @@ class GuardianBot:
         if status:
             summary["raw_keys"] = sorted(status.keys())
 
+            for source_key in ("mode", "signal", "action", "bias", "side"):
+                hint = self._normalise_mode_hint(status.get(source_key))
+                if hint:
+                    summary["mode_hint"] = hint
+                    summary["mode_hint_source"] = source_key
+                    break
+
         return summary
 
     def _evaluate_actionability(
@@ -618,20 +813,46 @@ class GuardianBot:
         return actionable, reasons
 
     def _brief_from_status(self, status: Dict[str, object], settings: Settings) -> GuardianBrief:
-        symbols = (settings.ai_symbols or "BTCUSDT").split(",")
-        symbol = symbols[0].strip().upper() or "BTCUSDT"
+        raw_symbol = status.get("symbol") or status.get("ticker") or status.get("pair")
+        symbol: Optional[str] = None
+
+        if isinstance(raw_symbol, str) and raw_symbol.strip():
+            symbol = raw_symbol.strip().upper()
+        else:
+            for candidate in (settings.ai_symbols or "").split(","):
+                candidate = candidate.strip()
+                if candidate:
+                    symbol = candidate.upper()
+                    break
+
+        if not symbol:
+            symbol = "BTCUSDT"
 
         probability = self._clamp_probability(float(status.get("probability") or 0.0))
         ev_bps = float(status.get("ev_bps") or 0.0)
-        side_hint = (status.get("side") or "").lower()
+
+        mode_hint: Optional[str] = None
+        for key in ("mode", "signal", "action", "bias"):
+            mode_hint = self._normalise_mode_hint(status.get(key))
+            if mode_hint:
+                break
+        side_hint = self._normalise_mode_hint(status.get("side"))
 
         buy_threshold = settings.ai_buy_threshold or 0.55
         sell_threshold = settings.ai_sell_threshold or 0.45
         min_ev = max(float(settings.ai_min_ev_bps or 0.0), 0.0)
 
-        if probability >= max(buy_threshold, 0.55) and ev_bps >= min_ev:
+        if mode_hint:
+            mode = mode_hint
+        elif side_hint == "wait":
+            mode = "wait"
+        elif probability >= max(buy_threshold, 0.55) and ev_bps >= min_ev:
             mode = "buy"
-        elif side_hint == "sell" and probability <= min(sell_threshold, buy_threshold) and ev_bps >= min_ev:
+        elif (
+            side_hint == "sell"
+            and probability <= min(sell_threshold, buy_threshold)
+            and ev_bps >= min_ev
+        ):
             mode = "sell"
         else:
             mode = "wait"
