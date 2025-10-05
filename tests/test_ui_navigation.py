@@ -36,6 +36,30 @@ def test_resolve_page_location_strips_absolute_and_prefixed_paths(streamlit_ctx)
     assert ui._resolve_page_location(windows_like) == target
 
 
+def test_resolve_page_location_without_ctx_still_resolves(monkeypatch):
+    monkeypatch.setattr(ui, "get_script_run_ctx", lambda: None)
+
+    expected = "pages/02_⚙️_Настройки.py"
+
+    calls: list[tuple[Path, Path]] = []
+
+    def fake_find(base: Path, relative: Path) -> str | None:
+        calls.append((base, relative))
+        if relative.as_posix() in {
+            "pages/02_⚙️_Настройки.py",
+            "pages/02_⚙️_Настройки.py",
+        }:
+            return expected
+        return None
+
+    monkeypatch.setattr(ui, "_find_existing_relative_path", fake_find)
+
+    result = ui._resolve_page_location("pages/02_⚙️_Настройки.py")
+
+    assert result == expected
+    assert calls, "Expected resolution to consult filesystem helpers"
+
+
 def test_find_existing_relative_path_preserves_filesystem_unicode(tmp_path):
     base = tmp_path / "pkg"
     pages = base / "pages"

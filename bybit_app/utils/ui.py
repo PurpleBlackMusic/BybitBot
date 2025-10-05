@@ -310,42 +310,55 @@ def _extract_pages_subpath(value: str) -> str | None:
 def _resolve_page_location(page: str) -> str:
     """Resolve a page path so it works both from the package root and wrappers."""
 
-    ctx = get_script_run_ctx()
-    if not ctx:
+    if not isinstance(page, str):
         return page
 
     page_path = Path(page)
-    main_script = Path(ctx.main_script_path)
-    try:
-        main_script = main_script.resolve(strict=True)
-    except FileNotFoundError:
-        main_script = main_script.resolve()
-    main_dir = main_script.parent
+    ctx = get_script_run_ctx()
+    main_dir: Path | None = None
+    if ctx is not None:
+        main_script_path = getattr(ctx, "main_script_path", None)
+        if main_script_path:
+            main_script = Path(main_script_path)
+            try:
+                main_script = main_script.resolve(strict=True)
+            except FileNotFoundError:
+                main_script = main_script.resolve()
+            main_dir = main_script.parent
+
     package_root = Path(__file__).resolve().parents[1]
-    bases = (main_dir, package_root)
-    resolved = _find_existing_relative_path(main_dir, page_path)
-    if resolved is not None:
+    bases: list[Path] = []
+    if main_dir is not None:
+        bases.append(main_dir)
+    if package_root not in bases:
+        bases.append(package_root)
+
+    search_roots = [root for root in (main_dir, package_root) if root is not None]
+
+    for root in search_roots:
+        resolved = _find_existing_relative_path(root, page_path)
+        if resolved is None:
+            continue
+        if root is package_root and main_dir is not None and package_root != main_dir:
+            alt_candidate = (package_root / resolved).resolve()
+            formatted = _format_relative_path(alt_candidate, tuple(bases))
+            return _extract_pages_subpath(formatted) or resolved
         return resolved
 
-    resolved = _find_existing_relative_path(package_root, page_path)
-    if resolved is not None:
-        alt_candidate = (package_root / resolved).resolve()
-        formatted = _format_relative_path(alt_candidate, bases)
-        return _extract_pages_subpath(formatted) or resolved
+    if page_path.is_absolute():
+        formatted = _format_relative_path(page_path, tuple(bases))
+        return _extract_pages_subpath(formatted) or formatted
 
-    if isinstance(page, str):
-        page_candidate = Path(page)
-        if page_candidate.is_absolute():
-            formatted = _format_relative_path(page_candidate, bases)
-            return _extract_pages_subpath(formatted) or formatted
+    extracted = _extract_pages_subpath(page)
+    if extracted:
+        extracted_path = Path(extracted)
+        for root in search_roots:
+            resolved = _find_existing_relative_path(root, extracted_path)
+            if resolved is not None:
+                return resolved
+        return extracted
 
-        extracted = _extract_pages_subpath(page)
-        if extracted:
-            return extracted
-
-        return page_candidate.as_posix()
-
-    return page
+    return page_path.as_posix()
 
 
 def navigation_link(page: str, *, label: str, icon: str | None = None, key: str | None = None) -> None:
