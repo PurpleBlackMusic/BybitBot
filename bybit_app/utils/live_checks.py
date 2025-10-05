@@ -46,19 +46,72 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
         if not isinstance(account, dict):
             continue
 
+        coins_source = account.get("coin") or account.get("coins")
+        coin_rows: Tuple[Dict[str, object], ...] = tuple()
+        if isinstance(coins_source, Iterable) and not isinstance(coins_source, (str, bytes)):
+            coin_rows = tuple(row for row in coins_source if isinstance(row, dict))
+
         total_val = _first_numeric(account, ("totalEquity", "equity", "walletBalance"))
+        if (total_val in (None, 0.0)) and coin_rows:
+            coin_total = 0.0
+            has_coin_total = False
+            for row in coin_rows:
+                row_total = _first_numeric(
+                    row,
+                    (
+                        "equity",
+                        "walletBalance",
+                        "balance",
+                        "total",
+                        "totalEquity",
+                    ),
+                )
+                if row_total is None:
+                    continue
+                coin_total += row_total
+                has_coin_total = True
+            if has_coin_total:
+                total_val = coin_total
         if total_val is not None:
             total += total_val
 
         available_val = _first_numeric(
             account,
             (
+                "totalAvailableBalance",
                 "availableBalance",
                 "availableMargin",
                 "availableToWithdraw",
                 "cashBalance",
+                "free",
+                "availableFunds",
             ),
         )
+
+        if (available_val in (None, 0.0)) and coin_rows:
+            coin_available = 0.0
+            has_coin_available = False
+            for row in coin_rows:
+                row_available = _first_numeric(
+                    row,
+                    (
+                        "totalAvailableBalance",
+                        "availableToWithdraw",
+                        "availableBalance",
+                        "available",
+                        "availableMargin",
+                        "free",
+                        "transferBalance",
+                        "cashBalance",
+                        "availableFunds",
+                    ),
+                )
+                if row_available is None:
+                    continue
+                coin_available += row_available
+                has_coin_available = True
+            if has_coin_available:
+                available_val = coin_available
         if available_val is not None:
             available += available_val
     return total, available
@@ -110,10 +163,15 @@ def _extract_wallet_assets(
             available = _first_numeric(
                 row,
                 (
+                    "totalAvailableBalance",
                     "availableToWithdraw",
                     "availableBalance",
                     "available",
                     "availableMargin",
+                    "free",
+                    "transferBalance",
+                    "cashBalance",
+                    "availableFunds",
                 ),
             )
 
