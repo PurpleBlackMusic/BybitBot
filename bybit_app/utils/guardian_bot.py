@@ -6,12 +6,13 @@ import copy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import json
 import time
 
 from .envs import Settings, get_settings
 from .paths import DATA_DIR
+from . import trade_control
 from .trade_analytics import (
     ExecutionRecord,
     aggregate_execution_metrics,
@@ -65,9 +66,12 @@ class GuardianSnapshot:
     recent_trades: List[Dict[str, object]]
     trade_stats: Dict[str, object]
     executions: Tuple[ExecutionRecord, ...]
+    manual_state: trade_control.TradeControlState
+    manual_summary: Dict[str, object]
     generated_at: float
     status_signature: float
     ledger_signature: float
+    manual_signature: float
 
 
 class GuardianBot:
@@ -457,9 +461,10 @@ class GuardianBot:
         )
 
     # snapshot helpers -------------------------------------------------
-    def _snapshot_signature(self) -> Tuple[float, float]:
+    def _snapshot_signature(self) -> Tuple[float, float, float]:
         status_path = self._status_path()
         ledger_path = self._ledger_path()
+        manual_path = Path(self.data_dir) / "ai" / "trade_commands.jsonl"
         try:
             status_mtime = status_path.stat().st_mtime
         except FileNotFoundError:
@@ -468,7 +473,11 @@ class GuardianBot:
             ledger_mtime = ledger_path.stat().st_mtime
         except FileNotFoundError:
             ledger_mtime = 0.0
-        return status_mtime, ledger_mtime
+        try:
+            manual_mtime = manual_path.stat().st_mtime
+        except FileNotFoundError:
+            manual_mtime = 0.0
+        return status_mtime, ledger_mtime, manual_mtime
 
     def _load_ledger_events(self) -> List[Dict[str, object]]:
         path = self._ledger_path()
@@ -649,7 +658,7 @@ class GuardianBot:
         filtered.sort(key=sort_key)
         return filtered
 
-    def _build_snapshot(self, signature: Tuple[float, float]) -> GuardianSnapshot:
+    def _build_snapshot(self, signature: Tuple[float, float, float]) -> GuardianSnapshot:
         status = self._load_status()
         self._last_status = status
         settings = self.settings
@@ -665,6 +674,10 @@ class GuardianBot:
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
 
+        manual_state = trade_control.trade_control_state(data_dir=self.data_dir)
+        manual_summary = self._manual_control_summary(manual_state)
+        status_summary["manual_control"] = manual_summary
+
         return GuardianSnapshot(
             status=status,
             brief=brief,
@@ -675,9 +688,12 @@ class GuardianBot:
             recent_trades=recent_trades,
             trade_stats=trade_stats,
             executions=execution_records,
+            manual_state=self._clone_trade_state(manual_state),
+            manual_summary=manual_summary,
             generated_at=time.time(),
             status_signature=signature[0],
             ledger_signature=signature[1],
+            manual_signature=signature[2],
         )
 
     @staticmethod
@@ -688,6 +704,131 @@ class GuardianBot:
     def _copy_list(payload: List[Dict[str, object]]) -> List[Dict[str, object]]:
         return copy.deepcopy(payload)
 
+    @staticmethod
+    def _clone_trade_entry(
+        entry: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if entry is None:
+            return None
+        return dict(entry)
+
+    def _clone_trade_state(
+        self, state: trade_control.TradeControlState
+    ) -> trade_control.TradeControlState:
+        commands = tuple(dict(entry) for entry in state.commands)
+        return trade_control.TradeControlState(
+            active=state.active,
+            commands=commands,
+            last_action=self._clone_trade_entry(state.last_action),
+            last_start=self._clone_trade_entry(state.last_start),
+            last_cancel=self._clone_trade_entry(state.last_cancel),
+        )
+
+    def _manual_control_summary(
+        self, state: trade_control.TradeControlState
+    ) -> Dict[str, object]:
+        history = [dict(entry) for entry in state.commands]
+
+        def _enrich(entry: Dict[str, Any]) -> Dict[str, Any]:
+            enriched = dict(entry)
+            enriched["ts_human"] = self._format_timestamp(entry.get("ts"))
+            action = str(entry.get("action") or "").upper()
+            if action:
+                enriched["action_label"] = action
+            prob = entry.get("probability_pct")
+            try:
+                if prob is not None:
+                    enriched["probability_text"] = f"{float(prob):.1f}%"
+            except (TypeError, ValueError):
+                pass
+            ev = entry.get("ev_bps")
+            try:
+                if ev is not None:
+                    enriched["ev_text"] = f"{float(ev):.1f} б.п."
+            except (TypeError, ValueError):
+                pass
+            note = entry.get("note") or entry.get("reason")
+            if note:
+                enriched["note_or_reason"] = str(note)
+            return enriched
+
+        enriched_history = [_enrich(entry) for entry in history]
+
+        last_action = self._clone_trade_entry(state.last_action)
+        last_start = self._clone_trade_entry(state.last_start)
+        last_cancel = self._clone_trade_entry(state.last_cancel)
+
+        symbol = None
+        for candidate in (last_action, last_start, last_cancel):
+            if candidate and candidate.get("symbol"):
+                symbol = str(candidate["symbol"])
+                break
+
+        def _age_seconds(entry: Optional[Dict[str, Any]]) -> Optional[float]:
+            if not entry:
+                return None
+            try:
+                ts = float(entry.get("ts"))
+            except (TypeError, ValueError):
+                return None
+            return max(0.0, time.time() - ts)
+
+        last_action_age = _age_seconds(last_action)
+        last_start_age = _age_seconds(last_start)
+        last_cancel_age = _age_seconds(last_cancel)
+
+        def _age_text(age: Optional[float]) -> Optional[str]:
+            if age is None:
+                return None
+            return self._format_duration(age)
+
+        if state.active:
+            status_label = "active"
+            if last_start_age is not None:
+                duration = _age_text(last_start_age)
+                status_text = (
+                    f"Торговля по {symbol or 'выбранному символу'} активна — старт был {duration} назад."
+                )
+            else:
+                status_text = "Торговля запущена вручную и отмечена как активная."
+        elif last_cancel:
+            status_label = "stopped"
+            if last_cancel_age is not None:
+                duration = _age_text(last_cancel_age)
+                status_text = (
+                    f"Торговля по {symbol or 'выбранному символу'} остановлена оператором {duration} назад."
+                )
+            else:
+                status_text = "Торговля остановлена командой оператора."
+        elif history:
+            status_label = "pending"
+            status_text = (
+                "Последняя команда — запуск торговли, но подтверждения активной сделки пока нет."
+            )
+        else:
+            status_label = "idle"
+            status_text = "Ручные команды ещё не отправлялись."
+
+        summary: Dict[str, object] = {
+            "active": state.active,
+            "symbol": symbol,
+            "status_label": status_label,
+            "status_text": status_text,
+            "history": enriched_history,
+            "history_count": len(enriched_history),
+            "last_action": last_action,
+            "last_start": last_start,
+            "last_cancel": last_cancel,
+            "last_action_at": self._format_timestamp((last_action or {}).get("ts")),
+            "last_start_at": self._format_timestamp((last_start or {}).get("ts")),
+            "last_cancel_at": self._format_timestamp((last_cancel or {}).get("ts")),
+            "last_action_age_seconds": last_action_age,
+            "last_start_age_seconds": last_start_age,
+            "last_cancel_age_seconds": last_cancel_age,
+        }
+
+        return summary
+
     def _get_snapshot(self, force: bool = False) -> GuardianSnapshot:
         signature = self._snapshot_signature()
         snapshot = self._snapshot
@@ -696,6 +837,7 @@ class GuardianBot:
             or snapshot is None
             or snapshot.status_signature != signature[0]
             or snapshot.ledger_signature != signature[1]
+            or snapshot.manual_signature != signature[2]
         ):
             snapshot = self._build_snapshot(signature)
             self._snapshot = snapshot
@@ -937,6 +1079,81 @@ class GuardianBot:
             lines.append("• Разрешено использовать заёмные средства — контролируйте плечо самостоятельно.")
 
         return "\n".join(lines)
+
+    def manual_trade_state(self) -> trade_control.TradeControlState:
+        """Return the manual trade control state for the current data directory."""
+
+        snapshot = self._get_snapshot()
+        return self._clone_trade_state(snapshot.manual_state)
+
+    def manual_trade_history(self, limit: int = 50) -> Tuple[Dict[str, Any], ...]:
+        """Return recent manual trade commands for the bot's data directory."""
+
+        snapshot = self._get_snapshot()
+        commands: List[Dict[str, Any]] = list(snapshot.manual_state.commands)
+        if limit > 0:
+            commands = commands[-limit:]
+        return tuple(dict(command) for command in commands)
+
+    def manual_trade_summary(self) -> Dict[str, object]:
+        """Return cached metadata about manual control commands."""
+
+        snapshot = self._get_snapshot()
+        return self._copy_dict(snapshot.manual_summary)
+
+    def manual_trade_start(
+        self,
+        *,
+        symbol: Optional[str],
+        mode: Optional[str],
+        probability_pct: Optional[float] = None,
+        ev_bps: Optional[float] = None,
+        source: str = "manual",
+        note: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist a manual request to start trading in the bot's workspace."""
+
+        record = trade_control.request_trade_start(
+            symbol=symbol,
+            mode=mode,
+            probability_pct=probability_pct,
+            ev_bps=ev_bps,
+            source=source,
+            note=note,
+            extra=extra,
+            data_dir=self.data_dir,
+        )
+        self._snapshot = None
+        return record
+
+    def manual_trade_cancel(
+        self,
+        *,
+        symbol: Optional[str],
+        reason: Optional[str] = None,
+        source: str = "manual",
+        note: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist a manual request to cancel trading in the bot's workspace."""
+
+        record = trade_control.request_trade_cancel(
+            symbol=symbol,
+            reason=reason,
+            source=source,
+            note=note,
+            extra=extra,
+            data_dir=self.data_dir,
+        )
+        self._snapshot = None
+        return record
+
+    def manual_trade_clear(self) -> None:
+        """Remove manual trade commands stored for this bot's workspace."""
+
+        trade_control.clear_trade_commands(data_dir=self.data_dir)
+        self._snapshot = None
 
     def plan_steps(self, brief: Optional[GuardianBrief] = None) -> List[str]:
         brief = brief or self.generate_brief()
