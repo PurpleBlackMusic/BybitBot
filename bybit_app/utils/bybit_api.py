@@ -15,6 +15,7 @@ API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
 
 from .helpers import ensure_link_id
+from .log import log
 
 @dataclass
 class BybitCreds:
@@ -181,10 +182,20 @@ class BybitAPI:
         params = {"accountType": accountType}
         return self._safe_req("GET", "/v5/account/wallet-balance", params=params, signed=True)
 
-    def open_orders(self, category: str = "spot", symbol: str | None = None, openOnly: int = 1):
+    def open_orders(
+        self,
+        category: str = "spot",
+        symbol: str | None = None,
+        openOnly: int = 1,
+        cursor: str | None = None,
+    ):
         params = {"category": category, "openOnly": int(openOnly)}
         if symbol:
             params["symbol"] = symbol
+        if cursor:
+            stripped = cursor.strip()
+            if stripped:
+                params["cursor"] = stripped
         return self._safe_req("GET", "/v5/order/realtime", params=params, signed=True)
 
     def execution_list(
@@ -273,9 +284,17 @@ class BybitAPI:
         self._normalise_numeric_fields(payload, numeric_fields)
         self._sanitise_order_link_id(payload)
 
-        return self._safe_req(
+        response = self._safe_req(
             "POST", "/v5/order/create", body=payload, signed=True
         )
+
+        self._self_check_order_action(
+            action="place",
+            payload=payload,
+            response=response,
+        )
+
+        return response
 
     def cancel_order(self, **kwargs):
         """Cancel an active order through the signed v5 endpoint."""
@@ -293,7 +312,204 @@ class BybitAPI:
 
         self._sanitise_order_link_id(payload)
 
-        return self._safe_req("POST", "/v5/order/cancel", body=payload, signed=True)
+        response = self._safe_req("POST", "/v5/order/cancel", body=payload, signed=True)
+
+        self._self_check_order_action(
+            action="cancel",
+            payload=payload,
+            response=response,
+        )
+
+        return response
+
+    def _self_check_order_action(
+        self,
+        *,
+        action: str,
+        payload: Mapping[str, object],
+        response: Mapping[str, object] | None,
+    ) -> None:
+        """Verify that order placement/cancellation affected Bybit state."""
+
+        try:
+            if action not in {"place", "cancel"}:
+                return
+
+            category_raw = payload.get("category")
+            category = str(category_raw).strip() if isinstance(category_raw, str) else None
+            if not category:
+                return
+
+            result = response.get("result") if isinstance(response, Mapping) else None
+            if not isinstance(result, Mapping):
+                result = {}
+
+            status_value: object = result.get("orderStatus")
+            if status_value is None:
+                status_value = payload.get("orderStatus")
+
+            status_str: str | None
+            if isinstance(status_value, str):
+                status_str = status_value.strip() or None
+            elif status_value is None:
+                status_str = None
+            else:
+                status_str = str(status_value).strip() or None
+
+            status_key: str | None
+            if status_str:
+                status_key = status_str.lower().replace("_", "").replace(" ", "")
+            else:
+                status_key = None
+
+            link_value: object = payload.get("orderLinkId")
+            if not isinstance(link_value, str) or not link_value.strip():
+                link_value = result.get("orderLinkId")
+
+            order_link_id = ensure_link_id(link_value) if isinstance(link_value, str) else None
+
+            order_id_value: object = payload.get("orderId")
+            if not isinstance(order_id_value, str) or not order_id_value.strip():
+                order_id_value = result.get("orderId")
+
+            order_id = str(order_id_value).strip() if isinstance(order_id_value, (str, int)) else None
+            if order_id == "":
+                order_id = None
+
+            if not order_link_id and not order_id:
+                return
+
+            symbol_value: object = payload.get("symbol")
+            if not isinstance(symbol_value, str) or not symbol_value.strip():
+                symbol_value = result.get("symbol")
+
+            symbol = str(symbol_value).strip().upper() if isinstance(symbol_value, str) else None
+
+            params = {"category": category, "openOnly": 1}
+            if symbol:
+                params["symbol"] = symbol
+
+            found = False
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            max_pages = 5
+
+            for _ in range(max_pages):
+                if cursor:
+                    params["cursor"] = cursor
+                elif "cursor" in params:
+                    params.pop("cursor", None)
+
+                try:
+                    orders_payload = self.open_orders(**params)
+                except Exception as exc:  # pragma: no cover - network/runtime errors
+                    log(
+                        f"order.self_check.{action}.error",
+                        category=category,
+                        symbol=symbol,
+                        orderLinkId=order_link_id,
+                        orderId=order_id,
+                        err=str(exc),
+                    )
+                    return
+
+                orders_source = (orders_payload or {}).get("result") if isinstance(orders_payload, Mapping) else None
+                orders = orders_source.get("list") if isinstance(orders_source, Mapping) else []
+
+                if isinstance(orders, Iterable):
+                    for row in orders:
+                        if not isinstance(row, Mapping):
+                            continue
+
+                        if order_link_id:
+                            candidate_link = row.get("orderLinkId")
+                            if (
+                                isinstance(candidate_link, str)
+                                and ensure_link_id(candidate_link) == order_link_id
+                            ):
+                                found = True
+                                break
+
+                        if order_id and not found:
+                            candidate_id = row.get("orderId")
+                            if (
+                                isinstance(candidate_id, (str, int))
+                                and str(candidate_id).strip() == order_id
+                            ):
+                                found = True
+                                break
+
+                if found:
+                    break
+
+                next_cursor_raw = orders_source.get("nextPageCursor") if isinstance(orders_source, Mapping) else None
+                if not isinstance(next_cursor_raw, str):
+                    break
+
+                next_cursor = next_cursor_raw.strip()
+                if not next_cursor:
+                    break
+
+                if next_cursor in seen_cursors:
+                    break
+
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+
+            expect_present = action == "place"
+
+            CLOSED_STATUS_KEYS = {
+                "filled",
+                "cancelled",
+                "canceled",
+                "rejected",
+                "deactivated",
+                "expired",
+                "closed",
+                "terminated",
+                "completed",
+            }
+
+            OPEN_STATUS_KEYS = {
+                "created",
+                "new",
+                "pendingnew",
+                "partiallyfilled",
+                "partiallyfilledcanceled",
+                "partiallyfilledcancelled",
+                "active",
+                "pendingcancel",
+                "triggered",
+                "untriggered",
+                "live",
+                "open",
+                "accepted",
+            }
+
+            if status_key:
+                if status_key in CLOSED_STATUS_KEYS:
+                    expect_present = False
+                elif action == "place" and status_key in OPEN_STATUS_KEYS:
+                    expect_present = True
+
+            ok = found if expect_present else not found
+
+            log(
+                f"order.self_check.{action}",
+                category=category,
+                symbol=symbol,
+                orderLinkId=order_link_id,
+                orderId=order_id,
+                found=found,
+                ok=ok,
+                status=status_str,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "order.self_check.exception",
+                action=action,
+                err=str(exc),
+            )
 
     def cancel_all(self, category: str | None = None, **kwargs):
         """Cancel multiple orders in bulk through the signed v5 endpoint."""

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import bybit_app.utils.bybit_api as bybit_api_module
 from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
 from bybit_app.utils.helpers import ensure_link_id
 
@@ -553,13 +554,14 @@ def test_place_order_rejects_invalid_side() -> None:
 def test_place_order_sanitises_order_link_id(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured.update({"body": body})
+        calls.append({"method": method, "path": path, "body": body, "params": params})
         return {"retCode": 0}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", lambda **_: {"result": {"list": []}})
 
     long_link = _long_link("ORDER")
     api.place_order(
@@ -571,7 +573,11 @@ def test_place_order_sanitises_order_link_id(monkeypatch) -> None:
         orderLinkId=long_link,
     )
 
-    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
+    assert calls
+    first = calls[0]
+    assert first["method"] == "POST"
+    assert first["path"] == "/v5/order/create"
+    assert first["body"]["orderLinkId"] == ensure_link_id(long_link)
 
 
 def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
@@ -592,6 +598,7 @@ def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
         return {"retCode": 0, "result": {}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", lambda **_: {"result": {"list": []}})
 
     payload = {
         "category": "spot",
@@ -633,18 +640,254 @@ def test_cancel_order_requires_identifier() -> None:
 def test_cancel_order_sanitises_order_link_id(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
-
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured["body"] = body
+        calls.append({"method": method, "path": path, "body": body, "params": params})
         return {"retCode": 0}
 
+    calls: list[dict[str, Any]] = []
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", lambda **_: {"result": {"list": []}})
 
     long_link = _long_link("CANCEL")
     api.cancel_order(category="spot", orderLinkId=long_link)
 
-    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
+    assert calls
+    first = calls[0]
+    assert first["method"] == "POST"
+    assert first["path"] == "/v5/order/cancel"
+    assert first["body"]["orderLinkId"] == ensure_link_id(long_link)
+
+
+def test_place_order_self_check_logs_presence(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    long_link = "AI-TEST-PLACE"
+    calls: list[dict[str, Any]] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        calls.append({"method": method, "path": path, "body": body, "params": params})
+        return {
+            "retCode": 0,
+            "result": {"orderLinkId": long_link, "orderStatus": "New"},
+        }
+
+    def fake_open_orders(**params):
+        return {"result": {"list": [{"orderLinkId": long_link}]}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
+
+    api.place_order(
+        category="spot",
+        symbol="BTCUSDT",
+        side="buy",
+        orderType="Limit",
+        qty="1",
+        orderLinkId=long_link,
+    )
+
+    assert any(call["path"] == "/v5/order/create" for call in calls)
+    assert events
+    event_name, payload = events[-1]
+    assert event_name == "order.self_check.place"
+    assert payload["ok"] is True
+    assert payload["found"] is True
+    assert payload["orderLinkId"] == ensure_link_id(long_link)
+    assert payload["orderId"] is None
+    assert payload["status"] == "New"
+
+
+def test_cancel_order_self_check_logs_absence(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    link = "AI-TEST-CANCEL"
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        return {"retCode": 0, "result": {"orderStatus": "Cancelled"}}
+
+    def fake_open_orders(**params):
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
+
+    api.cancel_order(category="spot", orderLinkId=link, symbol="BTCUSDT")
+
+    assert events
+    event_name, payload = events[-1]
+    assert event_name == "order.self_check.cancel"
+    assert payload["ok"] is True
+    assert payload["found"] is False
+    assert payload["orderLinkId"] == ensure_link_id(link)
+    assert payload["orderId"] is None
+    assert payload["status"] == "Cancelled"
+
+
+def test_cancel_order_self_check_handles_order_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        assert body["orderId"] == "123"
+        return {"retCode": 0, "result": {"orderId": "123"}}
+
+    def fake_open_orders(**params):
+        assert params["category"] == "spot"
+        return {"result": {"list": [{"orderId": "123"}]}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: emitted.append((event, payload)))
+
+    api.cancel_order(category="spot", orderId="123")
+
+    assert emitted
+    name, payload = emitted[-1]
+    assert name == "order.self_check.cancel"
+    assert payload["orderId"] == "123"
+    assert payload["orderLinkId"] is None
+    assert payload["found"] is True  # lingering order matched by ID
+    assert payload["ok"] is False
+    assert payload["status"] is None
+
+
+def test_place_order_self_check_handles_order_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    records: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        assert body["qty"] == "1"
+        return {
+            "retCode": 0,
+            "result": {"orderId": "abc123", "orderStatus": "PartiallyFilled"},
+        }
+
+    def fake_open_orders(**params):
+        return {"result": {"list": [{"orderId": "abc123"}]}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: records.append((event, payload)))
+
+    api.place_order(
+        category="spot",
+        symbol="ETHUSDT",
+        side="buy",
+        orderType="Limit",
+        qty="1",
+    )
+
+    assert records
+    name, payload = records[-1]
+    assert name == "order.self_check.place"
+    assert payload["orderId"] == "abc123"
+    assert payload["orderLinkId"] is None
+    assert payload["found"] is True
+    assert payload["ok"] is True
+    assert payload["status"] == "PartiallyFilled"
+
+
+def test_place_order_self_check_allows_immediate_fill(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        assert path == "/v5/order/create"
+        return {
+            "retCode": 0,
+            "result": {
+                "orderId": "filled-1",
+                "orderStatus": "Filled",
+            },
+        }
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", lambda **_: {"result": {"list": []}})
+    monkeypatch.setattr(
+        bybit_api_module,
+        "log",
+        lambda event, **payload: events.append((event, payload)),
+    )
+
+    api.place_order(
+        category="spot",
+        symbol="BTCUSDT",
+        side="buy",
+        orderType="Market",
+        qty="1",
+    )
+
+    assert events
+    event, payload = events[-1]
+    assert event == "order.self_check.place"
+    assert payload["orderId"] == "filled-1"
+    assert payload["found"] is False
+    assert payload["ok"] is True
+    assert payload["status"] == "Filled"
+
+
+def test_place_order_self_check_pages_open_orders(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    long_link = ensure_link_id("AI-TEST-PAGE")
+    events: list[tuple[str, dict[str, Any]]] = []
+    calls: list[dict[str, Any]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        return {
+            "retCode": 0,
+            "result": {"orderLinkId": long_link, "orderStatus": "New"},
+        }
+
+    def fake_open_orders(**params):
+        calls.append(params)
+        if len(calls) == 1:
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [{"orderLinkId": "OTHER"}],
+                    "nextPageCursor": " next-cursor ",
+                },
+            }
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "orderLinkId": long_link,
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
+
+    api.place_order(
+        category="spot",
+        symbol="BTCUSDT",
+        side="buy",
+        orderType="Limit",
+        qty="1",
+        orderLinkId=long_link,
+    )
+
+    assert len(calls) == 2
+    first_call, second_call = calls
+    assert "cursor" not in first_call
+    assert second_call.get("cursor") == "next-cursor"
+    assert events
+    _, payload = events[-1]
+    assert payload["found"] is True
+    assert payload["ok"] is True
 
 
 def test_cancel_all_uses_signed_endpoint(monkeypatch) -> None:
