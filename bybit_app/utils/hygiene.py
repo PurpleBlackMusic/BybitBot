@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from .bybit_api import BybitAPI
+from .helpers import ensure_link_id
 from .log import log
 
 
@@ -40,7 +41,7 @@ def cancel_stale_orders(
             {
                 "symbol": entry["symbol"],
                 "orderId": entry["orderId"],
-                "orderLinkId": entry["orderLinkId"],
+                "orderLinkId": ensure_link_id(entry.get("orderLinkId")),
             }
             for entry in chunk
         ]

@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
 
+from .helpers import ensure_link_id
+
 @dataclass
 class BybitCreds:
     key: str
@@ -139,6 +141,17 @@ class BybitAPI:
 
             payload[key] = normalised or "0"
 
+    @staticmethod
+    def _sanitise_order_link_id(payload: dict[str, object], key: str = "orderLinkId") -> None:
+        if key not in payload:
+            return
+
+        sanitised = ensure_link_id(payload.get(key))
+        if sanitised is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = sanitised
+
     # --- public market ---
     def server_time(self):
         return self._safe_req("GET", "/v5/market/time")
@@ -258,6 +271,7 @@ class BybitAPI:
         }
 
         self._normalise_numeric_fields(payload, numeric_fields)
+        self._sanitise_order_link_id(payload)
 
         return self._safe_req(
             "POST", "/v5/order/create", body=payload, signed=True
@@ -277,6 +291,8 @@ class BybitAPI:
         if not (payload.get("orderId") or payload.get("orderLinkId")):
             raise ValueError("cancel_order requires `orderId` or `orderLinkId`")
 
+        self._sanitise_order_link_id(payload)
+
         return self._safe_req("POST", "/v5/order/cancel", body=payload, signed=True)
 
     def cancel_all(self, category: str | None = None, **kwargs):
@@ -289,6 +305,18 @@ class BybitAPI:
 
         for key, value in kwargs.items():
             if value is None:
+                continue
+
+            if key == "orderLinkId":
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped:
+                        continue
+                    value = stripped
+                sanitised = ensure_link_id(value)
+                if sanitised is None:
+                    continue
+                payload[key] = sanitised
                 continue
 
             if isinstance(value, str):
@@ -329,6 +357,7 @@ class BybitAPI:
         }
 
         self._normalise_numeric_fields(payload, numeric_fields)
+        self._sanitise_order_link_id(payload)
 
         return self._safe_req("POST", "/v5/order/amend", body=payload, signed=True)
 
@@ -371,6 +400,7 @@ class BybitAPI:
                     "cancel_batch entries require `orderId` or `orderLinkId`"
                 )
 
+            self._sanitise_order_link_id(request_payload)
             normalised_requests.append(request_payload)
 
         body: dict[str, object] = {
@@ -490,6 +520,7 @@ class BybitAPI:
                 payload["side"] = normalised_side
 
             self._normalise_numeric_fields(payload, numeric_fields)
+            self._sanitise_order_link_id(payload)
 
             normalised_orders.append(payload)
 
