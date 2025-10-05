@@ -1,7 +1,9 @@
 
 from __future__ import annotations
 
+import re
 import sys
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 import streamlit as st
@@ -214,6 +216,410 @@ def render_signal_brief(bot: GuardianBot) -> GuardianBrief:
     return brief
 
 
+def _normalise_health(health: Mapping[str, object] | Sequence[tuple[str, object]] | None) -> dict[str, object]:
+    """Return a dictionary representation of the health payload."""
+
+    if health is None:
+        return {}
+    if isinstance(health, Mapping):
+        return dict(health)
+    try:
+        return dict(health)
+    except Exception:
+        return {}
+
+
+def _normalise_watchlist(watchlist: object) -> list[Mapping[str, object] | object]:
+    """Convert watchlist payloads to a list consumable by the UI."""
+
+    if watchlist is None:
+        return []
+
+    if hasattr(watchlist, "to_dict"):
+        try:
+            records = watchlist.to_dict("records")  # type: ignore[call-arg]
+        except Exception:
+            records = None
+        else:
+            if isinstance(records, Iterable) and not isinstance(records, (str, bytes)):
+                return list(records)
+
+    if isinstance(watchlist, Mapping):
+        return [watchlist]
+
+    if isinstance(watchlist, Sequence) and not isinstance(watchlist, (str, bytes)):
+        return list(watchlist)
+
+    if isinstance(watchlist, Iterable) and not isinstance(watchlist, (str, bytes)):
+        return list(watchlist)
+
+    return [watchlist]
+
+
+def collect_user_actions(
+    settings,
+    brief: GuardianBrief,
+    health: dict[str, dict[str, object]] | None,
+    watchlist: Sequence[object] | None,
+) -> list[dict[str, object]]:
+    """Compile context-aware next steps for the home dashboard."""
+
+    actions: list[dict[str, object]] = []
+    seen: dict[tuple[str, str], dict[str, object]] = {}
+    order_counter = 0
+
+    def _next_order() -> int:
+        nonlocal order_counter
+        order_counter += 1
+        return order_counter
+
+    def _combine_descriptions(primary: str, extra: str) -> str:
+        primary = (primary or "").strip()
+        extra = (extra or "").strip()
+        if not extra:
+            return primary
+        if not primary:
+            return extra
+        if extra.lower() == primary.lower():
+            return primary
+        if extra in primary:
+            return primary
+        if primary in extra:
+            return extra
+        joiner = " " if primary.endswith((".", "!", "?", ":", "—", "-", "–")) else " · "
+        return f"{primary}{joiner}{extra}".strip()
+
+    def _normalise_tone(value: object) -> str:
+        if not isinstance(value, str):
+            return "warning"
+        tone = value.strip().lower()
+        mapping = {
+            "critical": "danger",
+            "danger": "danger",
+            "error": "danger",
+            "severe": "danger",
+            "warn": "warning",
+            "warning": "warning",
+            "caution": "warning",
+            "info": "info",
+            "information": "info",
+            "notice": "info",
+            "success": "success",
+            "ok": "success",
+        }
+        return mapping.get(tone, "warning")
+
+    def _tone_priority(tone: str) -> int:
+        return {"danger": 0, "warning": 1, "info": 2, "success": 3}.get(tone, 1)
+
+    def _merge_action(existing: dict[str, object], incoming: dict[str, object]) -> None:
+        existing_priority = existing.get("priority", 1)
+        incoming_priority = incoming.get("priority", 1)
+        if incoming_priority < existing_priority:
+            incoming_desc = _combine_descriptions(
+                str(incoming.get("description") or ""),
+                str(existing.get("description") or ""),
+            )
+            incoming["description"] = incoming_desc
+            existing.update(incoming)
+        else:
+            existing["description"] = _combine_descriptions(
+                str(existing.get("description") or ""),
+                str(incoming.get("description") or ""),
+            )
+            if not existing.get("page") and incoming.get("page"):
+                existing["page"] = incoming["page"]
+            if not existing.get("page_label") and incoming.get("page_label"):
+                existing["page_label"] = incoming["page_label"]
+            existing_order = existing.get("_order")
+            incoming_order = incoming.get("_order")
+            if isinstance(existing_order, int) and isinstance(incoming_order, int):
+                existing["_order"] = min(existing_order, incoming_order)
+
+    def _normalise_step_item(item: object) -> str | None:
+        if isinstance(item, Mapping):
+            for key in ("title", "text", "description", "label", "message"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            values = [str(value).strip() for value in item.values() if str(value).strip()]
+            if values:
+                return " ".join(values)
+            return None
+        if isinstance(item, (str, bytes)):
+            text = item.decode() if isinstance(item, bytes) else item
+        else:
+            text = str(item)
+        text = text.strip()
+        return text or None
+
+    def _normalise_steps(raw: object) -> list[str]:
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            parts = [
+                part.strip(" •-–—")
+                for part in re.split(r"[\n;,•·]+", raw)
+                if part.strip(" •-–—")
+            ]
+            return parts
+        if isinstance(raw, Mapping):
+            return [
+                f"{key}: {value}".strip()
+                for key, value in raw.items()
+                if str(value).strip()
+            ]
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            steps: list[str] = []
+            for item in raw:
+                normalised = _normalise_step_item(item)
+                if normalised:
+                    steps.append(normalised)
+            return steps
+        if isinstance(raw, Iterable) and not isinstance(raw, (str, bytes)):
+            return [
+                step
+                for item in raw
+                if (step := _normalise_step_item(item))
+            ]
+        normalised = _normalise_step_item(raw)
+        return [normalised] if normalised else []
+
+    def _collect_steps(info: Mapping[str, object]) -> list[str]:
+        fields = ("checklist", "steps", "actions", "remediation", "recommendations")
+        steps: list[str] = []
+        for field in fields:
+            steps.extend(_normalise_steps(info.get(field)))
+        deduped: list[str] = []
+        seen_keys: set[str] = set()
+        for step in steps:
+            lowered = step.lower()
+            if lowered in seen_keys:
+                continue
+            seen_keys.add(lowered)
+            deduped.append(step)
+        return deduped
+
+    def add(
+        title: str,
+        description: str,
+        *,
+        icon: str | None = None,
+        tone: str | None = None,
+        page: str | None = None,
+        page_label: str | None = None,
+        priority: int | None = None,
+        identity_hint: tuple[str, str] | None = None,
+    ) -> None:
+        resolved_tone = _normalise_tone(tone)
+        resolved_icon = icon or {"danger": "⛔", "warning": "⚠️", "info": "ℹ️", "success": "✅"}[resolved_tone]
+        resolved_priority = priority if priority is not None else _tone_priority(resolved_tone)
+        identity = identity_hint or (title.strip(), description.strip())
+        payload = {
+            "title": title,
+            "description": description,
+            "icon": resolved_icon,
+            "tone": resolved_tone,
+            "page": page,
+            "page_label": page_label,
+            "priority": resolved_priority,
+            "_order": _next_order(),
+        }
+        existing = seen.get(identity)
+        if existing is not None:
+            _merge_action(existing, payload)
+            return
+        seen[identity] = payload
+        actions.append(payload)
+
+    has_keys = bool(getattr(settings, "api_key", None) and getattr(settings, "api_secret", None))
+    dry_run_enabled = bool(getattr(settings, "dry_run", False))
+    reserve_pct = getattr(settings, "spot_cash_reserve_pct", None)
+
+    if not has_keys:
+        add(
+            "Добавьте API ключи",
+            "Сохраните ключ и секрет Bybit в разделе подключения, чтобы бот смог размещать ордера.",
+            icon="🔑",
+            tone="warning",
+            page="pages/00_✅_Подключение_и_Состояние.py",
+            page_label="Открыть «Подключение»",
+        )
+    else:
+        if dry_run_enabled:
+            add(
+                "DRY-RUN активен",
+                "Живые заявки не отправляются. Отключите учебный режим, когда будете готовы к реальной торговле.",
+                icon="🧪",
+                tone="warning",
+                page="pages/02_⚙️_Настройки.py",
+                page_label="Перейти к настройкам",
+            )
+
+    if isinstance(reserve_pct, (int, float)) and reserve_pct < 10:
+        add(
+            "Резерв кэша ниже рекомендации",
+            f"Сейчас отложено {reserve_pct:.0f}% — держите не меньше 10%, чтобы бот не истощил депозит.",
+            icon="💧",
+            tone="warning",
+            page="pages/02_⚙️_Настройки.py",
+            page_label="Настроить резерв",
+        )
+
+    if brief.caution:
+        add(
+            "Проверка сигнала",
+            brief.caution,
+            icon="🛟",
+            tone="warning",
+            page="pages/00_🧭_Простой_режим.py",
+            page_label="Изучить сигнал",
+        )
+
+    if brief.status_age and brief.status_age > 300:
+        add(
+            "Сигнал устарел",
+            "Данные не обновлялись более пяти минут — перезапустите источник или обновите пайплайн сигналов.",
+            icon="⏱",
+            tone="danger",
+            page="pages/00_🧭_Простой_режим.py",
+            page_label="Проверить сигнал",
+        )
+
+    health_map = health or {}
+    page_lookup: dict[str, tuple[str | None, str | None]] = {
+        "ai_signal": ("pages/00_🧭_Простой_режим.py", "Открыть «Простой режим»"),
+        "executions": ("pages/05_📈_Мониторинг_Сделок.py", "Открыть «Мониторинг сделок»"),
+        "realtime_trading": ("pages/05_⚡_WS_Контроль.py", "Проверить real-time"),
+        "api_keys": ("pages/00_✅_Подключение_и_Состояние.py", "Проверить подключение"),
+    }
+    priority_lookup: dict[str, int] = {
+        "ai_signal": -1,
+    }
+
+    def _format_details(details: object) -> str:
+        if not details:
+            return ""
+        if isinstance(details, str):
+            return details
+        if isinstance(details, Mapping):
+            return "; ".join(f"{key}: {value}" for key, value in details.items())
+        if isinstance(details, Sequence) and not isinstance(details, (str, bytes)):
+            return "; ".join(str(item) for item in details)
+        return str(details)
+
+    for key, info in health_map.items():
+        if not isinstance(info, Mapping):
+            continue
+        if info.get("ok") is not False:
+            continue
+        if key == "realtime_trading" and (dry_run_enabled or not has_keys):
+            continue
+
+        title = str(info.get("title") or key)
+        message = str(info.get("message") or "").strip()
+        details_text = _format_details(info.get("details"))
+        description = " ".join(part for part in (message, details_text) if part).strip() or "Подробности недоступны."
+        default_page, default_page_label = page_lookup.get(key, (None, None))
+        page = info.get("page") or info.get("link") or default_page
+        if not isinstance(page, str):
+            page = default_page
+        page_label = info.get("page_label") or info.get("link_label") or info.get("action") or default_page_label
+        if not isinstance(page_label, str):
+            page_label = default_page_label
+        tone = info.get("tone") or info.get("status") or info.get("severity")
+        normalised_tone = _normalise_tone(tone)
+        computed_priority = _tone_priority(normalised_tone)
+        raw_priority = info.get("priority") if isinstance(info.get("priority"), int) else None
+        effective_priority = raw_priority if raw_priority is not None else computed_priority
+        if raw_priority is not None:
+            effective_priority = min(raw_priority, computed_priority)
+        default_priority = priority_lookup.get(key)
+        if default_priority is not None:
+            effective_priority = min(effective_priority, default_priority)
+        raw_icon = info.get("icon")
+        icon = raw_icon if isinstance(raw_icon, str) else None
+        steps = _collect_steps(info)
+        if steps:
+            limit = 4
+            trimmed = steps[:limit]
+            steps_text = "Шаги: " + " · ".join(trimmed)
+            if len(steps) > limit:
+                steps_text += f" (+{len(steps) - limit})"
+            description = _combine_descriptions(description, steps_text)
+
+        add(
+            title,
+            description,
+            icon=icon,
+            tone=normalised_tone,
+            page=page,
+            page_label=page_label,
+            priority=effective_priority,
+            identity_hint=(
+                title.strip(),
+                str(
+                    info.get("slug")
+                    or info.get("id")
+                    or message
+                    or description
+                    or key
+                    or title.strip()
+                ),
+            ),
+        )
+
+    if not watchlist:
+        add(
+            "Добавьте пары в наблюдение",
+            "Список пуст — соберите рабочий универсум через Universe Builder или добавьте тикеры вручную.",
+            icon="👀",
+            tone="warning",
+            page="pages/01d_🌐_Universe_Builder_Spot.py",
+            page_label="Открыть Universe Builder",
+        )
+
+    actions.sort(key=lambda item: (item.get("priority", 1), item.get("_order", 0)))
+    for action in actions:
+        action.pop("_order", None)
+    return actions
+
+
+def render_user_actions(
+    settings,
+    brief: GuardianBrief,
+    health: dict[str, dict[str, object]] | None,
+    watchlist: Sequence[object] | None,
+) -> None:
+    st.subheader("Быстрые действия")
+    actions = collect_user_actions(settings, brief, health, watchlist)
+
+    if not actions:
+        st.success("Все проверки зелёные — можно сосредоточиться на торговле.")
+        return
+
+    for index, action in enumerate(actions):
+        with st.container(border=True):
+            st.markdown(
+                build_status_card(
+                    str(action["title"]),
+                    str(action["description"]),
+                    icon=str(action.get("icon") or ""),
+                    tone=str(action.get("tone") or "warning"),
+                ),
+                unsafe_allow_html=True,
+            )
+            page = action.get("page")
+            if isinstance(page, str) and page:
+                navigation_link(
+                    page,
+                    label=action.get("page_label") or "Перейти",
+                    key=f"action_nav_{index}_{page}",
+                )
+
+        st.markdown("")
+
+
 def render_onboarding() -> None:
     st.subheader("Первые шаги")
     st.markdown(
@@ -249,9 +655,8 @@ def render_shortcuts() -> None:
     render_navigation_grid(shortcuts, columns=3)
 
 
-def render_data_health(bot: GuardianBot) -> None:
-    health = bot.data_health()
-
+def render_data_health(health: dict[str, dict[str, object]] | None) -> None:
+    health = health or {}
     with st.container(border=True):
         st.subheader("Диагностика бота")
         st.caption(
@@ -281,15 +686,15 @@ def render_data_health(bot: GuardianBot) -> None:
                 )
 
 
-def render_market_watchlist(bot: GuardianBot) -> None:
+def render_market_watchlist(
+    watchlist: Sequence[dict[str, object]] | Sequence[Mapping[str, object]]
+) -> None:
     st.subheader("Наблюдаемые активы")
-    items = bot.market_watchlist()
-
-    if not items:
+    if not watchlist:
         st.caption("Пока нет тикеров в списке наблюдения — бот ждёт новый сигнал.")
         return
 
-    st.dataframe(items, hide_index=True, use_container_width=True)
+    st.dataframe(watchlist, hide_index=True, use_container_width=True)
 
 
 def render_hidden_tools() -> None:
@@ -426,13 +831,17 @@ def main() -> None:
     st.divider()
     render_status(settings)
     st.divider()
+    health = _normalise_health(bot.data_health())
+    watchlist = _normalise_watchlist(bot.market_watchlist())
     brief = render_signal_brief(bot)
+    st.divider()
+    render_user_actions(settings, brief, health, watchlist)
     st.divider()
     render_shortcuts()
     st.divider()
-    render_data_health(bot)
+    render_data_health(health)
     st.divider()
-    render_market_watchlist(bot)
+    render_market_watchlist(watchlist)
     st.divider()
     render_guides(settings, bot, brief)
     st.divider()

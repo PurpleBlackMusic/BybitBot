@@ -362,6 +362,16 @@ def navigation_link(page: str, *, label: str, icon: str | None = None, key: str 
             page_link(page_arg, **kwargs)
         except StreamlitAPIException:
             pass
+        except TypeError:
+            if "key" in kwargs:
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("key", None)
+                try:
+                    page_link(page_arg, **fallback_kwargs)
+                except (StreamlitAPIException, TypeError):
+                    pass
+                else:
+                    return
         else:
             return
 
