@@ -121,6 +121,29 @@ class BybitAPI:
             params["symbol"] = symbol
         return self._safe_req("GET", "/v5/order/realtime", params=params, signed=True)
 
+    def execution_list(
+        self,
+        category: str = "spot",
+        symbol: str | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int = 50,
+    ):
+        """Fetch recent trade executions for the authenticated account.
+
+        Mirrors the ``GET /v5/execution/list`` endpoint and is used by health
+        checks to confirm that real trades are flowing through the account.
+        """
+
+        params: dict[str, object] = {"category": category, "limit": int(limit)}
+        if symbol:
+            params["symbol"] = symbol
+        if start is not None:
+            params["start"] = int(start)
+        if end is not None:
+            params["end"] = int(end)
+        return self._safe_req("GET", "/v5/execution/list", params=params, signed=True)
+
     def fee_rate(
         self,
         category: str = "spot",

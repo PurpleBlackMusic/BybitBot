@@ -99,22 +99,21 @@ else:
 st.divider()
 st.subheader("Дополнительная аналитика")
 
-health_cols = st.columns(3)
-health_cols[0].metric(
-    health["ai_signal"]["title"],
-    "✅" if health["ai_signal"]["ok"] else "⚠️",
-    health["ai_signal"]["message"],
-)
-health_cols[1].metric(
-    health["executions"]["title"],
-    "✅" if health["executions"]["ok"] else "⚠️",
-    health["executions"]["message"],
-)
-health_cols[2].metric(
-    health["api_keys"]["title"],
-    "✅" if health["api_keys"]["ok"] else "⚠️",
-    health["api_keys"]["message"],
-)
+health_cards = [
+    health.get("ai_signal"),
+    health.get("executions"),
+    health.get("api_keys"),
+    health.get("realtime_trading"),
+]
+health_cards = [card for card in health_cards if card]
+if health_cards:
+    cols = st.columns(len(health_cards))
+    for col, card in zip(cols, health_cards):
+        icon = "✅" if card.get("ok") else "⚠️"
+        col.metric(card.get("title", "Статус"), icon, card.get("message", ""))
+        details = card.get("details")
+        if details:
+            col.caption(details)
 
 if watchlist:
     st.markdown("#### Наблюдаемые пары")

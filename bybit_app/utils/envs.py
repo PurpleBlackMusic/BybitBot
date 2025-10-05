@@ -73,6 +73,7 @@ class Settings:
     # WS Watchdog
     ws_watchdog_enabled: bool = True
     ws_watchdog_max_age_sec: int = 90
+    execution_watchdog_max_age_sec: int = 600
 
     # Telegram
     telegram_token: str = ""
@@ -141,6 +142,7 @@ _ENV_MAP = {
     "heartbeat_minutes": "TG_HEARTBEAT_MINUTES",
     "heartbeat_interval_min": "TG_HEARTBEAT_INTERVAL_MIN",
     "ws_autostart": "WS_AUTOSTART",
+    "execution_watchdog_max_age_sec": "EXECUTION_WATCHDOG_MAX_AGE_SEC",
 }
 
 
@@ -208,6 +210,9 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["heartbeat_enabled"] = _cast_bool(m.get("heartbeat_enabled"))
     m["heartbeat_interval_min"] = _cast_int(m.get("heartbeat_interval_min"))
     m["heartbeat_minutes"] = _cast_int(m.get("heartbeat_minutes"))
+    m["execution_watchdog_max_age_sec"] = _cast_int(
+        m.get("execution_watchdog_max_age_sec")
+    )
 
     m["ws_autostart"] = _cast_bool(m.get("ws_autostart"))
     m["spot_cash_reserve_pct"] = _cast_float(m.get("spot_cash_reserve_pct", 10.0))

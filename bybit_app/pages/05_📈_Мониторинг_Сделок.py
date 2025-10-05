@@ -22,7 +22,7 @@ health = bot.data_health()
 
 with st.container(border=True):
     st.subheader("Диагностика источников данных")
-    for key in ("ai_signal", "executions", "api_keys"):
+    for key in ("ai_signal", "executions", "api_keys", "realtime_trading"):
         info = health.get(key, {})
         if not info:
             continue
@@ -33,6 +33,104 @@ with st.container(border=True):
         details = info.get("details")
         if details:
             st.caption(details)
+
+        if key == "realtime_trading":
+            stats: list[str] = []
+            latency = info.get("latency_ms")
+            if latency is not None:
+                stats.append(f"Задержка REST: {float(latency):.0f} мс")
+            total = info.get("balance_total")
+            available = info.get("balance_available")
+            if total is not None and available is not None:
+                stats.append(
+                    f"Баланс: {float(total):.2f} / {float(available):.2f} USDT"
+                )
+            assets = info.get("wallet_assets") or []
+            if assets:
+                asset_bits = []
+                for asset in assets:
+                    coin = asset.get("coin")
+                    total_val = asset.get("total")
+                    available_val = asset.get("available")
+                    if not isinstance(coin, str):
+                        continue
+                    try:
+                        total_float = float(total_val)
+                    except (TypeError, ValueError):
+                        continue
+                    available_text = ""
+                    try:
+                        available_float = float(available_val)
+                    except (TypeError, ValueError):
+                        available_float = None
+                    if available_float is not None:
+                        available_text = f" (доступно {available_float:.4f})"
+                    asset_bits.append(f"{coin} {total_float:.4f}{available_text}")
+                if asset_bits:
+                    stats.append("Активы: " + ", ".join(asset_bits))
+            orders = info.get("order_count")
+            if orders is not None:
+                stats.append(f"Открытых ордеров: {int(orders)}")
+            age = info.get("order_age_sec")
+            if age is not None:
+                human_age = info.get("order_age_human")
+                if human_age:
+                    stats.append(f"Последнее обновление ордеров: {human_age} назад")
+                else:
+                    stats.append(f"Последнее обновление ордеров: {float(age):.0f} с")
+            executions = info.get("execution_count")
+            if executions is not None:
+                stats.append(f"Исполнений: {int(executions)}")
+            exec_age = info.get("execution_age_sec")
+            last_exec_brief = info.get("last_execution_brief")
+            last_exec_at = info.get("last_execution_at")
+            last_exec = info.get("last_execution") or {}
+            if exec_age is not None:
+                exec_human = info.get("execution_age_human")
+                if exec_human:
+                    if last_exec_brief:
+                        stats.append(
+                            f"Последняя сделка: {exec_human} назад ({last_exec_brief})"
+                        )
+                    else:
+                        stats.append(f"Последняя сделка: {exec_human} назад")
+                else:
+                    stats.append(f"Последняя сделка: {float(exec_age):.0f} с назад")
+            elif last_exec_brief:
+                stats.append(f"Последняя сделка: {last_exec_brief}")
+
+            if last_exec_at:
+                stats.append(f"Время сделки: {last_exec_at}")
+
+            fee_val = last_exec.get("fee")
+            if fee_val not in (None, ""):
+                try:
+                    fee_float = float(fee_val)
+                except (TypeError, ValueError):
+                    fee_float = None
+                if fee_float is not None:
+                    maker_flag = last_exec.get("is_maker")
+                    maker_note = (
+                        " (мейкер)" if maker_flag is True else " (тейкер)" if maker_flag is False else ""
+                    )
+                    stats.append(
+                        f"Комиссия сделки: {fee_float:.6f}{maker_note}"
+                    )
+            ws_private = info.get("ws_private_age_human") or info.get("ws_private_age_sec")
+            if ws_private is not None:
+                if isinstance(ws_private, str):
+                    stats.append(f"Приватный WS: {ws_private} назад")
+                else:
+                    stats.append(f"Приватный WS: {float(ws_private):.0f} с назад")
+            ws_public = info.get("ws_public_age_human") or info.get("ws_public_age_sec")
+            if ws_public is not None:
+                if isinstance(ws_public, str):
+                    stats.append(f"Публичный WS: {ws_public} назад")
+                else:
+                    stats.append(f"Публичный WS: {float(ws_public):.0f} с назад")
+            stats = [s for s in stats if s]
+            if stats:
+                st.caption(" · ".join(stats))
 
 st.divider()
 

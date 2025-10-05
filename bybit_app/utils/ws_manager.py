@@ -192,9 +192,26 @@ class WSManager:
         self.stop_private()
 
     def status(self):
+        last_beat = self.last_beat if self.last_beat else None
+        age = None
+        if last_beat:
+            age = max(0.0, time.time() - last_beat)
+
+        private_ws = getattr(self._priv, "_ws", None)
+
         return {
-            "public": {"running": bool(self._pub_ws)},
-            "private": {"running": bool(self._priv)},
+            "public": {
+                "running": bool(self._pub_ws),
+                "subscriptions": list(self._pub_subs),
+                "last_beat": last_beat,
+                "age_seconds": age,
+            },
+            "private": {
+                "running": bool(self._priv),
+                "connected": bool(private_ws),
+                "last_beat": last_beat,
+                "age_seconds": age,
+            },
         }
 
 
