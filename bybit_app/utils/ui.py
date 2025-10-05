@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import unicodedata
 from importlib import import_module, util
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from textwrap import dedent
 from typing import Any, Callable
 
@@ -254,21 +254,55 @@ def _format_relative_path(candidate: Path, bases: Iterable[Path]) -> str:
     return candidate.as_posix()
 
 
+def _descend_casefold_path(base_dir: Path, relative_path: Path) -> Path | None:
+    """Return the existing path under ``base_dir`` matching ``relative_path``."""
+
+    current = base_dir
+    for part in relative_path.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+
+        try:
+            entries = {_normalise_filename(child.name): child for child in current.iterdir()}
+        except FileNotFoundError:
+            return None
+
+        current = entries.get(_normalise_filename(part))
+        if current is None:
+            return None
+
+    return current
+
+
 def _find_existing_relative_path(base_dir: Path, relative_path: Path) -> str | None:
     """Return the actual relative path if the file exists under ``base_dir``."""
 
+    base_dir = base_dir.resolve()
     candidate = (base_dir / relative_path).resolve()
     if candidate.exists():
         return _format_relative_path(candidate, (base_dir,))
 
-    parent_dir = (base_dir / relative_path.parent).resolve()
-    if not parent_dir.exists() or not parent_dir.is_dir():
+    descended = _descend_casefold_path(base_dir, relative_path)
+    if descended is not None:
+        return _format_relative_path(descended, (base_dir,))
+
+    return None
+
+
+def _extract_pages_subpath(value: str) -> str | None:
+    """Return the ``pages/``-relative subpath if present."""
+
+    if not value:
         return None
 
-    target_name = _normalise_filename(relative_path.name)
-    for child in parent_dir.iterdir():
-        if _normalise_filename(child.name) == target_name:
-            return _format_relative_path(child, (base_dir,))
+    normalised = value.replace("\\", "/")
+    parts = PurePosixPath(normalised).parts
+
+    for index, part in enumerate(parts):
+        if part == "pages":
+            return PurePosixPath(*parts[index:]).as_posix()
 
     return None
 
@@ -281,21 +315,34 @@ def _resolve_page_location(page: str) -> str:
         return page
 
     page_path = Path(page)
-    main_dir = Path(ctx.main_script_path).parent
+    main_script = Path(ctx.main_script_path)
+    try:
+        main_script = main_script.resolve(strict=True)
+    except FileNotFoundError:
+        main_script = main_script.resolve()
+    main_dir = main_script.parent
+    package_root = Path(__file__).resolve().parents[1]
+    bases = (main_dir, package_root)
     resolved = _find_existing_relative_path(main_dir, page_path)
     if resolved is not None:
         return resolved
 
-    package_root = Path(__file__).resolve().parents[1]
     resolved = _find_existing_relative_path(package_root, page_path)
     if resolved is not None:
         alt_candidate = (package_root / resolved).resolve()
-        return _format_relative_path(alt_candidate, (main_dir, package_root))
+        formatted = _format_relative_path(alt_candidate, bases)
+        return _extract_pages_subpath(formatted) or resolved
 
     if isinstance(page, str):
         page_candidate = Path(page)
         if page_candidate.is_absolute():
-            return _format_relative_path(page_candidate, (main_dir, package_root))
+            formatted = _format_relative_path(page_candidate, bases)
+            return _extract_pages_subpath(formatted) or formatted
+
+        extracted = _extract_pages_subpath(page)
+        if extracted:
+            return extracted
+
         return page_candidate.as_posix()
 
     return page
