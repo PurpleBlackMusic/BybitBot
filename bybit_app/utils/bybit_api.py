@@ -173,8 +173,20 @@ class BybitAPI:
         params = {"category": category, "symbol": symbol, "limit": int(limit)}
         return self._safe_req("GET", "/v5/market/orderbook", params=params)
 
-    def kline(self, category: str, symbol: str, interval: int = 1, limit: int = 200):
+    def kline(
+        self,
+        category: str,
+        symbol: str,
+        interval: int = 1,
+        limit: int = 200,
+        start: int | None = None,
+        end: int | None = None,
+    ):
         params = {"category": category, "symbol": symbol, "interval": str(interval), "limit": int(limit)}
+        if start is not None:
+            params["start"] = int(start)
+        if end is not None:
+            params["end"] = int(end)
         return self._safe_req("GET", "/v5/market/kline", params=params)
 
     # --- private ---
