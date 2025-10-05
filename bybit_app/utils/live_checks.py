@@ -8,11 +8,25 @@ from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings
 
 
-def _to_float(value: object) -> float:
+def _safe_float(value: object) -> Optional[float]:
     try:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return 0.0
+        return None
+
+
+def _first_numeric(source: dict, keys: Iterable[str]) -> Optional[float]:
+    """Return the first meaningful numeric value for the provided keys."""
+
+    fallback: Optional[float] = None
+    for key in keys:
+        value = _safe_float(source.get(key))
+        if value is None:
+            continue
+        if value != 0.0:
+            return value
+        fallback = value
+    return fallback
 
 
 def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
@@ -31,8 +45,22 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
     for account in accounts:
         if not isinstance(account, dict):
             continue
-        total += _to_float(account.get("totalEquity")) or _to_float(account.get("equity"))
-        available += _to_float(account.get("availableBalance")) or _to_float(account.get("availableMargin"))
+
+        total_val = _first_numeric(account, ("totalEquity", "equity", "walletBalance"))
+        if total_val is not None:
+            total += total_val
+
+        available_val = _first_numeric(
+            account,
+            (
+                "availableBalance",
+                "availableMargin",
+                "availableToWithdraw",
+                "cashBalance",
+            ),
+        )
+        if available_val is not None:
+            available += available_val
     return total, available
 
 
@@ -70,16 +98,23 @@ def _extract_wallet_assets(
             if not symbol:
                 continue
 
-            total = _safe_float(
-                row.get("equity")
-                or row.get("walletBalance")
-                or row.get("balance")
-                or row.get("total")
+            total = _first_numeric(
+                row,
+                (
+                    "equity",
+                    "walletBalance",
+                    "balance",
+                    "total",
+                ),
             )
-            available = _safe_float(
-                row.get("availableToWithdraw")
-                or row.get("availableBalance")
-                or row.get("available")
+            available = _first_numeric(
+                row,
+                (
+                    "availableToWithdraw",
+                    "availableBalance",
+                    "available",
+                    "availableMargin",
+                ),
             )
 
             if total is None and available is None:
@@ -115,13 +150,6 @@ def _extract_wallet_assets(
         )
 
     return tuple(trimmed)
-
-
-def _safe_float(value: object) -> Optional[float]:
-    try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
 
 
 def _format_decimal(value: Optional[float], *, decimals: int = 8) -> Optional[str]:
