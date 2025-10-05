@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import bybit_app.utils.guardian_bot as guardian_bot_module
+from bybit_app.utils import trade_control
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
 
@@ -613,3 +614,124 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
     assert bot.load_calls == 1
     assert bot.portfolio_calls == 1
     assert bot.recent_calls == 1
+
+
+def test_guardian_manual_trade_state_uses_bot_directory(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+
+    initial_state = bot.manual_trade_state()
+    assert initial_state.active is False
+
+    trade_control.clear_trade_commands(data_dir=bot.data_dir)
+    trade_control.request_trade_start(symbol="BNBUSDT", mode="buy", data_dir=bot.data_dir)
+
+    updated_state = bot.manual_trade_state()
+    assert updated_state.active is True
+    assert updated_state.last_start is not None
+    assert updated_state.last_start["symbol"] == "BNBUSDT"
+
+    trade_control.clear_trade_commands(data_dir=bot.data_dir)
+
+
+def test_guardian_manual_trade_wrappers_round_trip(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+
+    bot.manual_trade_clear()
+    assert bot.manual_trade_history() == ()
+
+    start_record = bot.manual_trade_start(
+        symbol="ethusdt",
+        mode="buy",
+        probability_pct=55.5,
+        ev_bps=120.0,
+        source="pytest",
+        note="начало теста",
+        extra={"foo": "bar"},
+    )
+    assert start_record["symbol"] == "ETHUSDT"
+    assert start_record["action"] == "start"
+
+    history = bot.manual_trade_history()
+    assert history
+    assert history[-1]["action"] == "start"
+
+    cancel_record = bot.manual_trade_cancel(
+        symbol="ethusdt",
+        reason="stop test",
+        source="pytest",
+        note="остановка",
+    )
+    assert cancel_record["action"] == "cancel"
+
+    state = bot.manual_trade_state()
+    assert state.active is False
+    assert state.last_cancel is not None
+
+    history = bot.manual_trade_history()
+    assert len(history) >= 2
+    assert history[-1]["action"] == "cancel"
+
+    bot.manual_trade_clear()
+    assert bot.manual_trade_history() == ()
+
+
+def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+
+    bot.manual_trade_clear()
+    base_summary = bot.manual_trade_summary()
+    assert base_summary["status_label"] == "idle"
+    assert base_summary["history_count"] == 0
+    assert base_summary["history"] == []
+
+    start_record = bot.manual_trade_start(
+        symbol="adausdt",
+        mode="buy",
+        source="pytest",
+    )
+    assert start_record["action"] == "start"
+
+    summary_after_start = bot.manual_trade_summary()
+    assert summary_after_start["status_label"] == "active"
+    assert summary_after_start["history_count"] == 1
+    assert summary_after_start["last_action"]["action"] == "start"
+    assert len(summary_after_start["history"]) == 1
+
+    summary_clone = bot.manual_trade_summary()
+    summary_clone["history"].append({"action": "fake"})
+    refreshed_summary = bot.manual_trade_summary()
+    assert refreshed_summary["history_count"] == 1
+    assert len(refreshed_summary["history"]) == 1
+
+    status_manual = bot.status_summary()["manual_control"]
+    assert status_manual["status_label"] == "active"
+    assert status_manual["history_count"] == 1
+
+    state = bot.manual_trade_state()
+    if state.last_action:
+        state.last_action["action"] = "mutated"
+    fresh_state = bot.manual_trade_state()
+    if fresh_state.last_action:
+        assert fresh_state.last_action["action"] == "start"
+
+    history_tail = bot.manual_trade_history(limit=1)
+    assert len(history_tail) == 1
+    assert history_tail[0]["action"] == "start"
+
+    cancel_record = bot.manual_trade_cancel(symbol="adausdt", reason="pytest stop")
+    assert cancel_record["action"] == "cancel"
+
+    summary_after_cancel = bot.manual_trade_summary()
+    assert summary_after_cancel["status_label"] == "stopped"
+    assert summary_after_cancel["history_count"] == 2
+    assert summary_after_cancel["last_action"]["action"] == "cancel"
+    assert summary_after_cancel["last_cancel"] is not None
+
+    history_tail_after = bot.manual_trade_history(limit=1)
+    assert len(history_tail_after) == 1
+    assert history_tail_after[0]["action"] == "cancel"
+
+    bot.manual_trade_clear()
+    cleared_summary = bot.manual_trade_summary()
+    assert cleared_summary["status_label"] == "idle"
+    assert cleared_summary["history_count"] == 0
