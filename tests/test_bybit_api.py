@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from decimal import Decimal
 from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
 
 from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
 
@@ -66,3 +70,705 @@ def test_signed_get_params_are_sorted_and_signed() -> None:
     expected_payload = f"{ts}key1235000{expected_query}".encode()
     expected_sign = hmac.new(b"secret456", expected_payload, hashlib.sha256).hexdigest()
     assert headers["X-BAPI-SIGN"] == expected_sign
+
+
+def test_batch_cancel_accepts_requests_payload() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    payload = [{"orderId": "1"}]
+    api.cancel_batch = MagicMock(return_value={"retCode": 0})
+
+    result = api.batch_cancel(category="spot", requests=payload, symbol="BTCUSDT")
+
+    assert result == {"retCode": 0}
+    api.cancel_batch.assert_called_once_with(
+        category="spot", request=payload, symbol="BTCUSDT"
+    )
+
+
+def test_batch_cancel_accepts_request_payload() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    payload = [{"orderId": "2"}]
+    api.cancel_batch = MagicMock(return_value={"retCode": 0})
+
+    result = api.batch_cancel(category="spot", request=payload)
+
+    assert result == {"retCode": 0}
+    api.cancel_batch.assert_called_once_with(category="spot", request=payload)
+
+
+def test_batch_cancel_requires_payload_key() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_cancel(category="spot")
+
+    assert "requires" in str(excinfo.value)
+
+
+def test_batch_cancel_materialises_iterables() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    # generator expression should be materialised into a list before dispatch
+    payload = ({"orderId": str(i)} for i in range(2))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"method": method, "path": path, "body": body, "signed": signed})
+        return {"retCode": 0}
+
+    with pytest.MonkeyPatch().context() as m:
+        m.setattr(api, "_safe_req", fake_safe_req)
+        result = api.batch_cancel(category="spot", requests=payload)
+
+    assert result == {"retCode": 0}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v5/order/cancel-batch"
+    assert captured["signed"] is True
+    assert captured["body"] == {
+        "category": "spot",
+        "request": [{"orderId": "0"}, {"orderId": "1"}],
+    }
+
+
+def test_batch_cancel_rejects_empty_payload() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_cancel(category="spot", request=[])
+
+    assert "non-empty" in str(excinfo.value)
+
+
+def test_batch_cancel_rejects_non_mapping_entries() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(TypeError) as excinfo:
+        api.batch_cancel(category="spot", request=[123])
+
+    assert "mappings" in str(excinfo.value)
+
+
+def test_batch_cancel_requires_identifier_per_entry() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_cancel(category="spot", request=[{"symbol": "BTCUSDT"}])
+
+    msg = str(excinfo.value)
+    assert "orderId" in msg and "orderLinkId" in msg
+
+
+def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = [{"orderId": "1"}, {"orderLinkId": "abc"}]
+
+    resp = api.cancel_batch(
+        category="spot",
+        request=payload,
+        symbol=" BTCUSDT ",
+        settleCoin="   ",
+    )
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v5/order/cancel-batch"
+    assert captured["params"] is None
+    assert captured["signed"] is True
+    assert captured["body"] == {
+        "category": "spot",
+        "request": [{"orderId": "1"}, {"orderLinkId": "abc"}],
+        "symbol": "BTCUSDT",
+    }
+
+
+def test_cancel_batch_accepts_requests_alias(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"body": body, "signed": signed})
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = [{"orderId": "7"}]
+
+    resp = api.cancel_batch(category="spot", requests=payload)
+
+    assert resp == {"retCode": 0}
+    assert captured["signed"] is True
+    assert captured["body"] == {
+        "category": "spot",
+        "request": [{"orderId": "7"}],
+    }
+
+
+def test_cancel_batch_materialises_iterables(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"body": body})
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = ({"orderId": str(i)} for i in range(2))
+
+    api.cancel_batch(category="spot", request=payload)
+
+    assert captured["body"]["request"] == [{"orderId": "0"}, {"orderId": "1"}]
+
+
+def test_cancel_batch_requires_category() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_batch(request=[{"orderId": "1"}])
+
+    assert "category" in str(excinfo.value)
+
+
+def test_cancel_batch_requires_payload_key() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_batch(category="spot")
+
+    assert "request" in str(excinfo.value)
+
+
+def test_cancel_batch_rejects_empty_payload() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_batch(category="spot", request=[])
+
+    assert "non-empty" in str(excinfo.value)
+
+
+def test_cancel_batch_rejects_non_mapping_entries() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(TypeError) as excinfo:
+        api.cancel_batch(category="spot", request=[123])
+
+    assert "mappings" in str(excinfo.value)
+
+
+def test_cancel_batch_requires_identifier_per_entry() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_batch(category="spot", request=[{"symbol": "BTCUSDT"}])
+
+    msg = str(excinfo.value)
+    assert "orderId" in msg and "orderLinkId" in msg
+
+
+def test_amend_order_uses_signed_endpoint(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "orderId": "123",
+        "qty": "0.1",
+    }
+
+    resp = api.amend_order(**payload)
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v5/order/amend"
+    assert captured["params"] is None
+    assert captured["body"] == payload
+    assert captured["signed"] is True
+
+
+def test_amend_order_normalises_numeric_fields(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"method": method, "path": path, "body": body, "signed": signed})
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "orderLinkId": "abc",
+        "qty": 1.234500,
+        "price": Decimal("27000.100000"),
+        "takeProfit": 28000,
+        "stopLoss": None,
+        "reduceOnly": False,
+    }
+
+    resp = api.amend_order(**payload)
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured["body"]["qty"] == "1.2345"
+    assert captured["body"]["price"] == "27000.1"
+    assert captured["body"]["takeProfit"] == "28000"
+    assert "stopLoss" in captured["body"] and captured["body"]["stopLoss"] is None
+    # Non-numeric values such as booleans should pass through untouched
+    assert captured["body"]["reduceOnly"] is False
+
+
+def test_amend_order_requires_parameters() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError):
+        api.amend_order()
+
+
+def test_amend_order_requires_category() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.amend_order(orderId="1")
+
+    assert "category" in str(excinfo.value)
+
+
+def test_amend_order_requires_identifier() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.amend_order(category="spot")
+
+    msg = str(excinfo.value)
+    assert "orderId" in msg and "orderLinkId" in msg
+
+
+def test_place_order_normalises_payload(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "orderType": "Limit",
+        "qty": Decimal("1.234500"),
+        "price": 42000.0,
+        "orderValue": 12345,
+    }
+
+    resp = api.place_order(**payload)
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v5/order/create"
+    assert captured["params"] is None
+    assert captured["signed"] is True
+    assert captured["body"]["side"] == "Buy"
+    assert captured["body"]["qty"] == "1.2345"
+    assert captured["body"]["price"] == "42000"
+    assert captured["body"]["orderValue"] == "12345"
+
+
+def test_place_order_normalises_string_numerics(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "sell",
+        "orderType": "Limit",
+        "qty": "1.000000",
+        "price": "25000.0000",
+        "triggerPrice": "24950.5000 ",
+    }
+
+    api.place_order(**payload)
+
+    assert captured["body"]["qty"] == "1"
+    assert captured["body"]["price"] == "25000"
+    assert captured["body"]["triggerPrice"] == "24950.5"
+
+
+def test_place_order_requires_required_fields() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.place_order(symbol="BTCUSDT", side="buy", orderType="Limit", qty=1)
+
+    assert "category" in str(excinfo.value)
+
+
+def test_place_order_requires_quantity() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.place_order(
+            category="spot",
+            symbol="BTCUSDT",
+            side="Buy",
+            orderType="Limit",
+        )
+
+    assert "quantity" in str(excinfo.value)
+
+
+def test_place_order_rejects_invalid_side() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.place_order(
+            category="spot",
+            symbol="BTCUSDT",
+            side="hold",
+            orderType="Limit",
+            qty=1,
+        )
+
+    assert "side" in str(excinfo.value)
+
+
+def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "orderId": "12345",
+        "symbol": "BTCUSDT",
+    }
+
+    resp = api.cancel_order(**payload)
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured == {
+        "method": "POST",
+        "path": "/v5/order/cancel",
+        "params": None,
+        "body": payload,
+        "signed": True,
+    }
+
+
+def test_cancel_order_requires_category() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_order(orderId="123")
+
+    assert "category" in str(excinfo.value)
+
+
+def test_cancel_order_requires_identifier() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_order(category="spot")
+
+    msg = str(excinfo.value)
+    assert "orderId" in msg and "orderLinkId" in msg
+
+
+def test_cancel_all_uses_signed_endpoint(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    resp = api.cancel_all(
+        category="spot",
+        symbol=" BTCUSDT ",
+        baseCoin=None,
+        orderFilter=" StopOrder ",
+        customFlag=True,
+    )
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured == {
+        "method": "POST",
+        "path": "/v5/order/cancel-all",
+        "params": None,
+        "body": {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "orderFilter": "StopOrder",
+            "customFlag": True,
+        },
+        "signed": True,
+    }
+
+
+def test_cancel_all_requires_category() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.cancel_all(symbol="BTCUSDT")
+
+    assert "category" in str(excinfo.value)
+
+
+def test_cancel_all_omits_blank_strings(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    api.cancel_all(category="spot", symbol="   ", settleCoin=" usdt ")
+
+    assert captured["body"] == {"category": "spot", "settleCoin": "usdt"}
+
+
+def test_batch_place_normalises_orders(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    orders = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "orderType": "Limit",
+            "qty": 1.234500,
+            "price": Decimal("27000.100000"),
+        },
+        {
+            "symbol": "ETHUSDT",
+            "side": "Sell",
+            "orderType": "Market",
+            "orderValue": 250,
+        },
+    ]
+
+    resp = api.batch_place(category="spot", orders=orders)
+
+    assert resp == {"retCode": 0, "result": {}}
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/v5/order/create-batch"
+    assert captured["params"] is None
+    assert captured["signed"] is True
+
+    body = captured["body"]
+    assert body["category"] == "spot"
+    assert body["request"][0]["side"] == "Buy"
+    assert body["request"][0]["qty"] == "1.2345"
+    assert body["request"][0]["price"] == "27000.1"
+    assert body["request"][1]["orderValue"] == "250"
+
+
+def test_batch_place_materialises_iterables(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    orders = (
+        {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "orderType": "Limit",
+            "qty": i + 1,
+        }
+        for i in range(2)
+    )
+
+    api.batch_place(category="spot", orders=orders)
+
+    assert captured["body"]["request"] == [
+        {"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": "1"},
+        {"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": "2"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "orders",
+    [
+        None,
+        [],
+    ],
+)
+def test_batch_place_requires_orders(orders) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError):
+        api.batch_place(category="spot", orders=orders)
+
+
+def test_batch_place_requires_category() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError):
+        api.batch_place(category="", orders=[{"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": 1}])
+
+
+def test_batch_place_rejects_too_many_orders() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    orders = (
+        {"symbol": f"S{i}", "side": "Buy", "orderType": "Limit", "qty": 1}
+        for i in range(11)
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_place(category="spot", orders=orders)
+
+    assert "10" in str(excinfo.value)
+
+
+def test_batch_place_requires_required_fields() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_place(category="spot", orders=[{"symbol": "BTCUSDT", "qty": 1}])
+
+    message = str(excinfo.value)
+    assert "side" in message and "orderType" in message
+
+
+def test_batch_place_requires_quantity() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_place(
+            category="spot",
+            orders=[{"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit"}],
+        )
+
+    assert "quantity" in str(excinfo.value)
+
+
+def test_batch_place_rejects_invalid_side() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    with pytest.raises(ValueError) as excinfo:
+        api.batch_place(
+            category="spot",
+            orders=[
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "hold",
+                    "orderType": "Limit",
+                    "qty": 1,
+                }
+            ],
+        )
+
+    assert "side" in str(excinfo.value)
