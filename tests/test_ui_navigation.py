@@ -34,3 +34,33 @@ def test_resolve_page_location_strips_absolute_and_prefixed_paths(streamlit_ctx)
     assert ui._resolve_page_location(absolute) == target
     assert ui._resolve_page_location(prefixed) == target
     assert ui._resolve_page_location(windows_like) == target
+
+
+def test_navigation_link_falls_back_when_page_is_missing(monkeypatch, streamlit_ctx):
+    calls = {"button": 0, "caption": 0}
+
+    def fake_page_link(*args, **kwargs):
+        raise ui.StreamlitAPIException("missing page")
+
+    def fake_button(*args, **kwargs):
+        calls["button"] += 1
+        return False
+
+    def fake_caption(*args, **kwargs):
+        calls["caption"] += 1
+
+    monkeypatch.setattr(ui.st, "page_link", fake_page_link, raising=False)
+    monkeypatch.setattr(ui.st, "button", fake_button, raising=False)
+    monkeypatch.setattr(ui.st, "caption", fake_caption, raising=False)
+    monkeypatch.setattr(ui, "get_query_params", lambda: {})
+    monkeypatch.setattr(ui, "set_query_params", lambda params: None)
+    monkeypatch.setattr(ui, "rerun", lambda: None)
+
+    session_state: dict[str, bool] = {}
+    monkeypatch.setattr(ui.st, "session_state", session_state, raising=False)
+
+    ui.navigation_link("pages/02_⚙️_Настройки.py", label="Настройки")
+
+    assert calls["button"] == 1
+    assert calls["caption"] == 1
+    assert session_state["_bybit_nav_hint_shown"] is True
