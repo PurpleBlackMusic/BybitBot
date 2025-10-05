@@ -10,9 +10,18 @@ from bybit_app.utils.ws_manager import WSManager
 
 def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
+    manager._pub_running = True
+    manager._pub_thread = SimpleNamespace(is_alive=lambda: True)
     manager._pub_ws = object()
     manager._pub_subs = ("tickers.BTCUSDT", "tickers.ETHUSDT")
-    manager._priv = object()
+
+    class DummyPrivate:
+        _thread = SimpleNamespace(is_alive=lambda: True)
+
+        def is_running(self) -> bool:
+            return True
+
+    manager._priv = DummyPrivate()
     manager.last_beat = 1_000_000.0
 
     monkeypatch.setattr(ws_manager_module.time, "time", lambda: 1_000_012.0)
@@ -33,6 +42,39 @@ def test_ws_manager_status_without_heartbeat() -> None:
     assert status["public"]["age_seconds"] is None
     assert status["public"]["subscriptions"] == []
     assert status["private"]["connected"] is False
+
+
+def test_ws_manager_status_detects_inactive_channels() -> None:
+    manager = WSManager()
+    manager._pub_running = True
+    manager._pub_thread = SimpleNamespace(is_alive=lambda: False)
+    manager._pub_ws = object()
+
+    class DummyPrivate:
+        def is_running(self) -> bool:
+            return False
+
+    manager._priv = DummyPrivate()
+
+    status = manager.status()
+    assert status["public"]["running"] is False
+    assert status["private"]["running"] is False
+
+
+def test_ws_manager_status_falls_back_to_private_ws_state() -> None:
+    manager = WSManager()
+
+    class DummyPrivate:
+        _thread = SimpleNamespace(is_alive=lambda: False)
+        _ws = object()
+
+        def is_running(self) -> bool:
+            return False
+
+    manager._priv = DummyPrivate()
+
+    status = manager.status()
+    assert status["private"]["running"] is True
 
 
 def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest.MonkeyPatch) -> None:

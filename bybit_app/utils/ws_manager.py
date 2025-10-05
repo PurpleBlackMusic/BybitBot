@@ -233,15 +233,43 @@ class WSManager:
 
         private_ws = getattr(self._priv, "_ws", None)
 
+        public_running = bool(
+            self._pub_running
+            and self._pub_thread
+            and self._pub_thread.is_alive()
+            and self._pub_ws
+        )
+
+        priv = self._priv
+        private_running = False
+        if priv is not None:
+            is_running = getattr(priv, "is_running", None)
+            if callable(is_running):
+                try:
+                    private_running = bool(is_running())
+                except Exception:  # pragma: no cover - defensive
+                    private_running = False
+            if not private_running:
+                priv_thread = getattr(priv, "_thread", None)
+                if priv_thread is not None:
+                    is_alive = getattr(priv_thread, "is_alive", None)
+                    if callable(is_alive):
+                        try:
+                            private_running = bool(is_alive())
+                        except Exception:  # pragma: no cover - defensive
+                            private_running = False
+                if not private_running and private_ws is not None:
+                    private_running = True
+
         return {
             "public": {
-                "running": bool(self._pub_ws),
+                "running": public_running,
                 "subscriptions": list(self._pub_subs),
                 "last_beat": last_beat,
                 "age_seconds": age,
             },
             "private": {
-                "running": bool(self._priv),
+                "running": private_running,
                 "connected": bool(private_ws),
                 "last_beat": last_beat,
                 "age_seconds": age,
