@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import unicodedata
 from importlib import import_module, util
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from textwrap import dedent
 from typing import Any, Callable
 
@@ -273,6 +273,22 @@ def _find_existing_relative_path(base_dir: Path, relative_path: Path) -> str | N
     return None
 
 
+def _extract_pages_subpath(value: str) -> str | None:
+    """Return the ``pages/``-relative subpath if present."""
+
+    if not value:
+        return None
+
+    normalised = value.replace("\\", "/")
+    parts = PurePosixPath(normalised).parts
+
+    for index, part in enumerate(parts):
+        if part == "pages":
+            return PurePosixPath(*parts[index:]).as_posix()
+
+    return None
+
+
 def _resolve_page_location(page: str) -> str:
     """Resolve a page path so it works both from the package root and wrappers."""
 
@@ -281,21 +297,34 @@ def _resolve_page_location(page: str) -> str:
         return page
 
     page_path = Path(page)
-    main_dir = Path(ctx.main_script_path).parent
+    main_script = Path(ctx.main_script_path)
+    try:
+        main_script = main_script.resolve(strict=True)
+    except FileNotFoundError:
+        main_script = main_script.resolve()
+    main_dir = main_script.parent
+    package_root = Path(__file__).resolve().parents[1]
+    bases = (main_dir, package_root)
     resolved = _find_existing_relative_path(main_dir, page_path)
     if resolved is not None:
         return resolved
 
-    package_root = Path(__file__).resolve().parents[1]
     resolved = _find_existing_relative_path(package_root, page_path)
     if resolved is not None:
         alt_candidate = (package_root / resolved).resolve()
-        return _format_relative_path(alt_candidate, (main_dir, package_root))
+        formatted = _format_relative_path(alt_candidate, bases)
+        return _extract_pages_subpath(formatted) or resolved
 
     if isinstance(page, str):
         page_candidate = Path(page)
         if page_candidate.is_absolute():
-            return _format_relative_path(page_candidate, (main_dir, package_root))
+            formatted = _format_relative_path(page_candidate, bases)
+            return _extract_pages_subpath(formatted) or formatted
+
+        extracted = _extract_pages_subpath(page)
+        if extracted:
+            return extracted
+
         return page_candidate.as_posix()
 
     return page
