@@ -38,6 +38,21 @@ import streamlit as st
 from collections.abc import Iterable, Mapping
 
 
+_streamlit_errors_spec = util.find_spec("streamlit.errors")
+if _streamlit_errors_spec is not None:
+    StreamlitAPIException = getattr(
+        import_module("streamlit.errors"),
+        "StreamlitAPIException",
+        Exception,
+    )
+else:
+
+    class StreamlitAPIException(Exception):
+        """Fallback Streamlit API exception when the real class is unavailable."""
+
+        pass
+
+
 def _patch_responsive_dataframe() -> None:
     """Remap deprecated ``use_container_width`` to the new API once."""
 
@@ -343,8 +358,12 @@ def navigation_link(page: str, *, label: str, icon: str | None = None, key: str 
             kwargs["icon"] = icon
         if key is not None:
             kwargs["key"] = key
-        page_link(page_arg, **kwargs)
-        return
+        try:
+            page_link(page_arg, **kwargs)
+        except StreamlitAPIException:
+            pass
+        else:
+            return
 
     slug = page_slug_from_path(page)
     icon_part = f"{icon} " if icon else ""
