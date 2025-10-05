@@ -210,6 +210,53 @@ def _extract_wallet_assets(
     return tuple(trimmed)
 
 
+_SERVER_TIME_KEYS: Tuple[str, ...] = (
+    "timeSecond",
+    "serverTime",
+    "currentTime",
+    "time",
+    "timestamp",
+)
+
+
+def _normalise_epoch(raw_value: float) -> float:
+    """Normalise Bybit server timestamps to seconds."""
+
+    if raw_value > 1e15:  # nanoseconds
+        return raw_value / 1_000_000_000.0
+    if raw_value > 1e12:  # milliseconds
+        return raw_value / 1_000.0
+    return raw_value
+
+
+def _extract_server_epoch(payload: Dict[str, object]) -> Optional[float]:
+    """Parse server time payload into a unix timestamp in seconds."""
+
+    if not isinstance(payload, dict):
+        return None
+
+    sources: Tuple[Dict[str, object], ...] = tuple(
+        source
+        for source in (
+            payload.get("result") if isinstance(payload.get("result"), dict) else None,
+            payload,
+        )
+        if isinstance(source, dict)
+    )
+
+    for source in sources:
+        for key in _SERVER_TIME_KEYS:
+            value = _safe_float(source.get(key))
+            if value is not None:
+                return _normalise_epoch(value)
+
+        nano_value = _safe_float(source.get("timeNano") or source.get("timeNs"))
+        if nano_value is not None:
+            return _normalise_epoch(nano_value)
+
+    return None
+
+
 def _format_decimal(value: Optional[float], *, decimals: int = 8) -> Optional[str]:
     """Convert a numeric value to a trimmed string with fixed precision."""
 
@@ -416,6 +463,19 @@ def bybit_realtime_status(
     else:
         client = api
 
+    server_time_payload: Optional[Dict[str, object]] = None
+    server_time_epoch: Optional[float] = None
+    server_time_diff: Optional[float] = None
+    server_time_error: Optional[str] = None
+
+    try:
+        server_time_payload = client.server_time()
+        server_time_epoch = _extract_server_epoch(server_time_payload)
+        if server_time_epoch is not None:
+            server_time_diff = abs(time.time() - server_time_epoch)
+    except Exception as exc:  # pragma: no cover - network errors only in production
+        server_time_error = str(exc)
+
     started = time.perf_counter()
     try:
         wallet = client.wallet_balance()
@@ -507,6 +567,10 @@ def bybit_realtime_status(
                 .strftime("%Y-%m-%d %H:%M:%S UTC")
             )
 
+    server_time_diff_human: Optional[str] = None
+    if server_time_diff is not None:
+        server_time_diff_human = _format_duration(server_time_diff)
+
     base_messages: list[str] = []
     warning_messages: list[str] = []
 
@@ -539,6 +603,29 @@ def bybit_realtime_status(
     else:
         warning_messages.append(
             "Однако журнал исполнений пуст — бот ещё не подтвердил реальные сделки."
+        )
+
+    time_drift_limit = float(getattr(settings, "server_time_max_drift_sec", 5.0) or 5.0)
+    if server_time_diff is not None:
+        if server_time_diff <= time_drift_limit:
+            base_messages.append(
+                "Серверное время Bybit синхронизировано — отставание"
+                f" {server_time_diff_human}."
+            )
+        else:
+            warning_messages.append(
+                "Однако серверное время Bybit отстаёт на"
+                f" {server_time_diff_human} — проверьте синхронизацию времени."
+            )
+    elif server_time_error:
+        warning_messages.append(
+            "Не удалось запросить серверное время Bybit — проверка реального"
+            " рынка ограничена."
+        )
+    elif server_time_payload is not None:
+        warning_messages.append(
+            "Серверное время Bybit не содержит ожидаемого таймстампа —"
+            " сверка времени невозможна."
         )
 
     if order_age is not None and order_age > watchdog:
@@ -624,6 +711,15 @@ def bybit_realtime_status(
     if last_execution_at:
         detail_parts.append(f"Время сделки (UTC): {last_execution_at}")
 
+    if server_time_diff is not None:
+        detail_parts.append(
+            f"Отставание серверного времени: {server_time_diff:.3f} сек"
+        )
+    elif server_time_error:
+        detail_parts.append("Серверное время недоступно: " + server_time_error)
+    elif server_time_payload is not None:
+        detail_parts.append("Серверное время без таймстампа — проверьте API ответ")
+
     if ws_private_age is not None:
         detail_parts.append(
             f"Приватный WebSocket: {_format_duration(ws_private_age)} назад"
@@ -701,4 +797,8 @@ def bybit_realtime_status(
         "ws_last_beat": ws_last_beat,
         "ws_public_age_human": ws_public_age_human,
         "ws_private_age_human": ws_private_age_human,
+        "server_time_epoch": server_time_epoch,
+        "server_time_diff_sec": server_time_diff,
+        "server_time_diff_human": server_time_diff_human,
+        "server_time_error": server_time_error,
     }
