@@ -6,6 +6,7 @@ from typing import Dict, Iterable, Optional, Tuple
 
 from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings
+from .time_sync import extract_server_epoch
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -210,51 +211,7 @@ def _extract_wallet_assets(
     return tuple(trimmed)
 
 
-_SERVER_TIME_KEYS: Tuple[str, ...] = (
-    "timeSecond",
-    "serverTime",
-    "currentTime",
-    "time",
-    "timestamp",
-)
-
-
-def _normalise_epoch(raw_value: float) -> float:
-    """Normalise Bybit server timestamps to seconds."""
-
-    if raw_value > 1e15:  # nanoseconds
-        return raw_value / 1_000_000_000.0
-    if raw_value > 1e12:  # milliseconds
-        return raw_value / 1_000.0
-    return raw_value
-
-
-def _extract_server_epoch(payload: Dict[str, object]) -> Optional[float]:
-    """Parse server time payload into a unix timestamp in seconds."""
-
-    if not isinstance(payload, dict):
-        return None
-
-    sources: Tuple[Dict[str, object], ...] = tuple(
-        source
-        for source in (
-            payload.get("result") if isinstance(payload.get("result"), dict) else None,
-            payload,
-        )
-        if isinstance(source, dict)
-    )
-
-    for source in sources:
-        for key in _SERVER_TIME_KEYS:
-            value = _safe_float(source.get(key))
-            if value is not None:
-                return _normalise_epoch(value)
-
-        nano_value = _safe_float(source.get("timeNano") or source.get("timeNs"))
-        if nano_value is not None:
-            return _normalise_epoch(nano_value)
-
-    return None
+_extract_server_epoch = extract_server_epoch
 
 
 def _format_decimal(value: Optional[float], *, decimals: int = 8) -> Optional[str]:
