@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+import unicodedata
 from importlib import import_module, util
 from pathlib import Path
 from textwrap import dedent
@@ -236,6 +237,37 @@ def build_status_card(title: str, description: str, *, icon: str | None = None, 
     ).strip()
 
 
+def _normalise_filename(name: str) -> str:
+    """Return a case-insensitive, Unicode-normalised file name."""
+
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _find_existing_relative_path(base_dir: Path, relative_path: Path) -> str | None:
+    """Return the actual relative path if the file exists under ``base_dir``."""
+
+    candidate = (base_dir / relative_path).resolve()
+    if candidate.exists():
+        try:
+            return str(candidate.relative_to(base_dir))
+        except ValueError:
+            return str(candidate)
+
+    parent_dir = (base_dir / relative_path.parent).resolve()
+    if not parent_dir.exists() or not parent_dir.is_dir():
+        return None
+
+    target_name = _normalise_filename(relative_path.name)
+    for child in parent_dir.iterdir():
+        if _normalise_filename(child.name) == target_name:
+            try:
+                return str(child.relative_to(base_dir))
+            except ValueError:
+                return str(child)
+
+    return None
+
+
 def _resolve_page_location(page: str) -> str:
     """Resolve a page path so it works both from the package root and wrappers."""
 
@@ -243,14 +275,16 @@ def _resolve_page_location(page: str) -> str:
     if not ctx:
         return page
 
+    page_path = Path(page)
     main_dir = Path(ctx.main_script_path).parent
-    candidate = (main_dir / page).resolve()
-    if candidate.exists():
-        return page
+    resolved = _find_existing_relative_path(main_dir, page_path)
+    if resolved is not None:
+        return resolved
 
     package_root = Path(__file__).resolve().parents[1]
-    alt_candidate = (package_root / page).resolve()
-    if alt_candidate.exists():
+    resolved = _find_existing_relative_path(package_root, page_path)
+    if resolved is not None:
+        alt_candidate = (package_root / resolved).resolve()
         try:
             return str(alt_candidate.relative_to(main_dir))
         except ValueError:
