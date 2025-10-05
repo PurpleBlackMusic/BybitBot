@@ -198,6 +198,22 @@ def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
     }
 
 
+def test_safe_req_accepts_string_retcode(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    def fake_req(method: str, path: str, *, params=None, body=None, signed=False):
+        assert method == "POST"
+        assert path == "/v5/order/create"
+        assert signed is True
+        return {"retCode": "0", "retMsg": "OK", "result": {}}
+
+    monkeypatch.setattr(api, "_req", fake_req)
+
+    resp = api._safe_req("POST", "/v5/order/create", body={"foo": "bar"}, signed=True)
+
+    assert resp == {"retCode": "0", "retMsg": "OK", "result": {}}
+
+
 def test_cancel_batch_accepts_requests_alias(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
