@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -718,6 +719,39 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
     assert bot.unified_report()["status"]["symbol"] == "ETHUSDT"
 
 
+def test_guardian_status_recovers_from_partial_write(tmp_path: Path, monkeypatch) -> None:
+    status_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.6,
+        "ev_bps": 12.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    original_read_bytes = Path.read_bytes
+    call_counter = {"count": 0}
+
+    def flaky_read(self: Path, *args, **kwargs):
+        if self == status_path and call_counter["count"] == 0:
+            call_counter["count"] += 1
+            return b"{\"symbol\": \"BTCUSDT\","
+        return original_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read)
+
+    bot = _make_bot(tmp_path)
+    summary = bot.status_summary()
+
+    assert summary["status_source"] == "live"
+    assert summary["fallback_used"] is False
+    assert summary["symbol"] == "BTCUSDT"
+    assert summary.get("status_error") is None
+    assert call_counter["count"] == 1
+
+
 def test_guardian_status_fallback_when_file_missing(tmp_path: Path) -> None:
     status_payload = {
         "symbol": "BTCUSDT",
@@ -745,6 +779,155 @@ def test_guardian_status_fallback_when_file_missing(tmp_path: Path) -> None:
     assert health["ai_signal"]["ok"] is False
     assert "сохран" in health["ai_signal"]["message"].lower()
 
+
+def test_guardian_status_fallback_forces_retry(tmp_path: Path, monkeypatch) -> None:
+    status_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.7,
+        "ev_bps": 20.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    live_summary = bot.status_summary()
+    assert live_summary["status_source"] == "live"
+
+    initial_signature = bot._snapshot.status_signature
+
+    status_path.write_text("{\"symbol\": \"BTCUSDT\"", encoding="utf-8")
+
+    call_counter = {"count": 0}
+    original_read_bytes = Path.read_bytes
+
+    def counting_read(self: Path, *args, **kwargs):
+        if self == status_path:
+            call_counter["count"] += 1
+        return original_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read)
+
+    fallback_summary = bot.status_summary()
+
+    assert fallback_summary["status_source"] == "cached"
+    assert fallback_summary["fallback_used"] is True
+    assert call_counter["count"] >= 1
+    assert bot._snapshot.status_signature == initial_signature
+
+    call_counter["count"] = 0
+
+    cached_summary = bot.status_summary()
+
+    assert cached_summary["fallback_used"] is True
+    assert call_counter["count"] >= 1
+
+
+def test_guardian_status_refreshes_when_mtime_static(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+
+    first_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.6,
+        "ev_bps": 12.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "explanation": "короткое описание",
+    }
+    status_path.write_text(json.dumps(first_status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    initial_summary = bot.status_summary()
+    assert initial_summary["probability_pct"] == 60.0
+    assert "короткое" in initial_summary["analysis"].lower()
+
+    prev_stat = status_path.stat()
+
+    updated_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.75,
+        "ev_bps": 20.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "explanation": "длинное описание сигнала с дополнительными деталями",
+    }
+    status_path.write_text(json.dumps(updated_status), encoding="utf-8")
+    os.utime(
+        status_path,
+        ns=(
+            getattr(prev_stat, "st_atime_ns", int(prev_stat.st_atime * 1_000_000_000)),
+            getattr(prev_stat, "st_mtime_ns", int(prev_stat.st_mtime * 1_000_000_000)),
+        ),
+    )
+
+    refreshed_summary = bot.status_summary()
+    assert refreshed_summary["probability_pct"] == 75.0
+    assert refreshed_summary["ev_bps"] == 20.0
+    assert "длинное" in refreshed_summary["analysis"].lower()
+
+
+def test_guardian_status_refreshes_when_content_size_static(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+
+    first_payload = (
+        '{"symbol":"BTCUSDT","probability":0.61,"ev_bps":12,"side":"buy","last_tick_ts":1234567890.0,"explanation":"alpha"}'
+    )
+    second_payload = (
+        '{"symbol":"BTCUSDT","probability":0.62,"ev_bps":12,"side":"buy","last_tick_ts":1234567891.0,"explanation":"bravo"}'
+    )
+    third_payload = (
+        '{"symbol":"BTCUSDT","probability":0.63,"ev_bps":12,"side":"buy","last_tick_ts":1234567892.0,"explanation":"charl"}'
+    )
+
+    assert len(first_payload) == len(second_payload) == len(third_payload)
+
+    status_path.write_text(first_payload, encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+
+    first_summary = bot.status_summary()
+    assert first_summary["probability_pct"] == 61.0
+    assert "alpha" in first_summary["analysis"].lower()
+
+    prev_stat = status_path.stat()
+
+    status_path.write_text(second_payload, encoding="utf-8")
+    os.utime(
+        status_path,
+        ns=(
+            getattr(prev_stat, "st_atime_ns", int(prev_stat.st_atime * 1_000_000_000)),
+            getattr(prev_stat, "st_mtime_ns", int(prev_stat.st_mtime * 1_000_000_000)),
+        ),
+    )
+
+    refreshed_summary = bot.status_summary()
+
+    assert refreshed_summary["probability_pct"] == 62.0
+    assert "bravo" in refreshed_summary["analysis"].lower()
+
+    mid_stat = status_path.stat()
+    assert getattr(prev_stat, "st_size", None) == getattr(mid_stat, "st_size", None)
+
+    status_path.write_text(third_payload, encoding="utf-8")
+    os.utime(
+        status_path,
+        ns=(
+            getattr(mid_stat, "st_atime_ns", int(mid_stat.st_atime * 1_000_000_000)),
+            getattr(mid_stat, "st_mtime_ns", int(mid_stat.st_mtime * 1_000_000_000)),
+        ),
+    )
+
+    final_stat = status_path.stat()
+    assert getattr(mid_stat, "st_size", None) == getattr(final_stat, "st_size", None)
+
+    final_summary = bot.status_summary()
+
+    assert final_summary["probability_pct"] == 63.0
+    assert "charl" in final_summary["analysis"].lower()
 
 def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
     status = {
