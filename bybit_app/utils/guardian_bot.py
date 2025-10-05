@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,9 +70,9 @@ class GuardianSnapshot:
     manual_state: trade_control.TradeControlState
     manual_summary: Dict[str, object]
     generated_at: float
-    status_signature: float
-    ledger_signature: float
-    manual_signature: float
+    status_signature: Tuple[int, int, int]
+    ledger_signature: int
+    manual_signature: int
 
 
 class GuardianBot:
@@ -88,9 +89,11 @@ class GuardianBot:
         self._custom_settings = settings is not None
         self._last_status: Dict[str, object] = {}
         self._snapshot: Optional[GuardianSnapshot] = None
-        self._ledger_signature: Optional[float] = None
+        self._ledger_signature: Optional[int] = None
         self._ledger_view: Optional[GuardianLedgerView] = None
         self._status_fallback_used: bool = False
+        self._status_read_error: Optional[str] = None
+        self._status_content_hash: Optional[int] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -103,6 +106,41 @@ class GuardianBot:
 
     def _ledger_path(self) -> Path:
         return Path(self.data_dir) / "pnl" / "executions.jsonl"
+
+    @staticmethod
+    def _hash_bytes(payload: bytes) -> int:
+        digest = hashlib.blake2b(payload, digest_size=16).digest()
+        return int.from_bytes(digest, "big")
+
+    def _prefetch_status(self) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
+        path = self._status_path()
+        if not path.exists():
+            return None, None, "status file not found"
+
+        attempts = 0
+        max_attempts = 3
+        delay = 0.05
+        last_error: Optional[str] = None
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                last_error = str(exc)
+                data = b""
+
+            if not data.strip():
+                if attempts < max_attempts:
+                    time.sleep(delay * attempts)
+                    continue
+                if last_error is None:
+                    last_error = "status file is empty"
+                return None, None, last_error
+
+            return data, self._hash_bytes(data), None
+
+        return None, None, last_error
 
     @property
     def settings(self) -> Settings:
@@ -122,28 +160,89 @@ class GuardianBot:
         self._ledger_signature = None
         self._ledger_view = None
 
-    def _load_status(self) -> Dict[str, object]:
+    def _load_status(
+        self,
+        prefetched: Optional[bytes] = None,
+        prefetched_hash: Optional[int] = None,
+    ) -> Dict[str, object]:
         path = self._status_path()
         fallback_used = False
 
         raw: Dict[str, object] = {}
-        if path.exists():
-            try:
-                content = path.read_text(encoding="utf-8")
-            except OSError:
-                content = ""
+        read_error: Optional[str] = None
+        content_hash: Optional[int] = prefetched_hash
 
-            if content.strip():
+        def _decode_and_parse(data: bytes) -> Dict[str, object]:
+            nonlocal read_error, content_hash
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                read_error = str(exc)
+                return {}
+
+            if not text.strip():
+                if read_error is None:
+                    read_error = "status file is empty"
+                return {}
+
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                read_error = str(exc)
+                return {}
+            except Exception as exc:  # pragma: no cover - unexpected decoder errors
+                read_error = str(exc)
+                return {}
+
+            if isinstance(parsed, dict):
+                return parsed
+
+            read_error = f"status payload is {type(parsed).__name__}, expected dict"
+            return {}
+
+        if prefetched is not None:
+            data = prefetched
+            if content_hash is None:
+                content_hash = self._hash_bytes(data)
+            raw = _decode_and_parse(data)
+        elif path.exists():
+            attempts = 0
+            max_attempts = 3
+            delay = 0.05
+            while attempts < max_attempts:
+                attempts += 1
                 try:
-                    parsed = json.loads(content)
-                    if isinstance(parsed, dict):
-                        raw = parsed
-                except Exception:
-                    raw = {}
+                    data = path.read_bytes()
+                except OSError as exc:
+                    read_error = str(exc)
+                    data = b""
+
+                if not data.strip():
+                    if attempts < max_attempts:
+                        time.sleep(delay * attempts)
+                        continue
+                    if read_error is None:
+                        read_error = "status file is empty"
+                    break
+
+                content_hash = self._hash_bytes(data)
+                raw = _decode_and_parse(data)
+                if raw:
+                    break
+
+                if attempts < max_attempts:
+                    time.sleep(delay * attempts)
+
+            if not raw and read_error is None and not path.exists():
+                read_error = "status file disappeared during read"
+        else:
+            read_error = "status file not found"
 
         if not raw and self._last_status:
             raw = copy.deepcopy(self._last_status)
             fallback_used = True
+            if content_hash is None:
+                content_hash = self._status_content_hash
 
         status = dict(raw)
         if status:
@@ -153,7 +252,20 @@ class GuardianBot:
                 ts = 0.0
             status["age_seconds"] = time.time() - ts if ts > 0 else None
 
+        if status and content_hash is None:
+            try:
+                canonical = json.dumps(status, sort_keys=True).encode("utf-8")
+            except Exception:
+                content_hash = self._status_content_hash
+            else:
+                content_hash = self._hash_bytes(canonical)
+
+        if content_hash is None:
+            content_hash = 0
+
+        self._status_content_hash = content_hash
         self._status_fallback_used = fallback_used
+        self._status_read_error = None if status and not fallback_used else read_error
         return status
 
     @staticmethod
@@ -461,23 +573,27 @@ class GuardianBot:
         )
 
     # snapshot helpers -------------------------------------------------
-    def _snapshot_signature(self) -> Tuple[float, float, float]:
+    def _snapshot_signature(self) -> Tuple[Tuple[int, int], int, int]:
         status_path = self._status_path()
         ledger_path = self._ledger_path()
         manual_path = Path(self.data_dir) / "ai" / "trade_commands.jsonl"
-        try:
-            status_mtime = status_path.stat().st_mtime
-        except FileNotFoundError:
-            status_mtime = 0.0
-        try:
-            ledger_mtime = ledger_path.stat().st_mtime
-        except FileNotFoundError:
-            ledger_mtime = 0.0
-        try:
-            manual_mtime = manual_path.stat().st_mtime
-        except FileNotFoundError:
-            manual_mtime = 0.0
-        return status_mtime, ledger_mtime, manual_mtime
+
+        def _stat_signature(path: Path) -> Tuple[int, int]:
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return 0, 0
+
+            mtime_ns = getattr(stat, "st_mtime_ns", None)
+            if mtime_ns is None:
+                mtime_ns = int(stat.st_mtime * 1_000_000_000)
+            size = getattr(stat, "st_size", 0)
+            return int(mtime_ns), int(size)
+
+        status_sig = _stat_signature(status_path)
+        ledger_sig = _stat_signature(ledger_path)[0]
+        manual_sig = _stat_signature(manual_path)[0]
+        return status_sig, ledger_sig, manual_sig
 
     def _load_ledger_events(self) -> List[Dict[str, object]]:
         path = self._ledger_path()
@@ -509,7 +625,7 @@ class GuardianBot:
                 spot.append(event)
         return spot
 
-    def _ledger_view_for_signature(self, signature: float) -> GuardianLedgerView:
+    def _ledger_view_for_signature(self, signature: int) -> GuardianLedgerView:
         cached_signature = self._ledger_signature
         cached_view = self._ledger_view
         if cached_signature == signature and cached_view is not None:
@@ -658,8 +774,14 @@ class GuardianBot:
         filtered.sort(key=sort_key)
         return filtered
 
-    def _build_snapshot(self, signature: Tuple[float, float, float]) -> GuardianSnapshot:
-        status = self._load_status()
+    def _build_snapshot(
+        self,
+        signature: Tuple[Tuple[int, int], int, int],
+        prefetched_status: Optional[bytes] = None,
+        prefetched_hash: Optional[int] = None,
+    ) -> GuardianSnapshot:
+        previous_snapshot = self._snapshot
+        status = self._load_status(prefetched=prefetched_status, prefetched_hash=prefetched_hash)
         self._last_status = status
         settings = self.settings
         brief = self._brief_from_status(status, settings)
@@ -678,6 +800,14 @@ class GuardianBot:
         manual_summary = self._manual_control_summary(manual_state)
         status_summary["manual_control"] = manual_summary
 
+        status_signature = (
+            signature[0][0],
+            signature[0][1],
+            int(self._status_content_hash or 0),
+        )
+        if self._status_fallback_used and previous_snapshot is not None:
+            status_signature = previous_snapshot.status_signature
+
         return GuardianSnapshot(
             status=status,
             brief=brief,
@@ -691,7 +821,7 @@ class GuardianBot:
             manual_state=self._clone_trade_state(manual_state),
             manual_summary=manual_summary,
             generated_at=time.time(),
-            status_signature=signature[0],
+            status_signature=status_signature,
             ledger_signature=signature[1],
             manual_signature=signature[2],
         )
@@ -832,14 +962,38 @@ class GuardianBot:
     def _get_snapshot(self, force: bool = False) -> GuardianSnapshot:
         signature = self._snapshot_signature()
         snapshot = self._snapshot
-        if (
+        prefetched_status: Optional[bytes] = None
+        prefetched_hash: Optional[int] = None
+
+        needs_rebuild = (
             force
             or snapshot is None
-            or snapshot.status_signature != signature[0]
             or snapshot.ledger_signature != signature[1]
             or snapshot.manual_signature != signature[2]
-        ):
-            snapshot = self._build_snapshot(signature)
+        )
+
+        if not needs_rebuild and snapshot is not None:
+            if snapshot.status_signature[:2] != signature[0]:
+                needs_rebuild = True
+            else:
+                data, data_hash, prefetch_error = self._prefetch_status()
+                if data is None:
+                    if prefetch_error is not None:
+                        needs_rebuild = True
+                else:
+                    if data_hash is None:
+                        needs_rebuild = True
+                    elif snapshot.status_signature[2] != data_hash:
+                        prefetched_status = data
+                        prefetched_hash = data_hash
+                        needs_rebuild = True
+
+        if needs_rebuild:
+            snapshot = self._build_snapshot(
+                signature,
+                prefetched_status=prefetched_status,
+                prefetched_hash=prefetched_hash,
+            )
             self._snapshot = snapshot
         return snapshot
 
@@ -896,6 +1050,7 @@ class GuardianBot:
             "has_status": bool(status),
             "fallback_used": bool(fallback_used),
             "status_source": "cached" if fallback_used else "live",
+            "status_error": self._status_read_error,
             "staleness": {
                 "state": staleness_state,
                 "message": staleness_message,
@@ -1265,6 +1420,10 @@ class GuardianBot:
                 f"Последнее обновление: {summary.get('last_update', '—')}. "
                 "Проверьте сервис, который пишет файл ai/status.json."
             )
+            if self._status_read_error:
+                error_text = str(self._status_read_error).strip()
+                if error_text:
+                    ai_details = f"{ai_details} Ошибка чтения: {error_text}."
         elif status:
             if staleness_state == "stale":
                 ai_ok = False
