@@ -157,12 +157,20 @@ class WSManager:
             if self._priv is None:
                 self._priv = WSPrivateV5(
                     url=self._private_url(),
-                    on_message=lambda m: (self.priv_store.append(m), setattr(self, 'last_beat', time.time())),
+                    on_msg=lambda m: (
+                        self.priv_store.append(m),
+                        setattr(self, "last_beat", time.time()),
+                    ),
                 )
-            self._priv.start()
-            return True
+            if getattr(self._priv, "is_running", None) and self._priv.is_running():
+                return True
+            started = self._priv.start()
+            if not started:
+                self._priv = None
+            return bool(started)
         except Exception as e:
             log("ws.private.start.error", err=str(e))
+            self._priv = None
             return False
 
     def start(self, subs: Iterable[str] | None = None, include_private: bool = True) -> bool:
@@ -185,6 +193,8 @@ class WSManager:
                 self._priv.stop()
         except Exception:
             pass
+        finally:
+            self._priv = None
 
     # ----------------------- Utils ------------------------
     def stop_all(self):
