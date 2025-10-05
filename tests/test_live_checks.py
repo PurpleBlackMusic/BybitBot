@@ -162,6 +162,51 @@ def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) 
     assert result["balance_available"] == pytest.approx(7.5)
 
 
+def test_wallet_totals_fall_back_to_coin_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 3_000_000.0
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: 75.0)
+
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "totalEquity": "0",
+                    "equity": "0",
+                    "walletBalance": "0",
+                    "availableBalance": "0",
+                    "totalAvailableBalance": "0",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "equity": "150.5",
+                            "totalAvailableBalance": "120.25",
+                        },
+                        {
+                            "coin": "USDC",
+                            "walletBalance": "20",
+                            "availableFunds": "18",
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    orders_payload = {"result": {"list": []}}
+    api = DummyAPI(wallet_payload, orders_payload)
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    result = bybit_realtime_status(settings, api=api, ws_status={})
+
+    assert result["balance_total"] == pytest.approx(170.5)
+    assert result["balance_available"] == pytest.approx(138.25)
+    assert result["wallet_assets"]
+    assert result["wallet_assets"][0]["coin"] == "USDT"
+    assert result["wallet_assets"][0]["reserved"] == pytest.approx(30.25)
+    assert any(asset["coin"] == "USDC" for asset in result["wallet_assets"])
+
+
 def test_bybit_realtime_status_detects_stale_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_700_000_000.0
     monkeypatch.setattr(live_checks.time, "time", lambda: now)
