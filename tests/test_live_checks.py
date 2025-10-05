@@ -136,6 +136,32 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["wallet_assets"][0]["total"] == pytest.approx(110.1)
 
 
+def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 2_000_000.0
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: 50.0)
+
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "totalEquity": "10",
+                    "availableBalance": "0",
+                    "availableToWithdraw": "7.5",
+                }
+            ]
+        }
+    }
+    orders_payload = {"result": {"list": []}}
+
+    api = DummyAPI(wallet_payload, orders_payload)
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    result = bybit_realtime_status(settings, api=api, ws_status={})
+    assert result["balance_total"] == pytest.approx(10.0)
+    assert result["balance_available"] == pytest.approx(7.5)
+
+
 def test_bybit_realtime_status_detects_stale_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 1_700_000_000.0
     monkeypatch.setattr(live_checks.time, "time", lambda: now)
