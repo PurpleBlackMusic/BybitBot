@@ -31,6 +31,7 @@ class WSManager:
 
         # private
         self._priv: Optional[WSPrivateV5] = None
+        self._priv_url: Optional[str] = None
 
         # stores
         self.pub_store = JLStore(DATA_DIR / "ws" / "public.jsonl", max_lines=2000)
@@ -39,7 +40,15 @@ class WSManager:
         self.last_beat: float = 0.0
 
     # ----------------------- Public -----------------------
+    def _refresh_settings(self) -> None:
+        """Reload settings so WS endpoints respect latest configuration."""
+        try:
+            self.s = get_settings(force_reload=True)
+        except Exception as e:  # pragma: no cover - defensive, rare
+            log("ws.settings.refresh.error", err=str(e))
+
     def _public_url(self) -> str:
+        self._refresh_settings()
         return (
             "wss://stream-testnet.bybit.com/v5/public/spot"
             if self.s.testnet
@@ -146,6 +155,7 @@ class WSManager:
 
     # ----------------------- Private ----------------------
     def _private_url(self) -> str:
+        self._refresh_settings()
         return (
             "wss://stream-testnet.bybit.com/v5/private"
             if self.s.testnet
@@ -154,23 +164,36 @@ class WSManager:
 
     def start_private(self) -> bool:
         try:
+            url = self._private_url()
+
+            if self._priv is not None and self._priv_url != url:
+                try:
+                    self._priv.stop()
+                except Exception as e:  # pragma: no cover - defensive, rare
+                    log("ws.private.stop.error", err=str(e))
+                finally:
+                    self._priv = None
+
             if self._priv is None:
                 self._priv = WSPrivateV5(
-                    url=self._private_url(),
+                    url=url,
                     on_msg=lambda m: (
                         self.priv_store.append(m),
                         setattr(self, "last_beat", time.time()),
                     ),
                 )
+                self._priv_url = url
             if getattr(self._priv, "is_running", None) and self._priv.is_running():
                 return True
             started = self._priv.start()
             if not started:
                 self._priv = None
+                self._priv_url = None
             return bool(started)
         except Exception as e:
             log("ws.private.start.error", err=str(e))
             self._priv = None
+            self._priv_url = None
             return False
 
     def start(self, subs: Iterable[str] | None = None, include_private: bool = True) -> bool:
@@ -195,6 +218,7 @@ class WSManager:
             pass
         finally:
             self._priv = None
+            self._priv_url = None
 
     # ----------------------- Utils ------------------------
     def stop_all(self):

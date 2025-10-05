@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from bybit_app.utils import ws_manager as ws_manager_module
@@ -31,6 +33,35 @@ def test_ws_manager_status_without_heartbeat() -> None:
     assert status["public"]["age_seconds"] is None
     assert status["public"]["subscriptions"] == []
     assert status["private"]["connected"] is False
+
+
+def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(testnet=True)
+
+    refreshed_public = SimpleNamespace(testnet=False)
+
+    def fake_get_settings_public(*, force_reload: bool = False):  # type: ignore[override]
+        assert force_reload is True
+        return refreshed_public
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", fake_get_settings_public)
+
+    pub_url = manager._public_url()
+    assert pub_url.endswith("stream.bybit.com/v5/public/spot")
+    assert manager.s is refreshed_public
+
+    refreshed_private = SimpleNamespace(testnet=True)
+
+    def fake_get_settings_private(*, force_reload: bool = False):  # type: ignore[override]
+        assert force_reload is True
+        return refreshed_private
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", fake_get_settings_private)
+
+    priv_url = manager._private_url()
+    assert priv_url.endswith("stream-testnet.bybit.com/v5/private")
+    assert manager.s is refreshed_private
 
 
 def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,3 +147,62 @@ def test_start_private_handles_start_failure(monkeypatch: pytest.MonkeyPatch) ->
 
     assert manager.start_private() is False
     assert manager._priv is None
+    assert manager._priv_url is None
+
+
+def test_start_private_restarts_when_environment_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(testnet=True)
+
+    def fake_get_settings(*, force_reload: bool = False):  # type: ignore[override]
+        assert force_reload is True
+        return settings
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", fake_get_settings)
+
+    events: list[str] = []
+
+    class DummyPrivate:
+        def __init__(self, url: str, on_msg):
+            events.append(f"init:{url}")
+            self.url = url
+            self.on_msg = on_msg
+            self.started = 0
+            self._running = False
+
+        def is_running(self) -> bool:
+            return self._running
+
+        def start(self) -> bool:
+            self.started += 1
+            self._running = True
+            return True
+
+        def stop(self) -> None:
+            events.append(f"stop:{self.url}")
+            self._running = False
+
+    monkeypatch.setattr(ws_manager_module, "WSPrivateV5", DummyPrivate)
+
+    assert manager.start_private() is True
+    assert events == ["init:wss://stream-testnet.bybit.com/v5/private"]
+
+    priv_first = manager._priv
+    assert isinstance(priv_first, DummyPrivate)
+    assert priv_first.started == 1
+
+    settings.testnet = False
+
+    assert manager.start_private() is True
+    assert events == [
+        "init:wss://stream-testnet.bybit.com/v5/private",
+        "stop:wss://stream-testnet.bybit.com/v5/private",
+        "init:wss://stream.bybit.com/v5/private",
+    ]
+
+    priv_second = manager._priv
+    assert isinstance(priv_second, DummyPrivate)
+    assert priv_second is not priv_first
+    assert priv_second.started == 1
+    assert manager._priv_url == "wss://stream.bybit.com/v5/private"
