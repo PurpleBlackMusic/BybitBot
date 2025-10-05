@@ -243,15 +243,23 @@ def _normalise_filename(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def _format_relative_path(candidate: Path, bases: Iterable[Path]) -> str:
+    """Return ``candidate`` as a POSIX path relative to the first matching base."""
+
+    for base in bases:
+        try:
+            return candidate.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return candidate.as_posix()
+
+
 def _find_existing_relative_path(base_dir: Path, relative_path: Path) -> str | None:
     """Return the actual relative path if the file exists under ``base_dir``."""
 
     candidate = (base_dir / relative_path).resolve()
     if candidate.exists():
-        try:
-            return str(candidate.relative_to(base_dir))
-        except ValueError:
-            return str(candidate)
+        return _format_relative_path(candidate, (base_dir,))
 
     parent_dir = (base_dir / relative_path.parent).resolve()
     if not parent_dir.exists() or not parent_dir.is_dir():
@@ -260,10 +268,7 @@ def _find_existing_relative_path(base_dir: Path, relative_path: Path) -> str | N
     target_name = _normalise_filename(relative_path.name)
     for child in parent_dir.iterdir():
         if _normalise_filename(child.name) == target_name:
-            try:
-                return str(child.relative_to(base_dir))
-            except ValueError:
-                return str(child)
+            return _format_relative_path(child, (base_dir,))
 
     return None
 
@@ -285,10 +290,13 @@ def _resolve_page_location(page: str) -> str:
     resolved = _find_existing_relative_path(package_root, page_path)
     if resolved is not None:
         alt_candidate = (package_root / resolved).resolve()
-        try:
-            return str(alt_candidate.relative_to(main_dir))
-        except ValueError:
-            return str(alt_candidate)
+        return _format_relative_path(alt_candidate, (main_dir, package_root))
+
+    if isinstance(page, str):
+        page_candidate = Path(page)
+        if page_candidate.is_absolute():
+            return _format_relative_path(page_candidate, (main_dir, package_root))
+        return page_candidate.as_posix()
 
     return page
 
