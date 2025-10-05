@@ -96,8 +96,17 @@ class BybitAPI:
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
         resp = self._req(method, path, params=params, body=body, signed=signed)
         # bybit v5 формат: {retCode, retMsg, result, ...}
-        if isinstance(resp, dict) and resp.get("retCode", 0) != 0:
-            raise RuntimeError(f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})")
+        if isinstance(resp, dict):
+            ret_code = resp.get("retCode", 0)
+            if isinstance(ret_code, str):
+                try:
+                    ret_code = int(ret_code)
+                except ValueError:
+                    pass
+            if ret_code != 0:
+                raise RuntimeError(
+                    f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})"
+                )
         return resp
 
     @staticmethod
