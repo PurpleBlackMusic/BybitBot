@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
+from bybit_app.utils.helpers import ensure_link_id
 
 
 class _DummyResponse:
@@ -43,6 +44,10 @@ class _RecordingSession:
 
     def request(self, *_, **__):  # pragma: no cover - not exercised in this test
         raise AssertionError("Unexpected request() call")
+
+
+def _long_link(label: str = "LINK") -> str:
+    return f"{label}-" + "X" * 40 + "-PRIMARY"
 
 
 def test_signed_get_params_are_sorted_and_signed() -> None:
@@ -196,6 +201,23 @@ def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
         "request": [{"orderId": "1"}, {"orderLinkId": "abc"}],
         "symbol": "BTCUSDT",
     }
+
+
+def test_cancel_batch_sanitises_order_link_ids(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("BATCH")
+    api.cancel_batch(category="spot", request=[{"orderLinkId": long_link}])
+
+    assert captured["body"]["request"][0]["orderLinkId"] == ensure_link_id(long_link)
 
 
 def test_safe_req_accepts_string_retcode(monkeypatch) -> None:
@@ -395,6 +417,23 @@ def test_amend_order_requires_identifier() -> None:
     assert "orderId" in msg and "orderLinkId" in msg
 
 
+def test_amend_order_sanitises_order_link_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("AMEND")
+    api.amend_order(category="spot", orderLinkId=long_link, qty=2)
+
+    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
+
+
 def test_place_order_normalises_payload(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
@@ -511,6 +550,30 @@ def test_place_order_rejects_invalid_side() -> None:
     assert "side" in str(excinfo.value)
 
 
+def test_place_order_sanitises_order_link_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"body": body})
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("ORDER")
+    api.place_order(
+        category="spot",
+        symbol="BTCUSDT",
+        side="buy",
+        orderType="Limit",
+        qty=1,
+        orderLinkId=long_link,
+    )
+
+    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
+
+
 def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
@@ -565,6 +628,23 @@ def test_cancel_order_requires_identifier() -> None:
 
     msg = str(excinfo.value)
     assert "orderId" in msg and "orderLinkId" in msg
+
+
+def test_cancel_order_sanitises_order_link_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("CANCEL")
+    api.cancel_order(category="spot", orderLinkId=long_link)
+
+    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
 
 
 def test_cancel_all_uses_signed_endpoint(monkeypatch) -> None:
@@ -634,6 +714,23 @@ def test_cancel_all_omits_blank_strings(monkeypatch) -> None:
     assert captured["body"] == {"category": "spot", "settleCoin": "usdt"}
 
 
+def test_cancel_all_sanitises_order_link_id(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("ALL")
+    api.cancel_all(category="spot", orderLinkId=f"  {long_link}  ")
+
+    assert captured["body"]["orderLinkId"] == ensure_link_id(long_link)
+
+
 def test_batch_place_normalises_orders(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
@@ -683,6 +780,34 @@ def test_batch_place_normalises_orders(monkeypatch) -> None:
     assert body["request"][0]["qty"] == "1.2345"
     assert body["request"][0]["price"] == "27000.1"
     assert body["request"][1]["orderValue"] == "250"
+
+
+def test_batch_place_sanitises_order_link_ids(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured["body"] = body
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    long_link = _long_link("BPLACE")
+    orders = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "orderType": "Limit",
+            "qty": 1,
+            "orderLinkId": long_link,
+        }
+    ]
+
+    api.batch_place(category="spot", orders=orders)
+
+    request = captured["body"]["request"]
+    assert request[0]["orderLinkId"] == ensure_link_id(long_link)
 
 
 def test_batch_place_materialises_iterables(monkeypatch) -> None:

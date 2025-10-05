@@ -2,7 +2,6 @@
 from __future__ import annotations
 from .helpers import ensure_link_id
 import json, time, threading
-from pathlib import Path
 from .paths import DATA_DIR
 from .log import log
 from .envs import get_api_client
@@ -10,27 +9,99 @@ from .telegram_notify import send_telegram
 
 STORE = DATA_DIR / "oco_groups.json"
 _LOCK = threading.Lock()
+_LINK_FIELDS = ("primary", "tp", "sl")
 
-def _load()->dict:
+
+def _save(data: dict) -> None:
+    STORE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_record(record: dict) -> bool:
+    changed = False
+    raw_links: dict[str, str] = dict(record.get("raw_links") or {})
+    for field in _LINK_FIELDS:
+        value = record.get(field)
+        sanitized = ensure_link_id(value)
+        if sanitized is None:
+            record[field] = None
+            continue
+        if sanitized != value:
+            raw_links[field] = value
+            record[field] = sanitized
+            changed = True
+    if raw_links:
+        record["raw_links"] = raw_links
+    elif "raw_links" in record:
+        record.pop("raw_links")
+    return changed
+
+
+def _normalize_db(db: dict) -> bool:
+    changed = False
+    for record in db.values():
+        if isinstance(record, dict) and _normalize_record(record):
+            changed = True
+    return changed
+
+
+def _load() -> dict:
     if STORE.exists():
         try:
-            return json.loads(STORE.read_text(encoding="utf-8"))
+            data = json.loads(STORE.read_text(encoding="utf-8"))
         except Exception:
             return {}
+        if _normalize_db(data):
+            _save(data)
+        return data
     return {}
 
-def _save(d:dict):
-    STORE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _find_group(db: dict, link: str) -> tuple[str | None, dict | None]:
+    normalized = ensure_link_id(link)
+    if not normalized:
+        return None, None
+    for group, record in db.items():
+        if not isinstance(record, dict):
+            continue
+        for field in _LINK_FIELDS:
+            stored = record.get(field)
+            if stored and stored == normalized:
+                return group, record
+        raw_links = record.get("raw_links") or {}
+        for field in _LINK_FIELDS:
+            raw_value = raw_links.get(field)
+            if raw_value and ensure_link_id(raw_value) == normalized:
+                return group, record
+    return None, None
 
 def register_group(group: str, symbol: str, category: str, primary: str, tp: str, sl: str):
+    primary_id = ensure_link_id(primary)
+    tp_id = ensure_link_id(tp)
+    sl_id = ensure_link_id(sl)
+    raw_links: dict[str, str] = {}
+    if primary_id and primary_id != primary:
+        raw_links["primary"] = primary
+    if tp_id and tp_id != tp:
+        raw_links["tp"] = tp
+    if sl_id and sl_id != sl:
+        raw_links["sl"] = sl
+
     with _LOCK:
         db = _load()
-        db[group] = {
-            "symbol": symbol, "category": category,
-            "primary": primary, "tp": tp, "sl": sl,
-            "closed": False, "created_ts": int(time.time()*1000),
-            "cumExecQty": 0.0, "avgPrice": None
+        rec = {
+            "symbol": symbol,
+            "category": category,
+            "primary": primary_id,
+            "tp": tp_id,
+            "sl": sl_id,
+            "closed": False,
+            "created_ts": int(time.time() * 1000),
+            "cumExecQty": 0.0,
+            "avgPrice": None,
         }
+        if raw_links:
+            rec["raw_links"] = raw_links
+        db[group] = rec
         _save(db)
     log("oco.guard.register", group=group, symbol=symbol, category=category)
 
@@ -75,10 +146,10 @@ def handle_private(msg: dict):
                 avg = None
 
             if link.endswith("-PRIMARY"):
-                group = link[:-8]
+                snapshot: dict | None = None
                 with _LOCK:
                     db = _load()
-                    rec = db.get(group)
+                    group_key, rec = _find_group(db, link)
                     if rec and not rec.get("closed"):
                         changed = False
                         if cum is not None and cum > (rec.get("cumExecQty") or 0):
@@ -89,32 +160,46 @@ def handle_private(msg: dict):
                             changed = True
                         if changed:
                             _save(db)
+                        snapshot = {
+                            "group": group_key,
+                            "symbol": rec.get("symbol"),
+                            "category": rec.get("category"),
+                            "tp": rec.get("tp"),
+                            "sl": rec.get("sl"),
+                            "closed": rec.get("closed"),
+                        }
                 # если есть частичное заполнение — подровнять TP/SL на cumExecQty
-                if cum and cum > 0:
-                    rec = _load().get(group)
-                    if rec and not rec.get("closed"):
-                        q = cum
-                        _amend_qty(rec["symbol"], rec["category"], rec["tp"], q)
-                        _amend_qty(rec["symbol"], rec["category"], rec["sl"], q)
+                if cum and cum > 0 and snapshot and not snapshot.get("closed"):
+                    q = cum
+                    _amend_qty(snapshot["symbol"], snapshot["category"], snapshot["tp"], q)
+                    _amend_qty(snapshot["symbol"], snapshot["category"], snapshot["sl"], q)
 
         # Order topic — ловим Filled TP/SL и чистим вторую ногу
         if topic.startswith("order"):
-            status = str(ev.get("orderStatus","")).lower()
+            status = str(ev.get("orderStatus", "")).lower()
             # Filled по TP/SL — отменяем другую ногу и закрываем группу
             if (link.endswith("-TP") or link.endswith("-SL")) and status == "filled":
-                if link.endswith("-TP"): other = link[:-3] + "SL"
-                else: other = link[:-3] + "TP"
-                group = link[:-3]
+                with _LOCK:
+                    db = _load()
+                    group_key, rec = _find_group(db, link)
+                group_name = group_key or link[:-3]
+                if rec:
+                    other_link = rec["sl"] if link.endswith("-TP") else rec["tp"]
+                else:
+                    other_link = link[:-3] + ("SL" if link.endswith("-TP") else "TP")
                 try:
                     api = _api()
-                    sym = str(ev.get("symbol",""))
-                    cat = str(ev.get("category","spot") or "spot")
-                    api.cancel_order(category=cat, symbol=sym, orderLinkId=ensure_link_id(other))
-                    log("oco.guard.cancel_other", group=group, cancelled_link=other)
-                    send_telegram(f"🧹 OCO [{group}] исполнено {link.split('-')[-1]}, вторая нога отменена.")
+                    sym = str(ev.get("symbol", ""))
+                    cat = str(ev.get("category", "spot") or "spot")
+                    api.cancel_order(category=cat, symbol=sym, orderLinkId=ensure_link_id(other_link))
+                    log("oco.guard.cancel_other", group=group_name, cancelled_link=other_link)
+                    send_telegram(
+                        f"🧹 OCO [{group_name}] исполнено {link.split('-')[-1]}, вторая нога отменена."
+                    )
                 except Exception as e:
-                    log("oco.guard.cancel_error", error=str(e), group=group, other=other)
-                mark_closed(group)
+                    log("oco.guard.cancel_error", error=str(e), group=group_name, other=other_link)
+                if group_key:
+                    mark_closed(group_key)
 
 def reconcile(open_orders: list[dict] | None = None):
     """Сверка групп с биржей: подтянуть cumExecQty, поправить qty TP/SL, закрыть висяки."""
@@ -122,7 +207,7 @@ def reconcile(open_orders: list[dict] | None = None):
         db = _load()
         api = _api()
         for group, rec in list(db.items()):
-            if rec.get("closed"): 
+            if rec.get("closed"):
                 continue
             sym = rec["symbol"]; cat = rec["category"]
             # подтянем открытые ордера из API
@@ -130,7 +215,13 @@ def reconcile(open_orders: list[dict] | None = None):
             lst = ((o.get("result") or {}).get("list") or [])
             links = {str(x.get("orderLinkId")): x for x in lst}
             # если ни одной ноги нет и первичный тоже отсутствует — считаем группа закрыта
-            if not any(l in links for l in (rec["primary"], rec["tp"], rec["sl"])):
+            tracked_links = {
+                ensure_link_id(rec.get(field))
+                for field in _LINK_FIELDS
+                if rec.get(field)
+            }
+            tracked_links.discard(None)
+            if not any(link in links for link in tracked_links):
                 mark_closed(group)
                 continue
             # если primary ещё висит но есть cumExecQty > 0 — убедимся, что TP/SL qty = cumExecQty

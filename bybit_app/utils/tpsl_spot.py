@@ -19,7 +19,7 @@ def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float
         "timeInForce": tif
     }
     if link_id:
-        body["orderLinkId"] = link_id
+        body["orderLinkId"] = ensure_link_id(link_id)
     if tp is not None:
         body["takeProfit"] = f"{tp:.10f}"
         body["tpOrderType"] = tp_order_type
