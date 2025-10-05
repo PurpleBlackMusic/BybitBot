@@ -37,7 +37,10 @@ class WSManager:
         self.pub_store = JLStore(DATA_DIR / "ws" / "public.jsonl", max_lines=2000)
         self.priv_store = JLStore(DATA_DIR / "ws" / "private.jsonl", max_lines=2000)
 
+        # heartbeats
         self.last_beat: float = 0.0
+        self.last_public_beat: float = 0.0
+        self.last_private_beat: float = 0.0
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -46,6 +49,11 @@ class WSManager:
             self.s = get_settings(force_reload=True)
         except Exception as e:  # pragma: no cover - defensive, rare
             log("ws.settings.refresh.error", err=str(e))
+
+    def _handle_private_beat(self) -> None:
+        now = time.time()
+        self.last_beat = now
+        self.last_private_beat = now
 
     def _public_url(self) -> str:
         self._refresh_settings()
@@ -103,7 +111,9 @@ class WSManager:
                 log("ws.public.sub.error", err=str(e))
 
         def on_message(ws, message: str):
-            self.last_beat = time.time()
+            now = time.time()
+            self.last_beat = now
+            self.last_public_beat = now
             try:
                 obj = json.loads(message)
             except Exception:
@@ -175,12 +185,13 @@ class WSManager:
                     self._priv = None
 
             if self._priv is None:
+                def _on_private_msg(message):
+                    self.priv_store.append(message)
+                    self._handle_private_beat()
+
                 self._priv = WSPrivateV5(
                     url=url,
-                    on_msg=lambda m: (
-                        self.priv_store.append(m),
-                        setattr(self, "last_beat", time.time()),
-                    ),
+                    on_msg=_on_private_msg,
                 )
                 self._priv_url = url
             if getattr(self._priv, "is_running", None) and self._priv.is_running():
@@ -227,18 +238,35 @@ class WSManager:
 
     def status(self):
         last_beat = self.last_beat if self.last_beat else None
-        age = None
-        if last_beat:
-            age = max(0.0, time.time() - last_beat)
+        now = time.time()
+        pub_last = self.last_public_beat or 0.0
+        priv_last = self.last_private_beat or 0.0
+
+        pub_age = max(0.0, now - pub_last) if pub_last else None
+        priv_age = max(0.0, now - priv_last) if priv_last else None
 
         private_ws = getattr(self._priv, "_ws", None)
 
+        public_ws = self._pub_ws
+        public_socket_connected = False
+        if public_ws is not None:
+            sock = getattr(public_ws, "sock", None)
+            if sock is not None:
+                public_socket_connected = bool(getattr(sock, "connected", False))
+
+        public_thread_alive = bool(
+            self._pub_thread and getattr(self._pub_thread, "is_alive", lambda: False)()
+        )
+
         public_running = bool(
             self._pub_running
-            and self._pub_thread
-            and self._pub_thread.is_alive()
-            and self._pub_ws
+            and (
+                (public_thread_alive and public_ws)
+                or public_socket_connected
+            )
         )
+        if not public_running and pub_age is not None and pub_age < 60.0:
+            public_running = True
 
         priv = self._priv
         private_running = False
@@ -260,19 +288,21 @@ class WSManager:
                             private_running = False
                 if not private_running and private_ws is not None:
                     private_running = True
+        if not private_running and priv_age is not None and priv_age < 90.0:
+            private_running = True
 
         return {
             "public": {
                 "running": public_running,
                 "subscriptions": list(self._pub_subs),
-                "last_beat": last_beat,
-                "age_seconds": age,
+                "last_beat": self.last_public_beat or None,
+                "age_seconds": pub_age,
             },
             "private": {
                 "running": private_running,
                 "connected": bool(private_ws),
-                "last_beat": last_beat,
-                "age_seconds": age,
+                "last_beat": self.last_private_beat or None,
+                "age_seconds": priv_age,
             },
         }
 

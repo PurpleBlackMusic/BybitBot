@@ -23,15 +23,18 @@ def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) ->
 
     manager._priv = DummyPrivate()
     manager.last_beat = 1_000_000.0
+    manager.last_public_beat = 1_000_000.0
+    manager.last_private_beat = 1_000_000.0
 
     monkeypatch.setattr(ws_manager_module.time, "time", lambda: 1_000_012.0)
 
     status = manager.status()
     assert status["public"]["running"] is True
     assert status["public"]["subscriptions"] == ["tickers.BTCUSDT", "tickers.ETHUSDT"]
-    assert status["public"]["last_beat"] == manager.last_beat
+    assert status["public"]["last_beat"] == manager.last_public_beat
     assert status["public"]["age_seconds"] == pytest.approx(12.0, abs=0.5)
     assert status["private"]["running"] is True
+    assert status["private"]["last_beat"] == manager.last_private_beat
     assert status["private"]["age_seconds"] == pytest.approx(12.0, abs=0.5)
 
 
@@ -76,6 +79,31 @@ def test_ws_manager_status_falls_back_to_private_ws_state() -> None:
     status = manager.status()
     assert status["private"]["running"] is True
 
+
+def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.last_public_beat = 10_000.0
+    manager.last_private_beat = 10_030.0
+
+    monkeypatch.setattr(ws_manager_module.time, "time", lambda: 10_050.0)
+
+    status = manager.status()
+    assert status["public"]["running"] is True
+    assert status["private"]["running"] is True
+
+
+def test_ws_manager_status_detects_connected_socket() -> None:
+    manager = WSManager()
+    manager._pub_running = True
+    manager._pub_thread = SimpleNamespace(is_alive=lambda: False)
+
+    class DummySock:
+        connected = True
+
+    manager._pub_ws = SimpleNamespace(sock=DummySock())
+
+    status = manager.status()
+    assert status["public"]["running"] is True
 
 def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
