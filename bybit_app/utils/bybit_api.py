@@ -1,9 +1,11 @@
 from __future__ import annotations
 import time, hmac, hashlib, json
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 import requests
 from functools import lru_cache
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -49,10 +51,22 @@ class BybitAPI:
         url = self.base + path
         if not signed:
             if method.upper() == "GET":
-                r = self.session.get(url, params=params, timeout=self.timeout, verify=self.verify_ssl)
+                r = self.session.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                    verify=self.verify_ssl,
+                )
             else:
-                r = self.session.request(method.upper(), url, params=None, data=json.dumps(body or {}),
-                                         timeout=self.timeout, verify=self.verify_ssl, headers={"Content-Type":"application/json"})
+                r = self.session.request(
+                    method.upper(),
+                    url,
+                    params=None,
+                    data=json.dumps(body or {}),
+                    timeout=self.timeout,
+                    verify=self.verify_ssl,
+                    headers={"Content-Type": "application/json"},
+                )
             r.raise_for_status()
             return r.json()
 
@@ -85,6 +99,36 @@ class BybitAPI:
         if isinstance(resp, dict) and resp.get("retCode", 0) != 0:
             raise RuntimeError(f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})")
         return resp
+
+    @staticmethod
+    def _normalise_numeric_fields(payload: dict[str, object], numeric_fields: set[str]) -> None:
+        for key in numeric_fields & payload.keys():
+            value = payload[key]
+            if value is None or isinstance(value, bool):
+                continue
+
+            try:
+                if isinstance(value, Decimal):
+                    dec_value = value
+                elif isinstance(value, int):
+                    dec_value = Decimal(value)
+                elif isinstance(value, float):
+                    dec_value = Decimal(str(value))
+                elif isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped:
+                        continue
+                    dec_value = Decimal(stripped)
+                else:
+                    continue
+            except (InvalidOperation, ValueError, TypeError):
+                continue
+
+            normalised = format(dec_value.normalize(), "f")
+            if "." in normalised:
+                normalised = normalised.rstrip("0").rstrip(".")
+
+            payload[key] = normalised or "0"
 
     # --- public market ---
     def server_time(self):
@@ -164,20 +208,286 @@ class BybitAPI:
         return self._safe_req("GET", "/v5/account/fee-rate", params=params, signed=True)
 
     def place_order(self, **kwargs):
-        # required: category, symbol, side, orderType, qty or (notional), [price for Limit]
-        return self._safe_req("POST", "/v5/order/create", body=kwargs, signed=True)
+        """Submit a single signed order with basic validation and normalisation."""
+
+        if not kwargs:
+            raise ValueError("place_order requires parameters")
+
+        payload = dict(kwargs)
+
+        required_fields = {"category", "symbol", "side", "orderType"}
+        missing = [field for field in required_fields if not payload.get(field)]
+        if missing:
+            raise ValueError(
+                "place_order requires fields: " + ", ".join(sorted(missing))
+            )
+
+        quantity_keys = {"qty", "orderQty", "orderValue", "notional"}
+        if not any(key in payload and payload[key] is not None for key in quantity_keys):
+            raise ValueError(
+                "place_order requires a quantity such as `qty` or `orderValue`"
+            )
+
+        if isinstance(payload["side"], str):
+            normalised_side = payload["side"].capitalize()
+            if normalised_side not in {"Buy", "Sell"}:
+                raise ValueError("place_order side must be 'buy' or 'sell'")
+            payload["side"] = normalised_side
+
+        numeric_fields = {
+            "qty",
+            "orderQty",
+            "price",
+            "triggerPrice",
+            "takeProfit",
+            "stopLoss",
+            "basePrice",
+            "tpTriggerPrice",
+            "slTriggerPrice",
+            "notional",
+            "orderValue",
+        }
+
+        self._normalise_numeric_fields(payload, numeric_fields)
+
+        return self._safe_req(
+            "POST", "/v5/order/create", body=payload, signed=True
+        )
 
     def cancel_order(self, **kwargs):
-        return self._safe_req("POST", "/v5/order/cancel", body=kwargs, signed=True)
+        """Cancel an active order through the signed v5 endpoint."""
 
-    def cancel_batch(self, **kwargs):
-        return self._safe_req("POST", "/v5/order/cancel-batch", body=kwargs, signed=True)
+        if not kwargs:
+            raise ValueError("cancel_order requires parameters")
 
-    def batch_place(self, category: str, orders: list[dict]):
-        """Place up to 10 orders in a single request via the batch endpoint."""
+        payload = dict(kwargs)
 
-        payload = {"category": category, "request": orders}
-        return self._safe_req("POST", "/v5/order/create-batch", body=payload, signed=True)
+        if not payload.get("category"):
+            raise ValueError("cancel_order requires `category`")
+
+        if not (payload.get("orderId") or payload.get("orderLinkId")):
+            raise ValueError("cancel_order requires `orderId` or `orderLinkId`")
+
+        return self._safe_req("POST", "/v5/order/cancel", body=payload, signed=True)
+
+    def cancel_all(self, category: str | None = None, **kwargs):
+        """Cancel multiple orders in bulk through the signed v5 endpoint."""
+
+        if not category:
+            raise ValueError("cancel_all requires `category`")
+
+        payload: dict[str, object] = {"category": category}
+
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    continue
+                payload[key] = stripped
+            else:
+                payload[key] = value
+
+        return self._safe_req(
+            "POST", "/v5/order/cancel-all", body=payload, signed=True
+        )
+
+    def amend_order(self, **kwargs):
+        """Amend an existing active order via the signed v5 endpoint."""
+
+        if not kwargs:
+            raise ValueError("amend_order requires parameters")
+
+        payload = dict(kwargs)
+
+        if not payload.get("category"):
+            raise ValueError("amend_order requires `category`")
+
+        if not (payload.get("orderId") or payload.get("orderLinkId")):
+            raise ValueError("amend_order requires `orderId` or `orderLinkId`")
+
+        numeric_fields = {
+            "qty",
+            "price",
+            "triggerPrice",
+            "takeProfit",
+            "stopLoss",
+            "basePrice",
+            "tpTriggerPrice",
+            "slTriggerPrice",
+        }
+
+        self._normalise_numeric_fields(payload, numeric_fields)
+
+        return self._safe_req("POST", "/v5/order/amend", body=payload, signed=True)
+
+    def cancel_batch(
+        self,
+        *,
+        category: str | None = None,
+        request: Iterable[Mapping[str, object]] | None = None,
+        requests: Iterable[Mapping[str, object]] | None = None,
+        **kwargs,
+    ):
+        if not category:
+            raise ValueError("cancel_batch requires `category`")
+
+        payload_iterable = request if request is not None else requests
+        if payload_iterable is None:
+            raise ValueError("cancel_batch requires `request` or `requests`")
+
+        if isinstance(payload_iterable, list):
+            payload_list = payload_iterable
+        else:
+            payload_list = list(payload_iterable)
+
+        if not payload_list:
+            raise ValueError("cancel_batch requires a non-empty request list")
+
+        normalised_requests: list[dict[str, object]] = []
+        for index, entry in enumerate(payload_list):
+            if not isinstance(entry, Mapping):
+                raise TypeError(
+                    "cancel_batch entries must be mappings; "
+                    f"got {type(entry).__name__} at index {index}"
+                )
+
+            request_payload = dict(entry)
+            if not (
+                request_payload.get("orderId") or request_payload.get("orderLinkId")
+            ):
+                raise ValueError(
+                    "cancel_batch entries require `orderId` or `orderLinkId`"
+                )
+
+            normalised_requests.append(request_payload)
+
+        body: dict[str, object] = {
+            "category": category,
+            "request": normalised_requests,
+        }
+
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    continue
+                body[key] = stripped
+            else:
+                body[key] = value
+
+        return self._safe_req(
+            "POST", "/v5/order/cancel-batch", body=body, signed=True
+        )
+
+    def batch_cancel(
+        self,
+        category: str,
+        requests: Iterable[Mapping[str, object]] | None = None,
+        request: Iterable[Mapping[str, object]] | None = None,
+        **kwargs,
+    ):
+        """Backwards compatible alias for :meth:`cancel_batch`.
+
+        Legacy callers historically passed either ``requests`` or ``request``
+        as the payload key. Accept both so that unsynchronised deployments keep
+        working while still funnelling the request through the signed helper.
+        The payload may be any iterable of request dictionaries; it will be
+        materialised into a list before dispatch to guard against generators
+        being consumed twice downstream. Any extra keyword arguments (for
+        example ``symbol``) are forwarded unchanged to :meth:`cancel_batch`.
+        """
+
+        payload_iterable = request if request is not None else requests
+        if payload_iterable is None:
+            raise ValueError("batch_cancel requires `requests` or `request`")
+
+        return self.cancel_batch(
+            category=category,
+            request=payload_iterable,
+            **kwargs,
+        )
+
+    def batch_place(
+        self,
+        category: str,
+        orders: Iterable[Mapping[str, object]] | None = None,
+    ):
+        """Place up to 10 orders in a single signed request."""
+
+        if not category:
+            raise ValueError("batch_place requires `category`")
+
+        if orders is None:
+            raise ValueError("batch_place requires `orders`")
+
+        if isinstance(orders, list):
+            order_list = orders
+        else:
+            order_list = list(orders)
+
+        if not order_list:
+            raise ValueError("batch_place requires a non-empty order list")
+
+        if len(order_list) > 10:
+            raise ValueError("batch_place supports up to 10 orders per request")
+
+        numeric_fields = {
+            "qty",
+            "price",
+            "triggerPrice",
+            "takeProfit",
+            "stopLoss",
+            "basePrice",
+            "tpTriggerPrice",
+            "slTriggerPrice",
+            "notional",
+            "orderValue",
+        }
+
+        required_fields = {"symbol", "side", "orderType"}
+        quantity_keys = {"qty", "orderQty", "orderValue", "notional"}
+
+        normalised_orders: list[dict[str, object]] = []
+        for index, entry in enumerate(order_list):
+            if not isinstance(entry, Mapping):
+                raise TypeError(
+                    "batch_place entries must be mappings; "
+                    f"got {type(entry).__name__} at index {index}"
+                )
+
+            payload = dict(entry)
+
+            missing = [field for field in required_fields if not payload.get(field)]
+            if missing:
+                raise ValueError(
+                    "batch_place entries require fields: " + ", ".join(sorted(missing))
+                )
+
+            if not any(key in payload and payload[key] is not None for key in quantity_keys):
+                raise ValueError(
+                    "batch_place entries require a quantity such as `qty` or `orderValue`"
+                )
+
+            if isinstance(payload["side"], str):
+                normalised_side = payload["side"].capitalize()
+                if normalised_side not in {"Buy", "Sell"}:
+                    raise ValueError("batch_place side must be 'buy' or 'sell'")
+                payload["side"] = normalised_side
+
+            self._normalise_numeric_fields(payload, numeric_fields)
+
+            normalised_orders.append(payload)
+
+        request_body = {"category": category, "request": normalised_orders}
+        return self._safe_req(
+            "POST", "/v5/order/create-batch", body=request_body, signed=True
+        )
 
 
 @lru_cache(maxsize=16)
@@ -245,7 +555,10 @@ API_CALLS = {
     "open_orders": {"method": "GET", "path": "/v5/order/realtime"},
     "place_order": {"method": "POST", "path": "/v5/order/create"},
     "cancel_order": {"method": "POST", "path": "/v5/order/cancel"},
+    "cancel_all": {"method": "POST", "path": "/v5/order/cancel-all"},
+    "amend_order": {"method": "POST", "path": "/v5/order/amend"},
     "cancel_batch": {"method": "POST", "path": "/v5/order/cancel-batch"},
+    "batch_cancel": {"method": "POST", "path": "/v5/order/cancel-batch"},
     "fee_rate": {"method": "GET", "path": "/v5/account/fee-rate"},
     "batch_place": {"method": "POST", "path": "/v5/order/create-batch"},
 }
