@@ -13,12 +13,15 @@ class DummyAPI:
         wallet_payload: dict,
         orders_payload: dict,
         executions_payload: dict | None = None,
+        server_time_payload: dict | None = None,
     ):
         self.wallet_payload = wallet_payload
         self.orders_payload = orders_payload
         self.executions_payload = executions_payload or {"result": {"list": []}}
+        self.server_time_payload = server_time_payload
         self.open_calls = []
         self.execution_calls = []
+        self.server_calls = []
 
     def wallet_balance(self):
         return self.wallet_payload
@@ -30,6 +33,24 @@ class DummyAPI:
     def execution_list(self, **params):
         self.execution_calls.append(params)
         return self.executions_payload
+
+    def server_time(self):
+        self.server_calls.append({})
+        if self.server_time_payload is None:
+            return {"result": {"timeSecond": str(live_checks.time.time())}}
+        return self.server_time_payload
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    (
+        ({"time": "1700000000000"}, 1_700_000_000.0),
+        ({"serverTime": 1_680_000_000.0}, 1_680_000_000.0),
+        ({"timeNs": "1690000000000000000"}, 1_690_000_000.0),
+    ),
+)
+def test_extract_server_epoch_fallbacks(payload: dict, expected: float) -> None:
+    assert live_checks._extract_server_epoch(payload) == pytest.approx(expected)  # type: ignore[attr-defined]
 
 
 def test_bybit_realtime_status_requires_keys() -> None:
@@ -52,6 +73,7 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(live_checks.time, "time", lambda: now)
     monkeypatch.setattr(live_checks.time, "perf_counter", lambda: next(perf_iter))
 
+    server_time_payload = {"result": {"timeSecond": str(now - 2)}}
     wallet_payload = {
         "result": {
             "list": [
@@ -92,7 +114,7 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
         }
     }
 
-    api = DummyAPI(wallet_payload, orders_payload, executions_payload)
+    api = DummyAPI(wallet_payload, orders_payload, executions_payload, server_time_payload)
     settings = Settings(api_key="key", api_secret="secret", dry_run=False)
 
     ws_status = {
@@ -134,6 +156,11 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["wallet_assets"][0]["coin"] == "USDT"
     assert result["wallet_assets"][1]["coin"] == "BTC"
     assert result["wallet_assets"][0]["total"] == pytest.approx(110.1)
+    assert result["server_time_epoch"] == pytest.approx(now - 2)
+    assert result["server_time_diff_sec"] == pytest.approx(2.0)
+    assert result["server_time_diff_human"] == "2 сек"
+    assert not result["server_time_error"]
+    assert "серверное время".lower() in result["message"].lower()
 
 
 def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -160,6 +187,65 @@ def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) 
     result = bybit_realtime_status(settings, api=api, ws_status={})
     assert result["balance_total"] == pytest.approx(10.0)
     assert result["balance_available"] == pytest.approx(7.5)
+
+
+def test_bybit_realtime_status_warns_when_server_time_skewed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 3_000_000.0
+    perf_iter = iter([200.0, 200.02])
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: next(perf_iter))
+
+    server_time_payload = {"result": {"timeSecond": str(now - 60)}}
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "totalEquity": "50",
+                    "availableBalance": "45",
+                }
+            ]
+        }
+    }
+    orders_payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "updatedTime": str((now - 10) * 1000),
+                }
+            ]
+        }
+    }
+    executions_payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "execTime": str((now - 5) * 1000),
+                    "side": "Sell",
+                    "execPrice": "1800",
+                    "execQty": "0.5",
+                    "execFee": "0.5",
+                }
+            ]
+        }
+    }
+
+    api = DummyAPI(
+        wallet_payload,
+        orders_payload,
+        executions_payload,
+        server_time_payload,
+    )
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    result = bybit_realtime_status(settings, api=api, ws_status={})
+    assert result["ok"] is False
+    assert result["server_time_diff_sec"] == pytest.approx(60.0)
+    assert "отстаёт" in result["message"]
+    assert result["server_time_diff_human"] == "1 мин"
 
 
 def test_wallet_totals_fall_back_to_coin_values(monkeypatch: pytest.MonkeyPatch) -> None:
