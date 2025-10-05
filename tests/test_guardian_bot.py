@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
 
@@ -158,6 +159,54 @@ def test_guardian_brief_wait_hint_from_russian_phrase(tmp_path: Path) -> None:
     assert "спокойный режим" in brief.headline.lower()
 
 
+def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:
+    settings = Settings(
+        ai_enabled=True,
+        ai_symbols="BTCUSDT, ETHUSDT",
+        ai_buy_threshold=0.62,
+        ai_sell_threshold=0.38,
+        ai_min_ev_bps=15.0,
+        ai_risk_per_trade_pct=0.45,
+        spot_cash_reserve_pct=22.0,
+        ai_daily_loss_limit_pct=4.5,
+        ai_max_concurrent=2,
+        ai_retrain_minutes=90,
+        ws_watchdog_enabled=True,
+        execution_watchdog_max_age_sec=600,
+        dry_run=False,
+        testnet=False,
+        spot_cash_only=True,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+    response = bot.answer("Какие настройки сейчас активны?")
+
+    assert "62.00%" in response
+    assert "15.00" in response
+    assert "капитала" in response
+    assert "600 с" in response
+    assert "ETHUSDT" in response and "BTCUSDT" in response
+
+
+def test_guardian_settings_answer_explains_safe_mode(tmp_path: Path) -> None:
+    settings = Settings(
+        ai_enabled=False,
+        dry_run=True,
+        testnet=True,
+        spot_cash_only=False,
+        ai_risk_per_trade_pct=0.2,
+        spot_cash_reserve_pct=10.0,
+        ai_daily_loss_limit_pct=0.0,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+    response = bot.answer("Настройки бота?")
+
+    assert "тестнете" in response.lower()
+    assert "ai сигналы выключены" in response.lower()
+    assert "плеч" in response.lower()
+
+
 def test_guardian_plan_and_risk_summary(tmp_path: Path) -> None:
     settings = Settings(
         dry_run=False,
@@ -212,6 +261,328 @@ def test_guardian_plan_answer_in_chat(tmp_path: Path) -> None:
     response = bot.answer("какой план действий?")
     assert response.startswith("План действий:")
     assert "1." in response
+
+
+def test_guardian_answer_reports_portfolio_positions(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "category": "spot",
+            "symbol": "ETHUSDT",
+            "side": "Buy",
+            "execPrice": "2000",
+            "execQty": "0.5",
+        },
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "27000",
+            "execQty": "0.01",
+        },
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("что в портфеле?")
+
+    assert "В портфеле" in reply
+    assert "ETHUSDT" in reply
+    assert "BTCUSDT" in reply
+
+
+def test_guardian_answer_exposure_summary(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "27000",
+            "execQty": "0.01",
+        },
+        {
+            "category": "spot",
+            "symbol": "ETHUSDT",
+            "side": "Buy",
+            "execPrice": "1800",
+            "execQty": "0.3",
+        },
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("какая сейчас экспозиция?")
+
+    lowered = reply.lower()
+    assert "в работе" in lowered
+    assert "резерв" in lowered
+    assert "btc" in lowered and "eth" in lowered
+    assert "%" in reply
+
+
+def test_guardian_answer_exposure_when_empty(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path, Settings(spot_cash_reserve_pct=25.0, ai_risk_per_trade_pct=1.2))
+    reply = bot.answer("что с загрузкой капитала?")
+
+    lowered = reply.lower()
+    assert "капитал свободен" in lowered
+    assert "25.0%" in reply
+    assert "1.20%" in reply
+
+
+def test_guardian_answer_watchlist_summary(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.6,
+        "ev_bps": 12.5,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "watchlist": {
+            "ETHUSDT": {"score": 0.7, "trend": "buy", "note": "объём растёт"},
+            "XRPUSDT": {"score": 0.4},
+            "DOGEUSDT": {"trend": "wait"},
+        },
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("что в вочлисте?")
+
+    assert reply.startswith("Список наблюдения:")
+    assert "ETHUSDT" in reply
+    assert "оценка 0.70" in reply
+
+
+def test_guardian_answer_health_summary(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.55,
+        "ev_bps": 8.0,
+        "side": "wait",
+        "last_tick_ts": time.time() - 4000,
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    old_trade_ts = time.time() - 7200
+    trade_event = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "execPrice": "26000",
+        "execQty": "0.01",
+        "execTime": old_trade_ts,
+    }
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(trade_event) + "\n")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("как здоровье данных?")
+
+    assert "AI сигнал" in reply
+    assert "Журнал исполнений" in reply
+    assert "API" in reply
+
+
+def test_guardian_answer_manual_control(tmp_path: Path) -> None:
+    trade_control.clear_trade_commands(data_dir=tmp_path)
+    trade_control.request_trade_start(
+        symbol="BTCUSDT",
+        mode="buy",
+        probability_pct=62.5,
+        ev_bps=14.0,
+        note="оператор проверяет гипотезу",
+        data_dir=tmp_path,
+    )
+    trade_control.request_trade_cancel(
+        symbol="BTCUSDT",
+        reason="фиксируем результат",
+        data_dir=tmp_path,
+    )
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("что по ручному управлению?")
+
+    lowered = reply.lower()
+    assert "останов" in lowered
+    assert "BTCUSDT" in reply
+    assert "уверенность 62.5%" in lowered
+    assert "оператор" in lowered
+
+
+def test_guardian_answer_trade_history(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "27000",
+            "execQty": "0.01",
+            "execFee": "0.15",
+            "execTime": now - 120,
+        },
+        {
+            "category": "spot",
+            "symbol": "ETHUSDT",
+            "side": "Sell",
+            "execPrice": "1850",
+            "execQty": "0.2",
+            "execFee": "0.05",
+            "execTime": now - 30,
+        },
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("покажи последние сделки")
+
+    assert "В журнале 2 сделок" in reply
+    assert "BTCUSDT" in reply and "ETHUSDT" in reply
+    assert "комиссия" in reply
+    assert "последние" in reply.lower()
+
+
+def test_guardian_answer_fees_without_history(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("какие комиссии мы платим?")
+
+    lowered = reply.lower()
+    assert "комиссий" in lowered
+    assert "журнал" in lowered
+
+
+def test_guardian_answer_fee_activity_summary(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "27000",
+            "execQty": "0.002",
+            "execFee": "0.00010",
+            "isMaker": True,
+            "execTime": (now - timedelta(minutes=2)).isoformat(),
+        },
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "execPrice": "28000",
+            "execQty": "0.002",
+            "execFee": "0.00009",
+            "isMaker": False,
+            "execTime": (now - timedelta(minutes=1)).isoformat(),
+        },
+        {
+            "category": "spot",
+            "symbol": "ETHUSDT",
+            "side": "Buy",
+            "execPrice": "1600",
+            "execQty": "0.01",
+            "execFee": "0.00005",
+            "isMaker": True,
+            "execTime": (now - timedelta(hours=2)).isoformat(),
+        },
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("дай сводку по комиссиям и maker/taker")
+
+    assert "0.00024" in reply
+    assert "66.7%" in reply
+    assert "за 15 минут 2" in reply
+    assert "за час 2" in reply
+    assert "за сутки 3" in reply
+    assert "BTCUSDT" in reply and "110.00" in reply
+
+
+def test_guardian_signal_quality_answer(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.72,
+        "ev_bps": 24.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(
+        tmp_path,
+        Settings(
+            ai_buy_threshold=0.65,
+            ai_sell_threshold=0.35,
+            ai_min_ev_bps=12.0,
+        ),
+    )
+
+    reply = bot.answer("расскажи про сигнал и пороги")
+
+    assert "72.00%" in reply
+    assert "24.00 б.п." in reply
+    assert "65.00%" in reply and "35.00%" in reply
+    assert "минимальная выгода 12.00 б.п." in reply
+
+
+def test_guardian_signal_quality_answer_without_status(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("что с качеством сигнала?")
+
+    assert "Живой сигнал пока не загружен" in reply
+
+
+def test_guardian_update_answer_reports_freshness(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.7,
+        "ev_bps": 18.0,
+        "last_tick_ts": time.time() - 120,
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path, Settings(ai_retrain_minutes=45))
+    reply = bot.answer("когда обновлялся сигнал?")
+
+    assert "AI сигнал обновился" in reply
+    assert "Данные обновлены" in reply
+    assert "Последняя отметка обновления" in reply
+    assert "Текущий возраст сигнала" in reply
+    assert "45 мин" in reply
+    assert "Текущий символ" in reply
+
+
+def test_guardian_update_answer_without_status(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    reply = bot.answer("почему статус давно не обновлялся?")
+
+    assert "Свежие данные ещё не поступали" in reply
+    assert "ai/status.json" in reply
 
 
 def test_guardian_market_story_returns_explanation(tmp_path: Path) -> None:

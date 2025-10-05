@@ -1395,10 +1395,592 @@ class GuardianBot:
             "Плавный прирост капитала важнее быстрых прыжков, поэтому бот закрывает сделки только при понятном плюсе."
         )
 
+    def _format_signal_quality_answer(self, summary: Dict[str, object]) -> str:
+        if not summary.get("has_status"):
+            return (
+                "Живой сигнал пока не загружен — обновите ai/status.json, "
+                "чтобы бот смог рассказать про вероятность и выгоду."
+            )
+
+        mode = str(summary.get("mode") or "wait")
+        probability_pct = float(summary.get("probability_pct") or 0.0)
+        ev_bps = float(summary.get("ev_bps") or 0.0)
+        thresholds = summary.get("thresholds") or {}
+        buy_threshold = float(thresholds.get("buy_probability_pct") or 0.0)
+        sell_threshold = float(thresholds.get("sell_probability_pct") or 0.0)
+        min_ev = float(thresholds.get("min_ev_bps") or 0.0)
+        status_source = str(summary.get("status_source") or "live")
+        actionable = bool(summary.get("actionable"))
+        reasons = summary.get("actionable_reasons") or []
+
+        lines = [
+            (
+                "Сигнал {mode} с уверенностью {prob:.2f}% и ожидаемой выгодой {ev:.2f} б.п.".format(
+                    mode="на покупку" if mode == "buy" else "на продажу" if mode == "sell" else "в режиме ожидания",
+                    prob=probability_pct,
+                    ev=ev_bps,
+                )
+            )
+        ]
+
+        threshold_line = (
+            "Пороги стратегии: покупка от {buy:.2f}%, продажа от {sell:.2f}%, минимальная выгода {ev:.2f} б.п.".format(
+                buy=buy_threshold or 0.0,
+                sell=sell_threshold or 0.0,
+                ev=min_ev,
+            )
+        )
+        lines.append(threshold_line)
+
+        if actionable:
+            lines.append("Показатели проходят контроль, сигнал можно исполнять при соблюдении риск-плана.")
+        else:
+            if reasons:
+                for reason in reasons:
+                    lines.append(f"⚠️ {reason}")
+            else:
+                lines.append("Сигнал пока наблюдаем — ждём совпадения с порогами стратегии.")
+
+        staleness = summary.get("staleness") or {}
+        staleness_message = staleness.get("message")
+        if isinstance(staleness_message, str) and staleness_message.strip():
+            lines.append(staleness_message.strip())
+
+        if status_source == "cached" or summary.get("fallback_used"):
+            lines.append(
+                "Данные получены из последнего сохранённого файла — проверьте, что бот обновляет статус в реальном времени."
+            )
+
+        last_update = summary.get("last_update")
+        if isinstance(last_update, str) and last_update.strip():
+            lines.append(f"Последнее обновление: {last_update.strip()}.")
+
+        return "\n".join(lines)
+
+    def _format_update_answer(self, summary: Dict[str, object]) -> str:
+        if not summary.get("has_status"):
+            return (
+                "Свежие данные ещё не поступали — файл ai/status.json отсутствует или пуст. "
+                "Запустите сервис генерации сигнала или загрузите демо-статус, чтобы бот видел обновления."
+            )
+
+        lines: List[str] = []
+
+        staleness = summary.get("staleness") or {}
+        staleness_message = staleness.get("message")
+        if isinstance(staleness_message, str) and staleness_message.strip():
+            lines.append(staleness_message.strip())
+
+        updated_text = summary.get("updated_text")
+        if isinstance(updated_text, str) and updated_text.strip():
+            lines.append(updated_text.strip())
+
+        last_update = summary.get("last_update")
+        if isinstance(last_update, str) and last_update.strip() and last_update.strip() != "—":
+            lines.append(f"Последняя отметка обновления: {last_update.strip()} по UTC.")
+
+        age_seconds = summary.get("age_seconds")
+        if isinstance(age_seconds, (int, float)) and age_seconds is not None and age_seconds >= 0:
+            lines.append(
+                f"Текущий возраст сигнала: {self._format_duration(float(age_seconds))}."
+            )
+
+        if summary.get("fallback_used"):
+            lines.append(
+                "Ответ собран из кэшированной копии — убедитесь, что статус обновляется автоматически."
+            )
+
+        retrain_minutes = int(getattr(self.settings, "ai_retrain_minutes", 0) or 0)
+        if retrain_minutes > 0:
+            lines.append(
+                f"Модель пересматривает веса примерно каждые {retrain_minutes} мин — держите статус свежим."
+            )
+
+        health = self.data_health()
+        ai_health = health.get("ai_signal") if isinstance(health, dict) else None
+        ai_details = ai_health.get("details") if isinstance(ai_health, dict) else None
+        if isinstance(ai_details, str) and ai_details.strip():
+            lines.append(f"Диагностика: {ai_details.strip()}")
+
+        if not lines:
+            lines.append(
+                "Статус обновляется без предупреждений — можно продолжать следить за сигналом."
+            )
+
+        return "\n".join(lines)
+
+    def _format_exposure_answer(self, portfolio: Dict[str, object]) -> str:
+        settings = self.settings
+        totals = portfolio.get("totals", {})
+        positions = portfolio.get("positions", [])
+
+        open_notional = float(totals.get("open_notional", 0.0))
+        realized = float(totals.get("realized_pnl", 0.0))
+        open_positions = int(totals.get("open_positions", 0))
+        reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0))
+        risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0))
+        cash_only = bool(getattr(settings, "spot_cash_only", True))
+
+        if open_notional <= 0:
+            reserve_line = (
+                "Капитал свободен — сделки не открыты. "
+                f"По плану держим резерв не менее {reserve_pct:.1f}% в кэше"
+            )
+            if cash_only:
+                reserve_line += ", работаем без плеча."
+            else:
+                reserve_line += ", при необходимости оператор может добавить плечо."
+            return (
+                reserve_line
+                + " На новую идею откладываем не более "
+                + f"{risk_pct:.2f}% капитала. Зафиксированная прибыль с начала сессии: "
+                + f"{realized:.2f} USDT."
+            )
+
+        engaged_line = (
+            f"В работе {open_notional:.2f} USDT через {open_positions} активных позиций. "
+            f"Резерв безопасности по настройкам — {reserve_pct:.1f}% капитала."
+        )
+
+        leaders: List[str] = []
+        for record in sorted(positions, key=lambda item: float(item.get("notional") or 0.0), reverse=True):
+            notional = float(record.get("notional") or 0.0)
+            if notional <= 0:
+                continue
+            symbol = str(record.get("symbol") or "?")
+            qty = float(record.get("qty") or 0.0)
+            share = (notional / open_notional * 100.0) if open_notional else 0.0
+            leaders.append(
+                f"{symbol}: {qty:.6g} шт ≈ {notional:.2f} USDT ({share:.1f}%)"
+            )
+            if len(leaders) == 3:
+                break
+
+        if leaders:
+            leaders_line = "Крупнейшие позиции: " + "; ".join(leaders) + "."
+        else:
+            leaders_line = "Позиции с ненулевой стоимостью не найдены — проверьте журнал сделок."
+
+        sizing_line = (
+            "Новые сделки открываем небольшими частями:"
+            f" до {risk_pct:.2f}% капитала на одну идею,"
+        )
+        if cash_only:
+            sizing_line += " работаем только на собственные средства."
+        else:
+            sizing_line += " допускается аккуратное использование плеча оператором."
+
+        return " ".join([engaged_line, leaders_line, sizing_line, f"Фиксированный результат: {realized:.2f} USDT."])
+
     def _format_plan_answer(self, brief: GuardianBrief) -> str:
         steps = self.plan_steps(brief)
         formatted = "\n".join(f"{idx + 1}. {step}" for idx, step in enumerate(steps))
         return f"План действий:\n{formatted}"
+
+    def _format_settings_answer(self) -> str:
+        settings = self.settings
+
+        lines: List[str] = []
+
+        if settings.testnet:
+            lines.append(
+                "Работаем на тестнете Bybit — все сделки учебные, можно проверять логику без риска."
+            )
+        else:
+            env_line = "Бот подключён к боевому счёту."
+            if settings.dry_run:
+                env_line += " Сделки подтверждаются в dry-run, исполнение нужно запускать вручную."
+            else:
+                env_line += " Реальные сделки включены — контролируйте лимиты тщательно."
+            lines.append(env_line)
+
+        if settings.testnet and not settings.dry_run:
+            lines.append(
+                "Несмотря на тестнет, dry-run выключен — ордера будут отправляться в симулятор биржи."
+            )
+        elif settings.dry_run and not settings.testnet:
+            lines.append(
+                "Dry-run включён: заявки не отправляются на биржу, но журнал и сигналы записываются."
+            )
+
+        ai_enabled = getattr(settings, "ai_enabled", False)
+        ai_symbols = str(getattr(settings, "ai_symbols", "") or "").strip()
+        if ai_enabled:
+            if ai_symbols:
+                raw_symbols = [symbol.strip().upper() for symbol in ai_symbols.split(",") if symbol.strip()]
+                if raw_symbols:
+                    symbol_text = ", ".join(sorted(raw_symbols))
+                else:
+                    symbol_text = "все доступные символы пресета"
+            else:
+                symbol_text = "все доступные символы пресета"
+            lines.append(
+                f"AI сигналы активны в категории {getattr(settings, 'ai_category', 'spot')} для: {symbol_text}."
+            )
+        else:
+            lines.append("AI сигналы выключены — бот может действовать только по ручным командам.")
+
+        buy_threshold = float(getattr(settings, "ai_buy_threshold", 0.0) or 0.0) * 100.0
+        sell_threshold = float(getattr(settings, "ai_sell_threshold", 0.0) or 0.0) * 100.0
+        min_ev = float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0)
+        lines.append(
+            "Порог входа: покупка от {buy:.2f}%, продажа от {sell:.2f}%, ожидаемая выгода не ниже {ev:.2f} б.п.".format(
+                buy=buy_threshold,
+                sell=sell_threshold,
+                ev=min_ev,
+            )
+        )
+
+        risk_per_trade = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
+        reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
+        daily_loss_limit = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
+        cash_only = bool(getattr(settings, "spot_cash_only", True))
+        risk_line_parts = [f"Риск на сделку ограничен {risk_per_trade:.2f}% капитала"]
+        risk_line_parts.append(f"резервируем в кэше не менее {reserve_pct:.1f}%")
+        if daily_loss_limit > 0:
+            risk_line_parts.append(f"дневной стоп по убытку {daily_loss_limit:.2f}%")
+        if cash_only:
+            risk_line_parts.append("работаем без заимствований")
+        else:
+            risk_line_parts.append("допускается использование плеча по усмотрению оператора")
+        lines.append(
+            ", ".join(risk_line_parts) + "."
+        )
+
+        max_concurrent = int(getattr(settings, "ai_max_concurrent", 0) or 0)
+        if max_concurrent > 0:
+            lines.append(
+                f"Одновременно AI ведёт до {max_concurrent} активных идей, чтобы не распылять капитал."
+            )
+
+        retrain_minutes = int(getattr(settings, "ai_retrain_minutes", 0) or 0)
+        if retrain_minutes > 0:
+            lines.append(
+                f"Модель обновляет весы примерно каждые {retrain_minutes} минут для актуальности статистики."
+            )
+
+        watchdog_enabled = bool(getattr(settings, "ws_watchdog_enabled", False))
+        execution_guard = int(getattr(settings, "execution_watchdog_max_age_sec", 0) or 0)
+        if watchdog_enabled or execution_guard:
+            guard_parts: List[str] = []
+            if watchdog_enabled:
+                guard_parts.append("веб-сокет сторож активен")
+            if execution_guard:
+                guard_parts.append(
+                    f"за обновлением сделок следим, предел задержки {execution_guard} с"
+                )
+            lines.append("Сторожа соединений: " + ", ".join(guard_parts) + ".")
+
+        return "\n".join(lines)
+
+    def _format_positions_answer(self, portfolio: Dict[str, object]) -> str:
+        positions = portfolio.get("positions") or []
+        totals = portfolio.get("totals") or {}
+
+        open_notional = float(totals.get("open_notional", 0.0))
+        realized = float(totals.get("realized_pnl", 0.0))
+        open_positions = int(totals.get("open_positions", 0))
+
+        meaningful_positions: List[Dict[str, object]] = []
+        for entry in positions:
+            try:
+                qty = float(entry.get("qty", 0.0))
+                notional = float(entry.get("notional", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 and notional <= 0:
+                continue
+            meaningful_positions.append(entry)
+
+        if not meaningful_positions:
+            return (
+                "Открытых позиций нет — капитал ждёт нового сигнала. "
+                f"Зафиксированная прибыль сейчас {realized:.2f} USDT."
+            )
+
+        sorted_positions = sorted(
+            meaningful_positions,
+            key=lambda item: float(item.get("notional") or 0.0),
+            reverse=True,
+        )
+
+        lines: List[str] = []
+        for entry in sorted_positions[:3]:
+            symbol = str(entry.get("symbol") or "?").upper()
+            qty = float(entry.get("qty") or 0.0)
+            avg_cost = float(entry.get("avg_cost") or 0.0)
+            notional = float(entry.get("notional") or 0.0)
+            lines.append(
+                (
+                    f"{symbol}: {qty:.4f} шт по {avg_cost:.2f} USDT "
+                    f"→ ~{notional:.2f} USDT"
+                )
+            )
+
+        if len(sorted_positions) > 3:
+            lines.append(
+                f"Ещё {len(sorted_positions) - 3} позиция(и) с меньшим весом остаются под контролем."
+            )
+
+        header = (
+            f"В портфеле {open_positions} актив(а) на сумму около {open_notional:.2f} USDT."
+        )
+        footer = (
+            "Дисциплина важна: каждая позиция укладывается в риск-профиль,"
+            " а свободные USDT страхуют волатильность."
+        )
+
+        return "\n".join([header, *lines, footer, f"Зафиксировано прибыли: {realized:.2f} USDT."])
+
+    def _format_watchlist_answer(self) -> str:
+        watchlist = self.market_watchlist()
+        if not watchlist:
+            return "Список наблюдения пуст — бот ждёт свежих сигналов, чтобы предложить идеи."
+
+        lines: List[str] = []
+        for entry in watchlist[:3]:
+            symbol = str(entry.get("symbol") or "?").upper()
+            bits: List[str] = []
+            score = entry.get("score")
+            trend = entry.get("trend")
+            note = entry.get("note")
+            if isinstance(trend, str) and trend:
+                bits.append(trend.lower())
+            if isinstance(score, (int, float)):
+                bits.append(f"оценка {float(score):.2f}")
+            if isinstance(note, str) and note:
+                bits.append(note)
+            detail = ", ".join(bits) if bits else "наблюдаем динамику"
+            lines.append(f"{symbol}: {detail}")
+
+        if len(watchlist) > 3:
+            lines.append(
+                f"В очереди наблюдения ещё {len(watchlist) - 3} инструмент(а) — бот отсортировал их по силе сигнала."
+            )
+
+        return "Список наблюдения:\n" + "\n".join(lines)
+
+    def _format_health_answer(self) -> str:
+        health = self.data_health()
+        order = ("ai_signal", "executions", "api_keys", "realtime_trading")
+
+        blocks: List[str] = []
+        for key in order:
+            block = health.get(key)
+            if not isinstance(block, dict):
+                continue
+
+            title = str(block.get("title") or key.replace("_", " ").title())
+            ok = bool(block.get("ok"))
+            message = str(block.get("message") or "")
+            details = block.get("details")
+            icon = "✅" if ok else "⚠️"
+
+            section = [f"{icon} {title}: {message}"]
+            if isinstance(details, str) and details.strip():
+                section.append(f"    {details.strip()}")
+            blocks.append("\n".join(section))
+
+        if not blocks:
+            return (
+                "Диагностика не дала результата — убедитесь, что данные бота обновляются хотя бы демо-файлами."
+            )
+
+        return "\n".join(blocks)
+
+    def _format_manual_control_answer(self, summary: Dict[str, object]) -> str:
+        if not summary:
+            return "Ручных команд нет — бот работает автономно и следует сигналам ИИ."
+
+        lines: List[str] = []
+
+        status_text = str(summary.get("status_text") or "Ручные команды ещё не отправлялись.")
+        lines.append(status_text)
+
+        symbol = summary.get("symbol")
+        if isinstance(symbol, str) and symbol:
+            lines.append(f"Цель оператора: {symbol}.")
+
+        last_action_age = summary.get("last_action_age_seconds")
+        if isinstance(last_action_age, (int, float)) and last_action_age > 0:
+            lines.append(
+                f"Последняя команда была {self._format_duration(float(last_action_age))} назад."
+            )
+
+        history = summary.get("history") or []
+        if history:
+            lines.append("Последние команды оператора:")
+            tail = list(history)[-3:]
+            for entry in reversed(tail):
+                action = str(entry.get("action_label") or entry.get("action") or "").lower()
+                if action:
+                    action_text = {
+                        "start": "запуск торговли",
+                        "cancel": "остановка",
+                    }.get(action, action)
+                else:
+                    action_text = "команда"
+
+                symbol_text = str(entry.get("symbol") or symbol or "—")
+                probability = entry.get("probability_text")
+                ev_text = entry.get("ev_text")
+                note = entry.get("note_or_reason")
+                when = entry.get("ts_human") or "—"
+
+                extras: List[str] = []
+                if isinstance(probability, str):
+                    extras.append(f"уверенность {probability}")
+                if isinstance(ev_text, str):
+                    extras.append(ev_text)
+                if isinstance(note, str) and note.strip():
+                    extras.append(note.strip())
+                details = ", ".join(extras)
+                if details:
+                    details = f" ({details})"
+
+                lines.append(f"- {when}: {action_text} по {symbol_text}{details}")
+
+            history_count = summary.get("history_count")
+            if isinstance(history_count, int) and history_count > 3:
+                lines.append(
+                    (
+                        f"Всего сохранено {history_count} команд — показаны последние три. "
+                        "Остальной журнал доступен в приложении."
+                    )
+                )
+        else:
+            lines.append("Журнал команд пуст — управлять можно через панель оператора.")
+
+        lines.append(
+            "Даже при ручном запуске держите риск в рамках лимитов и проверяйте свежесть сигналов перед действиями."
+        )
+
+        return "\n".join(lines)
+
+    def _format_trade_history_answer(
+        self,
+        trades: List[Dict[str, object]],
+        stats: Dict[str, object],
+    ) -> str:
+        total_trades = int(stats.get("trades", len(trades)) or 0)
+        gross_volume = float(stats.get("gross_volume") or 0.0)
+        header = (
+            f"В журнале {total_trades} сделок на сумму около {gross_volume:.2f} USDT."
+        )
+
+        if not trades:
+            return (
+                header
+                + " Пока бот только готовится: новые записи появятся после исполнения первой сделки."
+            )
+
+        lines = [header, "Последние операции:"]
+
+        def _format_side(value: object) -> str:
+            mapping = {"buy": "покупка", "sell": "продажа"}
+            if isinstance(value, str) and value:
+                key = value.lower()
+                return mapping.get(key, value.lower())
+            return "операция"
+
+        preview = trades[:3]
+        for entry in preview:
+            symbol = str(entry.get("symbol") or "?")
+            side = _format_side(entry.get("side"))
+            qty = entry.get("qty")
+            price = entry.get("price")
+            fee = entry.get("fee")
+            when = entry.get("when") or "—"
+
+            details: List[str] = []
+            if isinstance(qty, (int, float)) and qty:
+                details.append(f"{float(qty):.4f} шт")
+            if isinstance(price, (int, float)) and price:
+                details.append(f"по {float(price):.2f} USDT")
+            detail_text = " ".join(details) if details else "без детализации"
+
+            extra_bits: List[str] = []
+            if isinstance(fee, (int, float)) and fee:
+                extra_bits.append(f"комиссия {float(fee):.4f} USDT")
+            if when and when != "—":
+                extra_bits.append(f"в {when}")
+            extra_text = ", ".join(extra_bits)
+            if extra_text:
+                extra_text = f" ({extra_text})"
+
+            lines.append(f"- {symbol}: {side} {detail_text}{extra_text}")
+
+        if total_trades > len(preview):
+            lines.append(
+                f"Показаны последние {len(preview)} записи из {total_trades}. Полный журнал — в разделе исполнений."
+            )
+
+        last_trade_at = stats.get("last_trade_at")
+        if isinstance(last_trade_at, str) and last_trade_at.strip():
+            lines.append(f"Последняя сделка отмечена как {last_trade_at} по UTC.")
+
+        lines.append(
+            "Следите, чтобы серия сделок оставалась в рамках дневного лимита потерь и резервов по USDT."
+        )
+
+        return "\n".join(lines)
+
+    def _format_fee_activity_answer(self, stats: Dict[str, object]) -> str:
+        trades = int(stats.get("trades", 0) or 0)
+        if trades <= 0:
+            return (
+                "Комиссий ещё нет — журнал сделок пуст. "
+                "Как только появятся исполнения, покажу расход по комиссиям и активность."
+            )
+
+        gross_volume = float(stats.get("gross_volume") or 0.0)
+        fees_paid = float(stats.get("fees_paid") or 0.0)
+        avg_trade = float(stats.get("avg_trade_value") or 0.0)
+        maker_ratio = float(stats.get("maker_ratio") or 0.0) * 100.0
+        last_trade_at = str(stats.get("last_trade_at") or "—")
+
+        activity = stats.get("activity") or {}
+        recent_15 = int(activity.get("15m") or 0)
+        recent_hour = int(activity.get("1h") or 0)
+        recent_day = int(activity.get("24h") or 0)
+
+        lines = [
+            (
+                f"Совокупные комиссии: {fees_paid:.5f} USDT за {trades} сделк(и) "
+                f"с объёмом около {gross_volume:.2f} USDT."
+            ),
+            (
+                f"Средний размер сделки: {avg_trade:.2f} USDT. "
+                f"Доля maker-исполнений: {maker_ratio:.1f}%."
+            ),
+            (
+                "Активность: за 15 минут {recent_15}, за час {recent_hour}, за сутки {recent_day}. "
+                f"Последняя запись: {last_trade_at} по UTC."
+            ).format(
+                recent_15=recent_15,
+                recent_hour=recent_hour,
+                recent_day=recent_day,
+            ),
+        ]
+
+        per_symbol = stats.get("per_symbol") or []
+        if per_symbol:
+            top = per_symbol[0]
+            symbol = str(top.get("symbol") or "—")
+            volume = float(top.get("volume") or 0.0)
+            buy_share = float(top.get("buy_share") or 0.0) * 100.0
+            lines.append(
+                (
+                    f"Главный символ: {symbol} — {volume:.2f} USDT оборота, "
+                    f"покупки занимают {buy_share:.1f}% трафика."
+                )
+            )
+
+        lines.append(
+            "Контролируйте комиссии: чем выше доля maker, тем дешевле обходятся сделки."
+        )
+
+        return "\n".join(lines)
 
     def _default_response(self, brief: GuardianBrief, portfolio: Dict[str, object]) -> str:
         pieces = [
@@ -1449,8 +2031,44 @@ class GuardianBot:
         if self._contains_any(prompt, ["риск", "risk", "потер", "loss"]):
             return self.risk_summary()
 
+        if self._contains_any(prompt, ["обнов", "свеж", "давно", "last update", "обновил", "age"]):
+            summary = self.status_summary()
+            return self._format_update_answer(summary)
+
+        if self._contains_any(prompt, ["сигнал", "вероят", "threshold", "порог", "ev", "бп", "б.п."]):
+            summary = self.status_summary()
+            return self._format_signal_quality_answer(summary)
+
         if self._contains_any(prompt, ["план", "что делать", "как начать", "инструкц"]):
             return self._format_plan_answer(brief)
+
+        if self._contains_any(prompt, ["экспоз", "загруж", "капитал", "резерв", "exposure", "занято"]):
+            return self._format_exposure_answer(portfolio)
+
+        if self._contains_any(prompt, ["настрой", "config", "параметр", "режим работы", "ограничен", "лимит"]):
+            return self._format_settings_answer()
+
+        if self._contains_any(prompt, ["портф", "позици", "баланс", "актив", "hold"]):
+            return self._format_positions_answer(portfolio)
+
+        if self._contains_any(prompt, ["воч", "watch", "наблюд", "лист", "монитор"]):
+            return self._format_watchlist_answer()
+
+        if self._contains_any(prompt, ["здоров", "health", "жив", "данн", "статус"]):
+            return self._format_health_answer()
+
+        if self._contains_any(prompt, ["комисс", "fee", "fees", "maker", "taker", "активн"]):
+            stats = self.trade_statistics()
+            return self._format_fee_activity_answer(stats)
+
+        if self._contains_any(prompt, ["ручн", "manual", "оператор", "вручн", "start", "stop"]):
+            summary = self.manual_trade_summary()
+            return self._format_manual_control_answer(summary)
+
+        if self._contains_any(prompt, ["сделк", "trade", "истор", "журнал", "execut"]):
+            trades = self.recent_trades(limit=5)
+            stats = self.trade_statistics()
+            return self._format_trade_history_answer(trades, stats)
 
         if self._contains_any(prompt, ["почему", "объясн", "анализ", "что видит", "поясн"]):
             return self.market_story(brief)
