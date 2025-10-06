@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, List
 from types import MappingProxyType
 
+import pytest
+
 import bybit_app.utils.guardian_bot as guardian_bot_module
 from bybit_app.utils import trade_control
 from bybit_app.utils.envs import Settings
@@ -1194,6 +1196,10 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert watchlist[0]["score"] == 0.7
     assert watchlist[1]["score"] == 0.4
     assert watchlist[2]["score"] is None
+    assert watchlist[0]["actionable"] is True
+    assert watchlist[0]["trend_hint"] == "buy"
+    assert watchlist[0]["probability_pct"] == 70.0
+    assert isinstance(watchlist[0]["edge_score"], float)
 
     scorecard = bot.signal_scorecard(brief)
     assert scorecard["symbol"] == "BTCUSDT"
@@ -1204,6 +1210,233 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert scorecard["configured_buy_threshold"] == 55.0
     assert scorecard["configured_sell_threshold"] == 45.0
 
+    summary = bot.status_summary()
+    assert summary["watchlist_total"] == 3
+    assert summary["watchlist_actionable"] == 1
+    highlights = summary["watchlist_highlights"]
+    assert highlights[0]["symbol"] == "ETHUSDT"
+    assert highlights[0]["primary"] is True
+    assert highlights[0]["actionable"] is True
+    assert summary["primary_watch"]["symbol"] == "ETHUSDT"
+
+
+def test_guardian_brief_selects_best_watchlist_symbol(tmp_path: Path) -> None:
+    status = {
+        "analysis": "ETH идёт впереди по объёмам.",
+        "watchlist": {
+            "ETHUSDT": {"probability": 0.72, "ev_bps": 18.0, "trend": "buy"},
+            "BTCUSDT": {"probability": 0.55, "ev_bps": 8.0, "trend": "buy"},
+            "SOLUSDT": {"probability": 0.4, "ev_bps": 4.0, "trend": "wait"},
+        },
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT,ETHUSDT",
+        ai_buy_threshold=0.6,
+        ai_min_ev_bps=10.0,
+        ai_enabled=True,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    brief = bot.generate_brief()
+    assert brief.symbol == "ETHUSDT"
+    assert brief.mode == "buy"
+    assert "ETHUSDT" in brief.headline
+
+    summary = bot.status_summary()
+    assert summary["symbol"] == "ETHUSDT"
+    assert summary["probability_pct"] == 72.0
+    assert summary["ev_bps"] == 18.0
+    assert summary["symbol_source"] == "watchlist"
+    assert summary["probability_source"] == "watchlist"
+    assert summary.get("mode_hint_source") == "watchlist"
+
+
+def test_guardian_watchlist_skips_neutral_leaders(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {"symbol": "LTCUSDT", "score": 0.9, "probability": 0.9, "ev_bps": 14.0, "trend": "wait"},
+            {"symbol": "ETHUSDT", "probability": 0.71, "ev_bps": 16.0, "trend": "buy"},
+            {"symbol": "XRPUSDT", "probability": 0.68, "ev_bps": 11.0, "trend": "buy"},
+        ]
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT,ETHUSDT",
+        ai_buy_threshold=0.6,
+        ai_min_ev_bps=10.0,
+        ai_enabled=True,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    brief = bot.generate_brief()
+
+    assert brief.symbol == "ETHUSDT"
+    assert brief.mode == "buy"
+
+    summary = bot.status_summary()
+    assert summary["symbol"] == "ETHUSDT"
+    assert summary["probability_pct"] == 71.0
+    assert summary["ev_bps"] == 16.0
+    assert summary["symbol_source"] == "watchlist"
+    assert summary["probability_source"] == "watchlist"
+
+
+def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "ADAUSDT",
+                "probability": 0.66,
+                "ev_bps": 15.0,
+                "trend": "buy",
+                "note": "спрос растёт",
+            },
+            {
+                "symbol": "LTCUSDT",
+                "probability": 0.44,
+                "ev_bps": 12.0,
+                "trend": "sell",
+                "note": "давление продавцов",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "probability": 0.52,
+                "ev_bps": 6.0,
+                "trend": "buy",
+            },
+        ]
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="ADAUSDT,LTCUSDT,XRPUSDT",
+        ai_buy_threshold=0.6,
+        ai_min_ev_bps=10.0,
+        ai_sell_threshold=0.45,
+        ai_enabled=True,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    watchlist = bot.market_watchlist()
+    assert [item["symbol"] for item in watchlist[:2]] == ["ADAUSDT", "LTCUSDT"]
+    assert all(item["actionable"] for item in watchlist[:2])
+    assert watchlist[0]["edge_score"] >= watchlist[1]["edge_score"]
+
+    summary = bot.status_summary()
+    assert summary["watchlist_total"] == 3
+    assert summary["watchlist_actionable"] == 2
+    highlights = summary["watchlist_highlights"]
+    assert [item["symbol"] for item in highlights] == ["ADAUSDT", "LTCUSDT", "XRPUSDT"]
+    assert highlights[0]["probability_pct"] == 66.0
+    assert highlights[1]["trend"] == "sell"
+    assert highlights[1]["probability_gap_pct"] == 1.0
+    assert summary["primary_watch"]["symbol"] == "ADAUSDT"
+
+    breakdown = summary["watchlist_breakdown"]
+    counts = breakdown["counts"]
+    assert counts["total"] == 3
+    assert counts["actionable"] == 2
+    assert counts["actionable_buys"] == 1
+    assert counts["actionable_sells"] == 1
+    assert counts["buys"] == 2
+    assert counts["sells"] == 1
+    assert counts["neutral"] == 0
+    assert breakdown["dominant_trend"] == "buy"
+    assert [item["symbol"] for item in breakdown["top_buys"]] == ["ADAUSDT", "XRPUSDT"]
+    assert [item["symbol"] for item in breakdown["top_sells"]] == ["LTCUSDT"]
+    assert breakdown["top_neutral"] == []
+    assert [item["symbol"] for item in breakdown["actionable"]] == [
+        "ADAUSDT",
+        "LTCUSDT",
+    ]
+    metrics = breakdown["metrics"]
+    actionable_metrics = metrics["actionable"]
+    assert actionable_metrics["probability_avg_pct"] == pytest.approx(55.0)
+    assert actionable_metrics["ev_avg_bps"] == pytest.approx(13.5)
+    overall_metrics = metrics["overall"]
+    assert overall_metrics["probability_avg_pct"] == pytest.approx(54.0)
+    assert overall_metrics["ev_avg_bps"] == pytest.approx(11.0)
+
+    digest = summary["watchlist_digest"]
+    assert digest["headline"].startswith("3 инструментов в наблюдении")
+    assert digest["counts"]["actionable"] == 2
+    assert any("ADAUSDT" in detail for detail in digest["details"])
+    assert digest["dominant_trend"] == "buy"
+    assert any("Средние показатели активных идей" in detail for detail in digest["details"])
+    assert digest["metrics"] == metrics
+
+    watchlist_breakdown = bot.watchlist_breakdown()
+    assert watchlist_breakdown["counts"]["actionable"] == 2
+    assert watchlist_breakdown["dominant_trend"] == "buy"
+
+    watchlist_digest = bot.watchlist_digest()
+    assert watchlist_digest == digest
+
+
+def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "SOLUSDT",
+                "probability": 0.66,
+                "ev_bps": 18.0,
+                "trend": "buy",
+                "note": "обновление максимума",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "probability": 0.44,
+                "ev_bps": 13.0,
+                "trend": "sell",
+            },
+            {
+                "symbol": "DOGEUSDT",
+                "probability": 0.55,
+                "ev_bps": 6.0,
+                "trend": "wait",
+            },
+        ]
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="SOLUSDT,XRPUSDT,DOGEUSDT",
+        ai_buy_threshold=0.6,
+        ai_sell_threshold=0.45,
+        ai_min_ev_bps=10.0,
+        ai_enabled=True,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    actionable = bot.actionable_opportunities()
+    assert [item["symbol"] for item in actionable] == ["SOLUSDT", "XRPUSDT"]
+    assert all(item["actionable"] for item in actionable)
+    assert actionable[0]["note"] == "обновление максимума"
+
+    limited = bot.actionable_opportunities(limit=1)
+    assert [item["symbol"] for item in limited] == ["SOLUSDT"]
+
+    with_neutral = bot.actionable_opportunities(include_neutral=True)
+    assert [item["symbol"] for item in with_neutral] == [
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+    ]
 
 def test_guardian_recent_trades(tmp_path: Path) -> None:
     ledger_path = tmp_path / "pnl" / "executions.jsonl"
