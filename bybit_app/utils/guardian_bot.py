@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
@@ -14,7 +15,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from .envs import Settings, get_settings, get_api_client
 from .paths import DATA_DIR
-from . import trade_control
 from .trade_analytics import (
     ExecutionRecord,
     aggregate_execution_metrics,
@@ -70,12 +70,9 @@ class GuardianSnapshot:
     recent_trades: List[Dict[str, object]]
     trade_stats: Dict[str, object]
     executions: Tuple[ExecutionRecord, ...]
-    manual_state: trade_control.TradeControlState
-    manual_summary: Dict[str, object]
     generated_at: float
     status_signature: Tuple[int, int, int]
     ledger_signature: int
-    manual_signature: int
 
 
 class GuardianBot:
@@ -97,6 +94,8 @@ class GuardianBot:
         self._status_fallback_used: bool = False
         self._status_read_error: Optional[str] = None
         self._status_content_hash: Optional[int] = None
+        self._plan_cache_signature: Optional[int] = None
+        self._plan_cache: Optional[Dict[str, object]] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -162,6 +161,8 @@ class GuardianBot:
         self._snapshot = None
         self._ledger_signature = None
         self._ledger_view = None
+        self._plan_cache_signature = None
+        self._plan_cache = None
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -632,10 +633,9 @@ class GuardianBot:
         )
 
     # snapshot helpers -------------------------------------------------
-    def _snapshot_signature(self) -> Tuple[Tuple[int, int], int, int]:
+    def _snapshot_signature(self) -> Tuple[Tuple[int, int], int]:
         status_path = self._status_path()
         ledger_path = self._ledger_path()
-        manual_path = Path(self.data_dir) / "ai" / "trade_commands.jsonl"
 
         def _stat_signature(path: Path) -> Tuple[int, int]:
             try:
@@ -651,8 +651,7 @@ class GuardianBot:
 
         status_sig = _stat_signature(status_path)
         ledger_sig = _stat_signature(ledger_path)[0]
-        manual_sig = _stat_signature(manual_path)[0]
-        return status_sig, ledger_sig, manual_sig
+        return status_sig, ledger_sig
 
     def _load_ledger_events(self) -> List[Dict[str, object]]:
         path = self._ledger_path()
@@ -851,14 +850,8 @@ class GuardianBot:
         if min_change_pct <= 0:
             min_change_pct = 0.5
 
-        manual_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
         raw_whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
-        if raw_whitelist:
-            extra = [sym for sym in manual_symbols if sym not in raw_whitelist]
-            raw_whitelist.extend(extra)
-            whitelist: Optional[Sequence[str]] = raw_whitelist
-        else:
-            whitelist = None
+        whitelist: Optional[Sequence[str]] = raw_whitelist or None
 
         blacklist = self._parse_symbol_list(getattr(settings, "ai_blacklist", ""))
 
@@ -885,6 +878,112 @@ class GuardianBot:
         except Exception:
             return []
 
+    def _symbol_plan_signature(
+        self,
+        watchlist: Sequence[Dict[str, object]],
+        settings: Settings,
+        portfolio: Optional[Dict[str, object]] = None,
+    ) -> Optional[int]:
+        try:
+            limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0)
+        except Exception:
+            limit_hint = 0
+
+        def _float_component(value: object, decimals: int) -> str:
+            numeric = self._coerce_float(value)
+            if numeric is None or not math.isfinite(numeric):
+                return ""
+            return f"{numeric:.{decimals}f}"
+
+        def _text_component(value: object) -> str:
+            if value is None:
+                return ""
+            text = str(value).strip()
+            return text
+
+        watchlist_fingerprint: List[List[str]] = []
+        for idx, raw_entry in enumerate(watchlist):
+            if not isinstance(raw_entry, Mapping):
+                symbol = self._normalise_symbol_value(raw_entry) or _text_component(raw_entry)
+                watchlist_fingerprint.append(
+                    [
+                        str(idx),
+                        symbol,
+                        "",
+                        "0",
+                        "0",
+                        "0",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
+                continue
+
+            symbol = self._normalise_symbol_value(raw_entry.get("symbol")) or ""
+            trend = (
+                self._normalise_mode_hint(
+                    raw_entry.get("trend_hint") or raw_entry.get("trend")
+                )
+                or ""
+            )
+            note = _text_component(raw_entry.get("note"))
+            source = _text_component(raw_entry.get("source"))
+
+            watchlist_fingerprint.append(
+                [
+                    str(idx),
+                    symbol,
+                    trend,
+                    "1" if raw_entry.get("actionable") else "0",
+                    "1" if raw_entry.get("probability_ready") else "0",
+                    "1" if raw_entry.get("ev_ready") else "0",
+                    _float_component(raw_entry.get("probability"), 6),
+                    _float_component(raw_entry.get("ev_bps"), 6),
+                    _float_component(raw_entry.get("score"), 6),
+                    _float_component(raw_entry.get("edge_score"), 6),
+                    note,
+                    source,
+                ]
+            )
+
+        portfolio_fingerprint: List[Tuple[str, str, str, str]] = []
+        if isinstance(portfolio, Mapping):
+            raw_positions = portfolio.get("positions") or []
+            for raw_position in raw_positions:
+                if not isinstance(raw_position, Mapping):
+                    continue
+                symbol = self._normalise_symbol_value(raw_position.get("symbol"))
+                if not symbol:
+                    continue
+                qty = _float_component(raw_position.get("qty"), 8)
+                notional = _float_component(raw_position.get("notional"), 6)
+                avg_cost = _float_component(raw_position.get("avg_cost"), 8)
+                portfolio_fingerprint.append((symbol, qty, notional, avg_cost))
+
+        portfolio_fingerprint.sort()
+
+        payload = {
+            "limit": limit_hint,
+            "watchlist": watchlist_fingerprint,
+            "positions": portfolio_fingerprint,
+        }
+
+        try:
+            serialised = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+
+        return self._hash_bytes(serialised.encode("utf-8"))
+
     def _build_symbol_plan(
         self,
         watchlist: Sequence[Dict[str, object]],
@@ -893,7 +992,19 @@ class GuardianBot:
     ) -> Dict[str, object]:
         settings = settings or self.settings
 
-        manual_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
+        signature: Optional[int]
+        try:
+            signature = self._symbol_plan_signature(watchlist, settings, portfolio)
+        except Exception:
+            signature = None
+
+        if (
+            signature is not None
+            and signature == self._plan_cache_signature
+            and self._plan_cache is not None
+        ):
+            return copy.deepcopy(self._plan_cache)
+
         actionable: List[str] = []
         ready: List[str] = []
         watchlist_symbols: List[str] = []
@@ -920,10 +1031,6 @@ class GuardianBot:
                 detail["actionable"] = True
             elif source == "ready":
                 detail["ready"] = True
-            elif source == "manual":
-                detail["manual"] = True
-            elif source == "manual_only":
-                detail["manual_only"] = True
             elif source == "watchlist":
                 detail["watchlist"] = True
             elif source == "holding":
@@ -1046,18 +1153,6 @@ class GuardianBot:
                 ready.append(symbol)
                 _record(symbol, source="ready")
 
-        manual_only = [
-            sym
-            for sym in manual_symbols
-            if sym not in watchlist_symbols and sym not in position_symbols
-        ]
-
-        for symbol in manual_symbols:
-            _record(symbol, source="manual")
-
-        for symbol in manual_only:
-            _record(symbol, source="manual_only")
-
         positions_only = [
             sym for sym in position_symbols if sym not in watchlist_symbols
         ]
@@ -1069,15 +1164,6 @@ class GuardianBot:
             for symbol in bucket:
                 if symbol not in dynamic_sequence:
                     dynamic_sequence.append(symbol)
-
-        for symbol in manual_symbols:
-            if symbol not in dynamic_sequence:
-                dynamic_sequence.append(symbol)
-
-        combined: List[str] = list(dynamic_sequence)
-        for symbol in manual_only:
-            if symbol not in combined:
-                combined.append(symbol)
 
         limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0)
         if len(position_symbols) > limit_hint:
@@ -1120,11 +1206,9 @@ class GuardianBot:
             "actionable_count": len(actionable),
             "ready_count": len(ready),
             "watchlist_count": len(watchlist_symbols),
-            "manual_count": len(manual_symbols),
-            "manual_only_count": len(manual_only),
             "positions_only_count": len(positions_only),
             "dynamic_count": len(dynamic_sequence),
-            "combined_count": len(combined),
+            "combined_count": len(dynamic_sequence),
         }
 
         open_slots = limit_hint - len(position_symbols)
@@ -1184,8 +1268,6 @@ class GuardianBot:
             "actionable",
             "ready",
             "watchlist",
-            "manual",
-            "manual_only",
             "positions_only",
         ):
             count = sum(1 for info in details.values() if info.get(source_key))
@@ -1285,10 +1367,6 @@ class GuardianBot:
                 reasons.append("actionable")
             if info.get("ready") and "actionable" not in reasons:
                 reasons.append("ready")
-            if info.get("manual_only"):
-                reasons.append("manual_only")
-            elif info.get("manual") and "manual_only" not in reasons:
-                reasons.append("manual")
             if info.get("watchlist") and "actionable" not in reasons:
                 reasons.append("watchlist")
 
@@ -1302,8 +1380,6 @@ class GuardianBot:
                     "holding": bool(info.get("holding")),
                     "actionable": bool(info.get("actionable")),
                     "ready": bool(info.get("ready")),
-                    "manual": bool(info.get("manual")),
-                    "manual_only": bool(info.get("manual_only")),
                     "watchlist": bool(info.get("watchlist")),
                     "watchlist_order": info.get("watchlist_order"),
                     "watchlist_rank": info.get("watchlist_rank"),
@@ -1322,16 +1398,14 @@ class GuardianBot:
                 }
             )
 
-        return {
+        plan = {
             "actionable": tuple(actionable),
             "ready": tuple(sym for sym in ready if sym not in actionable),
             "watchlist": tuple(watchlist_symbols),
-            "manual": tuple(manual_symbols),
-            "manual_only": tuple(manual_only),
             "positions": tuple(position_symbols),
             "positions_only": tuple(positions_only),
             "dynamic": tuple(dynamic_sequence),
-            "combined": tuple(combined),
+            "combined": tuple(dynamic_sequence),
             "details": details,
             "limit": limit_hint,
             "stats": stats,
@@ -1342,6 +1416,21 @@ class GuardianBot:
             "source_breakdown": source_breakdown,
             "priority_table": tuple(priority_table),
         }
+
+        combined_pool = self._compose_symbol_pool(plan, only_actionable=False)
+        plan["combined"] = tuple(combined_pool)
+        stats["combined_count"] = len(combined_pool)
+        actionable_pool = self._compose_symbol_pool(plan, only_actionable=True)
+        plan["actionable_combined"] = tuple(actionable_pool)
+        stats["actionable_combined_count"] = len(actionable_pool)
+
+        if signature is not None:
+            self._plan_cache_signature = signature
+            self._plan_cache = copy.deepcopy(plan)
+        else:
+            self._plan_cache_signature = None
+            self._plan_cache = None
+        return plan
 
     def _build_watchlist(
         self, status: Dict[str, object], settings: Optional[Settings] = None
@@ -1510,7 +1599,6 @@ class GuardianBot:
         plan: Mapping[str, object],
         *,
         limit: Optional[int] = None,
-        include_manual: bool = True,
     ) -> List[Dict[str, object]]:
         """Build a compact, prioritised view of trade candidates."""
 
@@ -1518,11 +1606,6 @@ class GuardianBot:
         if not isinstance(priority_table, Sequence):
             return []
 
-        manual_only = {
-            str(symbol).strip().upper()
-            for symbol in (plan.get("manual_only") or [])
-            if str(symbol).strip()
-        }
         position_symbols = {
             str(symbol).strip().upper()
             for symbol in (plan.get("positions") or [])
@@ -1540,14 +1623,6 @@ class GuardianBot:
                 continue
 
             symbol = symbol_value.strip().upper()
-            manual_only_entry = bool(raw_entry.get("manual_only")) or symbol in manual_only
-            if (
-                not include_manual
-                and manual_only_entry
-                and symbol not in position_symbols
-            ):
-                continue
-
             probability_pct = self._coerce_float(raw_entry.get("probability_pct"))
             probability = self._coerce_float(raw_entry.get("probability"))
             ev_bps = self._coerce_float(raw_entry.get("ev_bps"))
@@ -1565,8 +1640,6 @@ class GuardianBot:
                 "actionable": bool(raw_entry.get("actionable")),
                 "ready": bool(raw_entry.get("ready")),
                 "holding": bool(raw_entry.get("holding")),
-                "manual": bool(raw_entry.get("manual")),
-                "manual_only": manual_only_entry,
                 "trend": raw_entry.get("trend"),
                 "note": raw_entry.get("note"),
                 "watchlist_rank": raw_entry.get("watchlist_rank"),
@@ -1857,48 +1930,53 @@ class GuardianBot:
         previous_snapshot = self._snapshot
         status = self._load_status(prefetched=prefetched_status, prefetched_hash=prefetched_hash)
         self._last_status = status
+        ledger_view = self._ledger_view_for_signature(signature[1])
+        portfolio = ledger_view.portfolio
         settings = self.settings
-        manual_state = trade_control.trade_control_state(data_dir=self.data_dir)
-        manual_summary = self._manual_control_summary(manual_state)
-        context = self._derive_signal_context(status, settings)
+        context = self._derive_signal_context(status, settings, portfolio=portfolio)
         brief = self._brief_from_status(status, settings, context)
         status_summary = self._build_status_summary(
             status,
             brief,
             settings,
             self._status_fallback_used,
-            manual_summary,
             context,
         )
 
-        ledger_view = self._ledger_view_for_signature(signature[1])
-        portfolio = ledger_view.portfolio
         watchlist = context.get("watchlist", [])
-        symbol_plan = self._build_symbol_plan(
-            watchlist,
-            settings,
-            portfolio=portfolio,
-        )
-        context["symbol_plan"] = copy.deepcopy(symbol_plan)
+        symbol_plan: Dict[str, object]
+        plan_from_context = context.get("symbol_plan") if isinstance(context, Mapping) else None
+        if isinstance(plan_from_context, Mapping):
+            symbol_plan = dict(plan_from_context)
+        else:
+            symbol_plan = self._build_symbol_plan(
+                watchlist,
+                settings,
+                portfolio=portfolio,
+            )
+        plan_copy = copy.deepcopy(symbol_plan)
+        context["symbol_plan"] = plan_copy
         recent_trades = list(ledger_view.recent_trades)
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
 
-        status_summary["manual_control"] = manual_summary
-        status_summary["symbol_plan"] = copy.deepcopy(symbol_plan)
+        summary_plan = copy.deepcopy(plan_copy)
+        status_summary["symbol_plan"] = summary_plan
 
         limit_hint = int(symbol_plan.get("limit") or 0)
-        combined = list(symbol_plan.get("combined") or [])
+        candidate_pool = list(symbol_plan.get("combined") or [])
+        fallback_symbol = self._normalise_symbol_value(brief.symbol)
+        if fallback_symbol and fallback_symbol not in candidate_pool:
+            candidate_pool.append(fallback_symbol)
         if limit_hint > 0:
-            status_summary["candidate_symbols"] = combined[:limit_hint]
+            status_summary["candidate_symbols"] = candidate_pool[:limit_hint]
         else:
-            status_summary["candidate_symbols"] = combined
+            status_summary["candidate_symbols"] = candidate_pool
 
         candidate_limit = max(limit_hint, 5) if limit_hint > 0 else 5
         status_summary["trade_candidates"] = self._summarise_trade_candidates(
             symbol_plan,
             limit=candidate_limit,
-            include_manual=True,
         )
 
         status_signature = (
@@ -1916,16 +1994,13 @@ class GuardianBot:
             status_from_cache=self._status_fallback_used,
             portfolio=portfolio,
             watchlist=watchlist,
-            symbol_plan=copy.deepcopy(symbol_plan),
+            symbol_plan=copy.deepcopy(plan_copy),
             recent_trades=recent_trades,
             trade_stats=trade_stats,
             executions=execution_records,
-            manual_state=self._clone_trade_state(manual_state),
-            manual_summary=manual_summary,
             generated_at=time.time(),
             status_signature=status_signature,
             ledger_signature=signature[1],
-            manual_signature=signature[2],
         )
 
     @staticmethod
@@ -1935,249 +2010,6 @@ class GuardianBot:
     @staticmethod
     def _copy_list(payload: List[Dict[str, object]]) -> List[Dict[str, object]]:
         return copy.deepcopy(payload)
-
-    @staticmethod
-    def _clone_trade_entry(
-        entry: Optional[Dict[str, Any]]
-    ) -> Optional[Dict[str, Any]]:
-        if entry is None:
-            return None
-        return dict(entry)
-
-    def _clone_trade_state(
-        self, state: trade_control.TradeControlState
-    ) -> trade_control.TradeControlState:
-        commands = tuple(dict(entry) for entry in state.commands)
-        return trade_control.TradeControlState(
-            active=state.active,
-            commands=commands,
-            last_action=self._clone_trade_entry(state.last_action),
-            last_start=self._clone_trade_entry(state.last_start),
-            last_cancel=self._clone_trade_entry(state.last_cancel),
-        )
-
-    @staticmethod
-    def _append_operator_note(
-        text: Optional[str], note: Optional[str]
-    ) -> Optional[str]:
-        base = text.strip() if isinstance(text, str) else ""
-        note_text = note.strip() if isinstance(note, str) else ""
-
-        if not note_text:
-            return base or None
-
-        formatted_note = note_text
-        if formatted_note and not formatted_note[0].isupper():
-            formatted_note = f"{formatted_note[0].upper()}{formatted_note[1:]}"
-        if formatted_note and formatted_note[-1] not in ".!?":
-            formatted_note = f"{formatted_note}."
-
-        if base:
-            base_sentence = base if base[-1] in ".!?" else f"{base}."
-            return f"{base_sentence} Комментарий оператора: {formatted_note}"
-
-        return f"Комментарий оператора: {formatted_note}"
-
-    def _manual_control_summary(
-        self, state: trade_control.TradeControlState
-    ) -> Dict[str, object]:
-        history = [dict(entry) for entry in state.commands]
-
-        def _enrich(entry: Dict[str, Any]) -> Dict[str, Any]:
-            enriched = dict(entry)
-            enriched["ts_human"] = self._format_timestamp(entry.get("ts"))
-            action = str(entry.get("action") or "").upper()
-            if action:
-                enriched["action_label"] = action
-            prob = entry.get("probability_pct")
-            try:
-                if prob is not None:
-                    enriched["probability_text"] = f"{float(prob):.1f}%"
-            except (TypeError, ValueError):
-                pass
-            ev = entry.get("ev_bps")
-            try:
-                if ev is not None:
-                    enriched["ev_text"] = f"{float(ev):.1f} б.п."
-            except (TypeError, ValueError):
-                pass
-            note = entry.get("note") or entry.get("reason")
-            if note:
-                enriched["note_or_reason"] = str(note).strip()
-            return enriched
-
-        enriched_history = [_enrich(entry) for entry in history]
-
-        last_action = self._clone_trade_entry(state.last_action)
-        last_start = self._clone_trade_entry(state.last_start)
-        last_cancel = self._clone_trade_entry(state.last_cancel)
-
-        symbol = None
-        for candidate in (last_action, last_start, last_cancel):
-            if candidate and candidate.get("symbol"):
-                symbol = str(candidate["symbol"])
-                break
-
-        def _age_seconds(entry: Optional[Dict[str, Any]]) -> Optional[float]:
-            if not entry:
-                return None
-            try:
-                ts = float(entry.get("ts"))
-            except (TypeError, ValueError):
-                return None
-            return max(0.0, time.time() - ts)
-
-        last_action_age = _age_seconds(last_action)
-        last_start_age = _age_seconds(last_start)
-        last_cancel_age = _age_seconds(last_cancel)
-
-        def _age_text(age: Optional[float]) -> Optional[str]:
-            if age is None:
-                return None
-            return self._format_duration(age)
-
-        def _note(entry: Optional[Dict[str, Any]]) -> Optional[str]:
-            if not entry:
-                return None
-            raw = entry.get("note") or entry.get("reason")
-            if raw is None:
-                return None
-            text = str(raw).strip()
-            return text or None
-
-        last_action_note = _note(last_action)
-        last_start_note = _note(last_start)
-        last_cancel_note = _note(last_cancel)
-
-        status_note: Optional[str] = None
-        status_note_source: Optional[str] = None
-
-        if state.active:
-            status_label = "active"
-            if last_start_age is not None:
-                duration = _age_text(last_start_age)
-                status_text = (
-                    f"Торговля по {symbol or 'выбранному символу'} активна — старт был {duration} назад."
-                )
-            else:
-                status_text = "Торговля запущена вручную и отмечена как активная."
-            status_note = last_start_note or last_action_note
-            if status_note:
-                status_note_source = "last_start" if last_start_note else "last_action"
-        elif last_cancel:
-            status_label = "stopped"
-            if last_cancel_age is not None:
-                duration = _age_text(last_cancel_age)
-                status_text = (
-                    f"Торговля по {symbol or 'выбранному символу'} остановлена оператором {duration} назад."
-                )
-            else:
-                status_text = "Торговля остановлена командой оператора."
-            status_note = last_cancel_note or last_action_note
-            if status_note:
-                status_note_source = "last_cancel" if last_cancel_note else "last_action"
-        elif history:
-            status_label = "pending"
-            status_text = (
-                "Последняя команда — запуск торговли, но подтверждения активной сделки пока нет."
-            )
-            status_note = last_start_note or last_action_note
-            if status_note:
-                status_note_source = "last_start" if last_start_note else "last_action"
-        else:
-            status_label = "idle"
-            status_text = "Ручные команды ещё не отправлялись."
-            status_note = last_action_note
-            if status_note:
-                status_note_source = "last_action"
-
-        status_message = self._append_operator_note(status_text, status_note)
-
-        summary: Dict[str, object] = {
-            "active": state.active,
-            "symbol": symbol,
-            "status_label": status_label,
-            "status_text": status_text,
-            "status_note": status_note,
-            "status_note_source": status_note_source,
-            "status_message": status_message,
-            "history": enriched_history,
-            "history_count": len(enriched_history),
-            "last_action": last_action,
-            "last_start": last_start,
-            "last_cancel": last_cancel,
-            "last_action_at": self._format_timestamp((last_action or {}).get("ts")),
-            "last_start_at": self._format_timestamp((last_start or {}).get("ts")),
-            "last_cancel_at": self._format_timestamp((last_cancel or {}).get("ts")),
-            "last_action_age_seconds": last_action_age,
-            "last_start_age_seconds": last_start_age,
-            "last_cancel_age_seconds": last_cancel_age,
-        }
-
-        return summary
-
-    def _manual_control_block_reason(
-        self, manual_summary: Optional[Dict[str, object]]
-    ) -> Optional[str]:
-        if not manual_summary:
-            return None
-
-        if manual_summary.get("active"):
-            return None
-
-        label = manual_summary.get("status_label")
-        if label in (None, "idle"):
-            return None
-
-        status_note = manual_summary.get("status_note")
-        symbol = manual_summary.get("symbol")
-        symbol_text = None
-        if isinstance(symbol, str):
-            cleaned_symbol = symbol.strip()
-            if cleaned_symbol:
-                symbol_text = cleaned_symbol.upper()
-
-        if label == "stopped":
-            age_seconds = manual_summary.get("last_cancel_age_seconds")
-            if isinstance(age_seconds, (int, float)) and age_seconds >= 0:
-                duration = self._format_duration(float(age_seconds))
-                message = (
-                    "Ручная команда остановила автоторговлю{target} {duration} назад — "
-                    "новые сделки заблокированы, пока оператор не разрешит работу."
-                ).format(
-                    target=f" по {symbol_text}" if symbol_text else "",
-                    duration=duration,
-                )
-            else:
-                message = (
-                    "Ручная команда остановила автоторговлю{target} — новые сделки заблокированы, "
-                    "пока оператор не разрешит работу."
-                )
-            return self._append_operator_note(message, status_note)
-
-        if label == "pending":
-            age_seconds = manual_summary.get("last_start_age_seconds")
-            if isinstance(age_seconds, (int, float)) and age_seconds >= 0:
-                duration = self._format_duration(float(age_seconds))
-                message = (
-                    "Оператор запустил торговлю вручную{target} {duration} назад, ждём подтверждение "
-                    "исполнения перед новыми сделками."
-                ).format(
-                    target=f" по {symbol_text}" if symbol_text else "",
-                    duration=duration,
-                )
-            else:
-                message = (
-                    "Оператор запустил торговлю вручную{target}, но подтверждения ещё нет — бот ждёт перед "
-                    "новыми сделками."
-                )
-            return self._append_operator_note(message, status_note)
-
-        status_message = manual_summary.get("status_message")
-        if isinstance(status_message, str) and status_message.strip():
-            return status_message.strip()
-
-        return None
 
     def _get_snapshot(self, force: bool = False) -> GuardianSnapshot:
         signature = self._snapshot_signature()
@@ -2189,7 +2021,6 @@ class GuardianBot:
             force
             or snapshot is None
             or snapshot.ledger_signature != signature[1]
-            or snapshot.manual_signature != signature[2]
         )
 
         if not needs_rebuild and snapshot is not None:
@@ -2225,7 +2056,6 @@ class GuardianBot:
         brief: GuardianBrief,
         settings: Settings,
         fallback_used: bool,
-        manual_summary: Optional[Dict[str, object]] = None,
         context: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         context = context or self._derive_signal_context(status, settings)
@@ -2241,9 +2071,6 @@ class GuardianBot:
             effective_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
-        raw_mode = str(getattr(settings, "operation_mode", "manual") or "").strip().lower()
-        operation_mode = "auto" if raw_mode in {"auto", "automatic", "авто"} else "manual"
-
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
         actionable, reasons = self._evaluate_actionability(
             brief.mode,
@@ -2255,20 +2082,10 @@ class GuardianBot:
             staleness_state,
         )
 
-        manual_reason = self._manual_control_block_reason(manual_summary)
-        if manual_reason:
-            reasons.append(manual_reason)
-            actionable = False
-
         if not getattr(settings, "ai_enabled", False):
-            if operation_mode == "manual":
-                reasons.append(
-                    "Включён ручной режим — AI даёт рекомендации, но сделки не исполняются автоматически."
-                )
-            else:
-                reasons.append(
-                    "AI сигналы выключены настройками — автоматические сделки не запускаются."
-                )
+            reasons.append(
+                "AI сигналы выключены настройками — автоматические сделки не запускаются."
+            )
             actionable = False
 
         summary = {
@@ -2310,7 +2127,7 @@ class GuardianBot:
                 "state": staleness_state,
                 "message": staleness_message,
             },
-            "operation_mode": operation_mode,
+            "operation_mode": "auto",
         }
 
         watchlist_entries = context.get("watchlist") or []
@@ -2351,38 +2168,6 @@ class GuardianBot:
             if not digest:
                 digest = self._watchlist_digest(breakdown)
             summary["watchlist_digest"] = digest
-
-        if operation_mode == "manual":
-            guidance_notes: List[str] = []
-            for note in (
-                brief.action_text,
-                brief.confidence_text,
-                brief.ev_text,
-                brief.caution,
-                staleness_message,
-            ):
-                if isinstance(note, str):
-                    cleaned = note.strip()
-                    if cleaned:
-                        guidance_notes.append(cleaned)
-
-            manual_plan = self.plan_steps(brief=brief)
-            risk_outline = self.risk_summary()
-            safety_notes = self.safety_notes()
-            control_status = self.manual_control_guidance(manual_summary)
-
-            summary["manual_guidance"] = {
-                "headline": brief.headline,
-                "notes": guidance_notes,
-                "reasons": list(reasons),
-                "thresholds": summary["thresholds"],
-                "plan_steps": list(manual_plan),
-                "risk_summary": risk_outline,
-                "safety_notes": list(safety_notes),
-            }
-
-            if control_status:
-                summary["manual_guidance"]["control_status"] = control_status
 
         if status:
             summary["raw_keys"] = sorted(status.keys())
@@ -2472,7 +2257,10 @@ class GuardianBot:
         return actionable, reasons
 
     def _derive_signal_context(
-        self, status: Dict[str, object], settings: Settings
+        self,
+        status: Dict[str, object],
+        settings: Settings,
+        portfolio: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         raw_symbol = status.get("symbol") or status.get("ticker") or status.get("pair")
         symbol: Optional[str] = None
@@ -2617,8 +2405,12 @@ class GuardianBot:
             context["watchlist_breakdown"] = watchlist_breakdown
             context["watchlist_digest"] = self._watchlist_digest(watchlist_breakdown)
 
-        context["symbol_plan"] = self._build_symbol_plan(watchlist, settings)
-
+        context["symbol_plan"] = self._build_symbol_plan(
+            watchlist,
+            settings,
+            portfolio=portfolio,
+        )
+        
         return context
 
     def _brief_from_status(
@@ -2742,173 +2534,6 @@ class GuardianBot:
 
         return "\n".join(lines)
 
-    def manual_trade_state(self) -> trade_control.TradeControlState:
-        """Return the manual trade control state for the current data directory."""
-
-        snapshot = self._get_snapshot()
-        return self._clone_trade_state(snapshot.manual_state)
-
-    def manual_trade_history(self, limit: int = 50) -> Tuple[Dict[str, Any], ...]:
-        """Return recent manual trade commands for the bot's data directory."""
-
-        snapshot = self._get_snapshot()
-        commands: List[Dict[str, Any]] = list(snapshot.manual_state.commands)
-        if limit > 0:
-            commands = commands[-limit:]
-        return tuple(dict(command) for command in commands)
-
-    def manual_trade_summary(self) -> Dict[str, object]:
-        """Return cached metadata about manual control commands."""
-
-        snapshot = self._get_snapshot()
-        return self._copy_dict(snapshot.manual_summary)
-
-    def manual_trade_start(
-        self,
-        *,
-        symbol: Optional[str],
-        mode: Optional[str],
-        probability_pct: Optional[float] = None,
-        ev_bps: Optional[float] = None,
-        source: str = "manual",
-        note: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Persist a manual request to start trading in the bot's workspace."""
-
-        record = trade_control.request_trade_start(
-            symbol=symbol,
-            mode=mode,
-            probability_pct=probability_pct,
-            ev_bps=ev_bps,
-            source=source,
-            note=note,
-            extra=extra,
-            data_dir=self.data_dir,
-        )
-        self._snapshot = None
-        return record
-
-    def manual_trade_cancel(
-        self,
-        *,
-        symbol: Optional[str],
-        reason: Optional[str] = None,
-        source: str = "manual",
-        note: Optional[str] = None,
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Persist a manual request to cancel trading in the bot's workspace."""
-
-        record = trade_control.request_trade_cancel(
-            symbol=symbol,
-            reason=reason,
-            source=source,
-            note=note,
-            extra=extra,
-            data_dir=self.data_dir,
-        )
-        self._snapshot = None
-        return record
-
-    def manual_trade_clear(self) -> None:
-        """Remove manual trade commands stored for this bot's workspace."""
-
-        trade_control.clear_trade_commands(data_dir=self.data_dir)
-        self._snapshot = None
-
-    def manual_control_guidance(
-        self, manual_summary: Optional[Dict[str, object]]
-    ) -> Optional[Dict[str, object]]:
-        """Build a compact view of manual control activity for guidance panels."""
-
-        if not manual_summary:
-            return None
-
-        label_key = str(manual_summary.get("status_label") or "idle").strip().lower() or "idle"
-        label_map = {
-            "active": "Торговля активна",
-            "pending": "Ожидаем подтверждение",
-            "stopped": "Остановлено оператором",
-            "idle": "Команды не отправлялись",
-        }
-        label = label_map.get(label_key, label_key)
-
-        message_value = manual_summary.get("status_message") or manual_summary.get("status_text")
-        message = str(message_value).strip() if isinstance(message_value, str) else ""
-
-        symbol_value = manual_summary.get("symbol")
-        symbol = str(symbol_value).strip().upper() if isinstance(symbol_value, str) else ""
-        symbol = symbol or None
-
-        last_action_at = manual_summary.get("last_action_at")
-        if isinstance(last_action_at, str):
-            last_action_at = last_action_at.strip()
-        if not last_action_at:
-            last_action_at = None
-
-        last_action_age = manual_summary.get("last_action_age_seconds")
-        last_action_age_text: Optional[str] = None
-        if isinstance(last_action_age, (int, float)) and last_action_age >= 0:
-            last_action_age_text = self._format_duration(float(last_action_age))
-
-        history_preview: List[str] = []
-        history = manual_summary.get("history")
-        if isinstance(history, list):
-            for entry in history[-3:][::-1]:
-                if not isinstance(entry, dict):
-                    continue
-
-                parts: List[str] = []
-                action_label = entry.get("action_label") or entry.get("action")
-                if isinstance(action_label, str) and action_label.strip():
-                    parts.append(action_label.strip())
-
-                entry_symbol = entry.get("symbol") or symbol
-                if isinstance(entry_symbol, str) and entry_symbol.strip():
-                    parts.append(entry_symbol.strip().upper())
-
-                ts_human = entry.get("ts_human")
-                if isinstance(ts_human, str) and ts_human.strip():
-                    parts.append(ts_human.strip())
-
-                prob_text = entry.get("probability_text")
-                if isinstance(prob_text, str) and prob_text.strip():
-                    parts.append(f"p={prob_text.strip()}")
-
-                ev_text = entry.get("ev_text")
-                if isinstance(ev_text, str) and ev_text.strip():
-                    parts.append(ev_text.strip())
-
-                note = entry.get("note_or_reason")
-                if isinstance(note, str) and note.strip():
-                    parts.append(note.strip())
-
-                line = " · ".join(parts)
-                if line:
-                    history_preview.append(line)
-
-        payload: Dict[str, object] = {
-            "label": label,
-            "raw_label": label_key,
-            "active": bool(manual_summary.get("active")),
-            "awaiting_operator": label_key in {"pending", "stopped"},
-            "history_count": int(manual_summary.get("history_count") or 0),
-        }
-
-        if message:
-            payload["message"] = message
-        if symbol:
-            payload["symbol"] = symbol
-        if last_action_at:
-            payload["last_action_at"] = last_action_at
-        if last_action_age_text:
-            payload["last_action_age"] = last_action_age_text
-        if history_preview:
-            payload["history_preview"] = history_preview
-
-        return payload
-
     def plan_steps(self, brief: Optional[GuardianBrief] = None) -> List[str]:
         brief = brief or self.generate_brief()
         steps = [
@@ -3009,6 +2634,83 @@ class GuardianBot:
         }
         return entry
 
+    @staticmethod
+    def _normalise_symbol_value(symbol: object) -> Optional[str]:
+        if isinstance(symbol, str):
+            cleaned = symbol.strip().upper()
+            if cleaned and cleaned != "?":
+                return cleaned
+        return None
+
+    @classmethod
+    def _extend_unique_symbols(
+        cls, target: List[str], symbols: Iterable[object]
+    ) -> None:
+        for symbol in symbols:
+            cleaned = cls._normalise_symbol_value(symbol)
+            if cleaned and cleaned not in target:
+                target.append(cleaned)
+
+    @classmethod
+    def _priority_symbols_from_plan(
+        cls, plan: Mapping[str, object]
+    ) -> List[str]:
+        priority_table = plan.get("priority_table") if isinstance(plan, Mapping) else None
+        if not isinstance(priority_table, Sequence):
+            return []
+
+        symbols: List[str] = []
+        for entry in priority_table:
+            if not isinstance(entry, Mapping):
+                continue
+            cleaned = cls._normalise_symbol_value(entry.get("symbol"))
+            if cleaned and cleaned not in symbols:
+                symbols.append(cleaned)
+        return symbols
+
+    def _compose_symbol_pool(
+        self,
+        plan: Mapping[str, object],
+        *,
+        only_actionable: bool,
+        fallback: Optional[object] = None,
+    ) -> List[str]:
+        if not isinstance(plan, Mapping):
+            plan = {}
+
+        def _items(key: str) -> List[object]:
+            value = plan.get(key)
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return list(value)
+            return [value]
+
+        pool: List[str] = []
+        priority_symbols = self._priority_symbols_from_plan(plan)
+
+        if only_actionable:
+            self._extend_unique_symbols(pool, _items("positions"))
+            self._extend_unique_symbols(pool, _items("actionable"))
+            if not pool:
+                self._extend_unique_symbols(pool, _items("ready"))
+            if not pool and priority_symbols:
+                self._extend_unique_symbols(pool, priority_symbols)
+        else:
+            self._extend_unique_symbols(pool, _items("dynamic"))
+            if not pool:
+                for key in ("positions", "actionable", "ready", "watchlist"):
+                    self._extend_unique_symbols(pool, _items(key))
+            if not pool and priority_symbols:
+                self._extend_unique_symbols(pool, priority_symbols)
+
+        if not pool and fallback is not None:
+            cleaned = self._normalise_symbol_value(fallback)
+            if cleaned and cleaned not in pool:
+                pool.append(cleaned)
+
+        return pool
+
     def market_watchlist(self) -> List[Dict[str, object]]:
         snapshot = self._get_snapshot()
         return self._copy_list(snapshot.watchlist)
@@ -3017,13 +2719,14 @@ class GuardianBot:
         self,
         limit: Optional[int] = None,
         *,
-        include_manual: bool = True,
         only_actionable: bool = False,
     ) -> List[str]:
         """Return a prioritised list of symbols to trade based on the watchlist."""
 
         snapshot = self._get_snapshot()
         plan = snapshot.symbol_plan or {}
+        if not isinstance(plan, Mapping):
+            plan = {}
 
         if limit is None:
             limit = int(plan.get("limit") or 0)
@@ -3032,50 +2735,29 @@ class GuardianBot:
         elif limit <= 0:
             limit = None
 
-        actionable = list(plan.get("actionable") or [])
-        ready = [sym for sym in plan.get("ready") or [] if sym not in actionable]
-        dynamic_sequence = list(plan.get("dynamic") or [])
-        manual = list(plan.get("manual") or [])
-        manual_only_set = set(plan.get("manual_only") or [])
-        position_symbols = list(plan.get("positions") or [])
-        position_set = {sym for sym in position_symbols}
-
         if only_actionable:
-            pool: List[str] = list(position_symbols)
-            pool.extend(sym for sym in actionable if sym not in pool)
-            if not pool:
-                pool.extend(sym for sym in ready if sym not in pool)
-            if include_manual and manual:
-                pool.extend(sym for sym in manual if sym not in pool)
+            pool = list(plan.get("actionable_combined") or [])
         else:
-            if include_manual:
-                combined = list(plan.get("combined") or [])
-                pool = combined if combined else list(dynamic_sequence or manual)
-            else:
-                pool = list(dynamic_sequence)
+            pool = list(plan.get("combined") or [])
 
-        if not include_manual:
-            pool = [sym for sym in pool if sym not in manual_only_set]
+        if not pool:
+            pool = self._compose_symbol_pool(
+                plan,
+                only_actionable=only_actionable,
+            )
 
-        deduped: List[str] = []
-        for symbol in pool:
-            cleaned = str(symbol).strip().upper()
-            if cleaned and cleaned not in deduped:
-                deduped.append(cleaned)
-
-        if not include_manual and manual_only_set:
-            deduped = [sym for sym in deduped if sym not in manual_only_set or sym in position_set]
+        fallback_symbol = self._normalise_symbol_value(snapshot.brief.symbol)
+        if fallback_symbol and fallback_symbol not in pool:
+            pool.append(fallback_symbol)
 
         if limit is not None:
-            deduped = deduped[:limit]
+            pool = pool[:limit]
 
-        return deduped
+        return pool
 
     def trade_candidates(
         self,
         limit: Optional[int] = None,
-        *,
-        include_manual: bool = True,
     ) -> List[Dict[str, object]]:
         """Expose prioritised trade candidates with context for execution logic."""
 
@@ -3088,7 +2770,6 @@ class GuardianBot:
         return self._summarise_trade_candidates(
             plan,
             limit=limit,
-            include_manual=include_manual,
         )
 
     def actionable_opportunities(
@@ -3211,92 +2892,36 @@ class GuardianBot:
             f"Режим: {'DRY-RUN' if settings.dry_run else 'Live'}"
         )
 
-        manual_summary = snapshot.manual_summary or {}
-        manual_label = str(manual_summary.get("status_label") or "idle")
-        manual_status_text = manual_summary.get("status_text")
-        manual_status_message = manual_summary.get("status_message")
-        manual_note = manual_summary.get("status_note")
-        manual_active = bool(manual_summary.get("active"))
+        automation_enabled = bool(getattr(settings, "ai_enabled", False))
+        actionable = bool(summary.get("actionable"))
+        automation_reasons = list(summary.get("actionable_reasons") or [])
+        current_mode = str(summary.get("mode") or "wait").lower()
 
-        symbol = manual_summary.get("symbol")
-        symbol_text = None
-        if isinstance(symbol, str):
-            cleaned_symbol = symbol.strip()
-            if cleaned_symbol:
-                symbol_text = cleaned_symbol.upper()
-
-        if manual_label == "stopped":
-            manual_ok = False
-            cancel_age = manual_summary.get("last_cancel_age_seconds")
-            if isinstance(cancel_age, (int, float)) and cancel_age >= 0:
-                duration = self._format_duration(float(cancel_age))
-                base_message = (
-                    "Ручная команда остановила автоторговлю{target} {duration} назад — "
-                    "автоматические сделки заблокированы."
-                ).format(
-                    target=f" по {symbol_text}" if symbol_text else "",
-                    duration=duration,
-                )
-            else:
-                base_message = (
-                    "Ручная команда остановила автоторговлю{target} — автоматические сделки заблокированы."
-                ).format(target=f" по {symbol_text}" if symbol_text else "")
-            manual_message = self._append_operator_note(base_message, manual_note) or base_message
-        elif manual_label == "pending":
-            manual_ok = False
-            start_age = manual_summary.get("last_start_age_seconds")
-            if isinstance(start_age, (int, float)) and start_age >= 0:
-                duration = self._format_duration(float(start_age))
-                base_message = (
-                    "Оператор запустил торговлю вручную{target} {duration} назад — ждём подтверждение "
-                    "перед новыми сделками."
-                ).format(
-                    target=f" по {symbol_text}" if symbol_text else "",
-                    duration=duration,
-                )
-            else:
-                base_message = (
-                    "Оператор запустил торговлю вручную{target}, но подтверждения ещё нет — бот ждёт "
-                    "перед новыми сделками."
-                ).format(target=f" по {symbol_text}" if symbol_text else "")
-            manual_message = self._append_operator_note(base_message, manual_note) or base_message
-        elif manual_label == "active":
-            manual_ok = True
-            manual_message = manual_status_message or self._append_operator_note(
-                manual_status_text, manual_note
+        if not automation_enabled:
+            automation_ok = False
+            automation_message = (
+                "Автоматическая торговля выключена — активируйте AI в настройках."
             )
-            if not manual_message:
-                base_message = "Ручное управление активно — оператор разрешил торговлю."
-                manual_message = self._append_operator_note(base_message, manual_note) or base_message
+            automation_details = (
+                "Настройка AI_ENABLED=False. Включите автоматизацию, чтобы бот мог исполнять сделки."
+            )
+        elif actionable:
+            automation_ok = True
+            automation_message = "AI готов к автоматическим сделкам."
+            automation_details = (
+                f"Режим: {current_mode.upper()} · Уверенность {summary.get('probability_pct', 0):.1f}% · "
+                f"EV {summary.get('ev_bps', 0):.1f} б.п."
+            )
         else:
-            manual_ok = True
-            manual_message = manual_status_message or self._append_operator_note(
-                manual_status_text, manual_note
+            automation_ok = False
+            if automation_reasons:
+                reasons_text = "; ".join(str(reason) for reason in automation_reasons)
+                automation_message = "Автоматизация приостановлена: " + reasons_text
+            else:
+                automation_message = "Автоматизация приостановлена — условия сигнала не выполнены."
+            automation_details = (
+                f"Текущий режим {current_mode.upper()}, вероятность {summary.get('probability_pct', 0):.1f}%"
             )
-            if not manual_message:
-                base_message = "Ручные команды не заданы — автоматический режим свободен."
-                manual_message = self._append_operator_note(base_message, manual_note) or base_message
-
-        manual_details_bits: List[str] = []
-        manual_symbol = manual_summary.get("symbol")
-        if isinstance(manual_symbol, str) and manual_symbol.strip():
-            manual_details_bits.append(f"Цель: {manual_symbol.strip()}")
-
-        history_count = manual_summary.get("history_count")
-        if isinstance(history_count, int):
-            manual_details_bits.append(f"Команд: {history_count}")
-
-        last_action_age = manual_summary.get("last_action_age_seconds")
-        if isinstance(last_action_age, (int, float)) and last_action_age > 0:
-            manual_details_bits.append(
-                f"Последняя команда была {self._format_duration(float(last_action_age))} назад"
-            )
-
-        status_note = manual_summary.get("status_note")
-        if isinstance(status_note, str) and status_note.strip():
-            manual_details_bits.append(f"Комментарий: {status_note.strip()}")
-
-        manual_details = " · ".join(manual_details_bits) if manual_details_bits else None
 
         realtime = bybit_realtime_status(settings)
 
@@ -3308,14 +2933,12 @@ class GuardianBot:
                 "details": ai_details,
                 "age_seconds": age,
             },
-            "manual_control": {
-                "title": "Ручное управление",
-                "ok": manual_ok,
-                "message": manual_message,
-                "details": manual_details,
-                "status_label": manual_label,
-                "active": manual_active,
-                "history_count": history_count if isinstance(history_count, int) else 0,
+            "automation": {
+                "title": "Автоматизация",
+                "ok": automation_ok,
+                "message": automation_message,
+                "details": automation_details,
+                "actionable": actionable,
             },
             "executions": {
                 "title": "Журнал исполнений",
@@ -3340,6 +2963,8 @@ class GuardianBot:
         self._snapshot = None
         self._ledger_signature = None
         self._ledger_view = None
+        self._plan_cache_signature = None
+        self._plan_cache = None
         return self._get_snapshot(force=True)
 
     def unified_report(self) -> Dict[str, object]:
@@ -3794,7 +3419,7 @@ class GuardianBot:
         health = self.data_health()
         order = (
             "ai_signal",
-            "manual_control",
+            "automation",
             "executions",
             "api_keys",
             "realtime_trading",
@@ -3824,95 +3449,19 @@ class GuardianBot:
 
         return "\n".join(blocks)
 
-    def _format_manual_control_answer(self, summary: Dict[str, object]) -> str:
-        if not summary:
-            return "Ручных команд нет — бот работает автономно и следует сигналам ИИ."
-
-        lines: List[str] = []
-
-        default_text = "Ручные команды ещё не отправлялись."
-        status_text = summary.get("status_text")
-        status_message = summary.get("status_message")
-        note_line_already_present = False
-
-        if isinstance(status_message, str) and status_message.strip():
-            rendered_status = status_message.strip()
-            note_line_already_present = "комментарий оператора" in rendered_status.lower()
-        elif isinstance(status_text, str) and status_text.strip():
-            rendered_status = status_text.strip()
-        else:
-            rendered_status = default_text
-
-        lines.append(rendered_status)
-
-        status_note = summary.get("status_note")
-        if (
-            not note_line_already_present
-            and isinstance(status_note, str)
-            and status_note.strip()
-        ):
-            cleaned = status_note.strip()
-            suffix = cleaned if cleaned.endswith((".", "!", "?")) else f"{cleaned}."
-            lines.append(f"Комментарий оператора: {suffix}")
-
-        symbol = summary.get("symbol")
-        if isinstance(symbol, str) and symbol:
-            lines.append(f"Цель оператора: {symbol}.")
-
-        last_action_age = summary.get("last_action_age_seconds")
-        if isinstance(last_action_age, (int, float)) and last_action_age > 0:
-            lines.append(
-                f"Последняя команда была {self._format_duration(float(last_action_age))} назад."
+    def _format_automation_answer(self, block: Dict[str, object]) -> str:
+        if not isinstance(block, dict) or not block:
+            return (
+                "Бот работает полностью автоматически — ручных команд больше не требуется."
             )
 
-        history = summary.get("history") or []
-        if history:
-            lines.append("Последние команды оператора:")
-            tail = list(history)[-3:]
-            for entry in reversed(tail):
-                action = str(entry.get("action_label") or entry.get("action") or "").lower()
-                if action:
-                    action_text = {
-                        "start": "запуск торговли",
-                        "cancel": "остановка",
-                    }.get(action, action)
-                else:
-                    action_text = "команда"
-
-                symbol_text = str(entry.get("symbol") or symbol or "—")
-                probability = entry.get("probability_text")
-                ev_text = entry.get("ev_text")
-                note = entry.get("note_or_reason")
-                when = entry.get("ts_human") or "—"
-
-                extras: List[str] = []
-                if isinstance(probability, str):
-                    extras.append(f"уверенность {probability}")
-                if isinstance(ev_text, str):
-                    extras.append(ev_text)
-                if isinstance(note, str) and note.strip():
-                    extras.append(note.strip())
-                details = ", ".join(extras)
-                if details:
-                    details = f" ({details})"
-
-                lines.append(f"- {when}: {action_text} по {symbol_text}{details}")
-
-            history_count = summary.get("history_count")
-            if isinstance(history_count, int) and history_count > 3:
-                lines.append(
-                    (
-                        f"Всего сохранено {history_count} команд — показаны последние три. "
-                        "Остальной журнал доступен в приложении."
-                    )
-                )
-        else:
-            lines.append("Журнал команд пуст — управлять можно через панель оператора.")
-
-        lines.append(
-            "Даже при ручном запуске держите риск в рамках лимитов и проверяйте свежесть сигналов перед действиями."
-        )
-
+        message = str(block.get("message") or "Автоматизация активна.").strip()
+        details = block.get("details")
+        lines = [message]
+        if isinstance(details, str) and details.strip():
+            lines.append(details.strip())
+        if block.get("actionable") is False:
+            lines.append("AI пока наблюдает рынок и ждёт подходящего сигнала для входа.")
         return "\n".join(lines)
 
     def _format_trade_history_answer(
@@ -4466,8 +4015,8 @@ class GuardianBot:
             return self._format_fee_activity_answer(stats)
 
         if self._contains_any(prompt, ["ручн", "manual", "оператор", "вручн", "start", "stop"]):
-            summary = self.manual_trade_summary()
-            return self._format_manual_control_answer(summary)
+            automation_block = self.data_health().get("automation")
+            return self._format_automation_answer(automation_block)
 
         if self._contains_any(prompt, ["сделк", "trade", "истор", "журнал", "execut"]):
             trades = self.recent_trades(limit=5)
