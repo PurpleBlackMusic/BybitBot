@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+
+WARNING_SIGNAL_SECONDS = 300.0
+STALE_SIGNAL_SECONDS = 900.0
+
 from .envs import Settings, get_settings, get_api_client
 from .paths import DATA_DIR
 from .trade_analytics import (
@@ -95,6 +99,7 @@ class GuardianBot:
         self._status_fallback_used: bool = False
         self._status_read_error: Optional[str] = None
         self._status_content_hash: Optional[int] = None
+        self._status_source: str = "missing"
         self._plan_cache_signature: Optional[int] = None
         self._plan_cache: Optional[Dict[str, object]] = None
         self._plan_cache_ledger_signature: Optional[int] = None
@@ -239,10 +244,22 @@ class GuardianBot:
         except (TypeError, ValueError):
             ts_value = None
 
+        age_seconds: Optional[float] = None
         if ts_value is not None:
             now = time.time()
             if ts_value > now + 86_400:  # demo payloads often have dates in the future
                 return True
+            age_seconds = now - ts_value
+
+        if age_seconds is None:
+            raw_age = status.get("age_seconds")
+            try:
+                age_seconds = float(raw_age) if raw_age is not None else None
+            except (TypeError, ValueError):
+                age_seconds = None
+
+        if age_seconds is not None and age_seconds >= STALE_SIGNAL_SECONDS:
+            return True
 
         return False
 
@@ -299,6 +316,7 @@ class GuardianBot:
         self._watchlist_breakdown_cache_signature = None
         self._watchlist_breakdown_cache = None
         self._live_fetcher = None
+        self._status_source = "missing"
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -334,6 +352,7 @@ class GuardianBot:
         raw: Dict[str, object] = {}
         read_error: Optional[str] = None
         content_hash: Optional[int] = prefetched_hash
+        status_source: str = "missing"
 
         def _decode_and_parse(data: bytes) -> Dict[str, object]:
             nonlocal read_error, content_hash
@@ -368,6 +387,8 @@ class GuardianBot:
             if content_hash is None:
                 content_hash = self._hash_bytes(data)
             raw = _decode_and_parse(data)
+            if raw:
+                status_source = "file"
         elif path.exists():
             attempts = 0
             max_attempts = 3
@@ -391,6 +412,7 @@ class GuardianBot:
                 content_hash = self._hash_bytes(data)
                 raw = _decode_and_parse(data)
                 if raw:
+                    status_source = "file"
                     break
 
                 if attempts < max_attempts:
@@ -404,6 +426,7 @@ class GuardianBot:
         if not raw and self._last_status:
             raw = copy.deepcopy(self._last_status)
             fallback_used = True
+            status_source = "cached"
             if content_hash is None:
                 content_hash = self._status_content_hash
 
@@ -418,6 +441,7 @@ class GuardianBot:
                 read_error = None
                 live_status_used = True
                 content_hash = None
+                status_source = "live"
 
         if status:
             try:
@@ -431,6 +455,14 @@ class GuardianBot:
                 status["age_seconds"] = time.time() - ts_value
             else:
                 status.setdefault("age_seconds", None)
+
+        if status:
+            if status_source == "missing":
+                existing_source = status.get("status_source")
+                if isinstance(existing_source, str) and existing_source.strip():
+                    status_source = existing_source.strip().lower()
+            status = dict(status)
+            status["status_source"] = status_source
 
         if status and content_hash is None:
             try:
@@ -449,6 +481,7 @@ class GuardianBot:
         self._status_content_hash = content_hash
         self._status_fallback_used = fallback_used
         self._status_read_error = None if status and not fallback_used else read_error
+        self._status_source = status_source
         return status
 
     @staticmethod
@@ -776,9 +809,9 @@ class GuardianBot:
             return "fresh", "AI сигнал обновился только что."
         if age < 60:
             return "fresh", "AI сигнал обновился менее минуты назад."
-        if age < 300:
+        if age < WARNING_SIGNAL_SECONDS:
             return "fresh", f"AI сигнал обновился {int(age // 60)} мин назад."
-        if age < 900:
+        if age < STALE_SIGNAL_SECONDS:
             return (
                 "warning",
                 f"AI сигнал обновлялся {self._format_duration(age)} назад — дождитесь скорого обновления.",
@@ -2331,7 +2364,9 @@ class GuardianBot:
             },
             "has_status": bool(status),
             "fallback_used": bool(fallback_used),
-            "status_source": "cached" if fallback_used else "live",
+            "status_source": self._status_source
+            if self._status_source
+            else ("cached" if fallback_used else "live"),
             "status_error": self._status_read_error,
             "staleness": {
                 "state": staleness_state,
@@ -3312,7 +3347,11 @@ class GuardianBot:
         if isinstance(staleness_message, str) and staleness_message.strip():
             lines.append(staleness_message.strip())
 
-        if status_source == "cached" or summary.get("fallback_used"):
+        if status_source == "file":
+            lines.append(
+                "Данные прочитаны из локального status.json — убедитесь, что файл обновляется автоматически."
+            )
+        elif status_source == "cached" or summary.get("fallback_used"):
             lines.append(
                 "Данные получены из последнего сохранённого файла — проверьте, что бот обновляет статус в реальном времени."
             )
@@ -4284,10 +4323,10 @@ class GuardianBot:
         age = brief.status_age
         if age is None:
             return None
-        if age >= 900:
+        if age >= STALE_SIGNAL_SECONDS:
             return (
                 "Сигнал старше 15 минут. Без свежих данных лучше не открывать новые сделки и проверить подключение."
             )
-        if age >= 300:
+        if age >= WARNING_SIGNAL_SECONDS:
             return "Данные не обновлялись более 5 минут. Убедитесь, что бот подключён и обновляет сигнал."
         return None
