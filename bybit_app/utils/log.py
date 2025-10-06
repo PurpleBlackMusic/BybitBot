@@ -1,7 +1,10 @@
 
 from __future__ import annotations
-import json, time
+import json
+import time
+
 from .paths import LOG_DIR
+from .file_io import tail_lines
 
 LOG_FILE = LOG_DIR / "app.log"
 
@@ -19,10 +22,14 @@ def read_tail(n: int | str = 1000):
     except (TypeError, ValueError):
         limit = 1000
 
-    if limit <= 0 or not LOG_FILE.exists():
+    if limit <= 0:
         return []
 
-    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-    if limit >= len(lines):
-        return lines
-    return lines[-limit:]
+    return tail_lines(
+        LOG_FILE,
+        limit,
+        encoding="utf-8",
+        errors="replace",
+        keep_newlines=False,
+        drop_blank=False,
+    )
