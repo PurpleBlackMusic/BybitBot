@@ -163,6 +163,51 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "серверное время".lower() in result["message"].lower()
 
 
+def test_bybit_realtime_status_accepts_recent_ws_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_100_000.0
+    perf_iter = iter([300.0, 300.03])
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: next(perf_iter))
+
+    wallet_payload = {"result": {"list": [{"totalEquity": "50", "availableBalance": "30"}]}}
+    orders_payload = {
+        "result": {
+            "list": [
+                {"symbol": "ETHUSDT", "updatedTime": str((now - 20) * 1000)}
+            ]
+        }
+    }
+    executions_payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "execTime": str((now - 10) * 1000),
+                    "side": "Sell",
+                    "execPrice": "1800",
+                    "execQty": "0.01",
+                }
+            ]
+        }
+    }
+
+    api = DummyAPI(wallet_payload, orders_payload, executions_payload)
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    ws_status = {
+        "public": {"running": False, "connected": True, "age_seconds": 5.0, "last_beat": now - 5},
+        "private": {"running": True, "connected": True, "age_seconds": 7.0, "last_beat": now - 7},
+    }
+
+    result = bybit_realtime_status(settings, api=api, ws_status=ws_status)
+    assert result["ok"] is True
+    assert "websocket не" not in result["message"].lower()
+    assert result["ws_public_age_sec"] == pytest.approx(5.0)
+    assert result["ws_private_age_sec"] == pytest.approx(7.0)
+
+
 def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) -> None:
     now = 2_000_000.0
     monkeypatch.setattr(live_checks.time, "time", lambda: now)
