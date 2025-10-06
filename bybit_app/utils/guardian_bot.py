@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from dataclasses import asdict, dataclass
+import json
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
-import json
-import time
 
 from .envs import Settings, get_settings
 from .paths import DATA_DIR
@@ -2676,8 +2677,354 @@ class GuardianBot:
             message_parts.append(staleness)
         return "\n\n".join(message_parts)
 
-    def answer(self, question: str) -> str:
-        prompt = (question or "").strip()
+    def _normalise_question(self, question: object | None) -> str:
+        preferred_roles = {"user", "human", "client", "trader", "customer"}
+        assistant_like_roles = {
+            "assistant",
+            "system",
+            "bot",
+            "ai",
+            "tool",
+            "function",
+        }
+
+        def _mapping_get(mapping: Mapping | object, key: str) -> object:
+            if isinstance(mapping, Mapping):
+                if hasattr(mapping, "get"):
+                    return mapping.get(key)
+                try:
+                    return mapping[key]  # type: ignore[index]
+                except Exception:
+                    return None
+            return None
+
+        def _as_role(value: object, depth: int = 0) -> str:
+            if value is None or depth > 6:
+                return ""
+
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                value = bytes(value).decode("utf-8", errors="ignore")
+
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if not text:
+                    return ""
+                for token in (*preferred_roles, *assistant_like_roles):
+                    if token in text:
+                        return token
+                return text
+
+            if is_dataclass(value):
+                try:
+                    dataclass_mapping = asdict(value)
+                except Exception:  # pragma: no cover - defensive
+                    dataclass_mapping = {
+                        key: getattr(value, key)
+                        for key in getattr(value, "__dataclass_fields__", {})
+                    }
+                return _as_role(dataclass_mapping, depth + 1)
+
+            for attr_name in ("model_dump", "dict", "to_dict", "as_dict", "asdict"):
+                attr = getattr(value, attr_name, None)
+                if not callable(attr):
+                    continue
+                try:
+                    mapping_like = attr()
+                except TypeError:
+                    try:
+                        mapping_like = attr(exclude_none=False)
+                    except TypeError:
+                        continue
+                    except Exception:  # pragma: no cover - defensive
+                        continue
+                except Exception:  # pragma: no cover - defensive
+                    continue
+
+                if isinstance(mapping_like, (dict, list, tuple, set, frozenset)):
+                    return _as_role(mapping_like, depth + 1)
+                if isinstance(mapping_like, str):
+                    return _as_role(mapping_like, depth + 1)
+
+            for attr_name in ("role", "type", "kind"):
+                if hasattr(value, attr_name):
+                    candidate = _as_role(getattr(value, attr_name), depth + 1)
+                    if candidate:
+                        return candidate
+
+            if isinstance(value, Mapping):
+                for key in ("role", "type", "kind", "value", "name", "label"):
+                    if key in value:
+                        candidate = _as_role(_mapping_get(value, key), depth + 1)
+                        if candidate:
+                            return candidate
+                return ""
+
+            if isinstance(value, (list, tuple, set, frozenset)):
+                for item in value:
+                    candidate = _as_role(item, depth + 1)
+                    if candidate:
+                        return candidate
+                return ""
+
+            for attr in ("value", "name"):
+                if hasattr(value, attr):
+                    candidate = _as_role(getattr(value, attr), depth + 1)
+                    if candidate:
+                        return candidate
+
+            if hasattr(value, "__dict__"):
+                mapping_like = getattr(value, "__dict__")
+                if isinstance(mapping_like, dict):
+                    candidate = _as_role(mapping_like, depth + 1)
+                    if candidate:
+                        return candidate
+
+            try:
+                text = str(value)
+            except Exception:  # pragma: no cover - defensive
+                return ""
+
+            text = text.strip().lower()
+            if not text:
+                return ""
+            for token in (*preferred_roles, *assistant_like_roles):
+                if token in text:
+                    return token
+            return text
+
+        def iter_parts(value: object | None, depth: int = 0) -> Iterable[str]:
+            if value is None or depth > 6:
+                return []
+
+            if isinstance(value, str):
+                stripped = value.strip()
+                if not stripped:
+                    return []
+
+                if len(stripped) <= 2000 and stripped[0] in "{[":
+                    try:
+                        parsed = json.loads(stripped)
+                    except Exception:
+                        pass
+                    else:
+                        parsed_parts = list(iter_parts(parsed, depth + 1))
+                        if parsed_parts:
+                            return parsed_parts
+
+                return [stripped]
+
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                decoded = bytes(value).decode("utf-8", errors="ignore").strip()
+                return [decoded] if decoded else []
+
+            if is_dataclass(value):
+                try:
+                    dataclass_mapping = asdict(value)
+                except Exception:  # pragma: no cover - defensive
+                    dataclass_mapping = {
+                        key: getattr(value, key)
+                        for key in getattr(value, "__dataclass_fields__", {})
+                    }
+                return list(iter_parts(dataclass_mapping, depth + 1))
+
+            for attr_name in ("model_dump", "dict", "to_dict", "as_dict", "asdict"):
+                attr = getattr(value, attr_name, None)
+                if not callable(attr):
+                    continue
+                try:
+                    mapping_like = attr()
+                except TypeError:
+                    try:
+                        mapping_like = attr(exclude_none=False)
+                    except TypeError:
+                        continue
+                    except Exception:  # pragma: no cover - defensive
+                        continue
+                except Exception:  # pragma: no cover - defensive
+                    continue
+
+                if isinstance(mapping_like, (dict, list, tuple, set, frozenset)):
+                    return list(iter_parts(mapping_like, depth + 1))
+                if isinstance(mapping_like, str):
+                    return list(iter_parts(mapping_like, depth + 1))
+
+            if isinstance(value, Mapping):
+                parts: List[str] = []
+                role = _as_role(_mapping_get(value, "role")) if "role" in value else ""
+
+                messages = _mapping_get(value, "messages") if "messages" in value else None
+                if isinstance(messages, (list, tuple, set, frozenset, Sequence)) and not isinstance(
+                    messages, (str, bytes, bytearray, memoryview)
+                ):
+                    user_parts: List[str] = []
+                    other_parts: List[str] = []
+                    for message in messages:
+                        msg_parts = list(iter_parts(message, depth + 1))
+                        msg_role = ""
+                        if isinstance(message, Mapping) and "role" in message:
+                            msg_role = _as_role(_mapping_get(message, "role"))
+                        if msg_role in preferred_roles:
+                            user_parts.extend(msg_parts)
+                        else:
+                            other_parts.extend(msg_parts)
+                    if user_parts:
+                        return user_parts
+                    if other_parts:
+                        parts.extend(other_parts)
+
+                choices = _mapping_get(value, "choices") if "choices" in value else None
+                if isinstance(choices, (list, tuple, set, frozenset, Sequence)) and not isinstance(
+                    choices, (str, bytes, bytearray, memoryview)
+                ):
+                    for choice in choices:
+                        parts.extend(iter_parts(choice, depth + 1))
+
+                content = _mapping_get(value, "content") if "content" in value else None
+                if isinstance(content, list):
+                    for item in content:
+                        parts.extend(iter_parts(item, depth + 1))
+                elif isinstance(content, dict):
+                    parts.extend(iter_parts(content, depth + 1))
+
+                priority_keys = (
+                    "text",
+                    "message",
+                    "content",
+                    "value",
+                    "question",
+                    "prompt",
+                    "input",
+                    "body",
+                    "delta",
+                    "messages",
+                    "response",
+                    "output",
+                    "outputs",
+                    "result",
+                    "arguments",
+                    "args",
+                    "data",
+                    "payload",
+                    "details",
+                    "tool_calls",
+                    "function_call",
+                    "function",
+                    "parameters",
+                    "params",
+                    "inputs",
+                    "parts",
+                    "segments",
+                    "items",
+                    "input_text",
+                    "output_text",
+                    "instruction",
+                    "instructions",
+                    "query",
+                    "request",
+                    "task",
+                )
+
+                if role in preferred_roles:
+                    for key in priority_keys:
+                        if key in value:
+                            candidate = list(iter_parts(value[key], depth + 1))
+                            if candidate:
+                                return candidate
+
+                if role and role not in preferred_roles:
+                    if role in assistant_like_roles:
+                        filtered: List[str] = []
+                        for key, item in value.items():
+                            if key in {"role", "name"}:
+                                continue
+                            filtered.extend(iter_parts(item, depth + 1))
+                        if filtered:
+                            return filtered
+                    nested_user_parts: List[str] = []
+                    for key, item in value.items():
+                        if key in {"role", "name"}:
+                            continue
+                        nested_user_parts.extend(iter_parts(item, depth + 1))
+                    return nested_user_parts
+
+                for key in priority_keys:
+                    if key in value:
+                        parts.extend(iter_parts(value[key], depth + 1))
+                if parts:
+                    return parts
+
+                for item in value.values():
+                    parts.extend(iter_parts(item, depth + 1))
+                return parts
+
+            attribute_priority = (
+                "content",
+                "message",
+                "messages",
+                "prompt",
+                "question",
+                "text",
+                "value",
+                "input",
+                "body",
+                "payload",
+                "data",
+                "details",
+                "arguments",
+                "args",
+                "delta",
+                "output",
+                "outputs",
+                "instruction",
+                "instructions",
+                "query",
+                "request",
+                "task",
+            )
+
+            collected_parts: List[str] = []
+            for attr_name in attribute_priority:
+                if hasattr(value, attr_name):
+                    collected_parts.extend(iter_parts(getattr(value, attr_name), depth + 1))
+
+            if hasattr(value, "__dict__"):
+                mapping_like = getattr(value, "__dict__")
+                if isinstance(mapping_like, dict):
+                    collected_parts.extend(iter_parts(mapping_like, depth + 1))
+
+            if collected_parts:
+                return collected_parts
+
+            if isinstance(value, Sequence) and not isinstance(
+                value, (str, bytes, bytearray, memoryview)
+            ):
+                parts: List[str] = []
+                for item in value:
+                    parts.extend(iter_parts(item, depth + 1))
+                return parts
+
+            if isinstance(value, (set, frozenset)):
+                parts: List[str] = []
+                for item in value:
+                    parts.extend(iter_parts(item, depth + 1))
+                return parts
+
+            try:
+                text = str(value).strip()
+            except Exception:  # pragma: no cover - defensive
+                return []
+            return [text] if text else []
+
+        parts = []
+        for part in iter_parts(question):
+            if part:
+                parts.append(part)
+
+        unique_parts = list(dict.fromkeys(parts))
+        return " ".join(unique_parts)
+
+    def answer(self, question: object | None = None) -> str:
+        prompt = self._normalise_question(question)
         if not prompt:
             return "Спросите меня о прибыли, риске или плане действий, и я объясню простыми словами."
 
