@@ -227,23 +227,12 @@ st.caption(
     "Минимальный интерфейс умного спотового бота: краткая сводка, пошаговый план и чат для вопросов."
 )
 
-feedback = st.session_state.pop("trade_control_feedback", None)
-if feedback:
-    kind, _payload = feedback
-    if kind == "start":
-        st.success("Команда на старт торговли отправлена боту.")
-    elif kind == "cancel":
-        st.warning("Команда на остановку торговли отправлена боту.")
-    elif kind == "clear":
-        st.info("История ручных команд очищена.")
-
 refresh = st.button("🔄 Обновить данные", use_container_width=True)
 if refresh:
     bot.refresh()
     rerun()
 
 summary = bot.status_summary()
-manual_summary = summary.get("manual_control", {})
 brief = bot.generate_brief()
 plan_steps = bot.plan_steps(brief)
 risk_text = bot.risk_summary()
@@ -252,6 +241,7 @@ watchlist = bot.market_watchlist()
 recent_trades = bot.recent_trades()
 trade_stats = bot.trade_statistics()
 health = bot.data_health()
+automation_health = health.get("automation") or {}
 
 previous_summary = st.session_state.get("previous_summary")
 previous_readiness = st.session_state.get("previous_readiness")
@@ -356,144 +346,28 @@ else:
             hide_index=True,
         )
 
-st.markdown("#### Управление торговлей")
-control_state = bot.manual_trade_state()
+st.markdown("#### Автоматизация")
 with st.container(border=True):
-    last_action = control_state.last_action or {}
-    symbol_hint = (
-        last_action.get("symbol")
-        or summary.get("symbol")
-        or brief.symbol
-        if hasattr(brief, "symbol")
-        else None
+    automation_ok = bool(automation_health.get("ok"))
+    automation_message = (
+        str(automation_health.get("message") or "AI готов к автоматическим сделкам.").strip()
     )
-    symbol_caption = symbol_hint or "—"
+    automation_details = automation_health.get("details")
+    reasons = summary.get("actionable_reasons") or []
 
-    manual_status_text = manual_summary.get("status_text")
-    manual_label = manual_summary.get("status_label")
-    manual_symbol = manual_summary.get("symbol") or symbol_caption
-
-    if control_state.active:
-        last_start = control_state.last_start or last_action
-        st.success(manual_status_text or "Торговля запущена вручную.")
-        meta_bits: list[str] = []
-        if manual_symbol:
-            meta_bits.append(str(manual_symbol))
-        started_text = manual_summary.get("last_start_at") or _format_timestamp(
-            (last_start or {}).get("ts")
-        )
-        if started_text and started_text != "—":
-            meta_bits.append(f"ручной старт: {started_text}")
-        last_source = (last_start or {}).get("source") or (last_action or {}).get("source")
-        if last_source:
-            meta_bits.append(f"источник: {last_source}")
-        if meta_bits:
-            st.caption(" · ".join(meta_bits))
-        if st.button("⏹️ Отменить торговлю", key="btn_stop_trade"):
-            record = bot.manual_trade_cancel(
-                symbol=summary.get("symbol"),
-                reason="Остановка через страницу 'Простой режим'.",
-                source="ui.simple",
-                note=f"mode={summary.get('mode', 'wait')}",
-                extra={
-                    "probability_pct": probability_pct,
-                    "ev_bps": ev_bps,
-                },
-            )
-            st.session_state["trade_control_feedback"] = ("cancel", record)
-            rerun()
+    if automation_ok:
+        st.success(automation_message)
     else:
-        st.info(
-            manual_status_text
-            or "Торговля не запущена — бот ждёт команды оператора."
-        )
-        meta_bits: list[str] = []
-        if manual_symbol:
-            meta_bits.append(str(manual_symbol))
-        last_cancel_at = manual_summary.get("last_cancel_at")
-        if last_cancel_at and last_cancel_at != "—":
-            meta_bits.append(f"последняя остановка: {last_cancel_at}")
-        last_action_source = (last_action or {}).get("source")
-        if last_action_source:
-            meta_bits.append(f"источник: {last_action_source}")
-        if manual_label == "pending" and manual_summary.get("last_action_at"):
-            meta_bits.append(f"последняя команда: {manual_summary['last_action_at']}")
-        if meta_bits:
-            st.caption(" · ".join(meta_bits))
-        disabled = not summary.get("actionable")
-        button_label = (
-            "🚀 Дать старт торговле"
-            if not disabled
-            else "🚀 Дать старт (после прохождения проверок)"
-        )
-        if st.button(button_label, key="btn_start_trade", disabled=disabled):
-            record = bot.manual_trade_start(
-                symbol=summary.get("symbol"),
-                mode=summary.get("mode"),
-                probability_pct=probability_pct,
-                ev_bps=ev_bps,
-                source="ui.simple",
-                note="Ручной старт через страницу 'Простой режим'.",
-                extra={
-                    "actionable": bool(summary.get("actionable")),
-                    "staleness": staleness,
-                },
-            )
-            st.session_state["trade_control_feedback"] = ("start", record)
-            rerun()
-        if disabled:
-            st.caption(
-                "Дождитесь, пока сигнал пройдёт проверки риска — после этого кнопка станет активной."
-            )
+        st.warning(automation_message)
 
-    history_records: list[dict[str, object]] = list(manual_summary.get("history", []))
-    if history_records:
-        st.caption("Последние команды оператора:")
-        rows: list[dict[str, str]] = []
-        for entry in reversed(history_records[-10:]):
-            probability_text = entry.get("probability_text")
-            if not probability_text:
-                prob_value = entry.get("probability_pct")
-                if prob_value is None:
-                    probability_text = "—"
-                else:
-                    try:
-                        probability_text = f"{float(prob_value):.1f}%"
-                    except (TypeError, ValueError):
-                        probability_text = str(prob_value)
+    if isinstance(automation_details, str) and automation_details.strip():
+        st.caption(automation_details.strip())
 
-            ev_text = entry.get("ev_text")
-            if not ev_text:
-                ev_value = entry.get("ev_bps")
-                if ev_value is None:
-                    ev_text = "—"
-                else:
-                    try:
-                        ev_text = f"{float(ev_value):.1f} б.п."
-                    except (TypeError, ValueError):
-                        ev_text = str(ev_value)
-
-            comment = entry.get("note_or_reason") or entry.get("note") or entry.get("reason")
-            comment_text = str(comment) if comment else "—"
-
-            row = {
-                "Время": str(entry.get("ts_human") or _format_timestamp(entry.get("ts"))),
-                "Действие": str(entry.get("action_label") or entry.get("action") or "").upper(),
-                "Символ": str(entry.get("symbol") or manual_symbol or "—"),
-                "Вероятность": probability_text,
-                "EV": ev_text,
-                "Источник": str(entry.get("source") or "—"),
-                "Комментарий": comment_text,
-            }
-            rows.append(row)
-
-        history_df = pd.DataFrame(rows)
-        st.dataframe(history_df, use_container_width=True, hide_index=True)
-
-        if st.button("🧹 Очистить историю команд", key="btn_clear_trade_history"):
-            bot.manual_trade_clear()
-            st.session_state["trade_control_feedback"] = ("clear", None)
-            rerun()
+    if not automation_ok and reasons:
+        st.caption("Почему бот ждёт:")
+        st.markdown("\n".join(f"• {reason}" for reason in reasons))
+    elif not reasons and not automation_ok:
+        st.caption("AI ожидает подходящий сигнал для безопасного входа.")
 
 readiness_checks = []
 staleness_state = (staleness.get("state") or "").lower()

@@ -9,224 +9,90 @@ st.title("⚙️ Настройки")
 
 s = get_settings()
 
-section("Режим работы GuardianBot")
-
-mode_options = {
-    "auto": {
-        "label": "🤖 Автоматически",
-        "description": "Бот сам обновляет параметры риска и исполняет сигналы.",
-    },
-    "manual": {
-        "label": "🛠 Ручной контроль",
-        "description": "Вы запускаете сделки сами, а AI подсказывает лучшие действия.",
-    },
-}
-
-current_mode = str(getattr(s, "operation_mode", "manual") or "manual").lower()
-if current_mode not in mode_options:
-    current_mode = "manual"
-
-mode_keys = list(mode_options.keys())
-default_index = mode_keys.index(current_mode)
-
-with st.form("operation_mode_form"):
-    selected_mode = st.radio(
-        "Как бот должен работать?",
-        options=mode_keys,
-        index=default_index,
-        format_func=lambda key: mode_options[key]["label"],
+with st.form("automation_toggle"):
+    ai_enabled_initial = bool(getattr(s, "ai_enabled", False))
+    ai_enabled_choice = st.checkbox(
+        "Включить автоматическое исполнение сигналов",
+        value=ai_enabled_initial,
+        help="Когда флажок активен, GuardianBot исполняет сделки автоматически при выполнении всех ограничений.",
     )
-    submitted = st.form_submit_button("💾 Применить режим")
+    toggle_submitted = st.form_submit_button("💾 Обновить режим")
 
-if submitted:
-    updates = {"operation_mode": selected_mode}
-    if selected_mode == "auto" and not getattr(s, "ai_enabled", False):
-        updates["ai_enabled"] = True
-    update_settings(**updates)
-    st.success("Режим работы обновлён.")
-    s = get_settings(force_reload=True)
-    current_mode = selected_mode
-else:
-    current_mode = selected_mode
-
-st.caption(mode_options[current_mode]["description"])
+if toggle_submitted:
+    if ai_enabled_choice != ai_enabled_initial:
+        update_settings(ai_enabled=ai_enabled_choice)
+        st.success("Настройка автоматизации обновлена.")
+        s = get_settings(force_reload=True)
+    else:
+        st.info("Настройки автоматизации без изменений.")
 
 bot = GuardianBot(settings=s)
 summary = bot.status_summary()
+automation_health = bot.data_health().get("automation") or {}
+brief = bot.generate_brief()
 
-if current_mode == "auto":
-    st.success(
-        "GuardianBot управляет параметрами автоматически: при совпадении условий сигнал исполняется без ручного вмешательства."
+ai_enabled = bool(getattr(s, "ai_enabled", False))
+
+if ai_enabled:
+    automation_ok = bool(automation_health.get("ok"))
+    automation_message = (
+        str(automation_health.get("message") or "AI готов к автоматическим сделкам.").strip()
     )
+    automation_details = automation_health.get("details")
+    status_renderer = st.success if automation_ok else st.warning
+    status_renderer(automation_message)
+    if isinstance(automation_details, str) and automation_details.strip():
+        st.caption(automation_details.strip())
     blockers = [reason for reason in summary.get("actionable_reasons", []) if reason]
     if blockers:
-        st.caption("Чтобы авто-режим торговал, убедитесь, что устранены ограничения ниже:")
+        st.markdown("**Почему бот пока ждёт:**")
         for reason in blockers:
             st.markdown(f"- {reason}")
 else:
-    guidance = summary.get("manual_guidance") or {}
     st.info(
-        "В ручном режиме сделки не отправляются автоматически — AI готовит вам подсказки и чек-лист действий."
+        "AI сигналы выключены — включите автоматизацию выше, чтобы GuardianBot исполнял сделки самостоятельно."
     )
-    headline = guidance.get("headline")
-    if headline:
-        st.subheader(headline)
-    control_status = guidance.get("control_status") or {}
-    if control_status:
-        awaiting_operator = bool(control_status.get("awaiting_operator"))
-        is_active = bool(control_status.get("active"))
-        message = control_status.get("message") or ""
-        label = control_status.get("label") or "Статус ручного управления"
-        status_block = st.warning if awaiting_operator else st.success if is_active else st.info
-        status_lines = [f"**{label}**"]
-        if message:
-            status_lines.append("")
-            status_lines.append(message)
-        status_block("\n\n".join(status_lines))
 
-        meta_bits = []
-        symbol = control_status.get("symbol")
-        if symbol:
-            meta_bits.append(f"Символ: {symbol}")
-        last_action_at = control_status.get("last_action_at")
-        if last_action_at:
-            meta_bits.append(f"Последняя команда: {last_action_at}")
-        last_action_age = control_status.get("last_action_age")
-        if last_action_age:
-            meta_bits.append(f"Прошло времени: {last_action_age}")
-        if meta_bits:
-            st.caption(" · ".join(meta_bits))
+plan_steps = bot.plan_steps(brief=brief)
+if plan_steps:
+    with st.expander("Чек-лист действий от AI", expanded=True):
+        for idx, step in enumerate(plan_steps, start=1):
+            st.markdown(f"{idx}. {step}")
 
-        history_preview = control_status.get("history_preview") or []
-        if history_preview:
-            with st.expander(
-                "История ручных команд", expanded=False
-            ):
-                for entry in history_preview:
-                    st.markdown(f"- {entry}")
-    notes = guidance.get("notes") or []
-    if notes:
-        st.markdown("**Что советует AI:**")
-        for note in notes:
+risk_outline = bot.risk_summary()
+if risk_outline:
+    with st.expander("Контроль рисков", expanded=False):
+        st.markdown(risk_outline.replace("\n", "  \n"))
+
+safety_notes = bot.safety_notes()
+if safety_notes:
+    with st.expander("Напоминания по безопасности", expanded=False):
+        for note in safety_notes:
             st.markdown(f"- {note}")
-    thresholds = guidance.get("thresholds") or {}
-    if thresholds:
-        col_buy, col_sell, col_ev = st.columns(3)
-        col_buy.metric("Порог покупки", f"{thresholds.get('effective_buy_probability_pct', 0):.2f}%")
-        col_sell.metric("Порог продажи", f"{thresholds.get('effective_sell_probability_pct', 0):.2f}%")
-        col_ev.metric("Мин. выгода", f"{thresholds.get('min_ev_bps', 0):.2f} б.п.")
 
-    blockers = guidance.get("reasons") or summary.get("actionable_reasons", [])
-    blockers = [reason for reason in blockers if reason]
-    if blockers:
-        st.markdown("**Почему автоматическое исполнение сейчас выключено:**")
-        for reason in blockers:
-            st.markdown(f"- {reason}")
+thresholds = summary.get("thresholds") or {}
+if thresholds:
+    st.subheader("Ориентиры GuardianBot")
+    st.caption(
+        "Пороговые значения из текущего сигнала помогают понять, когда AI готов действовать без лишнего риска."
+    )
+    cols = st.columns(3)
+    cols[0].metric(
+        "Порог покупки",
+        f"{float(thresholds.get('effective_buy_probability_pct') or 0.0):.1f}%",
+    )
+    cols[1].metric(
+        "Порог продажи",
+        f"{float(thresholds.get('effective_sell_probability_pct') or 0.0):.1f}%",
+    )
+    cols[2].metric(
+        "Мин. ожидаемая выгода",
+        f"{float(thresholds.get('min_ev_bps') or 0.0):.1f} б.п.",
+    )
 
-    plan_steps = guidance.get("plan_steps") or []
-    if plan_steps:
-        with st.expander("Чек-лист действий", expanded=True):
-            for idx, step in enumerate(plan_steps, start=1):
-                st.markdown(f"{idx}. {step}")
-
-    risk_outline = guidance.get("risk_summary") or ""
-    if risk_outline:
-        with st.expander("Контроль рисков", expanded=False):
-            st.markdown(risk_outline.replace("\n", "  \n"))
-
-    safety_notes = guidance.get("safety_notes") or []
-    if safety_notes:
-        with st.expander("Напоминания по безопасности", expanded=False):
-            for note in safety_notes:
-                st.markdown(f"- {note}")
-
-    thresholds = summary.get("thresholds") or {}
-    recommended_buy = thresholds.get("effective_buy_probability_pct", 0.0)
-    recommended_sell = thresholds.get("effective_sell_probability_pct", 0.0)
-    recommended_ev = thresholds.get("min_ev_bps", 0.0)
-
-    st.subheader("Настройка параметров под себя")
-    st.caption("AI делится актуальными ориентирами по вероятности сигнала и ожидаемой выгоде. Вы можете скорректировать лимиты вручную ниже.")
-
-    current_buy = float(getattr(s, "ai_buy_threshold", 0.55) or 0.0) * 100.0
-    current_sell = float(getattr(s, "ai_sell_threshold", 0.45) or 0.0) * 100.0
-    current_ev = float(getattr(s, "ai_min_ev_bps", 0.0) or 0.0)
-    current_risk = float(getattr(s, "ai_risk_per_trade_pct", 0.25) or 0.0)
-    current_reserve = float(getattr(s, "spot_cash_reserve_pct", 10.0) or 0.0)
-    current_daily_stop = float(getattr(s, "ai_daily_loss_limit_pct", 3.0) or 0.0)
-    ai_analysis_active = bool(getattr(s, "ai_enabled", False))
-
-    with st.form("manual_ai_tuning"):
-        col_buy_sell, col_ev, col_risk = st.columns([1.2, 1.0, 1.0])
-        with col_buy_sell:
-            buy_pct = st.slider(
-                "Порог покупки, %",
-                min_value=0.0,
-                max_value=100.0,
-                value=current_buy,
-                step=0.5,
-                help=f"AI советует ≥ {recommended_buy:.2f}%",
-            )
-            sell_pct = st.slider(
-                "Порог продажи, %",
-                min_value=0.0,
-                max_value=100.0,
-                value=current_sell,
-                step=0.5,
-                help=f"AI советует ≥ {recommended_sell:.2f}%",
-            )
-        with col_ev:
-            min_ev_bps = st.number_input(
-                "Мин. ожидаемая выгода, б.п.",
-                min_value=0.0,
-                max_value=200.0,
-                value=current_ev,
-                step=0.5,
-                help=f"AI не рекомендует опускаться ниже {recommended_ev:.2f} б.п.",
-            )
-            daily_stop = st.number_input(
-                "Дневной стоп по убытку, %",
-                min_value=0.0,
-                max_value=100.0,
-                value=current_daily_stop,
-                step=0.5,
-            )
-        with col_risk:
-            risk_pct = st.number_input(
-                "Риск на сделку, % капитала",
-                min_value=0.0,
-                max_value=100.0,
-                value=current_risk,
-                step=0.1,
-            )
-            reserve_pct = st.number_input(
-                "Резерв в кэше, %",
-                min_value=0.0,
-                max_value=100.0,
-                value=current_reserve,
-                step=1.0,
-            )
-
-        ai_analysis = st.checkbox(
-            "AI анализ сигналов включён",
-            value=ai_analysis_active,
-            help="Оставьте анализ включённым, чтобы получать подсказки без автоторговли.",
-        )
-
-        tuning_submitted = st.form_submit_button("💾 Сохранить параметры")
-
-    if tuning_submitted:
-        update_settings(
-            ai_buy_threshold=buy_pct / 100.0,
-            ai_sell_threshold=sell_pct / 100.0,
-            ai_min_ev_bps=min_ev_bps,
-            ai_risk_per_trade_pct=risk_pct,
-            spot_cash_reserve_pct=reserve_pct,
-            ai_daily_loss_limit_pct=daily_stop,
-            ai_enabled=ai_analysis,
-        )
-        st.success("Параметры сохранены. GuardianBot учтёт новые значения при следующем анализе.")
-        s = get_settings(force_reload=True)
+st.caption(
+    "GuardianBot автоматически подстраивает параметры риска и аккуратно ведёт сделки. Если нужны ручные правки, обновите settings.json напрямую."
+)
 
 section("Telegram")
 col1, col2 = st.columns(2)

@@ -14,7 +14,6 @@ from types import MappingProxyType
 import pytest
 
 import bybit_app.utils.guardian_bot as guardian_bot_module
-from bybit_app.utils import trade_control
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
 
@@ -324,36 +323,6 @@ def test_guardian_summary_highlights_sell_threshold(tmp_path: Path) -> None:
     assert "50.00%" in reason_text
 
 
-def test_guardian_summary_mentions_manual_stop(tmp_path: Path) -> None:
-    trade_control.clear_trade_commands(data_dir=tmp_path)
-    trade_control.request_trade_cancel(
-        symbol="BTCUSDT", reason="pause", data_dir=tmp_path
-    )
-
-    status = {
-        "symbol": "BTCUSDT",
-        "probability": 0.82,
-        "ev_bps": 25.0,
-        "mode": "buy",
-        "last_tick_ts": time.time(),
-    }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
-    settings = Settings(ai_symbols="BTCUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=5.0)
-    bot = _make_bot(tmp_path, settings)
-
-    summary = bot.status_summary()
-
-    assert summary["actionable"] is False
-    reason_text = " ".join(summary["actionable_reasons"])
-    assert "ручная" in reason_text.lower()
-    assert "останов" in reason_text.lower()
-    assert "BTCUSDT" in reason_text
-    assert "Комментарий оператора" in reason_text
-
-
 def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
@@ -384,52 +353,6 @@ def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
     )
 
 
-def test_guardian_manual_guidance_available(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path, Settings(operation_mode="manual", ai_enabled=False))
-    summary = bot.status_summary()
-
-    assert summary["operation_mode"] == "manual"
-    guidance = summary.get("manual_guidance")
-    assert guidance
-    assert guidance.get("notes")
-    assert any("ручной" in reason.lower() for reason in guidance.get("reasons", []))
-    assert guidance.get("plan_steps")
-    assert isinstance(guidance.get("plan_steps"), list)
-    assert any("бот" in step.lower() or "пауза" in step.lower() for step in guidance["plan_steps"])
-    risk_outline = guidance.get("risk_summary")
-    assert isinstance(risk_outline, str) and "Режим:" in risk_outline
-    safety_notes = guidance.get("safety_notes")
-    assert isinstance(safety_notes, list) and any("режим" in note.lower() for note in safety_notes)
-    control_status = guidance.get("control_status")
-    assert control_status is not None
-    assert control_status.get("label")
-    assert control_status.get("history_count") == 0
-    assert isinstance(control_status.get("message"), str)
-
-
-def test_guardian_manual_guidance_includes_history(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path, Settings(operation_mode="manual", ai_enabled=False))
-    bot.manual_trade_start(
-        symbol="BTCUSDT",
-        mode="buy",
-        probability_pct=58.5,
-        ev_bps=21.0,
-        note="Пробная команда",
-    )
-
-    summary = bot.status_summary()
-    guidance = summary.get("manual_guidance") or {}
-    control_status = guidance.get("control_status") or {}
-
-    assert control_status.get("history_count", 0) >= 1
-    history_preview = control_status.get("history_preview") or []
-    assert any("BTCUSDT" in entry for entry in history_preview)
-    assert control_status.get("label")
-    assert control_status.get("message")
-    if control_status.get("raw_label") == "active":
-        assert control_status.get("active") is True
-
-
 def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
     status_path = tmp_path / "ai" / "status.json"
     status_path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,14 +369,11 @@ def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = _make_bot(
-        tmp_path,
-        Settings(operation_mode="auto", ai_enabled=True, ai_symbols="BTCUSDT"),
-    )
+    bot = _make_bot(tmp_path, Settings(ai_enabled=True, ai_symbols="BTCUSDT"))
     summary = bot.status_summary()
 
     assert summary["operation_mode"] == "auto"
-    assert summary.get("manual_guidance") is None
+    assert "manual_guidance" not in summary
 
 
 def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:
@@ -942,36 +862,18 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
     reply = bot.answer("как здоровье данных?")
 
     assert "AI сигнал" in reply
-    assert "Ручное управление" in reply
+    assert "Автоматизация" in reply
     assert "Журнал исполнений" in reply
     assert "API" in reply
 
 
-def test_guardian_answer_manual_control(tmp_path: Path) -> None:
-    trade_control.clear_trade_commands(data_dir=tmp_path)
-    trade_control.request_trade_start(
-        symbol="BTCUSDT",
-        mode="buy",
-        probability_pct=62.5,
-        ev_bps=14.0,
-        note="оператор проверяет гипотезу",
-        data_dir=tmp_path,
-    )
-    trade_control.request_trade_cancel(
-        symbol="BTCUSDT",
-        reason="фиксируем результат",
-        data_dir=tmp_path,
-    )
+def test_guardian_data_health_highlights_disabled_ai(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path, Settings(ai_enabled=False))
+    health = bot.data_health()
 
-    bot = _make_bot(tmp_path)
-    reply = bot.answer("что по ручному управлению?")
-
-    lowered = reply.lower()
-    assert "останов" in lowered
-    assert "BTCUSDT" in reply
-    assert "уверенность 62.5%" in lowered
-    assert "оператор" in lowered
-    assert "Комментарий оператора" in reply
+    automation = health["automation"]
+    assert automation["ok"] is False
+    assert "выключ" in automation["message"].lower()
 
 
 def test_guardian_answer_trade_history(tmp_path: Path) -> None:
@@ -1434,50 +1336,6 @@ def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
     assert summary["watchlist_highlights"][0]["symbol"] == "SOLUSDT"
 
 
-def test_guardian_market_scan_not_limited_by_manual_symbols(tmp_path: Path) -> None:
-    snapshot_path = tmp_path / "ai" / "market_snapshot.json"
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_payload = {
-        "ts": time.time(),
-        "rows": [
-            {
-                "symbol": "SOLUSDT",
-                "turnover24h": "6000000",
-                "price24hPcnt": "2.4",
-                "bestBidPrice": "20",
-                "bestAskPrice": "20.02",
-                "volume24h": "1200000",
-            },
-            {
-                "symbol": "XRPUSDT",
-                "turnover24h": "3500000",
-                "price24hPcnt": "-1.6",
-                "bestBidPrice": "0.5",
-                "bestAskPrice": "0.501",
-                "volume24h": "2200000",
-            },
-        ],
-    }
-    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
-
-    settings = Settings(
-        ai_market_scan_enabled=True,
-        ai_enabled=True,
-        ai_min_turnover_usd=1_000_000.0,
-        ai_min_ev_bps=40.0,
-        ai_max_spread_bps=40.0,
-        ai_symbols="BTCUSDT",
-        ai_max_concurrent=2,
-    )
-
-    bot = GuardianBot(data_dir=tmp_path, settings=settings)
-
-    watchlist = bot.market_watchlist()
-    symbols = [entry["symbol"] for entry in watchlist[:2]]
-    assert symbols == ["SOLUSDT", "XRPUSDT"]
-    assert all(entry["symbol"] != "BTCUSDT" for entry in watchlist)
-
-
 def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None:
     snapshot_path = tmp_path / "ai" / "market_snapshot.json"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1618,7 +1476,6 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
     settings = Settings(
-        ai_symbols="BTCUSDT,ETHUSDT",
         ai_buy_threshold=0.55,
         ai_sell_threshold=0.45,
         ai_min_ev_bps=10.0,
@@ -1653,7 +1510,6 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     stats = plan["stats"]
     assert stats["actionable_count"] == 2
     assert stats["ready_count"] == 1
-    assert stats["manual_count"] == 2
 
     actionable_summary = plan["actionable_summary"]
     assert actionable_summary["count"] == 2
@@ -1665,15 +1521,13 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
         "SOLUSDT",
         "XRPUSDT",
         "DOGEUSDT",
-        "BTCUSDT",
-        "ETHUSDT",
     ]
-    assert bot.dynamic_symbols(limit=0, include_manual=False) == [
+    assert bot.dynamic_symbols(limit=0) == [
         "SOLUSDT",
         "XRPUSDT",
         "DOGEUSDT",
     ]
-    assert bot.dynamic_symbols(limit=0, include_manual=False, only_actionable=True) == [
+    assert bot.dynamic_symbols(limit=0, only_actionable=True) == [
         "SOLUSDT",
         "XRPUSDT",
     ]
@@ -1689,39 +1543,9 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     assert breakdown["watchlist"] == 3
     assert breakdown["actionable"] == 2
     assert breakdown["ready"] == 1
-    assert breakdown["manual"] == 2
-    assert breakdown["manual_only"] == 2
     assert breakdown["multi_source"] >= 3
 
     assert "diversification" not in plan["position_summary"]
-
-
-def test_guardian_dynamic_symbols_fallback_to_manual(tmp_path: Path) -> None:
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps({}), encoding="utf-8")
-
-    settings = Settings(
-        ai_symbols="BNBUSDT",
-        ai_max_concurrent=3,
-        ai_enabled=True,
-        ai_market_scan_enabled=False,
-    )
-
-    bot = _make_bot(tmp_path, settings)
-
-    assert bot.dynamic_symbols() == ["BNBUSDT"]
-    assert bot.dynamic_symbols(limit=0, include_manual=False) == []
-
-    summary = bot.status_summary()
-    plan = summary["symbol_plan"]
-    assert plan["manual"] == ("BNBUSDT",)
-    assert summary["candidate_symbols"] == ["BNBUSDT"]
-
-    capacity = plan["capacity_summary"]
-    assert capacity["limit"] == 3
-    assert capacity["backlog"] == 0
-    assert capacity["can_take_all_actionable"] is True
 
 
 def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
@@ -1807,7 +1631,6 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     assert summary_candidates[2]["probability_pct"] == pytest.approx(66.0, rel=1e-3)
 
     assert bot.dynamic_symbols() == ["ADAUSDT", "DOGEUSDT"]
-    assert bot.dynamic_symbols(include_manual=False) == ["ADAUSDT", "DOGEUSDT"]
     assert bot.dynamic_symbols(limit=0)[:3] == ["ADAUSDT", "DOGEUSDT", "SOLUSDT"]
     assert bot.dynamic_symbols(limit=0, only_actionable=True)[:3] == [
         "ADAUSDT",
@@ -1822,18 +1645,13 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
         "SOLUSDT",
     ]
     assert method_candidates[0]["holding"] is True
-    assert method_candidates[0]["manual_only"] is False
-    filtered_candidates = bot.trade_candidates(limit=0, include_manual=False)
+    filtered_candidates = bot.trade_candidates(limit=0)
     assert [item["symbol"] for item in filtered_candidates[:4]] == [
         "ADAUSDT",
         "DOGEUSDT",
         "SOLUSDT",
         "XRPUSDT",
     ]
-    assert all(
-        candidate["manual_only"] is False or candidate["holding"]
-        for candidate in filtered_candidates
-    )
 
     details = plan["details"]
     ada = details["ADAUSDT"]
@@ -1866,7 +1684,6 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     breakdown = plan["source_breakdown"]
     assert breakdown["holding"] == 2
     assert breakdown["positions_only"] == 2
-    assert breakdown["manual"] == 1
     assert breakdown["watchlist"] == 2
     assert breakdown["multi_source"] >= 2
 
@@ -1876,36 +1693,133 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     assert diversification["concentration_level"] == "high"
 
 
-def test_guardian_dynamic_symbols_manual_position_survives_filter(tmp_path: Path) -> None:
+def test_guardian_symbol_plan_cache_updates_on_watchlist_change(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.72,
+        "ev_bps": 22.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "watchlist": [
+            {
+                "symbol": "ETHUSDT",
+                "probability": 0.72,
+                "ev_bps": 22.0,
+                "trend": "buy",
+                "actionable": True,
+                "note": "первичное наблюдение",
+            }
+        ],
+    }
+
     status_path = tmp_path / "ai" / "status.json"
     status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps({}), encoding="utf-8")
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+
+    summary_initial = bot.status_summary()
+    details_initial = summary_initial["symbol_plan"]["details"]["ETHUSDT"]
+    assert details_initial["note"] == "первичное наблюдение"
+    initial_signature = bot._plan_cache_signature
+    assert initial_signature is not None
+
+    status["watchlist"][0]["note"] = "обновлено наблюдение"
+    time.sleep(0.01)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    summary_updated = bot.status_summary()
+    details_updated = summary_updated["symbol_plan"]["details"]["ETHUSDT"]
+    assert details_updated["note"] == "обновлено наблюдение"
+    assert bot._plan_cache_signature != initial_signature
+
+
+def test_guardian_symbol_plan_cache_updates_on_portfolio_change(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.7,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "watchlist": [
+            {
+                "symbol": "ETHUSDT",
+                "probability": 0.7,
+                "ev_bps": 18.0,
+                "trend": "buy",
+                "actionable": True,
+            }
+        ],
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
 
     ledger_path = tmp_path / "pnl" / "executions.jsonl"
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    events = [
+    initial_events = [
         {
             "category": "spot",
-            "symbol": "DOGEUSDT",
+            "symbol": "ADAUSDT",
             "side": "Buy",
-            "execPrice": "0.08",
-            "execQty": "500",
+            "execPrice": "0.50",
+            "execQty": "100",
             "execFee": "0",
         }
     ]
     with ledger_path.open("w", encoding="utf-8") as fh:
-        for event in events:
+        for event in initial_events:
             fh.write(json.dumps(event) + "\n")
 
-    settings = Settings(
-        ai_symbols="DOGEUSDT",
-        ai_enabled=True,
-        ai_market_scan_enabled=False,
-    )
+    bot = _make_bot(tmp_path)
 
+    summary_initial = bot.status_summary()
+    plan_initial = summary_initial["symbol_plan"]
+    assert plan_initial["positions"] == ("ADAUSDT",)
+    initial_signature = bot._plan_cache_signature
+    assert initial_signature is not None
+
+    new_event = {
+        "category": "spot",
+        "symbol": "DOGEUSDT",
+        "side": "Buy",
+        "execPrice": "0.08",
+        "execQty": "1000",
+        "execFee": "0",
+    }
+    with ledger_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(new_event) + "\n")
+
+    os.utime(ledger_path, None)
+    time.sleep(0.05)
+
+    summary_updated = bot.status_summary()
+    plan_updated = summary_updated["symbol_plan"]
+    assert plan_updated["positions"] == ("ADAUSDT", "DOGEUSDT")
+    assert bot._plan_cache_signature != initial_signature
+
+
+def test_guardian_dynamic_symbols_fallbacks_to_status_symbol(tmp_path: Path) -> None:
+    status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.61,
+        "ev_bps": 18.0,
+        "last_tick_ts": time.time(),
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(ai_enabled=True, ai_symbols="ETHUSDT")
     bot = _make_bot(tmp_path, settings)
 
-    assert bot.dynamic_symbols(include_manual=False) == ["DOGEUSDT"]
+    summary = bot.status_summary()
+    assert summary["candidate_symbols"] == ["ETHUSDT"]
+
+    assert bot.dynamic_symbols() == ["ETHUSDT"]
+    assert bot.dynamic_symbols(only_actionable=True) == ["ETHUSDT"]
 
 
 def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
@@ -2357,34 +2271,14 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
 
     assert health["ai_signal"]["ok"] is True
     assert "AI сигнал" in health["ai_signal"]["title"]
-    assert health["manual_control"]["ok"] is True
-    assert health["manual_control"]["status_label"] == "idle"
-    assert "Руч" in health["manual_control"]["title"]
+    automation = health["automation"]
+    assert automation["title"] == "Автоматизация"
+    assert automation["ok"] in (True, False)
     assert health["executions"]["trades"] == 1
     assert health["executions"]["ok"] is True
     assert health["api_keys"]["ok"] is True
     assert health["realtime_trading"]["ok"] is True
     assert health["realtime_trading"]["title"] == "RT"
-
-
-def test_guardian_data_health_manual_stop(tmp_path: Path) -> None:
-    trade_control.clear_trade_commands(data_dir=tmp_path)
-    trade_control.request_trade_cancel(
-        symbol="BTCUSDT",
-        reason="operator stop",
-        data_dir=tmp_path,
-    )
-
-    bot = _make_bot(tmp_path)
-    health = bot.data_health()
-
-    manual = health["manual_control"]
-    assert manual["ok"] is False
-    assert manual["status_label"] == "stopped"
-    assert "останов" in manual["message"].lower()
-    assert "operator stop" in manual["message"].lower()
-    assert "BTCUSDT" in (manual.get("details") or "")
-    assert "Комментарий" in (manual.get("details") or "")
 
 
 def test_guardian_unified_report(tmp_path: Path) -> None:
@@ -2502,129 +2396,3 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
     assert bot.recent_calls == 1
 
 
-def test_guardian_manual_trade_state_uses_bot_directory(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path)
-
-    initial_state = bot.manual_trade_state()
-    assert initial_state.active is False
-
-    trade_control.clear_trade_commands(data_dir=bot.data_dir)
-    trade_control.request_trade_start(symbol="BNBUSDT", mode="buy", data_dir=bot.data_dir)
-
-    updated_state = bot.manual_trade_state()
-    assert updated_state.active is True
-    assert updated_state.last_start is not None
-    assert updated_state.last_start["symbol"] == "BNBUSDT"
-
-    trade_control.clear_trade_commands(data_dir=bot.data_dir)
-
-
-def test_guardian_manual_trade_wrappers_round_trip(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path)
-
-    bot.manual_trade_clear()
-    assert bot.manual_trade_history() == ()
-
-    start_record = bot.manual_trade_start(
-        symbol="ethusdt",
-        mode="buy",
-        probability_pct=55.5,
-        ev_bps=120.0,
-        source="pytest",
-        note="начало теста",
-        extra={"foo": "bar"},
-    )
-    assert start_record["symbol"] == "ETHUSDT"
-    assert start_record["action"] == "start"
-
-    history = bot.manual_trade_history()
-    assert history
-    assert history[-1]["action"] == "start"
-
-    cancel_record = bot.manual_trade_cancel(
-        symbol="ethusdt",
-        reason="stop test",
-        source="pytest",
-        note="остановка",
-    )
-    assert cancel_record["action"] == "cancel"
-
-    state = bot.manual_trade_state()
-    assert state.active is False
-    assert state.last_cancel is not None
-
-    history = bot.manual_trade_history()
-    assert len(history) >= 2
-    assert history[-1]["action"] == "cancel"
-
-    bot.manual_trade_clear()
-    assert bot.manual_trade_history() == ()
-
-
-def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path)
-
-    bot.manual_trade_clear()
-    base_summary = bot.manual_trade_summary()
-    assert base_summary["status_label"] == "idle"
-    assert base_summary["history_count"] == 0
-    assert base_summary["history"] == []
-
-    start_record = bot.manual_trade_start(
-        symbol="adausdt",
-        mode="buy",
-        source="pytest",
-    )
-    assert start_record["action"] == "start"
-
-    summary_after_start = bot.manual_trade_summary()
-    assert summary_after_start["status_label"] == "active"
-    assert summary_after_start["history_count"] == 1
-    assert summary_after_start["last_action"]["action"] == "start"
-    assert len(summary_after_start["history"]) == 1
-    assert summary_after_start["status_message"] == summary_after_start["status_text"]
-
-    summary_clone = bot.manual_trade_summary()
-    summary_clone["history"].append({"action": "fake"})
-    refreshed_summary = bot.manual_trade_summary()
-    assert refreshed_summary["history_count"] == 1
-    assert len(refreshed_summary["history"]) == 1
-
-    status_manual = bot.status_summary()["manual_control"]
-    assert status_manual["status_label"] == "active"
-    assert status_manual["history_count"] == 1
-    assert status_manual["status_note"] is None
-    assert status_manual["status_message"] == status_manual["status_text"]
-
-    state = bot.manual_trade_state()
-    if state.last_action:
-        state.last_action["action"] = "mutated"
-    fresh_state = bot.manual_trade_state()
-    if fresh_state.last_action:
-        assert fresh_state.last_action["action"] == "start"
-
-    history_tail = bot.manual_trade_history(limit=1)
-    assert len(history_tail) == 1
-    assert history_tail[0]["action"] == "start"
-
-    cancel_record = bot.manual_trade_cancel(symbol="adausdt", reason="pytest stop")
-    assert cancel_record["action"] == "cancel"
-
-    summary_after_cancel = bot.manual_trade_summary()
-    assert summary_after_cancel["status_label"] == "stopped"
-    assert summary_after_cancel["status_note"] == "pytest stop"
-    assert summary_after_cancel["history_count"] == 2
-    assert summary_after_cancel["last_action"]["action"] == "cancel"
-    assert summary_after_cancel["last_cancel"] is not None
-    assert "Комментарий оператора" in (summary_after_cancel["status_message"] or "")
-    assert "pytest stop" in (summary_after_cancel["status_message"] or "").lower()
-
-    history_tail_after = bot.manual_trade_history(limit=1)
-    assert len(history_tail_after) == 1
-    assert history_tail_after[0]["action"] == "cancel"
-
-    bot.manual_trade_clear()
-    cleared_summary = bot.manual_trade_summary()
-    assert cleared_summary["status_label"] == "idle"
-    assert cleared_summary["history_count"] == 0
-    assert cleared_summary["status_message"] == cleared_summary["status_text"]

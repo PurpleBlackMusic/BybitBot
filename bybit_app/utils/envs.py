@@ -36,9 +36,6 @@ class Settings:
     spot_max_cap_per_trade_pct: float = 5.0
     spot_cash_reserve_pct: float = 10.0
 
-    # режим работы
-    operation_mode: str = "manual"
-
     # AI — общие
     ai_enabled: bool = False
     ai_category: str = "spot"
@@ -113,7 +110,6 @@ _ENV_MAP = {
     "http_timeout_ms": "BYBIT_HTTP_TIMEOUT_MS",
     "verify_ssl": "BYBIT_VERIFY_SSL",
     "dry_run": "BYBIT_DRY_RUN",
-    "operation_mode": "BOT_OPERATION_MODE",
     "ai_enabled": "AI_ENABLED",
     "ai_category": "AI_CATEGORY",
     "ai_symbols": "AI_SYMBOLS",
@@ -195,10 +191,6 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["testnet"] = _cast_bool(m.get("testnet"))
     m["verify_ssl"] = _cast_bool(m.get("verify_ssl"))
     m["dry_run"] = _cast_bool(m.get("dry_run"))
-
-    mode = m.get("operation_mode")
-    if mode is not None:
-        m["operation_mode"] = str(mode)
 
     m["ai_enabled"] = _cast_bool(m.get("ai_enabled"))
     m["ai_horizon_bars"] = _cast_int(m.get("ai_horizon_bars"))
