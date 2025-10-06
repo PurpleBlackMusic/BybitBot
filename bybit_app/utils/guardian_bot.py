@@ -806,7 +806,13 @@ class GuardianBot:
             return int(mtime_ns), int(size)
 
         status_sig = _stat_signature(status_path)
-        ledger_sig = _stat_signature(ledger_path)[0]
+        ledger_mtime, ledger_size = _stat_signature(ledger_path)
+
+        if ledger_mtime == 0 and ledger_size == 0:
+            ledger_sig = 0
+        else:
+            ledger_sig = self._hash_bytes(f"{ledger_mtime}:{ledger_size}".encode("utf-8"))
+
         return status_sig, ledger_sig
 
     def _load_ledger_events(self) -> List[Dict[str, object]]:
