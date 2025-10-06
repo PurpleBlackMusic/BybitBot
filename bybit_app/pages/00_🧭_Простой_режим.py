@@ -308,10 +308,16 @@ age_seconds = float(summary.get("age_seconds") or 0.0)
 detail_cols = st.columns(3)
 detail_cols[0].metric("Последнее обновление", summary.get("last_update", "—"))
 detail_cols[1].metric("Возраст статуса", _format_age(age_seconds))
-detail_cols[2].metric(
-    "Источник данных",
-    "Живой статус" if summary.get("status_source") == "live" else "Кэш",
-)
+source_label = str(summary.get("status_source") or "").lower()
+if source_label == "live":
+    source_text = "Живой статус"
+elif source_label == "file":
+    source_text = "Файл status.json"
+elif source_label == "cached":
+    source_text = "Кэш"
+else:
+    source_text = "Нет данных"
+detail_cols[2].metric("Источник данных", source_text)
 
 reasons = summary.get("actionable_reasons") or []
 staleness = summary.get("staleness") or {}
@@ -630,7 +636,16 @@ with st.expander("Технические детали сигнала", expanded=
         else "Сырые поля статуса пока не загружены."
     )
     st.caption(
-        "Источник статуса: живой" if summary.get("status_source") == "live" else "Источник статуса: кэш"
+        (
+            {
+                "live": "Источник статуса: живой",
+                "file": "Источник статуса: файл",
+                "cached": "Источник статуса: кэш",
+            }.get(
+                str(summary.get("status_source") or "").lower(),
+                "Источник статуса: нет данных",
+            )
+        )
     )
 
 st.divider()

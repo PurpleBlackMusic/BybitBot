@@ -2016,7 +2016,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
     assert summary["actionable_reasons"] == []
     assert summary["thresholds"]["buy_probability_pct"] == 70.0
     assert summary["fallback_used"] is False
-    assert summary["status_source"] == "live"
+    assert summary["status_source"] == "file"
     assert summary["staleness"]["state"] == "fresh"
     assert "extra" in summary["raw_keys"]
 
@@ -2027,7 +2027,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
     report = bot.unified_report()
     assert report["status"]["symbol"] == "ETHUSDT"
     assert report["status"]["actionable"] is True
-    assert report["status"]["status_source"] == "live"
+    assert report["status"]["status_source"] == "file"
     assert report["status"]["actionable_reasons"] == []
     assert report["status"]["staleness"]["state"] == "fresh"
     report["status"]["symbol"] = "MUTATED"
@@ -2060,7 +2060,7 @@ def test_guardian_status_recovers_from_partial_write(tmp_path: Path, monkeypatch
     bot = _make_bot(tmp_path)
     summary = bot.status_summary()
 
-    assert summary["status_source"] == "live"
+    assert summary["status_source"] == "file"
     assert summary["fallback_used"] is False
     assert summary["symbol"] == "BTCUSDT"
     assert summary.get("status_error") is None
@@ -2081,7 +2081,7 @@ def test_guardian_status_fallback_when_file_missing(tmp_path: Path) -> None:
 
     bot = _make_bot(tmp_path)
     live_summary = bot.status_summary()
-    assert live_summary["status_source"] == "live"
+    assert live_summary["status_source"] == "file"
 
     status_path.unlink()
 
@@ -2109,7 +2109,7 @@ def test_guardian_status_fallback_forces_retry(tmp_path: Path, monkeypatch) -> N
 
     bot = _make_bot(tmp_path)
     live_summary = bot.status_summary()
-    assert live_summary["status_source"] == "live"
+    assert live_summary["status_source"] == "file"
 
     initial_signature = bot._snapshot.status_signature
 
@@ -2317,6 +2317,57 @@ def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
     health = bot.data_health()
     assert health["ai_signal"]["ok"] is False
     assert "15 минут" in health["ai_signal"]["message"] or "статус" in health["ai_signal"]["message"].lower()
+
+
+def test_guardian_status_refreshes_stale_signal_with_live_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.9,
+        "ev_bps": 35.0,
+        "side": "buy",
+        "last_tick_ts": time.time() - (guardian_bot_module.STALE_SIGNAL_SECONDS * 2),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(old_status), encoding="utf-8")
+
+    fresh_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.95,
+        "ev_bps": 40.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+
+    class DummyFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch(self) -> Dict[str, object]:
+            self.calls += 1
+            return fresh_payload
+
+    fetcher = DummyFetcher()
+
+    def _get_live_fetcher(self: GuardianBot) -> DummyFetcher:
+        return fetcher
+
+    monkeypatch.setattr(GuardianBot, "_get_live_fetcher", _get_live_fetcher, raising=False)
+
+    bot = _make_bot(
+        tmp_path,
+        Settings(ai_enabled=True, ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
+    )
+    summary = bot.status_summary()
+
+    assert fetcher.calls == 1
+    assert summary["status_source"] == "live"
+    assert summary["staleness"]["state"] == "fresh"
+    assert not any(
+        "устар" in str(reason).lower() for reason in summary["actionable_reasons"]
+    )
 
 
 def test_guardian_trade_statistics(tmp_path: Path) -> None:
