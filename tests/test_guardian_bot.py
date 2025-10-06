@@ -20,7 +20,9 @@ from bybit_app.utils.guardian_bot import GuardianBot
 
 
 def _make_bot(tmp_path: Path, settings: Settings | None = None) -> GuardianBot:
-    return GuardianBot(data_dir=tmp_path, settings=settings or Settings())
+    settings = settings or Settings()
+    settings.ai_market_scan_enabled = False
+    return GuardianBot(data_dir=tmp_path, settings=settings)
 
 
 def test_guardian_brief_waits_when_status_missing(tmp_path: Path) -> None:
@@ -1384,6 +1386,383 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     assert watchlist_digest == digest
 
 
+def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "ai" / "market_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_payload = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "SOLUSDT",
+                "turnover24h": "6000000",
+                "price24hPcnt": "2.4",
+                "bestBidPrice": "20",
+                "bestAskPrice": "20.02",
+                "volume24h": "1200000",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "turnover24h": "3500000",
+                "price24hPcnt": "-1.6",
+                "bestBidPrice": "0.5",
+                "bestAskPrice": "0.501",
+                "volume24h": "2200000",
+            },
+        ],
+    }
+    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
+
+    settings = Settings(
+        ai_market_scan_enabled=True,
+        ai_enabled=True,
+        ai_min_turnover_usd=1_000_000.0,
+        ai_min_ev_bps=40.0,
+        ai_max_spread_bps=40.0,
+        ai_symbols="",
+        ai_max_concurrent=2,
+    )
+
+    bot = GuardianBot(data_dir=tmp_path, settings=settings)
+
+    watchlist = bot.market_watchlist()
+    symbols = [entry["symbol"] for entry in watchlist[:2]]
+    assert symbols == ["SOLUSDT", "XRPUSDT"]
+    assert any(entry.get("source") == "market_scanner" for entry in watchlist)
+
+    summary = bot.status_summary()
+    assert summary["watchlist_total"] >= 2
+    assert summary["watchlist_highlights"][0]["symbol"] == "SOLUSDT"
+
+
+def test_guardian_market_scan_respects_lists(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "ai" / "market_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_payload = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "SOLUSDT",
+                "turnover24h": "6500000",
+                "price24hPcnt": "1.8",
+                "bestBidPrice": "20.4",
+                "bestAskPrice": "20.42",
+                "volume24h": "920000",
+            },
+            {
+                "symbol": "DOGEUSDT",
+                "turnover24h": "500000",
+                "price24hPcnt": "2.5",
+                "bestBidPrice": "0.07",
+                "bestAskPrice": "0.0702",
+                "volume24h": "32000000",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "turnover24h": "4200000",
+                "price24hPcnt": "-1.2",
+                "bestBidPrice": "0.5",
+                "bestAskPrice": "0.5008",
+                "volume24h": "18000000",
+            },
+        ],
+    }
+    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
+
+    settings = Settings(
+        ai_market_scan_enabled=True,
+        ai_enabled=True,
+        ai_min_turnover_usd=1_000_000.0,
+        ai_min_ev_bps=25.0,
+        ai_max_spread_bps=50.0,
+        ai_symbols="",
+        ai_whitelist="DOGEUSDT",
+        ai_blacklist="XRPUSDT",
+        ai_max_concurrent=2,
+    )
+
+    bot = GuardianBot(data_dir=tmp_path, settings=settings)
+
+    watchlist = bot.market_watchlist()
+    symbols = [entry["symbol"] for entry in watchlist[:3]]
+    assert "SOLUSDT" in symbols
+    assert "DOGEUSDT" in symbols
+    assert "XRPUSDT" not in symbols
+    doge_entry = next(item for item in watchlist if item["symbol"] == "DOGEUSDT")
+    assert doge_entry["actionable"] is True
+
+
+def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "SOLUSDT",
+                "probability": 0.72,
+                "ev_bps": 20.0,
+                "trend": "buy",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "probability": 0.35,
+                "ev_bps": 12.0,
+                "trend": "sell",
+            },
+            {
+                "symbol": "DOGEUSDT",
+                "probability": 0.52,
+                "ev_bps": 14.0,
+                "trend": "buy",
+            },
+        ]
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT,ETHUSDT",
+        ai_buy_threshold=0.55,
+        ai_sell_threshold=0.45,
+        ai_min_ev_bps=10.0,
+        ai_max_concurrent=2,
+        ai_enabled=True,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+    plan = summary["symbol_plan"]
+    assert plan["actionable"] == ("SOLUSDT", "XRPUSDT")
+    assert summary["candidate_symbols"] == ["SOLUSDT", "XRPUSDT"]
+
+    stats = plan["stats"]
+    assert stats["actionable_count"] == 2
+    assert stats["ready_count"] == 1
+    assert stats["manual_count"] == 2
+
+    actionable_summary = plan["actionable_summary"]
+    assert actionable_summary["count"] == 2
+    assert actionable_summary["top_probability"]["symbol"] == "SOLUSDT"
+    assert actionable_summary["top_ev"]["symbol"] == "SOLUSDT"
+
+    assert bot.dynamic_symbols() == ["SOLUSDT", "XRPUSDT"]
+    assert bot.dynamic_symbols(limit=0) == [
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+        "BTCUSDT",
+        "ETHUSDT",
+    ]
+    assert bot.dynamic_symbols(limit=0, include_manual=False) == [
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+    ]
+    assert bot.dynamic_symbols(limit=0, include_manual=False, only_actionable=True) == [
+        "SOLUSDT",
+        "XRPUSDT",
+    ]
+
+    capacity = plan["capacity_summary"]
+    assert capacity["limit"] == 2
+    assert capacity["backlog"] == 0
+    assert capacity["slot_pressure"] == pytest.approx(1.0)
+    assert capacity["can_take_all_actionable"] is True
+    assert capacity["needs_attention"] is False
+
+    breakdown = plan["source_breakdown"]
+    assert breakdown["watchlist"] == 3
+    assert breakdown["actionable"] == 2
+    assert breakdown["ready"] == 1
+    assert breakdown["manual"] == 2
+    assert breakdown["manual_only"] == 2
+    assert breakdown["multi_source"] >= 3
+
+    assert "diversification" not in plan["position_summary"]
+
+
+def test_guardian_dynamic_symbols_fallback_to_manual(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps({}), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BNBUSDT",
+        ai_max_concurrent=3,
+        ai_enabled=True,
+        ai_market_scan_enabled=False,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    assert bot.dynamic_symbols() == ["BNBUSDT"]
+    assert bot.dynamic_symbols(limit=0, include_manual=False) == []
+
+    summary = bot.status_summary()
+    plan = summary["symbol_plan"]
+    assert plan["manual"] == ("BNBUSDT",)
+    assert summary["candidate_symbols"] == ["BNBUSDT"]
+
+    capacity = plan["capacity_summary"]
+    assert capacity["limit"] == 3
+    assert capacity["backlog"] == 0
+    assert capacity["can_take_all_actionable"] is True
+
+
+def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "SOLUSDT",
+                "probability": 0.66,
+                "ev_bps": 25.0,
+                "trend": "buy",
+                "actionable": True,
+                "note": "сильный импульс",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "probability": 0.51,
+                "ev_bps": 8.0,
+                "trend": "buy",
+                "probability_ready": True,
+            },
+        ]
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "category": "spot",
+            "symbol": "ADAUSDT",
+            "side": "Buy",
+            "execPrice": "0.40",
+            "execQty": "100",
+            "execFee": "0",
+        },
+        {
+            "category": "spot",
+            "symbol": "DOGEUSDT",
+            "side": "Buy",
+            "execPrice": "0.08",
+            "execQty": "1000",
+            "execFee": "0",
+        },
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    settings = Settings(
+        ai_symbols="SOLUSDT",
+        ai_max_concurrent=1,
+        ai_enabled=True,
+        ai_market_scan_enabled=False,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+    plan = summary["symbol_plan"]
+
+    assert plan["positions"] == ("ADAUSDT", "DOGEUSDT")
+    assert plan["positions_only"] == plan["positions"]
+    stats = plan["stats"]
+    assert stats["position_count"] == 2
+    assert stats["open_slots"] == 0
+    assert plan["position_summary"]["total_notional"] == pytest.approx(120.0, rel=1e-3)
+    largest = plan["position_summary"]["largest"]
+    assert largest["symbol"] == "DOGEUSDT"
+    assert largest["exposure_pct"] == pytest.approx(66.67, rel=1e-3)
+    assert summary["candidate_symbols"][:2] == ["ADAUSDT", "DOGEUSDT"]
+
+    assert bot.dynamic_symbols() == ["ADAUSDT", "DOGEUSDT"]
+    assert bot.dynamic_symbols(include_manual=False) == ["ADAUSDT", "DOGEUSDT"]
+    assert bot.dynamic_symbols(limit=0)[:3] == ["ADAUSDT", "DOGEUSDT", "SOLUSDT"]
+    assert bot.dynamic_symbols(limit=0, only_actionable=True)[:3] == [
+        "ADAUSDT",
+        "DOGEUSDT",
+        "SOLUSDT",
+    ]
+
+    details = plan["details"]
+    ada = details["ADAUSDT"]
+    doge = details["DOGEUSDT"]
+    sol = details["SOLUSDT"]
+
+    assert ada["holding"] is True
+    assert doge["holding"] is True
+    assert set(sol["sources"]) >= {"watchlist", "actionable"}
+    assert sol["actionable"] is True
+    assert ada["position_qty"] == pytest.approx(100.0)
+    assert doge["position_qty"] == pytest.approx(1000.0)
+    assert ada["exposure_pct"] == pytest.approx(33.33, rel=1e-3)
+    assert doge["exposure_pct"] == pytest.approx(66.67, rel=1e-3)
+    assert sol["probability_pct"] == pytest.approx(66.0, rel=1e-3)
+
+    priority_order = [item["symbol"] for item in plan["priority_table"][:4]]
+    assert priority_order[:3] == ["ADAUSDT", "DOGEUSDT", "SOLUSDT"]
+    doge_entry = next(
+        item for item in plan["priority_table"] if item["symbol"] == "DOGEUSDT"
+    )
+    assert "holding" in doge_entry["reasons"]
+
+    capacity = plan["capacity_summary"]
+    assert capacity["limit"] == 2
+    assert capacity["backlog"] == 1
+    assert capacity["slot_pressure"] == pytest.approx(1.0)
+    assert capacity["needs_attention"] is True
+
+    breakdown = plan["source_breakdown"]
+    assert breakdown["holding"] == 2
+    assert breakdown["positions_only"] == 2
+    assert breakdown["manual"] == 1
+    assert breakdown["watchlist"] == 2
+    assert breakdown["multi_source"] >= 2
+
+    diversification = plan["position_summary"]["diversification"]
+    assert diversification["effective_positions"] == pytest.approx(1.8, rel=1e-3)
+    assert diversification["largest_share_pct"] == pytest.approx(66.67, rel=1e-3)
+    assert diversification["concentration_level"] == "high"
+
+
+def test_guardian_dynamic_symbols_manual_position_survives_filter(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps({}), encoding="utf-8")
+
+    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "category": "spot",
+            "symbol": "DOGEUSDT",
+            "side": "Buy",
+            "execPrice": "0.08",
+            "execQty": "500",
+            "execFee": "0",
+        }
+    ]
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    settings = Settings(
+        ai_symbols="DOGEUSDT",
+        ai_enabled=True,
+        ai_market_scan_enabled=False,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    assert bot.dynamic_symbols(include_manual=False) == ["DOGEUSDT"]
+
+
 def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
     status = {
         "watchlist": [
@@ -1954,7 +2333,7 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = CountingGuardianBot(data_dir=tmp_path)
+    bot = CountingGuardianBot(data_dir=tmp_path, settings=Settings(ai_market_scan_enabled=False))
     first_report = bot.unified_report()
     assert first_report["statistics"]["trades"] == 1
     assert bot.load_calls == 1

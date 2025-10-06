@@ -43,6 +43,8 @@ class Settings:
     ai_enabled: bool = False
     ai_category: str = "spot"
     ai_symbols: str = ""
+    ai_whitelist: str = ""
+    ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
     # трейдинг параметры
@@ -56,6 +58,7 @@ class Settings:
     ai_retrain_minutes: int = 60
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
+    ai_market_scan_enabled: bool = True
 
     # TWAP
     twap_slices: int = 5
@@ -114,6 +117,8 @@ _ENV_MAP = {
     "ai_enabled": "AI_ENABLED",
     "ai_category": "AI_CATEGORY",
     "ai_symbols": "AI_SYMBOLS",
+    "ai_whitelist": "AI_WHITELIST",
+    "ai_blacklist": "AI_BLACKLIST",
     "ai_interval": "AI_INTERVAL",
     "ai_horizon_bars": "AI_HORIZON_BARS",
     "ai_max_slippage_bps": "AI_MAX_SLIPPAGE_BPS",
@@ -126,6 +131,7 @@ _ENV_MAP = {
     "ai_min_ev_bps": "AI_MIN_EV_BPS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
+    "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
     "twap_slices": "TWAP_SLICES",
     "twap_interval_sec": "TWAP_INTERVAL_SEC",
     "twap_child_secs": "TWAP_CHILD_SECS",
@@ -206,6 +212,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_min_ev_bps"] = _cast_float(m.get("ai_min_ev_bps"))
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
+    m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
 
     m["recv_window_ms"] = _cast_int(m.get("recv_window_ms"))
     m["http_timeout_ms"] = _cast_int(m.get("http_timeout_ms"))

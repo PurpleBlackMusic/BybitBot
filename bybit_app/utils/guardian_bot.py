@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
-from .envs import Settings, get_settings
+from .envs import Settings, get_settings, get_api_client
 from .paths import DATA_DIR
 from . import trade_control
 from .trade_analytics import (
@@ -22,6 +22,7 @@ from .trade_analytics import (
 )
 from .spot_pnl import spot_inventory_and_pnl
 from .live_checks import bybit_realtime_status
+from .market_scanner import scan_market_opportunities
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class GuardianSnapshot:
     status_from_cache: bool
     portfolio: Dict[str, object]
     watchlist: List[Dict[str, object]]
+    symbol_plan: Dict[str, object]
     recent_trades: List[Dict[str, object]]
     trade_stats: Dict[str, object]
     executions: Tuple[ExecutionRecord, ...]
@@ -160,6 +162,29 @@ class GuardianBot:
         self._snapshot = None
         self._ledger_signature = None
         self._ledger_view = None
+
+    @staticmethod
+    def _parse_symbol_list(raw: object) -> List[str]:
+        if raw is None:
+            return []
+
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            items = list(raw)
+        elif isinstance(raw, str):
+            items = raw.split(",")
+        else:
+            items = str(raw).split(",")
+
+        symbols: List[str] = []
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                continue
+            symbol = text.upper()
+            if symbol not in symbols:
+                symbols.append(symbol)
+
+        return symbols
 
     def _load_status(
         self,
@@ -800,6 +825,523 @@ class GuardianBot:
             numeric = 0.0
         return self._clamp_probability(numeric)
 
+    def _market_scanner_watchlist(
+        self, settings: Optional[Settings] = None
+    ) -> List[Dict[str, object]]:
+        settings = settings or self.settings
+        enabled = bool(getattr(settings, "ai_market_scan_enabled", False))
+        if not enabled:
+            return []
+
+        try:
+            min_turnover = float(getattr(settings, "ai_min_turnover_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            min_turnover = 0.0
+
+        try:
+            max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            max_spread = 0.0
+
+        try:
+            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0) / 100.0
+        except (TypeError, ValueError):
+            min_change_pct = 0.0
+
+        if min_change_pct <= 0:
+            min_change_pct = 0.5
+
+        manual_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
+        whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
+        if not whitelist:
+            whitelist = list(manual_symbols)
+        else:
+            extra = [sym for sym in manual_symbols if sym not in whitelist]
+            whitelist.extend(extra)
+
+        blacklist = self._parse_symbol_list(getattr(settings, "ai_blacklist", ""))
+
+        limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0) * 4
+        if limit_hint <= 0:
+            limit_hint = 25
+
+        try:
+            api = get_api_client()
+        except Exception:
+            api = None
+
+        try:
+            return scan_market_opportunities(
+                api,
+                data_dir=self.data_dir,
+                limit=limit_hint,
+                min_turnover=min_turnover,
+                min_change_pct=min_change_pct,
+                max_spread_bps=max_spread,
+                whitelist=whitelist or None,
+                blacklist=blacklist or None,
+            )
+        except Exception:
+            return []
+
+    def _build_symbol_plan(
+        self,
+        watchlist: Sequence[Dict[str, object]],
+        settings: Optional[Settings] = None,
+        portfolio: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        settings = settings or self.settings
+
+        manual_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
+        actionable: List[str] = []
+        ready: List[str] = []
+        watchlist_symbols: List[str] = []
+        position_symbols: List[str] = []
+        position_payload: Dict[str, Dict[str, float]] = {}
+        total_notional = 0.0
+
+        def _coerce_metric(value: object) -> Optional[float]:
+            if isinstance(value, bool):
+                return None
+            return self._coerce_float(value)
+
+        symbol_details: Dict[str, Dict[str, object]] = {}
+
+        def _record(symbol: str, source: Optional[str] = None, **fields: object) -> None:
+            if not symbol:
+                return
+            detail = symbol_details.setdefault(symbol, {"sources": []})
+            sources: List[str] = detail.setdefault("sources", [])  # type: ignore[assignment]
+            if source and source not in sources:
+                sources.append(source)
+
+            if source == "actionable":
+                detail["actionable"] = True
+            elif source == "ready":
+                detail["ready"] = True
+            elif source == "manual":
+                detail["manual"] = True
+            elif source == "manual_only":
+                detail["manual_only"] = True
+            elif source == "watchlist":
+                detail["watchlist"] = True
+            elif source == "holding":
+                detail["holding"] = True
+            elif source == "positions_only":
+                detail["positions_only"] = True
+
+            for key, value in fields.items():
+                if value is None:
+                    continue
+                if key == "note":
+                    value = str(value).strip()
+                    if not value:
+                        continue
+                if key not in detail:
+                    detail[key] = value
+
+        if portfolio:
+            raw_positions = portfolio.get("positions") or []
+            for entry in raw_positions:
+                symbol_value = entry.get("symbol")
+                if not isinstance(symbol_value, str):
+                    continue
+                symbol = symbol_value.strip().upper()
+                if not symbol:
+                    continue
+
+                qty = self._coerce_float(entry.get("qty")) or 0.0
+                notional = self._coerce_float(entry.get("notional"))
+                avg_cost = self._coerce_float(entry.get("avg_cost")) or 0.0
+                if notional is None:
+                    notional = qty * avg_cost
+
+                if qty <= 0 and (notional is None or notional <= 0):
+                    continue
+
+                notional = float(notional or 0.0)
+                position_symbols.append(symbol)
+                position_payload[symbol] = {
+                    "qty": float(qty),
+                    "notional": notional,
+                    "avg_cost": avg_cost,
+                }
+                if notional > 0:
+                    total_notional += notional
+
+            for symbol, info in position_payload.items():
+                exposure_pct: Optional[float] = None
+                notional = info.get("notional") or 0.0
+                if total_notional > 0:
+                    exposure_pct = round((notional / total_notional) * 100.0, 2)
+
+                _record(
+                    symbol,
+                    source="holding",
+                    position_qty=info.get("qty"),
+                    position_notional=notional,
+                    position_avg_cost=info.get("avg_cost"),
+                    exposure_pct=exposure_pct,
+                )
+
+        for watch_idx, entry in enumerate(watchlist):
+            symbol_value = entry.get("symbol")
+            if not isinstance(symbol_value, str):
+                continue
+            symbol = symbol_value.strip().upper()
+            if not symbol:
+                continue
+
+            if symbol not in watchlist_symbols:
+                watchlist_symbols.append(symbol)
+
+            probability_value = self._normalise_probability_input(entry.get("probability"))
+            probability_pct = (
+                round(probability_value * 100.0, 2) if probability_value is not None else None
+            )
+            ev_value = _coerce_metric(entry.get("ev_bps"))
+            score_value = _coerce_metric(entry.get("score"))
+            edge_score = _coerce_metric(entry.get("edge_score"))
+            gap_pct = _coerce_metric(entry.get("probability_gap_pct"))
+            trend_hint = str(entry.get("trend_hint") or entry.get("trend") or "").lower()
+
+            _record(
+                symbol,
+                source="watchlist",
+                watchlist_rank=watch_idx,
+                watchlist_order=watch_idx + 1,
+                trend=trend_hint or None,
+                score=score_value,
+                probability=probability_value,
+                probability_pct=probability_pct,
+                ev_bps=ev_value,
+                note=entry.get("note"),
+                probability_ready=(
+                    bool(entry.get("probability_ready"))
+                    if entry.get("probability_ready") is not None
+                    else None
+                ),
+                ev_ready=(
+                    bool(entry.get("ev_ready")) if entry.get("ev_ready") is not None else None
+                ),
+                edge_score=edge_score,
+                probability_gap_pct=gap_pct,
+            )
+
+            if symbol not in actionable and bool(entry.get("actionable")):
+                actionable.append(symbol)
+                _record(symbol, source="actionable")
+                continue
+
+            probability_ready = bool(entry.get("probability_ready"))
+            ev_ready = bool(entry.get("ev_ready"))
+
+            if (
+                symbol not in actionable
+                and symbol not in ready
+                and trend_hint in {"buy", "sell"}
+                and (probability_ready or ev_ready)
+            ):
+                ready.append(symbol)
+                _record(symbol, source="ready")
+
+        manual_only = [
+            sym
+            for sym in manual_symbols
+            if sym not in watchlist_symbols and sym not in position_symbols
+        ]
+
+        for symbol in manual_symbols:
+            _record(symbol, source="manual")
+
+        for symbol in manual_only:
+            _record(symbol, source="manual_only")
+
+        positions_only = [
+            sym for sym in position_symbols if sym not in watchlist_symbols
+        ]
+        for symbol in positions_only:
+            _record(symbol, source="positions_only")
+
+        dynamic_sequence: List[str] = []
+        for bucket in (position_symbols, actionable, ready, watchlist_symbols):
+            for symbol in bucket:
+                if symbol not in dynamic_sequence:
+                    dynamic_sequence.append(symbol)
+
+        for symbol in manual_symbols:
+            if symbol not in dynamic_sequence:
+                dynamic_sequence.append(symbol)
+
+        combined: List[str] = list(dynamic_sequence)
+        for symbol in manual_only:
+            if symbol not in combined:
+                combined.append(symbol)
+
+        limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0)
+        if len(position_symbols) > limit_hint:
+            limit_hint = len(position_symbols)
+
+        for idx, symbol in enumerate(dynamic_sequence):
+            _record(symbol, priority_rank=idx, priority_order=idx + 1)
+
+        details: Dict[str, Dict[str, object]] = {}
+        for symbol, payload in symbol_details.items():
+            sources = tuple(payload.get("sources") or [])
+            payload["sources"] = sources
+            details[symbol] = payload
+
+        def _best_of(
+            symbols: Sequence[str],
+            metric: str,
+        ) -> Optional[Dict[str, object]]:
+            best_symbol: Optional[str] = None
+            best_value: Optional[float] = None
+            for symbol in symbols:
+                info = details.get(symbol) or {}
+                raw_value = info.get(metric)
+                if isinstance(raw_value, bool):
+                    continue
+                value = self._coerce_float(raw_value)
+                if value is None:
+                    continue
+                if best_value is None or value > best_value:
+                    best_value = value
+                    best_symbol = symbol
+
+            if best_symbol is None or best_value is None:
+                return None
+
+            return {"symbol": best_symbol, metric: best_value}
+
+        stats = {
+            "position_count": len(position_symbols),
+            "actionable_count": len(actionable),
+            "ready_count": len(ready),
+            "watchlist_count": len(watchlist_symbols),
+            "manual_count": len(manual_symbols),
+            "manual_only_count": len(manual_only),
+            "positions_only_count": len(positions_only),
+            "dynamic_count": len(dynamic_sequence),
+            "combined_count": len(combined),
+        }
+
+        open_slots = limit_hint - len(position_symbols)
+        stats["limit"] = limit_hint
+        stats["open_slots"] = open_slots if open_slots > 0 else 0
+
+        actionable_summary = {
+            "count": len(actionable),
+            "top_probability": _best_of(actionable, "probability_pct"),
+            "top_ev": _best_of(actionable, "ev_bps"),
+            "top_edge_score": _best_of(actionable, "edge_score"),
+        }
+
+        ready_summary = {
+            "count": len(ready),
+            "top_probability": _best_of(ready, "probability_pct"),
+            "top_ev": _best_of(ready, "ev_bps"),
+            "top_edge_score": _best_of(ready, "edge_score"),
+        }
+
+        total_notional = float(total_notional)
+        sorted_positions = sorted(
+            (
+                (
+                    symbol,
+                    float(position_payload.get(symbol, {}).get("notional") or 0.0),
+                )
+                for symbol in position_symbols
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        position_summary: Dict[str, object] = {
+            "total_notional": round(total_notional, 4),
+            "positions": tuple(
+                {
+                    "symbol": symbol,
+                    "notional": round(notional, 4),
+                    "exposure_pct": details.get(symbol, {}).get("exposure_pct"),
+                }
+                for symbol, notional in sorted_positions
+            ),
+        }
+
+        if sorted_positions:
+            largest_symbol, largest_notional = sorted_positions[0]
+            position_summary["largest"] = {
+                "symbol": largest_symbol,
+                "notional": round(largest_notional, 4),
+                "exposure_pct": details.get(largest_symbol, {}).get("exposure_pct"),
+            }
+
+        source_breakdown: Dict[str, int] = {}
+        for source_key in (
+            "holding",
+            "actionable",
+            "ready",
+            "watchlist",
+            "manual",
+            "manual_only",
+            "positions_only",
+        ):
+            count = sum(1 for info in details.values() if info.get(source_key))
+            if count:
+                source_breakdown[source_key] = count
+
+        multi_source = sum(
+            1 for info in details.values() if len(info.get("sources", ())) > 1
+        )
+        if multi_source:
+            source_breakdown["multi_source"] = multi_source
+
+        capacity_summary: Dict[str, object] = {
+            "positions": len(position_symbols),
+            "actionable": len(actionable),
+            "ready": len(ready),
+            "open_slots": stats.get("open_slots", 0),
+        }
+
+        effective_limit = limit_hint if limit_hint > 0 else None
+        capacity_summary["limit"] = effective_limit
+
+        if effective_limit is not None:
+            remaining_capacity = max(effective_limit - len(position_symbols), 0)
+            utilisation_pct: Optional[float]
+            if effective_limit > 0:
+                utilisation_pct = round(
+                    (len(position_symbols) / effective_limit) * 100.0, 2
+                )
+            else:
+                utilisation_pct = None
+            capacity_summary["remaining_capacity"] = remaining_capacity
+            capacity_summary["utilisation_pct"] = utilisation_pct
+        else:
+            capacity_summary["remaining_capacity"] = None
+            capacity_summary["utilisation_pct"] = None
+
+        backlog = 0
+        open_slots_value = stats.get("open_slots", 0)
+        if effective_limit is not None:
+            backlog = max(len(actionable) - open_slots_value, 0)
+        capacity_summary["backlog"] = backlog
+        capacity_summary["can_take_all_actionable"] = backlog == 0
+
+        if len(actionable):
+            if open_slots_value > 0:
+                slot_pressure = round(len(actionable) / open_slots_value, 2)
+            else:
+                slot_pressure = float(len(actionable))
+            capacity_summary["slot_pressure"] = slot_pressure
+        else:
+            capacity_summary["slot_pressure"] = 0.0
+
+        capacity_summary["needs_attention"] = backlog > 0 or (
+            effective_limit is not None and len(position_symbols) >= effective_limit
+        )
+
+        exposures: List[float] = []
+        if total_notional > 0:
+            for symbol in position_symbols:
+                notional_value = float(
+                    position_payload.get(symbol, {}).get("notional") or 0.0
+                )
+                if notional_value <= 0:
+                    continue
+                exposures.append(notional_value / total_notional)
+
+        if exposures:
+            hhi = sum(fraction * fraction for fraction in exposures)
+            max_fraction = max(exposures)
+            diversification: Dict[str, object] = {
+                "hhi": round(hhi, 6),
+                "largest_share_pct": round(max_fraction * 100.0, 2),
+                "diversification_score": round((1.0 - hhi) * 100.0, 2),
+            }
+            if hhi > 0:
+                diversification["effective_positions"] = round(1.0 / hhi, 2)
+
+            if diversification["largest_share_pct"] >= 60.0:
+                concentration_level = "high"
+            elif diversification["largest_share_pct"] >= 40.0:
+                concentration_level = "medium"
+            else:
+                concentration_level = "low"
+            diversification["concentration_level"] = concentration_level
+
+            position_summary["diversification"] = diversification
+
+        priority_table: List[Dict[str, object]] = []
+        for idx, symbol in enumerate(dynamic_sequence):
+            info = details.get(symbol, {})
+            sources = tuple(info.get("sources") or ())
+            reasons: List[str] = []
+            if info.get("holding"):
+                reasons.append("holding")
+            if info.get("actionable"):
+                reasons.append("actionable")
+            if info.get("ready") and "actionable" not in reasons:
+                reasons.append("ready")
+            if info.get("manual_only"):
+                reasons.append("manual_only")
+            elif info.get("manual") and "manual_only" not in reasons:
+                reasons.append("manual")
+            if info.get("watchlist") and "actionable" not in reasons:
+                reasons.append("watchlist")
+
+            priority_table.append(
+                {
+                    "symbol": symbol,
+                    "priority": idx + 1,
+                    "sources": sources,
+                    "source_count": len(sources),
+                    "reasons": tuple(reasons),
+                    "holding": bool(info.get("holding")),
+                    "actionable": bool(info.get("actionable")),
+                    "ready": bool(info.get("ready")),
+                    "manual": bool(info.get("manual")),
+                    "manual_only": bool(info.get("manual_only")),
+                    "watchlist": bool(info.get("watchlist")),
+                    "watchlist_order": info.get("watchlist_order"),
+                    "watchlist_rank": info.get("watchlist_rank"),
+                    "probability_pct": info.get("probability_pct"),
+                    "probability": info.get("probability"),
+                    "ev_bps": info.get("ev_bps"),
+                    "edge_score": info.get("edge_score"),
+                    "probability_gap_pct": info.get("probability_gap_pct"),
+                    "score": info.get("score"),
+                    "note": info.get("note"),
+                    "trend": info.get("trend"),
+                    "position_qty": info.get("position_qty"),
+                    "position_notional": info.get("position_notional"),
+                    "position_avg_cost": info.get("position_avg_cost"),
+                    "exposure_pct": info.get("exposure_pct"),
+                }
+            )
+
+        return {
+            "actionable": tuple(actionable),
+            "ready": tuple(sym for sym in ready if sym not in actionable),
+            "watchlist": tuple(watchlist_symbols),
+            "manual": tuple(manual_symbols),
+            "manual_only": tuple(manual_only),
+            "positions": tuple(position_symbols),
+            "positions_only": tuple(positions_only),
+            "dynamic": tuple(dynamic_sequence),
+            "combined": tuple(combined),
+            "details": details,
+            "limit": limit_hint,
+            "stats": stats,
+            "actionable_summary": actionable_summary,
+            "ready_summary": ready_summary,
+            "position_summary": position_summary,
+            "capacity_summary": capacity_summary,
+            "source_breakdown": source_breakdown,
+            "priority_table": tuple(priority_table),
+        }
+
     def _build_watchlist(
         self, status: Dict[str, object], settings: Optional[Settings] = None
     ) -> List[Dict[str, object]]:
@@ -828,10 +1370,27 @@ class GuardianBot:
 
         filtered = [entry for entry in entries if any(entry.values())]
 
+        settings = settings or self.settings
+
+        dynamic_entries = self._market_scanner_watchlist(settings)
+        if dynamic_entries:
+            seen_symbols = {
+                str(entry.get("symbol")).upper()
+                for entry in filtered
+                if isinstance(entry.get("symbol"), str)
+            }
+            for dynamic_entry in dynamic_entries:
+                symbol = dynamic_entry.get("symbol")
+                if not isinstance(symbol, str):
+                    continue
+                upper_symbol = symbol.upper()
+                if upper_symbol in seen_symbols:
+                    continue
+                filtered.append(dynamic_entry)
+                seen_symbols.add(upper_symbol)
+
         if not filtered:
             return filtered
-
-        settings = settings or self.settings
         (
             _,
             _,
@@ -1232,11 +1791,25 @@ class GuardianBot:
         ledger_view = self._ledger_view_for_signature(signature[1])
         portfolio = ledger_view.portfolio
         watchlist = context.get("watchlist", [])
+        symbol_plan = self._build_symbol_plan(
+            watchlist,
+            settings,
+            portfolio=portfolio,
+        )
+        context["symbol_plan"] = copy.deepcopy(symbol_plan)
         recent_trades = list(ledger_view.recent_trades)
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
 
         status_summary["manual_control"] = manual_summary
+        status_summary["symbol_plan"] = copy.deepcopy(symbol_plan)
+
+        limit_hint = int(symbol_plan.get("limit") or 0)
+        combined = list(symbol_plan.get("combined") or [])
+        if limit_hint > 0:
+            status_summary["candidate_symbols"] = combined[:limit_hint]
+        else:
+            status_summary["candidate_symbols"] = combined
 
         status_signature = (
             signature[0][0],
@@ -1253,6 +1826,7 @@ class GuardianBot:
             status_from_cache=self._status_fallback_used,
             portfolio=portfolio,
             watchlist=watchlist,
+            symbol_plan=copy.deepcopy(symbol_plan),
             recent_trades=recent_trades,
             trade_stats=trade_stats,
             executions=execution_records,
@@ -1946,6 +2520,8 @@ class GuardianBot:
             context["watchlist_breakdown"] = watchlist_breakdown
             context["watchlist_digest"] = self._watchlist_digest(watchlist_breakdown)
 
+        context["symbol_plan"] = self._build_symbol_plan(watchlist, settings)
+
         return context
 
     def _brief_from_status(
@@ -2340,6 +2916,64 @@ class GuardianBot:
         snapshot = self._get_snapshot()
         return self._copy_list(snapshot.watchlist)
 
+    def dynamic_symbols(
+        self,
+        limit: Optional[int] = None,
+        *,
+        include_manual: bool = True,
+        only_actionable: bool = False,
+    ) -> List[str]:
+        """Return a prioritised list of symbols to trade based on the watchlist."""
+
+        snapshot = self._get_snapshot()
+        plan = snapshot.symbol_plan or {}
+
+        if limit is None:
+            limit = int(plan.get("limit") or 0)
+            if limit <= 0:
+                limit = None
+        elif limit <= 0:
+            limit = None
+
+        actionable = list(plan.get("actionable") or [])
+        ready = [sym for sym in plan.get("ready") or [] if sym not in actionable]
+        dynamic_sequence = list(plan.get("dynamic") or [])
+        manual = list(plan.get("manual") or [])
+        manual_only_set = set(plan.get("manual_only") or [])
+        position_symbols = list(plan.get("positions") or [])
+        position_set = {sym for sym in position_symbols}
+
+        if only_actionable:
+            pool: List[str] = list(position_symbols)
+            pool.extend(sym for sym in actionable if sym not in pool)
+            if not pool:
+                pool.extend(sym for sym in ready if sym not in pool)
+            if include_manual and manual:
+                pool.extend(sym for sym in manual if sym not in pool)
+        else:
+            if include_manual:
+                combined = list(plan.get("combined") or [])
+                pool = combined if combined else list(dynamic_sequence or manual)
+            else:
+                pool = list(dynamic_sequence)
+
+        if not include_manual:
+            pool = [sym for sym in pool if sym not in manual_only_set]
+
+        deduped: List[str] = []
+        for symbol in pool:
+            cleaned = str(symbol).strip().upper()
+            if cleaned and cleaned not in deduped:
+                deduped.append(cleaned)
+
+        if not include_manual and manual_only_set:
+            deduped = [sym for sym in deduped if sym not in manual_only_set or sym in position_set]
+
+        if limit is not None:
+            deduped = deduped[:limit]
+
+        return deduped
+
     def actionable_opportunities(
         self, limit: int = 5, include_neutral: bool = False
     ) -> List[Dict[str, object]]:
@@ -2601,6 +3235,7 @@ class GuardianBot:
             "brief": snapshot.brief.to_dict(),
             "portfolio": self._copy_dict(snapshot.portfolio),
             "watchlist": self._copy_list(snapshot.watchlist),
+            "symbol_plan": copy.deepcopy(snapshot.symbol_plan),
             "recent_trades": self._copy_list(snapshot.recent_trades),
             "statistics": copy.deepcopy(snapshot.trade_stats),
             "health": self.data_health(),
