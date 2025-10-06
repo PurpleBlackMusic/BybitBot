@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 from collections import deque
 from dataclasses import dataclass
@@ -1286,6 +1287,97 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
 
     watchlist_digest = bot.watchlist_digest()
     assert watchlist_digest == digest
+
+
+def test_guardian_watchlist_breakdown_cache_reuse_and_invalidation(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    entries = [
+        {
+            "symbol": "ADAUSDT",
+            "trend": "buy",
+            "actionable": True,
+            "probability_pct": 66.0,
+            "ev_bps": 15.0,
+        },
+        {
+            "symbol": "LTCUSDT",
+            "trend": "sell",
+            "actionable": True,
+            "probability_pct": 44.0,
+            "ev_bps": 12.0,
+        },
+        {
+            "symbol": "XRPUSDT",
+            "trend": "buy",
+            "actionable": False,
+            "probability_pct": 52.0,
+            "ev_bps": 6.0,
+        },
+    ]
+
+    breakdown_first = bot._watchlist_breakdown(entries)
+    signature_first = bot._watchlist_breakdown_cache_signature
+    assert signature_first is not None
+    assert bot._watchlist_breakdown_cache is not None
+
+    breakdown_second = bot._watchlist_breakdown(copy.deepcopy(entries))
+    assert breakdown_second == breakdown_first
+
+    breakdown_second["counts"]["total"] = 0
+    breakdown_third = bot._watchlist_breakdown(entries)
+    assert breakdown_third["counts"]["total"] == breakdown_first["counts"]["total"]
+
+    mutated_entries = copy.deepcopy(entries)
+    mutated_entries[0]["trend"] = "sell"
+    breakdown_mutated = bot._watchlist_breakdown(mutated_entries)
+    assert breakdown_mutated["counts"]["buys"] != breakdown_first["counts"]["buys"]
+    assert bot._watchlist_breakdown_cache_signature != signature_first
+
+
+def test_guardian_watchlist_digest_cache_returns_copies(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    entries = [
+        {
+            "symbol": "ADAUSDT",
+            "trend": "buy",
+            "actionable": True,
+            "probability_pct": 66.0,
+            "ev_bps": 15.0,
+        },
+        {
+            "symbol": "LTCUSDT",
+            "trend": "sell",
+            "actionable": True,
+            "probability_pct": 44.0,
+            "ev_bps": 12.0,
+        },
+        {
+            "symbol": "XRPUSDT",
+            "trend": "buy",
+            "actionable": False,
+            "probability_pct": 52.0,
+            "ev_bps": 6.0,
+        },
+    ]
+
+    breakdown = bot._watchlist_breakdown(entries)
+    digest_first = bot._watchlist_digest(breakdown)
+    signature_first = bot._digest_cache_signature
+    assert signature_first is not None
+    assert bot._digest_cache is not None
+
+    digest_second = bot._watchlist_digest(copy.deepcopy(breakdown))
+    assert digest_second == digest_first
+
+    digest_second["counts"]["actionable"] = 0
+    digest_third = bot._watchlist_digest(breakdown)
+    assert digest_third["counts"]["actionable"] == digest_first["counts"]["actionable"]
+
+    breakdown_mutated = copy.deepcopy(breakdown)
+    breakdown_mutated["counts"]["actionable"] = 0
+    digest_mutated = bot._watchlist_digest(breakdown_mutated)
+    assert digest_mutated["counts"]["actionable"] == 0
+    assert bot._digest_cache_signature != signature_first
 
 
 def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:

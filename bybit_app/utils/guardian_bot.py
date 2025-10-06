@@ -96,6 +96,10 @@ class GuardianBot:
         self._status_content_hash: Optional[int] = None
         self._plan_cache_signature: Optional[int] = None
         self._plan_cache: Optional[Dict[str, object]] = None
+        self._digest_cache_signature: Optional[int] = None
+        self._digest_cache: Optional[Dict[str, object]] = None
+        self._watchlist_breakdown_cache_signature: Optional[int] = None
+        self._watchlist_breakdown_cache: Optional[Dict[str, object]] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -113,6 +117,69 @@ class GuardianBot:
     def _hash_bytes(payload: bytes) -> int:
         digest = hashlib.blake2b(payload, digest_size=16).digest()
         return int.from_bytes(digest, "big")
+
+    @staticmethod
+    def _canonicalise_for_signature(value: object) -> object:
+        if is_dataclass(value):
+            value = asdict(value)
+
+        if isinstance(value, Mapping):
+            ordered_items = []
+            for key in sorted(value.keys(), key=lambda item: str(item)):
+                ordered_items.append(
+                    (
+                        str(key),
+                        GuardianBot._canonicalise_for_signature(value[key]),
+                    )
+                )
+            return {key: val for key, val in ordered_items}
+
+        if isinstance(value, (list, tuple)):
+            return [GuardianBot._canonicalise_for_signature(item) for item in value]
+
+        if isinstance(value, (set, frozenset)):
+            processed = [
+                GuardianBot._canonicalise_for_signature(item) for item in value
+            ]
+            processed.sort(key=lambda item: repr(item))
+            return processed
+
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+
+        if isinstance(value, datetime):
+            return value.isoformat()
+
+        if isinstance(value, Path):
+            return str(value)
+
+        if isinstance(value, float):
+            number = float(value)
+            if not math.isfinite(number):
+                return None
+            return round(number, 12)
+
+        if isinstance(value, (int, bool)) or value is None:
+            return value
+
+        if isinstance(value, str):
+            return value
+
+        return str(value)
+
+    def _stable_signature(self, payload: object) -> Optional[int]:
+        try:
+            canonical = self._canonicalise_for_signature(payload)
+            serialised = json.dumps(
+                canonical,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+
+        return self._hash_bytes(serialised.encode("utf-8"))
 
     def _prefetch_status(self) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
         path = self._status_path()
@@ -163,6 +230,10 @@ class GuardianBot:
         self._ledger_view = None
         self._plan_cache_signature = None
         self._plan_cache = None
+        self._digest_cache_signature = None
+        self._digest_cache = None
+        self._watchlist_breakdown_cache_signature = None
+        self._watchlist_breakdown_cache = None
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -1686,7 +1757,21 @@ class GuardianBot:
     ) -> Dict[str, object]:
         """Provide aggregated perspective for dashboards and chat replies."""
 
-        total = len(entries)
+        condensed_entries: List[Dict[str, object]] = []
+        for raw_entry in entries:
+            if not isinstance(raw_entry, Mapping):
+                raw_entry = {"symbol": raw_entry}
+            condensed_entries.append(self._condense_watchlist_entry(raw_entry))
+
+        signature = self._stable_signature(condensed_entries)
+        if (
+            signature is not None
+            and signature == self._watchlist_breakdown_cache_signature
+            and self._watchlist_breakdown_cache is not None
+        ):
+            return copy.deepcopy(self._watchlist_breakdown_cache)
+
+        total = len(condensed_entries)
         buys: List[Dict[str, object]] = []
         sells: List[Dict[str, object]] = []
         neutral: List[Dict[str, object]] = []
@@ -1699,8 +1784,7 @@ class GuardianBot:
         actionable_probabilities: List[float] = []
         actionable_expectancies: List[float] = []
 
-        for raw_entry in entries:
-            compact = self._condense_watchlist_entry(raw_entry)
+        for compact in condensed_entries:
             trend = str(compact.get("trend") or "wait").lower()
 
             if trend == "buy":
@@ -1783,7 +1867,7 @@ class GuardianBot:
         if actionable_metrics:
             metrics["actionable"] = actionable_metrics
 
-        return {
+        breakdown = {
             "counts": counts,
             "dominant_trend": dominant_trend,
             "actionable": _take(actionable, limit=5),
@@ -1792,6 +1876,15 @@ class GuardianBot:
             "top_neutral": _take(neutral),
             "metrics": metrics,
         }
+
+        if signature is not None:
+            self._watchlist_breakdown_cache_signature = signature
+            self._watchlist_breakdown_cache = copy.deepcopy(breakdown)
+        else:
+            self._watchlist_breakdown_cache_signature = None
+            self._watchlist_breakdown_cache = None
+
+        return breakdown
 
     @staticmethod
     def _format_watchlist_detail(entry: Dict[str, object]) -> str:
@@ -1821,6 +1914,14 @@ class GuardianBot:
         return ", ".join(parts)
 
     def _watchlist_digest(self, breakdown: Dict[str, object]) -> Dict[str, object]:
+        signature = self._stable_signature(breakdown)
+        if (
+            signature is not None
+            and signature == self._digest_cache_signature
+            and self._digest_cache is not None
+        ):
+            return copy.deepcopy(self._digest_cache)
+
         counts = copy.deepcopy(breakdown.get("counts") or {})
         total = int(counts.get("total") or 0)
         actionable = int(counts.get("actionable") or 0)
@@ -1918,6 +2019,13 @@ class GuardianBot:
             digest["top_actionable"] = [
                 copy.deepcopy(entry) for entry in actionable_entries[:3]
             ]
+
+        if signature is not None:
+            self._digest_cache_signature = signature
+            self._digest_cache = copy.deepcopy(digest)
+        else:
+            self._digest_cache_signature = None
+            self._digest_cache = None
 
         return digest
 
@@ -2965,6 +3073,10 @@ class GuardianBot:
         self._ledger_view = None
         self._plan_cache_signature = None
         self._plan_cache = None
+        self._digest_cache_signature = None
+        self._digest_cache = None
+        self._watchlist_breakdown_cache_signature = None
+        self._watchlist_breakdown_cache = None
         return self._get_snapshot(force=True)
 
     def unified_report(self) -> Dict[str, object]:
