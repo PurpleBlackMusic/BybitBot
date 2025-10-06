@@ -370,7 +370,82 @@ def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
 
     assert summary["mode"] == "buy"
     assert summary["actionable"] is False
-    assert any("выключены" in reason.lower() for reason in summary["actionable_reasons"])
+    lowered = [reason.lower() for reason in summary["actionable_reasons"]]
+    assert any("выключены" in reason for reason in lowered) or any(
+        "ручной режим" in reason for reason in lowered
+    )
+
+
+def test_guardian_manual_guidance_available(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path, Settings(operation_mode="manual", ai_enabled=False))
+    summary = bot.status_summary()
+
+    assert summary["operation_mode"] == "manual"
+    guidance = summary.get("manual_guidance")
+    assert guidance
+    assert guidance.get("notes")
+    assert any("ручной" in reason.lower() for reason in guidance.get("reasons", []))
+    assert guidance.get("plan_steps")
+    assert isinstance(guidance.get("plan_steps"), list)
+    assert any("бот" in step.lower() or "пауза" in step.lower() for step in guidance["plan_steps"])
+    risk_outline = guidance.get("risk_summary")
+    assert isinstance(risk_outline, str) and "Режим:" in risk_outline
+    safety_notes = guidance.get("safety_notes")
+    assert isinstance(safety_notes, list) and any("режим" in note.lower() for note in safety_notes)
+    control_status = guidance.get("control_status")
+    assert control_status is not None
+    assert control_status.get("label")
+    assert control_status.get("history_count") == 0
+    assert isinstance(control_status.get("message"), str)
+
+
+def test_guardian_manual_guidance_includes_history(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path, Settings(operation_mode="manual", ai_enabled=False))
+    bot.manual_trade_start(
+        symbol="BTCUSDT",
+        mode="buy",
+        probability_pct=58.5,
+        ev_bps=21.0,
+        note="Пробная команда",
+    )
+
+    summary = bot.status_summary()
+    guidance = summary.get("manual_guidance") or {}
+    control_status = guidance.get("control_status") or {}
+
+    assert control_status.get("history_count", 0) >= 1
+    history_preview = control_status.get("history_preview") or []
+    assert any("BTCUSDT" in entry for entry in history_preview)
+    assert control_status.get("label")
+    assert control_status.get("message")
+    if control_status.get("raw_label") == "active":
+        assert control_status.get("active") is True
+
+
+def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "symbol": "BTCUSDT",
+                "probability": 0.8,
+                "ev_bps": 20.0,
+                "mode": "buy",
+                "last_tick_ts": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    bot = _make_bot(
+        tmp_path,
+        Settings(operation_mode="auto", ai_enabled=True, ai_symbols="BTCUSDT"),
+    )
+    summary = bot.status_summary()
+
+    assert summary["operation_mode"] == "auto"
+    assert summary.get("manual_guidance") is None
 
 
 def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:

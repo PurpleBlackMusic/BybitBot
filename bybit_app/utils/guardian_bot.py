@@ -1174,6 +1174,9 @@ class GuardianBot:
             effective_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
+        raw_mode = str(getattr(settings, "operation_mode", "manual") or "").strip().lower()
+        operation_mode = "auto" if raw_mode in {"auto", "automatic", "авто"} else "manual"
+
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
         actionable, reasons = self._evaluate_actionability(
             brief.mode,
@@ -1191,9 +1194,14 @@ class GuardianBot:
             actionable = False
 
         if not getattr(settings, "ai_enabled", False):
-            reasons.append(
-                "AI сигналы выключены настройками — автоматические сделки не запускаются."
-            )
+            if operation_mode == "manual":
+                reasons.append(
+                    "Включён ручной режим — AI даёт рекомендации, но сделки не исполняются автоматически."
+                )
+            else:
+                reasons.append(
+                    "AI сигналы выключены настройками — автоматические сделки не запускаются."
+                )
             actionable = False
 
         summary = {
@@ -1232,7 +1240,40 @@ class GuardianBot:
                 "state": staleness_state,
                 "message": staleness_message,
             },
+            "operation_mode": operation_mode,
         }
+
+        if operation_mode == "manual":
+            guidance_notes: List[str] = []
+            for note in (
+                brief.action_text,
+                brief.confidence_text,
+                brief.ev_text,
+                brief.caution,
+                staleness_message,
+            ):
+                if isinstance(note, str):
+                    cleaned = note.strip()
+                    if cleaned:
+                        guidance_notes.append(cleaned)
+
+            manual_plan = self.plan_steps(brief=brief)
+            risk_outline = self.risk_summary()
+            safety_notes = self.safety_notes()
+            control_status = self.manual_control_guidance(manual_summary)
+
+            summary["manual_guidance"] = {
+                "headline": brief.headline,
+                "notes": guidance_notes,
+                "reasons": list(reasons),
+                "thresholds": summary["thresholds"],
+                "plan_steps": list(manual_plan),
+                "risk_summary": risk_outline,
+                "safety_notes": list(safety_notes),
+            }
+
+            if control_status:
+                summary["manual_guidance"]["control_status"] = control_status
 
         if status:
             summary["raw_keys"] = sorted(status.keys())
@@ -1520,6 +1561,98 @@ class GuardianBot:
 
         trade_control.clear_trade_commands(data_dir=self.data_dir)
         self._snapshot = None
+
+    def manual_control_guidance(
+        self, manual_summary: Optional[Dict[str, object]]
+    ) -> Optional[Dict[str, object]]:
+        """Build a compact view of manual control activity for guidance panels."""
+
+        if not manual_summary:
+            return None
+
+        label_key = str(manual_summary.get("status_label") or "idle").strip().lower() or "idle"
+        label_map = {
+            "active": "Торговля активна",
+            "pending": "Ожидаем подтверждение",
+            "stopped": "Остановлено оператором",
+            "idle": "Команды не отправлялись",
+        }
+        label = label_map.get(label_key, label_key)
+
+        message_value = manual_summary.get("status_message") or manual_summary.get("status_text")
+        message = str(message_value).strip() if isinstance(message_value, str) else ""
+
+        symbol_value = manual_summary.get("symbol")
+        symbol = str(symbol_value).strip().upper() if isinstance(symbol_value, str) else ""
+        symbol = symbol or None
+
+        last_action_at = manual_summary.get("last_action_at")
+        if isinstance(last_action_at, str):
+            last_action_at = last_action_at.strip()
+        if not last_action_at:
+            last_action_at = None
+
+        last_action_age = manual_summary.get("last_action_age_seconds")
+        last_action_age_text: Optional[str] = None
+        if isinstance(last_action_age, (int, float)) and last_action_age >= 0:
+            last_action_age_text = self._format_duration(float(last_action_age))
+
+        history_preview: List[str] = []
+        history = manual_summary.get("history")
+        if isinstance(history, list):
+            for entry in history[-3:][::-1]:
+                if not isinstance(entry, dict):
+                    continue
+
+                parts: List[str] = []
+                action_label = entry.get("action_label") or entry.get("action")
+                if isinstance(action_label, str) and action_label.strip():
+                    parts.append(action_label.strip())
+
+                entry_symbol = entry.get("symbol") or symbol
+                if isinstance(entry_symbol, str) and entry_symbol.strip():
+                    parts.append(entry_symbol.strip().upper())
+
+                ts_human = entry.get("ts_human")
+                if isinstance(ts_human, str) and ts_human.strip():
+                    parts.append(ts_human.strip())
+
+                prob_text = entry.get("probability_text")
+                if isinstance(prob_text, str) and prob_text.strip():
+                    parts.append(f"p={prob_text.strip()}")
+
+                ev_text = entry.get("ev_text")
+                if isinstance(ev_text, str) and ev_text.strip():
+                    parts.append(ev_text.strip())
+
+                note = entry.get("note_or_reason")
+                if isinstance(note, str) and note.strip():
+                    parts.append(note.strip())
+
+                line = " · ".join(parts)
+                if line:
+                    history_preview.append(line)
+
+        payload: Dict[str, object] = {
+            "label": label,
+            "raw_label": label_key,
+            "active": bool(manual_summary.get("active")),
+            "awaiting_operator": label_key in {"pending", "stopped"},
+            "history_count": int(manual_summary.get("history_count") or 0),
+        }
+
+        if message:
+            payload["message"] = message
+        if symbol:
+            payload["symbol"] = symbol
+        if last_action_at:
+            payload["last_action_at"] = last_action_at
+        if last_action_age_text:
+            payload["last_action_age"] = last_action_age_text
+        if history_preview:
+            payload["history_preview"] = history_preview
+
+        return payload
 
     def plan_steps(self, brief: Optional[GuardianBrief] = None) -> List[str]:
         brief = brief or self.generate_brief()
