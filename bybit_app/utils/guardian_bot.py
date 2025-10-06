@@ -773,7 +773,36 @@ class GuardianBot:
                 records.append(record)
         return tuple(records)
 
-    def _build_watchlist(self, status: Dict[str, object]) -> List[Dict[str, object]]:
+    @staticmethod
+    def _coerce_float(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return float(stripped)
+            except ValueError:
+                return None
+        return None
+
+    def _normalise_probability_input(self, value: object) -> Optional[float]:
+        numeric = self._coerce_float(value)
+        if numeric is None:
+            return None
+        if numeric > 1.0:
+            if numeric <= 100.0:
+                numeric /= 100.0
+            else:
+                numeric = 1.0
+        elif numeric < 0.0:
+            numeric = 0.0
+        return self._clamp_probability(numeric)
+
+    def _build_watchlist(
+        self, status: Dict[str, object], settings: Optional[Settings] = None
+    ) -> List[Dict[str, object]]:
         candidates = (
             status.get("watchlist")
             or status.get("heatmap")
@@ -799,14 +828,383 @@ class GuardianBot:
 
         filtered = [entry for entry in entries if any(entry.values())]
 
+        if not filtered:
+            return filtered
+
+        settings = settings or self.settings
+        (
+            _,
+            _,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        ) = self._resolve_thresholds(settings)
+
+        def annotate(entry: Dict[str, object]) -> None:
+            trend_hint = self._normalise_mode_hint(entry.get("trend"))
+            probability = self._normalise_probability_input(entry.get("probability"))
+            ev_value = self._coerce_float(entry.get("ev_bps"))
+            score_value = entry.get("score")
+            numeric_score = float(score_value) if isinstance(score_value, (int, float)) else None
+
+            entry["trend_hint"] = trend_hint
+            entry["probability"] = probability
+            entry["ev_bps"] = ev_value
+            if probability is not None:
+                entry["probability_pct"] = round(probability * 100.0, 2)
+            else:
+                entry["probability_pct"] = None
+
+            if numeric_score is not None:
+                entry["score"] = round(numeric_score, 2)
+
+            if ev_value is not None:
+                entry["ev_bps"] = round(ev_value, 3)
+
+            if trend_hint in {"buy", "sell"}:
+                if probability is None:
+                    probability_ready = True
+                    probability_gap = None
+                elif trend_hint == "sell":
+                    probability_ready = probability <= effective_sell_threshold
+                    probability_gap = effective_sell_threshold - probability
+                else:
+                    probability_ready = probability >= effective_buy_threshold
+                    probability_gap = probability - effective_buy_threshold
+            else:
+                if probability is None:
+                    probability_ready = False
+                    probability_gap = None
+                else:
+                    probability_ready = probability >= 0.5
+                    probability_gap = probability - 0.5
+
+            ev_ready = ev_value is None or ev_value >= min_ev
+            actionable = trend_hint in {"buy", "sell"} and probability_ready and ev_ready
+
+            entry["ev_ready"] = bool(ev_value is not None and ev_value >= min_ev)
+            entry["probability_ready"] = probability_ready
+            entry["probability_gap_pct"] = (
+                round(probability_gap * 100.0, 2) if probability_gap is not None else None
+            )
+            entry["actionable"] = actionable
+            entry["trend_category"] = trend_hint if trend_hint in {"buy", "sell"} else "wait"
+
+            edge_components: List[float] = []
+            if actionable:
+                edge_components.append(5.0)
+            elif trend_hint in {"buy", "sell"} and probability_ready:
+                edge_components.append(2.5)
+
+            if probability_gap is not None:
+                edge_components.append(probability_gap * 100.0)
+
+            if ev_value is not None and min_ev > 0:
+                edge_components.append(ev_value / min_ev)
+            elif ev_value is not None:
+                edge_components.append(ev_value)
+
+            if numeric_score is not None:
+                edge_components.append(numeric_score)
+
+            entry["edge_score"] = (
+                round(sum(edge_components), 4) if edge_components else None
+            )
+
+        for item in filtered:
+            annotate(item)
+
+        def best_metric(item: Dict[str, object]) -> Optional[float]:
+            for key in ("edge_score", "score", "probability", "ev_bps"):
+                value = item.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return None
+
         def sort_key(item: Dict[str, object]) -> tuple:
-            score = item.get("score")
-            if isinstance(score, (int, float)):
-                return (0, -float(score), item["symbol"])
-            return (1, item["symbol"])
+            trend_hint = item.get("trend_hint")
+            actionable = bool(item.get("actionable"))
+            probability_ready = bool(item.get("probability_ready"))
+            ev_ready = bool(item.get("ev_ready"))
+            metric = best_metric(item)
+            if isinstance(item.get("edge_score"), (int, float)):
+                metric_value = -float(item["edge_score"])
+            elif metric is not None:
+                metric_value = -metric
+            else:
+                metric_value = float("inf")
+
+            return (
+                0 if actionable else 1,
+                0 if trend_hint in {"buy", "sell"} and probability_ready else 1,
+                0 if ev_ready else 1,
+                metric_value,
+                item["symbol"],
+            )
 
         filtered.sort(key=sort_key)
         return filtered
+
+    @staticmethod
+    def _condense_watchlist_entry(entry: Dict[str, object]) -> Dict[str, object]:
+        """Reduce a raw watchlist entry to UI-friendly fields."""
+
+        trend_hint = entry.get("trend_hint") or entry.get("trend")
+        compact = {
+            "symbol": entry.get("symbol"),
+            "trend": trend_hint,
+            "actionable": bool(entry.get("actionable")),
+            "probability_pct": entry.get("probability_pct"),
+            "probability_ready": entry.get("probability_ready"),
+            "probability_gap_pct": entry.get("probability_gap_pct"),
+            "ev_bps": entry.get("ev_bps"),
+            "ev_ready": entry.get("ev_ready"),
+            "edge_score": entry.get("edge_score"),
+            "score": entry.get("score"),
+            "note": entry.get("note"),
+        }
+
+        return compact
+
+    def _watchlist_breakdown(
+        self, entries: Sequence[Dict[str, object]]
+    ) -> Dict[str, object]:
+        """Provide aggregated perspective for dashboards and chat replies."""
+
+        total = len(entries)
+        buys: List[Dict[str, object]] = []
+        sells: List[Dict[str, object]] = []
+        neutral: List[Dict[str, object]] = []
+        actionable: List[Dict[str, object]] = []
+        actionable_buys = 0
+        actionable_sells = 0
+
+        overall_probabilities: List[float] = []
+        overall_expectancies: List[float] = []
+        actionable_probabilities: List[float] = []
+        actionable_expectancies: List[float] = []
+
+        for raw_entry in entries:
+            compact = self._condense_watchlist_entry(raw_entry)
+            trend = str(compact.get("trend") or "wait").lower()
+
+            if trend == "buy":
+                buys.append(copy.deepcopy(compact))
+                if compact["actionable"]:
+                    actionable_buys += 1
+            elif trend == "sell":
+                sells.append(copy.deepcopy(compact))
+                if compact["actionable"]:
+                    actionable_sells += 1
+            else:
+                neutral.append(copy.deepcopy(compact))
+
+            if compact["actionable"]:
+                actionable.append(copy.deepcopy(compact))
+
+            probability_value = compact.get("probability_pct")
+            if isinstance(probability_value, (int, float)):
+                probability_number = float(probability_value)
+                overall_probabilities.append(probability_number)
+                if compact["actionable"]:
+                    actionable_probabilities.append(probability_number)
+
+            expectancy_value = compact.get("ev_bps")
+            if isinstance(expectancy_value, (int, float)):
+                expectancy_number = float(expectancy_value)
+                overall_expectancies.append(expectancy_number)
+                if compact["actionable"]:
+                    actionable_expectancies.append(expectancy_number)
+
+        counts = {
+            "total": total,
+            "actionable": len(actionable),
+            "actionable_buys": actionable_buys,
+            "actionable_sells": actionable_sells,
+            "buys": len(buys),
+            "sells": len(sells),
+            "neutral": len(neutral),
+        }
+
+        dominant_trend: Optional[str]
+        if actionable_buys or actionable_sells:
+            dominant_trend = "buy" if actionable_buys >= actionable_sells else "sell"
+        elif len(buys) > len(sells):
+            dominant_trend = "buy"
+        elif len(sells) > len(buys):
+            dominant_trend = "sell"
+        elif total:
+            dominant_trend = "wait"
+        else:
+            dominant_trend = None
+
+        def _take(items: Sequence[Dict[str, object]], limit: int = 3) -> List[Dict[str, object]]:
+            return [copy.deepcopy(item) for item in list(items)[:limit]]
+
+        def _average(values: Sequence[float]) -> Optional[float]:
+            if not values:
+                return None
+            return round(sum(values) / len(values), 2)
+
+        overall_metrics: Dict[str, float] = {}
+        overall_probability_avg = _average(overall_probabilities)
+        if overall_probability_avg is not None:
+            overall_metrics["probability_avg_pct"] = overall_probability_avg
+        overall_expectancy_avg = _average(overall_expectancies)
+        if overall_expectancy_avg is not None:
+            overall_metrics["ev_avg_bps"] = overall_expectancy_avg
+
+        actionable_metrics: Dict[str, float] = {}
+        actionable_probability_avg = _average(actionable_probabilities)
+        if actionable_probability_avg is not None:
+            actionable_metrics["probability_avg_pct"] = actionable_probability_avg
+        actionable_expectancy_avg = _average(actionable_expectancies)
+        if actionable_expectancy_avg is not None:
+            actionable_metrics["ev_avg_bps"] = actionable_expectancy_avg
+
+        metrics: Dict[str, Dict[str, float]] = {}
+        if overall_metrics:
+            metrics["overall"] = overall_metrics
+        if actionable_metrics:
+            metrics["actionable"] = actionable_metrics
+
+        return {
+            "counts": counts,
+            "dominant_trend": dominant_trend,
+            "actionable": _take(actionable, limit=5),
+            "top_buys": _take(buys),
+            "top_sells": _take(sells),
+            "top_neutral": _take(neutral),
+            "metrics": metrics,
+        }
+
+    @staticmethod
+    def _format_watchlist_detail(entry: Dict[str, object]) -> str:
+        symbol = str(entry.get("symbol") or "").upper() or "—"
+        trend = str(entry.get("trend") or "wait").lower()
+        trend_text = {
+            "buy": "покупка",
+            "sell": "продажа",
+        }.get(trend, "наблюдение")
+
+        parts = [symbol, trend_text]
+
+        probability = entry.get("probability_pct")
+        if isinstance(probability, (int, float)):
+            parts.append(f"{float(probability):.1f}%")
+
+        ev_bps = entry.get("ev_bps")
+        if isinstance(ev_bps, (int, float)):
+            parts.append(f"EV {float(ev_bps):.1f} б.п.")
+
+        note = entry.get("note")
+        if isinstance(note, str):
+            note_text = note.strip()
+            if note_text:
+                parts.append(note_text)
+
+        return ", ".join(parts)
+
+    def _watchlist_digest(self, breakdown: Dict[str, object]) -> Dict[str, object]:
+        counts = copy.deepcopy(breakdown.get("counts") or {})
+        total = int(counts.get("total") or 0)
+        actionable = int(counts.get("actionable") or 0)
+        actionable_buys = int(counts.get("actionable_buys") or 0)
+        actionable_sells = int(counts.get("actionable_sells") or 0)
+        buys = int(counts.get("buys") or 0)
+        sells = int(counts.get("sells") or 0)
+        neutral = int(counts.get("neutral") or 0)
+
+        if total == 0:
+            headline = "Список наблюдения пуст — ждём новые сигналы."
+        elif actionable:
+            headline = (
+                f"{total} инструментов в наблюдении, {actionable} готовы к сделке."
+            )
+        else:
+            headline = f"{total} инструментов в наблюдении, пока без готовых сделок."
+
+        dominant = breakdown.get("dominant_trend")
+        dominant_note = None
+        if dominant == "buy":
+            dominant_note = "Преобладает спрос — бычьи сигналы ведут список."
+        elif dominant == "sell":
+            dominant_note = "Преобладает давление продавцов — важен контроль риска."
+        elif dominant == "wait":
+            dominant_note = "Преобладают нейтральные сигналы — наблюдаем и ждём подтверждений."
+
+        actionable_entries = breakdown.get("actionable") or []
+        metrics = copy.deepcopy(breakdown.get("metrics") or {})
+        actionable_metrics = metrics.get("actionable") if isinstance(metrics, dict) else {}
+        overall_metrics = metrics.get("overall") if isinstance(metrics, dict) else {}
+
+        detail_lines: List[str] = []
+        if actionable_entries:
+            formatted = "; ".join(
+                self._format_watchlist_detail(entry)
+                for entry in actionable_entries[:3]
+            )
+            detail_lines.append(f"Активные идеи: {formatted}.")
+            metric_bits: List[str] = []
+            if isinstance(actionable_metrics, dict):
+                probability_avg = actionable_metrics.get("probability_avg_pct")
+                if isinstance(probability_avg, (int, float)):
+                    metric_bits.append(f"уверенность {float(probability_avg):.1f}%")
+                ev_avg = actionable_metrics.get("ev_avg_bps")
+                if isinstance(ev_avg, (int, float)):
+                    metric_bits.append(f"EV {float(ev_avg):.1f} б.п.")
+            if metric_bits:
+                detail_lines.append(
+                    "Средние показатели активных идей: " + ", ".join(metric_bits) + "."
+                )
+        elif total:
+            leaders = breakdown.get("top_buys") or breakdown.get("top_neutral") or []
+            if leaders:
+                formatted = "; ".join(
+                    self._format_watchlist_detail(entry) for entry in leaders[:3]
+                )
+                detail_lines.append(f"На радаре: {formatted}.")
+            metric_bits: List[str] = []
+            if isinstance(overall_metrics, dict):
+                probability_avg = overall_metrics.get("probability_avg_pct")
+                if isinstance(probability_avg, (int, float)):
+                    metric_bits.append(f"средняя уверенность {float(probability_avg):.1f}%")
+                ev_avg = overall_metrics.get("ev_avg_bps")
+                if isinstance(ev_avg, (int, float)):
+                    metric_bits.append(f"средний EV {float(ev_avg):.1f} б.п.")
+            if metric_bits:
+                detail_lines.append(
+                    "Пульс наблюдения: " + ", ".join(metric_bits) + "."
+                )
+
+        if total:
+            detail_lines.append(
+                "Структура: "
+                f"{buys} buy / {sells} sell / {neutral} нейтральных сигналов."
+            )
+
+        if dominant_note:
+            detail_lines.append(dominant_note)
+
+        if actionable and (actionable_buys or actionable_sells):
+            detail_lines.append(
+                f"Готовые сделки: {actionable_buys} на покупку и {actionable_sells} на продажу."
+            )
+
+        digest = {
+            "headline": headline,
+            "details": detail_lines,
+            "dominant_trend": dominant,
+            "counts": counts,
+            "metrics": metrics,
+        }
+
+        if actionable_entries:
+            digest["top_actionable"] = [
+                copy.deepcopy(entry) for entry in actionable_entries[:3]
+            ]
+
+        return digest
 
     def _build_snapshot(
         self,
@@ -820,18 +1218,20 @@ class GuardianBot:
         settings = self.settings
         manual_state = trade_control.trade_control_state(data_dir=self.data_dir)
         manual_summary = self._manual_control_summary(manual_state)
-        brief = self._brief_from_status(status, settings)
+        context = self._derive_signal_context(status, settings)
+        brief = self._brief_from_status(status, settings, context)
         status_summary = self._build_status_summary(
             status,
             brief,
             settings,
             self._status_fallback_used,
             manual_summary,
+            context,
         )
 
         ledger_view = self._ledger_view_for_signature(signature[1])
         portfolio = ledger_view.portfolio
-        watchlist = self._build_watchlist(status)
+        watchlist = context.get("watchlist", [])
         recent_trades = list(ledger_view.recent_trades)
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
@@ -1162,9 +1562,11 @@ class GuardianBot:
         settings: Settings,
         fallback_used: bool,
         manual_summary: Optional[Dict[str, object]] = None,
+        context: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
-        probability = self._clamp_probability(float(status.get("probability") or 0.0))
-        ev_bps = float(status.get("ev_bps") or 0.0)
+        context = context or self._derive_signal_context(status, settings)
+        probability = float(context.get("probability") or 0.0)
+        ev_bps = float(context.get("ev_bps") or 0.0)
         last_tick = status.get("last_tick_ts") or status.get("timestamp")
 
         (
@@ -1222,6 +1624,9 @@ class GuardianBot:
             "last_update": self._format_timestamp(last_tick),
             "actionable": actionable,
             "actionable_reasons": reasons,
+            "symbol_source": context.get("symbol_source"),
+            "probability_source": context.get("probability_source"),
+            "ev_source": context.get("ev_source"),
             "thresholds": {
                 "buy_probability_pct": round(buy_threshold * 100.0, 2),
                 "sell_probability_pct": round(sell_threshold * 100.0, 2),
@@ -1243,6 +1648,45 @@ class GuardianBot:
             },
             "operation_mode": operation_mode,
         }
+
+        watchlist_entries = context.get("watchlist") or []
+        watchlist_breakdown = context.get("watchlist_breakdown") if context else None
+        if watchlist_entries:
+            summary["watchlist_total"] = len(watchlist_entries)
+            summary["watchlist_actionable"] = sum(
+                1 for item in watchlist_entries if item.get("actionable")
+            )
+            highlights: List[Dict[str, object]] = []
+            for idx, entry in enumerate(watchlist_entries[:3]):
+                highlight = {
+                    "symbol": entry.get("symbol"),
+                    "trend": entry.get("trend_hint") or entry.get("trend"),
+                    "probability_pct": entry.get("probability_pct"),
+                    "probability_ready": entry.get("probability_ready"),
+                    "probability_gap_pct": entry.get("probability_gap_pct"),
+                    "ev_bps": entry.get("ev_bps"),
+                    "ev_ready": entry.get("ev_ready"),
+                    "score": entry.get("score"),
+                    "note": entry.get("note"),
+                    "actionable": entry.get("actionable"),
+                    "edge_score": entry.get("edge_score"),
+                }
+                if idx == 0:
+                    highlight["primary"] = True
+                highlights.append(highlight)
+
+            summary["watchlist_highlights"] = highlights
+            summary["primary_watch"] = copy.deepcopy(watchlist_entries[0])
+            breakdown = (
+                copy.deepcopy(watchlist_breakdown)
+                if watchlist_breakdown
+                else self._watchlist_breakdown(watchlist_entries)
+            )
+            summary["watchlist_breakdown"] = breakdown
+            digest = context.get("watchlist_digest") if context else None
+            if not digest:
+                digest = self._watchlist_digest(breakdown)
+            summary["watchlist_digest"] = digest
 
         if operation_mode == "manual":
             guidance_notes: List[str] = []
@@ -1285,6 +1729,10 @@ class GuardianBot:
                     summary["mode_hint"] = hint
                     summary["mode_hint_source"] = source_key
                     break
+
+            if "mode_hint" not in summary and context.get("side_hint"):
+                summary["mode_hint"] = context.get("side_hint")
+                summary["mode_hint_source"] = "watchlist"
 
         return summary
 
@@ -1359,13 +1807,17 @@ class GuardianBot:
         actionable = len(reasons) == 0
         return actionable, reasons
 
-    def _brief_from_status(self, status: Dict[str, object], settings: Settings) -> GuardianBrief:
+    def _derive_signal_context(
+        self, status: Dict[str, object], settings: Settings
+    ) -> Dict[str, object]:
         raw_symbol = status.get("symbol") or status.get("ticker") or status.get("pair")
         symbol: Optional[str] = None
+        symbol_source = "status"
 
         if isinstance(raw_symbol, str) and raw_symbol.strip():
             symbol = raw_symbol.strip().upper()
         else:
+            symbol_source = "settings"
             for candidate in (settings.ai_symbols or "").split(","):
                 candidate = candidate.strip()
                 if candidate:
@@ -1374,16 +1826,145 @@ class GuardianBot:
 
         if not symbol:
             symbol = "BTCUSDT"
+            symbol_source = "default"
 
-        probability = self._clamp_probability(float(status.get("probability") or 0.0))
-        ev_bps = float(status.get("ev_bps") or 0.0)
+        probability_value = self._normalise_probability_input(status.get("probability"))
+        probability_source: Optional[str] = None
+        if probability_value is not None and probability_value > 0.0:
+            probability_source = "status"
+
+        ev_value = self._coerce_float(status.get("ev_bps"))
+        ev_source: Optional[str] = None
+        if ev_value is not None and ev_value != 0.0:
+            ev_source = "status"
+
+        side_hint = self._normalise_mode_hint(status.get("side"))
+        status_side_hint = side_hint
+
+        (
+            buy_threshold,
+            sell_threshold,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        ) = self._resolve_thresholds(settings)
+
+        watchlist = self._build_watchlist(status, settings)
+        watchlist_breakdown = self._watchlist_breakdown(watchlist) if watchlist else None
+        primary_entry: Optional[Dict[str, object]] = None
+        fallback_entry: Optional[Tuple[Dict[str, object], Optional[str]]] = None
+        watchlist_hint: Optional[str] = None
+
+        for entry in watchlist:
+            trend_hint = entry.get("trend_hint") or self._normalise_mode_hint(entry.get("trend"))
+
+            if bool(entry.get("actionable")):
+                primary_entry = entry
+                watchlist_hint = trend_hint
+                break
+
+            if fallback_entry is None:
+                fallback_entry = (entry, trend_hint)
+            elif fallback_entry[1] not in {"buy", "sell"} and trend_hint in {"buy", "sell"}:
+                fallback_entry = (entry, trend_hint)
+
+        if primary_entry is None and fallback_entry is not None:
+            primary_entry, trend_hint = fallback_entry
+            watchlist_hint = trend_hint
+
+        if primary_entry is None and watchlist:
+            primary_entry = watchlist[0]
+            trend_hint = self._normalise_mode_hint(primary_entry.get("trend"))
+            watchlist_hint = trend_hint
+
+        status_actionable = False
+        if symbol_source == "status":
+            if status_side_hint == "sell":
+                status_actionable = (
+                    probability_value is not None
+                    and probability_value <= effective_sell_threshold
+                    and (ev_value is None or ev_value >= min_ev)
+                )
+            else:
+                status_actionable = (
+                    probability_value is not None
+                    and probability_value >= effective_buy_threshold
+                    and (ev_value is None or ev_value >= min_ev)
+                )
+
+        if primary_entry:
+            same_symbol_as_status = (
+                symbol_source == "status"
+                and isinstance(primary_entry.get("symbol"), str)
+                and primary_entry.get("symbol") == symbol
+            )
+            allow_watchlist_symbol = symbol_source != "status" or not status_actionable
+            using_watchlist_symbol = allow_watchlist_symbol or same_symbol_as_status
+
+            if allow_watchlist_symbol and isinstance(primary_entry.get("symbol"), str):
+                symbol = primary_entry["symbol"]
+                symbol_source = "watchlist"
+
+            if using_watchlist_symbol and watchlist_hint and (
+                not side_hint or side_hint == "wait"
+            ):
+                side_hint = watchlist_hint
+
+            if using_watchlist_symbol:
+                for key in ("probability", "score"):
+                    candidate_prob = self._normalise_probability_input(
+                        primary_entry.get(key)
+                    )
+                    if candidate_prob is not None and candidate_prob > 0.0:
+                        probability_value = candidate_prob
+                        probability_source = "watchlist"
+                        break
+
+                candidate_ev = self._coerce_float(primary_entry.get("ev_bps"))
+                if candidate_ev is not None and candidate_ev != 0.0:
+                    ev_value = candidate_ev
+                    ev_source = "watchlist"
+        else:
+            side_hint = status_side_hint
+
+        probability = self._clamp_probability(probability_value or 0.0)
+        ev_bps = float(ev_value or 0.0)
+
+        context = {
+            "symbol": symbol,
+            "symbol_source": symbol_source,
+            "probability": probability,
+            "probability_source": probability_source or symbol_source,
+            "ev_bps": ev_bps,
+            "ev_source": ev_source or symbol_source,
+            "side_hint": side_hint,
+            "watchlist": watchlist,
+            "primary_watch": primary_entry,
+        }
+
+        if watchlist_breakdown:
+            context["watchlist_breakdown"] = watchlist_breakdown
+            context["watchlist_digest"] = self._watchlist_digest(watchlist_breakdown)
+
+        return context
+
+    def _brief_from_status(
+        self,
+        status: Dict[str, object],
+        settings: Settings,
+        context: Optional[Dict[str, object]] = None,
+    ) -> GuardianBrief:
+        context = context or self._derive_signal_context(status, settings)
+        symbol = context.get("symbol") or "BTCUSDT"
+        probability = float(context.get("probability") or 0.0)
+        ev_bps = float(context.get("ev_bps") or 0.0)
 
         mode_hint: Optional[str] = None
         for key in ("mode", "signal", "action", "bias"):
             mode_hint = self._normalise_mode_hint(status.get(key))
             if mode_hint:
                 break
-        side_hint = self._normalise_mode_hint(status.get("side"))
+        side_hint = context.get("side_hint") or self._normalise_mode_hint(status.get("side"))
 
         (
             buy_threshold,
@@ -1684,9 +2265,9 @@ class GuardianBot:
     def signal_scorecard(self, brief: Optional[GuardianBrief] = None) -> Dict[str, object]:
         snapshot = self._get_snapshot()
         brief = brief or snapshot.brief
-        status = snapshot.status
-        probability = float(status.get("probability") or 0.0)
-        ev_bps = float(status.get("ev_bps") or 0.0)
+        summary = snapshot.status_summary
+        probability = float(summary.get("probability") or 0.0)
+        ev_bps = float(summary.get("ev_bps") or 0.0)
         (
             configured_buy_threshold,
             configured_sell_threshold,
@@ -1709,36 +2290,87 @@ class GuardianBot:
 
     def _normalise_watchlist_entry(self, symbol: str, payload: object) -> Dict[str, object]:
         if isinstance(payload, dict):
-            score = payload.get("score") or payload.get("probability") or payload.get("ev")
+            score_candidate = payload.get("score")
             trend = payload.get("trend") or payload.get("direction") or payload.get("side")
             note = payload.get("note") or payload.get("comment") or payload.get("reason")
+
+            probability_value: Optional[float] = None
+            for key in ("probability", "confidence", "p", "prob"):
+                probability_value = self._normalise_probability_input(payload.get(key))
+                if probability_value is not None:
+                    break
+
+            ev_value: Optional[float] = None
+            for key in ("ev_bps", "ev", "edge", "alpha", "expected_value"):
+                ev_value = self._coerce_float(payload.get(key))
+                if ev_value is not None:
+                    break
         else:
-            score = payload
+            score_candidate = payload
             trend = None
             note = None
+            probability_value = None
+            ev_value = None
 
         numeric_score: Optional[float] = None
-        if isinstance(score, (int, float)):
-            numeric_score = round(float(score), 2)
-        elif isinstance(score, str):
-            stripped = score.strip()
+        if isinstance(score_candidate, (int, float)):
+            numeric_score = round(float(score_candidate), 2)
+        elif isinstance(score_candidate, str):
+            stripped = score_candidate.strip()
             if stripped:
                 try:
                     numeric_score = round(float(stripped), 2)
                 except ValueError:
                     numeric_score = None
 
+        if probability_value is None and numeric_score is not None:
+            probability_value = self._normalise_probability_input(numeric_score)
+
         entry = {
             "symbol": symbol.upper(),
             "score": numeric_score,
             "trend": str(trend) if trend not in (None, "") else None,
             "note": str(note) if note not in (None, "") else None,
+            "probability": probability_value,
+            "ev_bps": ev_value,
         }
         return entry
 
     def market_watchlist(self) -> List[Dict[str, object]]:
         snapshot = self._get_snapshot()
         return self._copy_list(snapshot.watchlist)
+
+    def actionable_opportunities(
+        self, limit: int = 5, include_neutral: bool = False
+    ) -> List[Dict[str, object]]:
+        """Return the strongest opportunities ranked by the guardian bot."""
+
+        snapshot = self._get_snapshot()
+        ranked: List[Dict[str, object]] = []
+
+        for entry in snapshot.watchlist:
+            trend = str(entry.get("trend_hint") or entry.get("trend") or "").lower()
+            if entry.get("actionable"):
+                ranked.append(copy.deepcopy(entry))
+            elif include_neutral and trend not in {"buy", "sell"}:
+                ranked.append(copy.deepcopy(entry))
+
+        if limit and limit > 0:
+            return ranked[:limit]
+        return ranked
+
+    def watchlist_breakdown(self) -> Dict[str, object]:
+        """Expose aggregated watchlist stats for dashboards or APIs."""
+
+        snapshot = self._get_snapshot()
+        return self._watchlist_breakdown(snapshot.watchlist)
+
+    def watchlist_digest(self) -> Dict[str, object]:
+        """Return ready-to-use text snippets summarising the watchlist."""
+
+        snapshot = self._get_snapshot()
+        breakdown = self._watchlist_breakdown(snapshot.watchlist)
+        return self._watchlist_digest(breakdown)
 
     def recent_trades(self, limit: int = 10) -> List[Dict[str, object]]:
         snapshot = self._get_snapshot()
@@ -1784,8 +2416,8 @@ class GuardianBot:
             else:
                 ai_ok = True
             ai_message = staleness_message
-            symbol = str(status.get("symbol") or "?").upper()
-            probability = float(status.get("probability") or 0.0) * 100.0
+            symbol = str(summary.get("symbol") or status.get("symbol") or "?").upper()
+            probability = float(summary.get("probability") or 0.0) * 100.0
             ai_details = f"Текущий символ: {symbol}, уверенность {probability:.1f}%."
         else:
             ai_ok = False
@@ -2374,16 +3006,30 @@ class GuardianBot:
             symbol = str(entry.get("symbol") or "?").upper()
             bits: List[str] = []
             score = entry.get("score")
-            trend = entry.get("trend")
+            trend = entry.get("trend_hint") or entry.get("trend")
             note = entry.get("note")
+            probability_pct = entry.get("probability_pct")
+            ev_bps = entry.get("ev_bps")
+            if entry.get("actionable"):
+                bits.append("готов к сделке")
             if isinstance(trend, str) and trend:
                 bits.append(trend.lower())
             if isinstance(score, (int, float)):
                 bits.append(f"оценка {float(score):.2f}")
+            if isinstance(probability_pct, (int, float)):
+                bits.append(f"уверенность {float(probability_pct):.1f}%")
+            if isinstance(ev_bps, (int, float)) and ev_bps:
+                bits.append(f"выгода ~{float(ev_bps):.1f} б.п.")
             if isinstance(note, str) and note:
                 bits.append(note)
             detail = ", ".join(bits) if bits else "наблюдаем динамику"
             lines.append(f"{symbol}: {detail}")
+
+        actionable_total = sum(1 for entry in watchlist if entry.get("actionable"))
+        if actionable_total:
+            lines.append(
+                f"Активных идей: {actionable_total} — бот уже проверил вероятность и выгоду."
+            )
 
         if len(watchlist) > 3:
             lines.append(
