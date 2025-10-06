@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import enum
+from collections import deque
+from dataclasses import dataclass
 import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List
+from types import MappingProxyType
 
 import bybit_app.utils.guardian_bot as guardian_bot_module
 from bybit_app.utils import trade_control
@@ -512,6 +516,259 @@ def test_guardian_plan_and_risk_summary(tmp_path: Path) -> None:
     assert "15.0%" in risk
     assert "0.75%" in risk
     assert "заёмные" in risk
+
+
+def test_guardian_answer_handles_non_string_questions(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+
+    empty_prompt = bot.answer(None)
+    assert "Спросите" in empty_prompt
+
+    numeric_prompt = bot.answer(42)
+    assert isinstance(numeric_prompt, str)
+    assert numeric_prompt
+
+    bytes_prompt = bot.answer(b" profit ")
+    assert "прибыл" in bytes_prompt.lower()
+
+    dict_prompt = bot.answer({"text": "Risk overview, please"})
+    assert "риск" in dict_prompt.lower()
+
+    structured_prompt = bot.answer(
+        {
+            "content": [
+                {"type": "meta", "text": {"value": "ignored"}},
+                {"type": "input_text", "text": {"value": "Что за план?"}},
+            ]
+        }
+    )
+    assert "шаг" in structured_prompt.lower() or "план" in structured_prompt.lower()
+
+    chat_prompt = bot.answer(
+        {
+            "messages": [
+                {"role": "system", "content": "Объясняй коротко"},
+                {"role": "assistant", "content": "Последний ответ"},
+                {"role": "user", "content": [{"type": "text", "text": "Риск какой?"}]},
+            ]
+        }
+    )
+    assert "риск" in chat_prompt.lower()
+
+    fallback_prompt = bot.answer(
+        {
+            "messages": [{"role": "assistant", "content": "Отвечаю вместо пользователя"}],
+            "question": "Когда было обновление?",
+        }
+    )
+    assert "обнов" in fallback_prompt.lower()
+
+    streaming_prompt = bot.answer(
+        {
+            "choices": [
+                {"delta": {"role": "assistant"}},
+                {"delta": {"content": "Profit insight"}},
+            ]
+        }
+    )
+    assert "прибыл" in streaming_prompt.lower()
+
+    hybrid_role_prompt = bot.answer(
+        {
+            "messages": [
+                {"role": {"type": "system", "value": "assistant"}, "content": "Прошлый ответ"},
+                {
+                    "role": {"kind": "User", "name": "Trader"},
+                    "content": {"prompt": {"value": "Расскажи про прибыль"}},
+                },
+            ]
+        }
+    )
+    assert "прибыл" in hybrid_role_prompt.lower()
+
+    class Role(enum.Enum):
+        USER = "User"
+        ASSISTANT = "assistant"
+
+    enum_role_prompt = bot.answer(
+        {
+            "messages": [
+                {"role": Role.ASSISTANT, "content": "Предыдущий ответ"},
+                {
+                    "role": Role.USER,
+                    "content": {"arguments": {"details": {"value": "Подскажи по рискам"}}},
+                },
+            ]
+        }
+    )
+    assert "риск" in enum_role_prompt.lower()
+
+    deeply_nested_prompt = bot.answer(
+        {
+            "payload": {
+                "data": {
+                    "messages": [
+                        {"role": "assistant", "content": "Старый ответ"},
+                        {
+                            "role": "user",
+                            "content": {
+                                "details": {
+                                    "args": [
+                                        {
+                                            "type": "input_text",
+                                            "text": {"value": "Что с риском?"},
+                                        }
+                                    ]
+                                }
+                            },
+                        },
+                    ]
+                }
+            }
+        }
+    )
+    assert "риск" in deeply_nested_prompt.lower()
+
+    json_string_prompt = bot.answer(
+        {
+            "messages": [
+                {"role": "user", "content": '{"prompt": {"text": "Поделись планом"}}'},
+            ]
+        }
+    )
+    assert "план" in json_string_prompt.lower()
+
+    tool_call_prompt = bot.answer(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "relay_user_question",
+                                "arguments": json.dumps({"question": "Когда последнее обновление?"}),
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert "обнов" in tool_call_prompt.lower()
+
+    dict_content_prompt = bot.answer(
+        {"messages": [{"role": "user", "content": {"text": "Расскажи про риск"}}]}
+    )
+    assert "риск" in dict_content_prompt.lower()
+
+    @dataclass
+    class DataclassMessage:
+        role: object
+        content: object
+
+    dataclass_prompt = bot.answer(
+        {
+            "messages": [
+                DataclassMessage(role="assistant", content="Исторический ответ"),
+                DataclassMessage(
+                    role="user",
+                    content={"prompt": {"text": "Поделись рисками"}},
+                ),
+            ]
+        }
+    )
+    assert "риск" in dataclass_prompt.lower()
+
+    @dataclass
+    class DataclassRole:
+        kind: str
+
+    dataclass_role_prompt = bot.answer(
+        {
+            "messages": [
+                {
+                    "role": DataclassRole(kind="assistant"),
+                    "content": "Исторический ответ",
+                },
+                {
+                    "role": DataclassRole(kind="user"),
+                    "content": {"prompt": {"text": "Поделись обновлениями"}},
+                },
+            ]
+        }
+    )
+    assert "обнов" in dataclass_role_prompt.lower()
+
+    class ModelLike:
+        def __init__(self, payload: object) -> None:
+            self._payload = payload
+
+        def model_dump(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return self._payload
+
+    model_prompt = bot.answer(
+        ModelLike(
+            {
+                "messages": [
+                    {"role": "assistant", "content": "Прошлый ответ"},
+                    {
+                        "role": "user",
+                        "content": {"details": {"value": "Расскажи про прибыль"}},
+                    },
+                ]
+            }
+        )
+    )
+    assert "прибыл" in model_prompt.lower()
+
+    class ObjectMessage:
+        def __init__(self, role: object, content: object) -> None:
+            self.role = role
+            self.content = content
+
+    class ObjectEnvelope:
+        def __init__(self, messages: object) -> None:
+            self.messages = messages
+
+    object_prompt = bot.answer(
+        ObjectEnvelope(
+            [
+                ObjectMessage(role="assistant", content="Исторический ответ"),
+                ObjectMessage(
+                    role="user",
+                    content={"payload": {"text": "Поделись планом действий"}},
+                ),
+            ]
+        )
+    )
+    assert "план" in object_prompt.lower()
+
+    response_prompt = bot.answer(
+        {
+            "response": {
+                "output": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "output_text", "text": "Поделись прибылью"},
+                        ],
+                    }
+                ]
+            }
+        }
+    )
+    assert "прибыл" in response_prompt.lower()
+
+    instructions_prompt = bot.answer({"instructions": {"text": "Какой риск сейчас?"}})
+    assert "риск" in instructions_prompt.lower()
+
+    sequence_prompt = bot.answer(deque([{"prompt": "Что по плану?"}]))
+    assert "план" in sequence_prompt.lower()
+
+    proxy_prompt = bot.answer(MappingProxyType({"question": "Когда было обновление?"}))
+    assert "обнов" in proxy_prompt.lower()
 
 
 def test_guardian_profit_answer_uses_ledger(tmp_path: Path) -> None:
