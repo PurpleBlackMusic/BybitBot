@@ -118,6 +118,12 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
     return total, available
 
 
+def extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
+    """Public helper that exposes wallet totals for other modules."""
+
+    return _extract_wallet_totals(payload)
+
+
 def _extract_wallet_assets(
     payload: Dict[str, object], *, limit: int = 5
 ) -> Tuple[Dict[str, object], ...]:

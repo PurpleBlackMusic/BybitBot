@@ -22,6 +22,7 @@ from .trade_analytics import (
 )
 from .spot_pnl import spot_inventory_and_pnl
 from .live_checks import bybit_realtime_status
+from .live_signal import LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
 
 
@@ -96,10 +97,12 @@ class GuardianBot:
         self._status_content_hash: Optional[int] = None
         self._plan_cache_signature: Optional[int] = None
         self._plan_cache: Optional[Dict[str, object]] = None
+        self._plan_cache_ledger_signature: Optional[int] = None
         self._digest_cache_signature: Optional[int] = None
         self._digest_cache: Optional[Dict[str, object]] = None
         self._watchlist_breakdown_cache_signature: Optional[int] = None
         self._watchlist_breakdown_cache: Optional[Dict[str, object]] = None
+        self._live_fetcher: Optional[LiveSignalFetcher] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -211,6 +214,66 @@ class GuardianBot:
 
         return None, None, last_error
 
+    def _get_live_fetcher(self) -> LiveSignalFetcher:
+        fetcher = self._live_fetcher
+        if fetcher is None:
+            fetcher = LiveSignalFetcher(settings=self.settings, data_dir=self.data_dir)
+            self._live_fetcher = fetcher
+        return fetcher
+
+    def _should_use_live_status(self, status: Dict[str, object]) -> bool:
+        if not status:
+            return True
+
+        source = str(status.get("source") or "").lower()
+        if source in {"demo", "seed", "demo_signal"}:
+            return True
+
+        mode = str(status.get("mode") or "").lower()
+        if mode == "demo":
+            return True
+
+        ts_candidate = status.get("ts") or status.get("last_tick_ts")
+        try:
+            ts_value = float(ts_candidate)
+        except (TypeError, ValueError):
+            ts_value = None
+
+        if ts_value is not None:
+            now = time.time()
+            if ts_value > now + 86_400:  # demo payloads often have dates in the future
+                return True
+
+        return False
+
+    def _fetch_live_status(self) -> Dict[str, object]:
+        try:
+            fetcher = self._get_live_fetcher()
+        except Exception:
+            return {}
+
+        try:
+            status = fetcher.fetch()
+        except Exception:
+            return {}
+
+        if not isinstance(status, dict):
+            return {}
+
+        status = copy.deepcopy(status)
+        if status:
+            status.setdefault("status_source", "live")
+        return status
+
+    def _persist_live_status(self, status: Dict[str, object]) -> None:
+        path = self._status_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(status, ensure_ascii=False, indent=2)
+            path.write_text(payload, encoding="utf-8")
+        except Exception:
+            return
+
     @property
     def settings(self) -> Settings:
         if self._custom_settings:
@@ -230,10 +293,12 @@ class GuardianBot:
         self._ledger_view = None
         self._plan_cache_signature = None
         self._plan_cache = None
+        self._plan_cache_ledger_signature = None
         self._digest_cache_signature = None
         self._digest_cache = None
         self._watchlist_breakdown_cache_signature = None
         self._watchlist_breakdown_cache = None
+        self._live_fetcher = None
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -343,12 +408,29 @@ class GuardianBot:
                 content_hash = self._status_content_hash
 
         status = dict(raw)
+        live_status_used = False
+
+        if self._should_use_live_status(status):
+            live_candidate = self._fetch_live_status()
+            if live_candidate:
+                status = live_candidate
+                fallback_used = False
+                read_error = None
+                live_status_used = True
+                content_hash = None
+
         if status:
             try:
-                ts = float(status.get("last_tick_ts") or 0.0)
+                ts_value = float(
+                    status.get("last_tick_ts") or status.get("ts") or 0.0
+                )
             except Exception:
-                ts = 0.0
-            status["age_seconds"] = time.time() - ts if ts > 0 else None
+                ts_value = 0.0
+
+            if ts_value > 0:
+                status["age_seconds"] = time.time() - ts_value
+            else:
+                status.setdefault("age_seconds", None)
 
         if status and content_hash is None:
             try:
@@ -357,6 +439,9 @@ class GuardianBot:
                 content_hash = self._status_content_hash
             else:
                 content_hash = self._hash_bytes(canonical)
+
+        if live_status_used and status:
+            self._persist_live_status(status)
 
         if content_hash is None:
             content_hash = 0
@@ -1060,6 +1145,8 @@ class GuardianBot:
         watchlist: Sequence[Dict[str, object]],
         settings: Optional[Settings] = None,
         portfolio: Optional[Dict[str, object]] = None,
+        *,
+        ledger_signature: Optional[int] = None,
     ) -> Dict[str, object]:
         settings = settings or self.settings
 
@@ -1073,6 +1160,10 @@ class GuardianBot:
             signature is not None
             and signature == self._plan_cache_signature
             and self._plan_cache is not None
+            and (
+                ledger_signature is None
+                or ledger_signature == self._plan_cache_ledger_signature
+            )
         ):
             return copy.deepcopy(self._plan_cache)
 
@@ -1498,9 +1589,11 @@ class GuardianBot:
         if signature is not None:
             self._plan_cache_signature = signature
             self._plan_cache = copy.deepcopy(plan)
+            self._plan_cache_ledger_signature = ledger_signature
         else:
             self._plan_cache_signature = None
             self._plan_cache = None
+            self._plan_cache_ledger_signature = None
         return plan
 
     def _build_watchlist(
@@ -1547,7 +1640,9 @@ class GuardianBot:
                 upper_symbol = symbol.upper()
                 if upper_symbol in seen_symbols:
                     continue
-                filtered.append(dynamic_entry)
+                entry_copy = dict(dynamic_entry)
+                entry_copy.setdefault("source", "market_scanner")
+                filtered.append(entry_copy)
                 seen_symbols.add(upper_symbol)
 
         if not filtered:
@@ -2061,6 +2156,7 @@ class GuardianBot:
                 watchlist,
                 settings,
                 portfolio=portfolio,
+                ledger_signature=signature[1],
             )
         plan_copy = copy.deepcopy(symbol_plan)
         context["symbol_plan"] = plan_copy
@@ -2517,6 +2613,7 @@ class GuardianBot:
             watchlist,
             settings,
             portfolio=portfolio,
+            ledger_signature=self._ledger_signature,
         )
         
         return context
@@ -2699,6 +2796,7 @@ class GuardianBot:
             score_candidate = payload.get("score")
             trend = payload.get("trend") or payload.get("direction") or payload.get("side")
             note = payload.get("note") or payload.get("comment") or payload.get("reason")
+            source_value = payload.get("source")
 
             probability_value: Optional[float] = None
             for key in ("probability", "confidence", "p", "prob"):
@@ -2717,6 +2815,7 @@ class GuardianBot:
             note = None
             probability_value = None
             ev_value = None
+            source_value = None
 
         numeric_score: Optional[float] = None
         if isinstance(score_candidate, (int, float)):
@@ -2740,6 +2839,8 @@ class GuardianBot:
             "probability": probability_value,
             "ev_bps": ev_value,
         }
+        if isinstance(source_value, str) and source_value.strip():
+            entry["source"] = source_value.strip()
         return entry
 
     @staticmethod
@@ -3073,6 +3174,7 @@ class GuardianBot:
         self._ledger_view = None
         self._plan_cache_signature = None
         self._plan_cache = None
+        self._plan_cache_ledger_signature = None
         self._digest_cache_signature = None
         self._digest_cache = None
         self._watchlist_breakdown_cache_signature = None
@@ -3106,6 +3208,11 @@ class GuardianBot:
 
         snapshot = self._get_snapshot()
         return self._copy_dict(snapshot.status_summary)
+
+    def auto_executor(self):  # pragma: no cover - simple factory wrapper
+        from .signal_executor import SignalExecutor
+
+        return SignalExecutor(self, settings=self.settings)
 
     # ------------------------------------------------------------------
     # conversation helpers
