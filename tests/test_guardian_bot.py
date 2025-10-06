@@ -141,6 +141,105 @@ def test_guardian_brief_understands_russian_buy_hint(tmp_path: Path) -> None:
     assert "покуп" in brief.action_text.lower()
 
 
+def test_guardian_respects_custom_buy_threshold(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.42,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.4,
+        ai_min_ev_bps=10.0,
+        ai_enabled=True,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    brief = bot.generate_brief()
+    assert brief.mode == "buy"
+
+    summary = bot.status_summary()
+    assert summary["actionable"] is True
+    assert summary["actionable_reasons"] == []
+
+
+def test_guardian_summary_flags_low_confidence_under_defaults(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.48,
+        "ev_bps": 22.0,
+        "mode": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+
+    summary = bot.status_summary()
+
+    assert summary["mode"] == "buy"
+    assert summary["actionable"] is False
+    assert any("порог" in reason.lower() for reason in summary["actionable_reasons"])
+    reason_text = " ".join(summary["actionable_reasons"])
+    assert "48.00%" in reason_text
+    assert "55.00%" in reason_text
+    assert summary["thresholds"]["buy_probability_pct"] == 55.0
+    assert summary["thresholds"]["sell_probability_pct"] == 45.0
+    assert (
+        summary["thresholds"]["effective_buy_probability_pct"]
+        == summary["thresholds"]["buy_probability_pct"]
+    )
+    assert (
+        summary["thresholds"]["effective_sell_probability_pct"]
+        == summary["thresholds"]["sell_probability_pct"]
+    )
+
+
+def test_guardian_summary_reports_effective_thresholds(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.35,
+        "ev_bps": 25.0,
+        "side": "sell",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.4,
+        ai_sell_threshold=0.8,
+        ai_min_ev_bps=10.0,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+    thresholds = summary["thresholds"]
+
+    assert thresholds["buy_probability_pct"] == 40.0
+    assert thresholds["sell_probability_pct"] == 80.0
+    assert thresholds["effective_buy_probability_pct"] == 40.0
+    assert thresholds["effective_sell_probability_pct"] == 40.0
+
+    response = bot.answer("какие пороги сигнала сейчас?")
+    lowered = response.lower()
+    assert "продажа" in lowered
+    assert "40.00%" in response
+    assert "80.00%" in response
+    assert "однако для безопасности используется 40.00%" in lowered
+
+
 def test_guardian_brief_wait_hint_from_russian_phrase(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
@@ -158,6 +257,120 @@ def test_guardian_brief_wait_hint_from_russian_phrase(tmp_path: Path) -> None:
 
     assert brief.mode == "wait"
     assert "спокойный режим" in brief.headline.lower()
+
+
+def test_guardian_summary_highlights_ev_shortfall(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.68,
+        "ev_bps": 7.5,
+        "mode": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.6,
+        ai_min_ev_bps=12.0,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+
+    assert summary["actionable"] is False
+    assert any("выгода" in reason.lower() for reason in summary["actionable_reasons"])
+    reason_text = " ".join(summary["actionable_reasons"])
+    assert "7.50 б.п." in reason_text
+    assert "12.00 б.п." in reason_text
+
+
+def test_guardian_summary_highlights_sell_threshold(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.42,
+        "ev_bps": 18.0,
+        "mode": "sell",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.6,
+        ai_sell_threshold=0.5,
+        ai_min_ev_bps=10.0,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+
+    assert summary["mode"] == "sell"
+    assert summary["actionable"] is False
+    reason_text = " ".join(summary["actionable_reasons"])
+    assert "42.00%" in reason_text
+    assert "50.00%" in reason_text
+
+
+def test_guardian_summary_mentions_manual_stop(tmp_path: Path) -> None:
+    trade_control.clear_trade_commands(data_dir=tmp_path)
+    trade_control.request_trade_cancel(
+        symbol="BTCUSDT", reason="pause", data_dir=tmp_path
+    )
+
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.82,
+        "ev_bps": 25.0,
+        "mode": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(ai_symbols="BTCUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=5.0)
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+
+    assert summary["actionable"] is False
+    reason_text = " ".join(summary["actionable_reasons"])
+    assert "ручная" in reason_text.lower()
+    assert "останов" in reason_text.lower()
+    assert "BTCUSDT" in reason_text
+    assert "Комментарий оператора" in reason_text
+
+
+def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.78,
+        "ev_bps": 18.0,
+        "mode": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.6,
+        ai_min_ev_bps=5.0,
+        ai_enabled=False,
+    )
+    bot = _make_bot(tmp_path, settings)
+
+    summary = bot.status_summary()
+
+    assert summary["mode"] == "buy"
+    assert summary["actionable"] is False
+    assert any("выключены" in reason.lower() for reason in summary["actionable_reasons"])
 
 
 def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:
@@ -393,6 +606,7 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
     reply = bot.answer("как здоровье данных?")
 
     assert "AI сигнал" in reply
+    assert "Ручное управление" in reply
     assert "Журнал исполнений" in reply
     assert "API" in reply
 
@@ -421,6 +635,7 @@ def test_guardian_answer_manual_control(tmp_path: Path) -> None:
     assert "BTCUSDT" in reply
     assert "уверенность 62.5%" in lowered
     assert "оператор" in lowered
+    assert "Комментарий оператора" in reply
 
 
 def test_guardian_answer_trade_history(tmp_path: Path) -> None:
@@ -652,6 +867,10 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert scorecard["symbol"] == "BTCUSDT"
     assert scorecard["probability_pct"] == 60.0
     assert scorecard["ev_bps"] == 12.5
+    assert scorecard["buy_threshold"] == 55.0
+    assert scorecard["sell_threshold"] == 45.0
+    assert scorecard["configured_buy_threshold"] == 55.0
+    assert scorecard["configured_sell_threshold"] == 45.0
 
 
 def test_guardian_recent_trades(tmp_path: Path) -> None:
@@ -691,6 +910,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
         ai_buy_threshold=0.7,
         ai_sell_threshold=0.4,
         ai_min_ev_bps=10.0,
+        ai_enabled=True,
     )
     bot = _make_bot(tmp_path, settings)
 
@@ -1048,11 +1268,34 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
 
     assert health["ai_signal"]["ok"] is True
     assert "AI сигнал" in health["ai_signal"]["title"]
+    assert health["manual_control"]["ok"] is True
+    assert health["manual_control"]["status_label"] == "idle"
+    assert "Руч" in health["manual_control"]["title"]
     assert health["executions"]["trades"] == 1
     assert health["executions"]["ok"] is True
     assert health["api_keys"]["ok"] is True
     assert health["realtime_trading"]["ok"] is True
     assert health["realtime_trading"]["title"] == "RT"
+
+
+def test_guardian_data_health_manual_stop(tmp_path: Path) -> None:
+    trade_control.clear_trade_commands(data_dir=tmp_path)
+    trade_control.request_trade_cancel(
+        symbol="BTCUSDT",
+        reason="operator stop",
+        data_dir=tmp_path,
+    )
+
+    bot = _make_bot(tmp_path)
+    health = bot.data_health()
+
+    manual = health["manual_control"]
+    assert manual["ok"] is False
+    assert manual["status_label"] == "stopped"
+    assert "останов" in manual["message"].lower()
+    assert "operator stop" in manual["message"].lower()
+    assert "BTCUSDT" in (manual.get("details") or "")
+    assert "Комментарий" in (manual.get("details") or "")
 
 
 def test_guardian_unified_report(tmp_path: Path) -> None:
@@ -1250,6 +1493,7 @@ def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
     assert summary_after_start["history_count"] == 1
     assert summary_after_start["last_action"]["action"] == "start"
     assert len(summary_after_start["history"]) == 1
+    assert summary_after_start["status_message"] == summary_after_start["status_text"]
 
     summary_clone = bot.manual_trade_summary()
     summary_clone["history"].append({"action": "fake"})
@@ -1260,6 +1504,8 @@ def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
     status_manual = bot.status_summary()["manual_control"]
     assert status_manual["status_label"] == "active"
     assert status_manual["history_count"] == 1
+    assert status_manual["status_note"] is None
+    assert status_manual["status_message"] == status_manual["status_text"]
 
     state = bot.manual_trade_state()
     if state.last_action:
@@ -1277,9 +1523,12 @@ def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
 
     summary_after_cancel = bot.manual_trade_summary()
     assert summary_after_cancel["status_label"] == "stopped"
+    assert summary_after_cancel["status_note"] == "pytest stop"
     assert summary_after_cancel["history_count"] == 2
     assert summary_after_cancel["last_action"]["action"] == "cancel"
     assert summary_after_cancel["last_cancel"] is not None
+    assert "Комментарий оператора" in (summary_after_cancel["status_message"] or "")
+    assert "pytest stop" in (summary_after_cancel["status_message"] or "").lower()
 
     history_tail_after = bot.manual_trade_history(limit=1)
     assert len(history_tail_after) == 1
@@ -1289,3 +1538,4 @@ def test_guardian_manual_summary_updates_and_isolated(tmp_path: Path) -> None:
     cleared_summary = bot.manual_trade_summary()
     assert cleared_summary["status_label"] == "idle"
     assert cleared_summary["history_count"] == 0
+    assert cleared_summary["status_message"] == cleared_summary["status_text"]

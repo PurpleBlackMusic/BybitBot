@@ -497,6 +497,39 @@ class GuardianBot:
     def _clamp_probability(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
+    def _resolve_thresholds(
+        self, settings: Settings
+    ) -> Tuple[float, float, float, float, float]:
+        """Normalise user-provided thresholds and derive safe fallbacks."""
+
+        def _clamp_threshold(value: object, default: float) -> float:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = default
+            return max(0.0, min(numeric, 1.0))
+
+        buy_threshold = _clamp_threshold(
+            getattr(settings, "ai_buy_threshold", None),
+            0.55,
+        )
+        sell_threshold = _clamp_threshold(
+            getattr(settings, "ai_sell_threshold", None),
+            0.45,
+        )
+        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0), 0.0)
+
+        effective_buy_threshold = buy_threshold
+        effective_sell_threshold = max(0.0, min(sell_threshold, effective_buy_threshold))
+
+        return (
+            buy_threshold,
+            sell_threshold,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        )
+
     @staticmethod
     def _age_to_text(age: Optional[float]) -> str:
         if age is None:
@@ -784,9 +817,15 @@ class GuardianBot:
         status = self._load_status(prefetched=prefetched_status, prefetched_hash=prefetched_hash)
         self._last_status = status
         settings = self.settings
+        manual_state = trade_control.trade_control_state(data_dir=self.data_dir)
+        manual_summary = self._manual_control_summary(manual_state)
         brief = self._brief_from_status(status, settings)
         status_summary = self._build_status_summary(
-            status, brief, settings, self._status_fallback_used
+            status,
+            brief,
+            settings,
+            self._status_fallback_used,
+            manual_summary,
         )
 
         ledger_view = self._ledger_view_for_signature(signature[1])
@@ -796,8 +835,6 @@ class GuardianBot:
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
 
-        manual_state = trade_control.trade_control_state(data_dir=self.data_dir)
-        manual_summary = self._manual_control_summary(manual_state)
         status_summary["manual_control"] = manual_summary
 
         status_signature = (
@@ -854,6 +891,28 @@ class GuardianBot:
             last_cancel=self._clone_trade_entry(state.last_cancel),
         )
 
+    @staticmethod
+    def _append_operator_note(
+        text: Optional[str], note: Optional[str]
+    ) -> Optional[str]:
+        base = text.strip() if isinstance(text, str) else ""
+        note_text = note.strip() if isinstance(note, str) else ""
+
+        if not note_text:
+            return base or None
+
+        formatted_note = note_text
+        if formatted_note and not formatted_note[0].isupper():
+            formatted_note = f"{formatted_note[0].upper()}{formatted_note[1:]}"
+        if formatted_note and formatted_note[-1] not in ".!?":
+            formatted_note = f"{formatted_note}."
+
+        if base:
+            base_sentence = base if base[-1] in ".!?" else f"{base}."
+            return f"{base_sentence} Комментарий оператора: {formatted_note}"
+
+        return f"Комментарий оператора: {formatted_note}"
+
     def _manual_control_summary(
         self, state: trade_control.TradeControlState
     ) -> Dict[str, object]:
@@ -879,7 +938,7 @@ class GuardianBot:
                 pass
             note = entry.get("note") or entry.get("reason")
             if note:
-                enriched["note_or_reason"] = str(note)
+                enriched["note_or_reason"] = str(note).strip()
             return enriched
 
         enriched_history = [_enrich(entry) for entry in history]
@@ -912,6 +971,22 @@ class GuardianBot:
                 return None
             return self._format_duration(age)
 
+        def _note(entry: Optional[Dict[str, Any]]) -> Optional[str]:
+            if not entry:
+                return None
+            raw = entry.get("note") or entry.get("reason")
+            if raw is None:
+                return None
+            text = str(raw).strip()
+            return text or None
+
+        last_action_note = _note(last_action)
+        last_start_note = _note(last_start)
+        last_cancel_note = _note(last_cancel)
+
+        status_note: Optional[str] = None
+        status_note_source: Optional[str] = None
+
         if state.active:
             status_label = "active"
             if last_start_age is not None:
@@ -921,6 +996,9 @@ class GuardianBot:
                 )
             else:
                 status_text = "Торговля запущена вручную и отмечена как активная."
+            status_note = last_start_note or last_action_note
+            if status_note:
+                status_note_source = "last_start" if last_start_note else "last_action"
         elif last_cancel:
             status_label = "stopped"
             if last_cancel_age is not None:
@@ -930,20 +1008,34 @@ class GuardianBot:
                 )
             else:
                 status_text = "Торговля остановлена командой оператора."
+            status_note = last_cancel_note or last_action_note
+            if status_note:
+                status_note_source = "last_cancel" if last_cancel_note else "last_action"
         elif history:
             status_label = "pending"
             status_text = (
                 "Последняя команда — запуск торговли, но подтверждения активной сделки пока нет."
             )
+            status_note = last_start_note or last_action_note
+            if status_note:
+                status_note_source = "last_start" if last_start_note else "last_action"
         else:
             status_label = "idle"
             status_text = "Ручные команды ещё не отправлялись."
+            status_note = last_action_note
+            if status_note:
+                status_note_source = "last_action"
+
+        status_message = self._append_operator_note(status_text, status_note)
 
         summary: Dict[str, object] = {
             "active": state.active,
             "symbol": symbol,
             "status_label": status_label,
             "status_text": status_text,
+            "status_note": status_note,
+            "status_note_source": status_note_source,
+            "status_message": status_message,
             "history": enriched_history,
             "history_count": len(enriched_history),
             "last_action": last_action,
@@ -958,6 +1050,69 @@ class GuardianBot:
         }
 
         return summary
+
+    def _manual_control_block_reason(
+        self, manual_summary: Optional[Dict[str, object]]
+    ) -> Optional[str]:
+        if not manual_summary:
+            return None
+
+        if manual_summary.get("active"):
+            return None
+
+        label = manual_summary.get("status_label")
+        if label in (None, "idle"):
+            return None
+
+        status_note = manual_summary.get("status_note")
+        symbol = manual_summary.get("symbol")
+        symbol_text = None
+        if isinstance(symbol, str):
+            cleaned_symbol = symbol.strip()
+            if cleaned_symbol:
+                symbol_text = cleaned_symbol.upper()
+
+        if label == "stopped":
+            age_seconds = manual_summary.get("last_cancel_age_seconds")
+            if isinstance(age_seconds, (int, float)) and age_seconds >= 0:
+                duration = self._format_duration(float(age_seconds))
+                message = (
+                    "Ручная команда остановила автоторговлю{target} {duration} назад — "
+                    "новые сделки заблокированы, пока оператор не разрешит работу."
+                ).format(
+                    target=f" по {symbol_text}" if symbol_text else "",
+                    duration=duration,
+                )
+            else:
+                message = (
+                    "Ручная команда остановила автоторговлю{target} — новые сделки заблокированы, "
+                    "пока оператор не разрешит работу."
+                )
+            return self._append_operator_note(message, status_note)
+
+        if label == "pending":
+            age_seconds = manual_summary.get("last_start_age_seconds")
+            if isinstance(age_seconds, (int, float)) and age_seconds >= 0:
+                duration = self._format_duration(float(age_seconds))
+                message = (
+                    "Оператор запустил торговлю вручную{target} {duration} назад, ждём подтверждение "
+                    "исполнения перед новыми сделками."
+                ).format(
+                    target=f" по {symbol_text}" if symbol_text else "",
+                    duration=duration,
+                )
+            else:
+                message = (
+                    "Оператор запустил торговлю вручную{target}, но подтверждения ещё нет — бот ждёт перед "
+                    "новыми сделками."
+                )
+            return self._append_operator_note(message, status_note)
+
+        status_message = manual_summary.get("status_message")
+        if isinstance(status_message, str) and status_message.strip():
+            return status_message.strip()
+
+        return None
 
     def _get_snapshot(self, force: bool = False) -> GuardianSnapshot:
         signature = self._snapshot_signature()
@@ -1005,25 +1160,41 @@ class GuardianBot:
         brief: GuardianBrief,
         settings: Settings,
         fallback_used: bool,
+        manual_summary: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         probability = self._clamp_probability(float(status.get("probability") or 0.0))
         ev_bps = float(status.get("ev_bps") or 0.0)
         last_tick = status.get("last_tick_ts") or status.get("timestamp")
 
-        buy_threshold = float(settings.ai_buy_threshold or 0.0)
-        sell_threshold = float(settings.ai_sell_threshold or 0.0)
-        min_ev = float(settings.ai_min_ev_bps or 0.0)
+        (
+            buy_threshold,
+            sell_threshold,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        ) = self._resolve_thresholds(settings)
 
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
         actionable, reasons = self._evaluate_actionability(
             brief.mode,
             probability,
             ev_bps,
-            buy_threshold,
-            sell_threshold,
+            effective_buy_threshold,
+            effective_sell_threshold,
             min_ev,
             staleness_state,
         )
+
+        manual_reason = self._manual_control_block_reason(manual_summary)
+        if manual_reason:
+            reasons.append(manual_reason)
+            actionable = False
+
+        if not getattr(settings, "ai_enabled", False):
+            reasons.append(
+                "AI сигналы выключены настройками — автоматические сделки не запускаются."
+            )
+            actionable = False
 
         summary = {
             "symbol": brief.symbol,
@@ -1045,6 +1216,12 @@ class GuardianBot:
             "thresholds": {
                 "buy_probability_pct": round(buy_threshold * 100.0, 2),
                 "sell_probability_pct": round(sell_threshold * 100.0, 2),
+                "effective_buy_probability_pct": round(
+                    effective_buy_threshold * 100.0, 2
+                ),
+                "effective_sell_probability_pct": round(
+                    effective_sell_threshold * 100.0, 2
+                ),
                 "min_ev_bps": round(min_ev, 2),
             },
             "has_status": bool(status),
@@ -1081,6 +1258,12 @@ class GuardianBot:
     ) -> Tuple[bool, List[str]]:
         reasons: List[str] = []
 
+        def _pct(value: float) -> str:
+            return f"{value * 100.0:.2f}%"
+
+        def _bps(value: float) -> str:
+            return f"{value:.2f} б.п."
+
         if staleness_state == "stale":
             reasons.append(
                 "Сигнал устарел — обновите status.json перед тем, как открывать сделки."
@@ -1089,20 +1272,44 @@ class GuardianBot:
         if mode == "buy":
             if probability < max(buy_threshold, 0.0):
                 reasons.append(
-                    "Уверенность модели ниже порога покупки — дождитесь более сильного сигнала."
+                    (
+                        "Уверенность модели {prob} ниже порога покупки {threshold} — "
+                        "дождитесь более сильного сигнала."
+                    ).format(
+                        prob=_pct(probability),
+                        threshold=_pct(max(buy_threshold, 0.0)),
+                    )
                 )
             if ev_bps < min_ev:
                 reasons.append(
-                    "Ожидаемая выгода ниже безопасного минимума — риск/прибыль не в нашу пользу."
+                    (
+                        "Ожидаемая выгода {value} ниже безопасного минимума {minimum} — "
+                        "риск/прибыль не в нашу пользу."
+                    ).format(
+                        value=_bps(ev_bps),
+                        minimum=_bps(min_ev),
+                    )
                 )
         elif mode == "sell":
             if probability < max(sell_threshold, 0.0):
                 reasons.append(
-                    "Уверенность продажи ниже заданного порога — можно не спешить с фиксацией."
+                    (
+                        "Уверенность продажи {prob} ниже заданного порога {threshold} — "
+                        "можно не спешить с фиксацией."
+                    ).format(
+                        prob=_pct(probability),
+                        threshold=_pct(max(sell_threshold, 0.0)),
+                    )
                 )
             if ev_bps < min_ev:
                 reasons.append(
-                    "Ожидаемая выгода по продаже ниже минимума — сделка может быть невыгодной."
+                    (
+                        "Ожидаемая выгода по продаже {value} ниже минимума {minimum} — "
+                        "сделка может быть невыгодной."
+                    ).format(
+                        value=_bps(ev_bps),
+                        minimum=_bps(min_ev),
+                    )
                 )
         else:
             reasons.append("Нет активного сигнала — бот предпочитает выжидать.")
@@ -1136,19 +1343,23 @@ class GuardianBot:
                 break
         side_hint = self._normalise_mode_hint(status.get("side"))
 
-        buy_threshold = settings.ai_buy_threshold or 0.55
-        sell_threshold = settings.ai_sell_threshold or 0.45
-        min_ev = max(float(settings.ai_min_ev_bps or 0.0), 0.0)
+        (
+            buy_threshold,
+            sell_threshold,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        ) = self._resolve_thresholds(settings)
 
         if mode_hint:
             mode = mode_hint
         elif side_hint == "wait":
             mode = "wait"
-        elif probability >= max(buy_threshold, 0.55) and ev_bps >= min_ev:
+        elif probability >= effective_buy_threshold and ev_bps >= min_ev:
             mode = "buy"
         elif (
             side_hint == "sell"
-            and probability <= min(sell_threshold, buy_threshold)
+            and probability <= effective_sell_threshold
             and ev_bps >= min_ev
         ):
             mode = "sell"
@@ -1342,14 +1553,23 @@ class GuardianBot:
         status = snapshot.status
         probability = float(status.get("probability") or 0.0)
         ev_bps = float(status.get("ev_bps") or 0.0)
+        (
+            configured_buy_threshold,
+            configured_sell_threshold,
+            min_ev,
+            effective_buy_threshold,
+            effective_sell_threshold,
+        ) = self._resolve_thresholds(self.settings)
         return {
             "symbol": brief.symbol,
             "mode": brief.mode,
             "probability_pct": round(self._clamp_probability(probability) * 100.0, 2),
             "ev_bps": round(ev_bps, 2),
-            "buy_threshold": float(self.settings.ai_buy_threshold or 0.0) * 100.0,
-            "sell_threshold": float(self.settings.ai_sell_threshold or 0.0) * 100.0,
-            "min_ev_bps": float(self.settings.ai_min_ev_bps or 0.0),
+            "buy_threshold": round(effective_buy_threshold * 100.0, 2),
+            "sell_threshold": round(effective_sell_threshold * 100.0, 2),
+            "configured_buy_threshold": round(configured_buy_threshold * 100.0, 2),
+            "configured_sell_threshold": round(configured_sell_threshold * 100.0, 2),
+            "min_ev_bps": round(min_ev, 2),
             "last_update": brief.updated_text,
         }
 
@@ -1474,6 +1694,93 @@ class GuardianBot:
             f"Режим: {'DRY-RUN' if settings.dry_run else 'Live'}"
         )
 
+        manual_summary = snapshot.manual_summary or {}
+        manual_label = str(manual_summary.get("status_label") or "idle")
+        manual_status_text = manual_summary.get("status_text")
+        manual_status_message = manual_summary.get("status_message")
+        manual_note = manual_summary.get("status_note")
+        manual_active = bool(manual_summary.get("active"))
+
+        symbol = manual_summary.get("symbol")
+        symbol_text = None
+        if isinstance(symbol, str):
+            cleaned_symbol = symbol.strip()
+            if cleaned_symbol:
+                symbol_text = cleaned_symbol.upper()
+
+        if manual_label == "stopped":
+            manual_ok = False
+            cancel_age = manual_summary.get("last_cancel_age_seconds")
+            if isinstance(cancel_age, (int, float)) and cancel_age >= 0:
+                duration = self._format_duration(float(cancel_age))
+                base_message = (
+                    "Ручная команда остановила автоторговлю{target} {duration} назад — "
+                    "автоматические сделки заблокированы."
+                ).format(
+                    target=f" по {symbol_text}" if symbol_text else "",
+                    duration=duration,
+                )
+            else:
+                base_message = (
+                    "Ручная команда остановила автоторговлю{target} — автоматические сделки заблокированы."
+                ).format(target=f" по {symbol_text}" if symbol_text else "")
+            manual_message = self._append_operator_note(base_message, manual_note) or base_message
+        elif manual_label == "pending":
+            manual_ok = False
+            start_age = manual_summary.get("last_start_age_seconds")
+            if isinstance(start_age, (int, float)) and start_age >= 0:
+                duration = self._format_duration(float(start_age))
+                base_message = (
+                    "Оператор запустил торговлю вручную{target} {duration} назад — ждём подтверждение "
+                    "перед новыми сделками."
+                ).format(
+                    target=f" по {symbol_text}" if symbol_text else "",
+                    duration=duration,
+                )
+            else:
+                base_message = (
+                    "Оператор запустил торговлю вручную{target}, но подтверждения ещё нет — бот ждёт "
+                    "перед новыми сделками."
+                ).format(target=f" по {symbol_text}" if symbol_text else "")
+            manual_message = self._append_operator_note(base_message, manual_note) or base_message
+        elif manual_label == "active":
+            manual_ok = True
+            manual_message = manual_status_message or self._append_operator_note(
+                manual_status_text, manual_note
+            )
+            if not manual_message:
+                base_message = "Ручное управление активно — оператор разрешил торговлю."
+                manual_message = self._append_operator_note(base_message, manual_note) or base_message
+        else:
+            manual_ok = True
+            manual_message = manual_status_message or self._append_operator_note(
+                manual_status_text, manual_note
+            )
+            if not manual_message:
+                base_message = "Ручные команды не заданы — автоматический режим свободен."
+                manual_message = self._append_operator_note(base_message, manual_note) or base_message
+
+        manual_details_bits: List[str] = []
+        manual_symbol = manual_summary.get("symbol")
+        if isinstance(manual_symbol, str) and manual_symbol.strip():
+            manual_details_bits.append(f"Цель: {manual_symbol.strip()}")
+
+        history_count = manual_summary.get("history_count")
+        if isinstance(history_count, int):
+            manual_details_bits.append(f"Команд: {history_count}")
+
+        last_action_age = manual_summary.get("last_action_age_seconds")
+        if isinstance(last_action_age, (int, float)) and last_action_age > 0:
+            manual_details_bits.append(
+                f"Последняя команда была {self._format_duration(float(last_action_age))} назад"
+            )
+
+        status_note = manual_summary.get("status_note")
+        if isinstance(status_note, str) and status_note.strip():
+            manual_details_bits.append(f"Комментарий: {status_note.strip()}")
+
+        manual_details = " · ".join(manual_details_bits) if manual_details_bits else None
+
         realtime = bybit_realtime_status(settings)
 
         return {
@@ -1483,6 +1790,15 @@ class GuardianBot:
                 "message": ai_message,
                 "details": ai_details,
                 "age_seconds": age,
+            },
+            "manual_control": {
+                "title": "Ручное управление",
+                "ok": manual_ok,
+                "message": manual_message,
+                "details": manual_details,
+                "status_label": manual_label,
+                "active": manual_active,
+                "history_count": history_count if isinstance(history_count, int) else 0,
             },
             "executions": {
                 "title": "Журнал исполнений",
@@ -1567,6 +1883,12 @@ class GuardianBot:
         thresholds = summary.get("thresholds") or {}
         buy_threshold = float(thresholds.get("buy_probability_pct") or 0.0)
         sell_threshold = float(thresholds.get("sell_probability_pct") or 0.0)
+        effective_buy_threshold = float(
+            thresholds.get("effective_buy_probability_pct") or buy_threshold
+        )
+        effective_sell_threshold = float(
+            thresholds.get("effective_sell_probability_pct") or sell_threshold
+        )
         min_ev = float(thresholds.get("min_ev_bps") or 0.0)
         status_source = str(summary.get("status_source") or "live")
         actionable = bool(summary.get("actionable"))
@@ -1583,13 +1905,30 @@ class GuardianBot:
         ]
 
         threshold_line = (
-            "Пороги стратегии: покупка от {buy:.2f}%, продажа от {sell:.2f}%, минимальная выгода {ev:.2f} б.п.".format(
-                buy=buy_threshold or 0.0,
-                sell=sell_threshold or 0.0,
+            "Рабочие пороги: покупка от {buy:.2f}%, продажа от {sell:.2f}%, минимальная выгода {ev:.2f} б.п.".format(
+                buy=effective_buy_threshold or 0.0,
+                sell=effective_sell_threshold or 0.0,
                 ev=min_ev,
             )
         )
         lines.append(threshold_line)
+
+        configured_notes: List[str] = []
+        if abs(buy_threshold - effective_buy_threshold) >= 0.01:
+            configured_notes.append(
+                "⚙️ Настройка покупки была {configured:.2f}%, но фактически применяется {effective:.2f}% после авто-коррекции.".format(
+                    configured=buy_threshold,
+                    effective=effective_buy_threshold,
+                )
+            )
+        if abs(sell_threshold - effective_sell_threshold) >= 0.01:
+            configured_notes.append(
+                "⚙️ Порог продажи из настроек {configured:.2f}%, однако для безопасности используется {effective:.2f}%.".format(
+                    configured=sell_threshold,
+                    effective=effective_sell_threshold,
+                )
+            )
+        lines.extend(configured_notes)
 
         if actionable:
             lines.append("Показатели проходят контроль, сигнал можно исполнять при соблюдении риск-плана.")
@@ -1921,7 +2260,13 @@ class GuardianBot:
 
     def _format_health_answer(self) -> str:
         health = self.data_health()
-        order = ("ai_signal", "executions", "api_keys", "realtime_trading")
+        order = (
+            "ai_signal",
+            "manual_control",
+            "executions",
+            "api_keys",
+            "realtime_trading",
+        )
 
         blocks: List[str] = []
         for key in order:
@@ -1953,8 +2298,30 @@ class GuardianBot:
 
         lines: List[str] = []
 
-        status_text = str(summary.get("status_text") or "Ручные команды ещё не отправлялись.")
-        lines.append(status_text)
+        default_text = "Ручные команды ещё не отправлялись."
+        status_text = summary.get("status_text")
+        status_message = summary.get("status_message")
+        note_line_already_present = False
+
+        if isinstance(status_message, str) and status_message.strip():
+            rendered_status = status_message.strip()
+            note_line_already_present = "комментарий оператора" in rendered_status.lower()
+        elif isinstance(status_text, str) and status_text.strip():
+            rendered_status = status_text.strip()
+        else:
+            rendered_status = default_text
+
+        lines.append(rendered_status)
+
+        status_note = summary.get("status_note")
+        if (
+            not note_line_already_present
+            and isinstance(status_note, str)
+            and status_note.strip()
+        ):
+            cleaned = status_note.strip()
+            suffix = cleaned if cleaned.endswith((".", "!", "?")) else f"{cleaned}."
+            lines.append(f"Комментарий оператора: {suffix}")
 
         symbol = summary.get("symbol")
         if isinstance(symbol, str) and symbol:
