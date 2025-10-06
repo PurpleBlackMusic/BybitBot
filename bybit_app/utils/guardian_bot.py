@@ -852,12 +852,13 @@ class GuardianBot:
             min_change_pct = 0.5
 
         manual_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
-        whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
-        if not whitelist:
-            whitelist = list(manual_symbols)
+        raw_whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
+        if raw_whitelist:
+            extra = [sym for sym in manual_symbols if sym not in raw_whitelist]
+            raw_whitelist.extend(extra)
+            whitelist: Optional[Sequence[str]] = raw_whitelist
         else:
-            extra = [sym for sym in manual_symbols if sym not in whitelist]
-            whitelist.extend(extra)
+            whitelist = None
 
         blacklist = self._parse_symbol_list(getattr(settings, "ai_blacklist", ""))
 
@@ -878,7 +879,7 @@ class GuardianBot:
                 min_turnover=min_turnover,
                 min_change_pct=min_change_pct,
                 max_spread_bps=max_spread,
-                whitelist=whitelist or None,
+                whitelist=whitelist,
                 blacklist=blacklist or None,
             )
         except Exception:
@@ -1504,6 +1505,88 @@ class GuardianBot:
         filtered.sort(key=sort_key)
         return filtered
 
+    def _summarise_trade_candidates(
+        self,
+        plan: Mapping[str, object],
+        *,
+        limit: Optional[int] = None,
+        include_manual: bool = True,
+    ) -> List[Dict[str, object]]:
+        """Build a compact, prioritised view of trade candidates."""
+
+        priority_table = plan.get("priority_table") if isinstance(plan, Mapping) else None
+        if not isinstance(priority_table, Sequence):
+            return []
+
+        manual_only = {
+            str(symbol).strip().upper()
+            for symbol in (plan.get("manual_only") or [])
+            if str(symbol).strip()
+        }
+        position_symbols = {
+            str(symbol).strip().upper()
+            for symbol in (plan.get("positions") or [])
+            if str(symbol).strip()
+        }
+
+        summary: List[Dict[str, object]] = []
+
+        for idx, raw_entry in enumerate(priority_table):
+            if not isinstance(raw_entry, Mapping):
+                continue
+
+            symbol_value = raw_entry.get("symbol")
+            if not isinstance(symbol_value, str) or not symbol_value.strip():
+                continue
+
+            symbol = symbol_value.strip().upper()
+            manual_only_entry = bool(raw_entry.get("manual_only")) or symbol in manual_only
+            if (
+                not include_manual
+                and manual_only_entry
+                and symbol not in position_symbols
+            ):
+                continue
+
+            probability_pct = self._coerce_float(raw_entry.get("probability_pct"))
+            probability = self._coerce_float(raw_entry.get("probability"))
+            ev_bps = self._coerce_float(raw_entry.get("ev_bps"))
+            edge_score = self._coerce_float(raw_entry.get("edge_score"))
+            score = self._coerce_float(raw_entry.get("score"))
+            exposure_pct = self._coerce_float(raw_entry.get("exposure_pct"))
+            position_qty = self._coerce_float(raw_entry.get("position_qty"))
+            position_notional = self._coerce_float(raw_entry.get("position_notional"))
+
+            entry = {
+                "symbol": symbol,
+                "priority": int(raw_entry.get("priority") or idx + 1),
+                "sources": tuple(raw_entry.get("sources") or ()),
+                "reasons": tuple(raw_entry.get("reasons") or ()),
+                "actionable": bool(raw_entry.get("actionable")),
+                "ready": bool(raw_entry.get("ready")),
+                "holding": bool(raw_entry.get("holding")),
+                "manual": bool(raw_entry.get("manual")),
+                "manual_only": manual_only_entry,
+                "trend": raw_entry.get("trend"),
+                "note": raw_entry.get("note"),
+                "watchlist_rank": raw_entry.get("watchlist_rank"),
+                "probability_pct": round(probability_pct, 2) if probability_pct is not None else None,
+                "probability": round(probability, 4) if probability is not None else None,
+                "ev_bps": round(ev_bps, 3) if ev_bps is not None else None,
+                "edge_score": round(edge_score, 3) if edge_score is not None else None,
+                "score": round(score, 3) if score is not None else None,
+                "exposure_pct": round(exposure_pct, 3) if exposure_pct is not None else None,
+                "position_qty": position_qty,
+                "position_notional": position_notional,
+            }
+
+            summary.append(entry)
+
+            if limit is not None and limit > 0 and len(summary) >= limit:
+                break
+
+        return summary
+
     @staticmethod
     def _condense_watchlist_entry(entry: Dict[str, object]) -> Dict[str, object]:
         """Reduce a raw watchlist entry to UI-friendly fields."""
@@ -1810,6 +1893,13 @@ class GuardianBot:
             status_summary["candidate_symbols"] = combined[:limit_hint]
         else:
             status_summary["candidate_symbols"] = combined
+
+        candidate_limit = max(limit_hint, 5) if limit_hint > 0 else 5
+        status_summary["trade_candidates"] = self._summarise_trade_candidates(
+            symbol_plan,
+            limit=candidate_limit,
+            include_manual=True,
+        )
 
         status_signature = (
             signature[0][0],
@@ -2472,7 +2562,14 @@ class GuardianBot:
                 and isinstance(primary_entry.get("symbol"), str)
                 and primary_entry.get("symbol") == symbol
             )
-            allow_watchlist_symbol = symbol_source != "status" or not status_actionable
+            primary_actionable = bool(primary_entry.get("actionable"))
+            primary_source = str(primary_entry.get("source") or "").strip().lower()
+            primary_dynamic = bool(primary_source and primary_source != "status")
+            allow_watchlist_symbol = (
+                symbol_source != "status"
+                or not status_actionable
+                or (primary_actionable and primary_dynamic)
+            )
             using_watchlist_symbol = allow_watchlist_symbol or same_symbol_as_status
 
             if allow_watchlist_symbol and isinstance(primary_entry.get("symbol"), str):
@@ -2973,6 +3070,26 @@ class GuardianBot:
             deduped = deduped[:limit]
 
         return deduped
+
+    def trade_candidates(
+        self,
+        limit: Optional[int] = None,
+        *,
+        include_manual: bool = True,
+    ) -> List[Dict[str, object]]:
+        """Expose prioritised trade candidates with context for execution logic."""
+
+        snapshot = self._get_snapshot()
+        plan = snapshot.symbol_plan or {}
+
+        if limit is not None and limit <= 0:
+            limit = None
+
+        return self._summarise_trade_candidates(
+            plan,
+            limit=limit,
+            include_manual=include_manual,
+        )
 
     def actionable_opportunities(
         self, limit: int = 5, include_neutral: bool = False

@@ -1434,6 +1434,104 @@ def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
     assert summary["watchlist_highlights"][0]["symbol"] == "SOLUSDT"
 
 
+def test_guardian_market_scan_not_limited_by_manual_symbols(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "ai" / "market_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_payload = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "SOLUSDT",
+                "turnover24h": "6000000",
+                "price24hPcnt": "2.4",
+                "bestBidPrice": "20",
+                "bestAskPrice": "20.02",
+                "volume24h": "1200000",
+            },
+            {
+                "symbol": "XRPUSDT",
+                "turnover24h": "3500000",
+                "price24hPcnt": "-1.6",
+                "bestBidPrice": "0.5",
+                "bestAskPrice": "0.501",
+                "volume24h": "2200000",
+            },
+        ],
+    }
+    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
+
+    settings = Settings(
+        ai_market_scan_enabled=True,
+        ai_enabled=True,
+        ai_min_turnover_usd=1_000_000.0,
+        ai_min_ev_bps=40.0,
+        ai_max_spread_bps=40.0,
+        ai_symbols="BTCUSDT",
+        ai_max_concurrent=2,
+    )
+
+    bot = GuardianBot(data_dir=tmp_path, settings=settings)
+
+    watchlist = bot.market_watchlist()
+    symbols = [entry["symbol"] for entry in watchlist[:2]]
+    assert symbols == ["SOLUSDT", "XRPUSDT"]
+    assert all(entry["symbol"] != "BTCUSDT" for entry in watchlist)
+
+
+def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "ai" / "market_snapshot.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_payload = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "SOLUSDT",
+                "turnover24h": "7200000",
+                "price24hPcnt": "2.8",
+                "bestBidPrice": "20",
+                "bestAskPrice": "20.02",
+                "volume24h": "1800000",
+            },
+            {
+                "symbol": "BTCUSDT",
+                "turnover24h": "12000000",
+                "price24hPcnt": "0.003",
+                "bestBidPrice": "30000",
+                "bestAskPrice": "30010",
+                "volume24h": "4500",
+            },
+        ],
+    }
+    snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_payload = {
+        "symbol": "BTCUSDT",
+        "probability": 0.82,
+        "ev_bps": 45.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path.write_text(json.dumps(status_payload), encoding="utf-8")
+
+    settings = Settings(
+        ai_market_scan_enabled=True,
+        ai_enabled=True,
+        ai_min_turnover_usd=1_000_000.0,
+        ai_min_ev_bps=30.0,
+        ai_max_spread_bps=40.0,
+        ai_symbols="BTCUSDT",
+        ai_buy_threshold=0.6,
+    )
+
+    bot = GuardianBot(data_dir=tmp_path, settings=settings)
+
+    summary = bot.status_summary()
+    assert summary["symbol"] == "SOLUSDT"
+    assert summary["symbol_source"] == "watchlist"
+    assert summary["primary_watch"]["symbol"] == "SOLUSDT"
+
+
 def test_guardian_market_scan_respects_lists(tmp_path: Path) -> None:
     snapshot_path = tmp_path / "ai" / "market_snapshot.json"
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1534,6 +1632,23 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     plan = summary["symbol_plan"]
     assert plan["actionable"] == ("SOLUSDT", "XRPUSDT")
     assert summary["candidate_symbols"] == ["SOLUSDT", "XRPUSDT"]
+
+    candidates = summary["trade_candidates"]
+    assert [item["symbol"] for item in candidates[:3]] == [
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+    ]
+    assert candidates[0]["actionable"] is True
+    assert candidates[1]["trend"] == "sell"
+    assert any("watchlist" in source for source in candidates[0]["sources"])
+
+    method_candidates = bot.trade_candidates(limit=3)
+    assert [item["symbol"] for item in method_candidates] == [
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+    ]
 
     stats = plan["stats"]
     assert stats["actionable_count"] == 2
@@ -1681,6 +1796,16 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     assert largest["exposure_pct"] == pytest.approx(66.67, rel=1e-3)
     assert summary["candidate_symbols"][:2] == ["ADAUSDT", "DOGEUSDT"]
 
+    summary_candidates = summary["trade_candidates"]
+    assert [item["symbol"] for item in summary_candidates[:3]] == [
+        "ADAUSDT",
+        "DOGEUSDT",
+        "SOLUSDT",
+    ]
+    assert summary_candidates[0]["holding"] is True
+    assert summary_candidates[2]["actionable"] is True
+    assert summary_candidates[2]["probability_pct"] == pytest.approx(66.0, rel=1e-3)
+
     assert bot.dynamic_symbols() == ["ADAUSDT", "DOGEUSDT"]
     assert bot.dynamic_symbols(include_manual=False) == ["ADAUSDT", "DOGEUSDT"]
     assert bot.dynamic_symbols(limit=0)[:3] == ["ADAUSDT", "DOGEUSDT", "SOLUSDT"]
@@ -1689,6 +1814,26 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
         "DOGEUSDT",
         "SOLUSDT",
     ]
+
+    method_candidates = bot.trade_candidates(limit=4)
+    assert [item["symbol"] for item in method_candidates[:3]] == [
+        "ADAUSDT",
+        "DOGEUSDT",
+        "SOLUSDT",
+    ]
+    assert method_candidates[0]["holding"] is True
+    assert method_candidates[0]["manual_only"] is False
+    filtered_candidates = bot.trade_candidates(limit=0, include_manual=False)
+    assert [item["symbol"] for item in filtered_candidates[:4]] == [
+        "ADAUSDT",
+        "DOGEUSDT",
+        "SOLUSDT",
+        "XRPUSDT",
+    ]
+    assert all(
+        candidate["manual_only"] is False or candidate["holding"]
+        for candidate in filtered_candidates
+    )
 
     details = plan["details"]
     ada = details["ADAUSDT"]
