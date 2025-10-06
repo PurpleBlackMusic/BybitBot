@@ -598,6 +598,8 @@ def bybit_realtime_status(
     if ws_status is None:
         ws_status = _load_ws_status()
 
+    max_ws_age = max(watchdog, 30.0)
+
     ws_public_age: Optional[float] = None
     ws_private_age: Optional[float] = None
     ws_last_beat: Optional[float] = None
@@ -609,14 +611,44 @@ def bybit_realtime_status(
         if isinstance(public_info, dict):
             ws_public_age = _safe_float(public_info.get("age_seconds"))
             ws_last_beat = _safe_float(public_info.get("last_beat")) or ws_last_beat
-            if not public_info.get("running"):
+
+            public_running = bool(public_info.get("running"))
+            if not public_running:
+                age_hint = ws_public_age
+                if age_hint is None:
+                    for field in ("age", "age_sec"):
+                        age_hint = _safe_float(public_info.get(field))
+                        if age_hint is not None:
+                            break
+                connected_hint = public_info.get("connected")
+                if (age_hint is not None and age_hint <= max_ws_age) or bool(connected_hint):
+                    public_running = True
+
+            if not public_running:
                 warning_messages.append(
                     "Однако публичный WebSocket не запущен — данные маркетов не обновляются автоматически."
                 )
+
         if isinstance(private_info, dict):
             ws_private_age = _safe_float(private_info.get("age_seconds"))
             ws_last_beat = _safe_float(private_info.get("last_beat")) or ws_last_beat
-            if not private_info.get("running"):
+
+            private_running = bool(private_info.get("running"))
+            if not private_running:
+                age_hint = ws_private_age
+                if age_hint is None:
+                    for field in ("age", "age_sec"):
+                        age_hint = _safe_float(private_info.get(field))
+                        if age_hint is not None:
+                            break
+                connected_hint = private_info.get("connected")
+                max_private_age = watchdog
+                if bool(connected_hint) or (
+                    age_hint is not None and age_hint <= max_private_age
+                ):
+                    private_running = True
+
+            if not private_running:
                 warning_messages.append(
                     "Однако приватный WebSocket не запущен — нет подтверждения сделок в реальном времени."
                 )
@@ -624,8 +656,6 @@ def bybit_realtime_status(
                 warning_messages.append(
                     "Однако приватный WebSocket не подключён — перепроверьте ключи и соединение."
                 )
-
-    max_ws_age = max(watchdog, 30.0)
     if ws_private_age is not None and ws_private_age > watchdog:
         warning_messages.append(
             "Однако приватный WebSocket не присылал данные слишком долго — перезапустите соединение."
