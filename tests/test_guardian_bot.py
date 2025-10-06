@@ -2244,6 +2244,57 @@ def test_guardian_status_refreshes_when_content_size_static(tmp_path: Path) -> N
     assert final_summary["probability_pct"] == 63.0
     assert "charl" in final_summary["analysis"].lower()
 
+
+def test_guardian_replaces_demo_with_live_signal(tmp_path: Path, monkeypatch) -> None:
+    demo_status = {
+        "ts": time.time() + 86400 * 5,
+        "symbol": "BTCUSDT",
+        "probability": 0.5,
+        "ev_bps": 10.0,
+        "side": "buy",
+        "watchlist": [],
+    }
+
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(demo_status), encoding="utf-8")
+
+    live_payload = {
+        "symbol": "LTCUSDT",
+        "probability": 0.68,
+        "ev_bps": 42.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+        "watchlist": [
+            {
+                "symbol": "LTCUSDT",
+                "trend": "buy",
+                "probability": 0.68,
+                "ev_bps": 42.0,
+                "actionable": True,
+            }
+        ],
+        "source": "live_scanner",
+    }
+
+    class DummyFetcher:
+        def __init__(self, *_, **__):
+            pass
+
+        def fetch(self):
+            return copy.deepcopy(live_payload)
+
+    monkeypatch.setattr(guardian_bot_module, "LiveSignalFetcher", DummyFetcher)
+
+    bot = _make_bot(tmp_path, Settings(ai_enabled=True))
+    summary = bot.status_summary()
+
+    assert summary["symbol"] == "LTCUSDT"
+    assert summary["status_source"] == "live"
+    assert summary["fallback_used"] is False
+    assert summary["watchlist_total"] == 1
+
+
 def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
