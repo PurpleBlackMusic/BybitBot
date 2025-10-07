@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from bybit_app.utils import ws_private_v5
-from bybit_app.utils.ws_private_v5 import WSPrivateV5
+from bybit_app.utils.ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
 
 
 class _ImmediateThread:
@@ -114,6 +114,47 @@ def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.Mo
     assert {evt for evt, _ in events} >= {"ws.private.message.decode_error", "ws.private.callback.error", "ws.private.close"}
     assert client._ws is None
     assert client._thread is None
+
+
+def test_ws_private_v5_subscribes_to_default_topics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ws_private_v5,
+        "get_settings",
+        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(ws_private_v5, "log", lambda event, **payload: events.append((event, payload)))
+    _install_thread_stub(monkeypatch)
+
+    messages = [json.dumps({"op": "auth", "success": True})]
+    sent = _install_websocket_stub(monkeypatch, messages)
+
+    client = WSPrivateV5(reconnect=False)
+    assert client.start() is True
+
+    subscribe_msgs = [json.loads(msg) for msg in sent if json.loads(msg).get("op") == "subscribe"]
+    assert subscribe_msgs, "subscribe message was not sent"
+    assert subscribe_msgs[-1]["args"] == list(DEFAULT_TOPICS)
+    assert ("ws.private.auth.ok", {}) in events
+
+
+def test_ws_private_v5_merges_custom_topics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ws_private_v5,
+        "get_settings",
+        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+    )
+    _install_thread_stub(monkeypatch)
+
+    messages = [json.dumps({"op": "auth", "success": True})]
+    sent = _install_websocket_stub(monkeypatch, messages)
+
+    client = WSPrivateV5(reconnect=False)
+    assert client.start(topics=["position", "order", "wallet", "position"]) is True
+
+    subscribe_msgs = [json.loads(msg) for msg in sent if json.loads(msg).get("op") == "subscribe"]
+    assert subscribe_msgs
+    assert subscribe_msgs[-1]["args"] == list(DEFAULT_TOPICS)
 
 
 def test_ws_private_v5_stop_closes_socket(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,7 +8,7 @@ import pytest
 from bybit_app.utils import ws_manager as ws_manager_module
 import bybit_app.utils.pnl as pnl_module
 from bybit_app.utils.ws_manager import WSManager
-from bybit_app.utils.ws_private_v5 import WSPrivateV5
+from bybit_app.utils.ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
 
 
 def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -381,5 +381,5 @@ def test_ws_private_v5_resubscribe_requires_connected_socket() -> None:
     ws_client._ws = DummyWS(True)
     assert ws_client.start(["wallet"])
     assert ws_client._ws.sent == [
-        {"op": "subscribe", "args": ["wallet"]}
+        {"op": "subscribe", "args": list(DEFAULT_TOPICS)}
     ]
