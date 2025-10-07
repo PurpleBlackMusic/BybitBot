@@ -188,6 +188,7 @@ class WSManager:
                 def _on_private_msg(message):
                     self.priv_store.append(message)
                     self._handle_private_beat()
+                    self._process_private_payload(message)
 
                 self._priv = WSPrivateV5(
                     url=url,
@@ -305,6 +306,38 @@ class WSManager:
                 "age_seconds": priv_age,
             },
         }
+
+    def _process_private_payload(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        topic = str(payload.get("topic") or payload.get("topicName") or "").lower()
+        if not topic:
+            return
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            rows = [data]
+        elif isinstance(data, list):
+            rows = [row for row in data if isinstance(row, dict)]
+        else:
+            rows = []
+
+        if not rows:
+            return
+
+        if "execution" in topic:
+            try:
+                from .pnl import add_execution
+            except Exception as exc:  # pragma: no cover - import errors rare
+                log("ws.private.execution.import_error", err=str(exc))
+                return
+
+            for row in rows:
+                try:
+                    add_execution(row)
+                except Exception as exc:  # pragma: no cover - ledger write failures
+                    log("ws.private.execution.persist.error", err=str(exc))
 
 
 manager = WSManager()

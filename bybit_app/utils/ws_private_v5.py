@@ -17,12 +17,18 @@ class WSPrivateV5:
         self,
         url: str = "wss://stream.bybit.com/v5/private",
         on_msg: Callable[[dict], None] | None = None,
+        *,
+        reconnect: bool = True,
     ):
         self.url = url
         self.on_msg = on_msg or (lambda m: None)
         self._ws = None
         self._thread: threading.Thread | None = None
         self._stop = False
+        self._topics: tuple[str, ...] = ("order", "execution")
+        self._authenticated = False
+        self._ws_lock = threading.Lock()
+        self._reconnect = reconnect
 
     def _sign(self, ts: int, recv_window: int, key: str, secret: str) -> str:
         to_sign = f"{ts}{key}{recv_window}"
@@ -35,6 +41,14 @@ class WSPrivateV5:
 
     def start(self, topics: list[str] | None = None) -> bool:
         if self.is_running():
+            if topics:
+                self._topics = tuple(topics)
+                ws = self._ws
+                if ws is not None:
+                    try:
+                        ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                    except Exception as exc:
+                        log("ws.private.resub.error", err=str(exc))
             return True
 
         settings = get_settings()
@@ -59,17 +73,17 @@ class WSPrivateV5:
         ts = int(time.time() * 1000)
         sign = self._sign(ts, recv_window_int, api_key, api_secret)
         auth = {"op": "auth", "args": [api_key, str(ts), str(recv_window_int), sign]}
-        subs = {"op": "subscribe", "args": topics or ["order", "execution"]}
+        self._topics = tuple(topics or ["order", "execution"])
 
         def run() -> None:
             import ssl
             import websocket  # type: ignore
 
+            backoff = 1.0
+
             def handle_open(ws) -> None:
                 try:
                     ws.send(json.dumps(auth))
-                    time.sleep(0.2)
-                    ws.send(json.dumps(subs))
                 except Exception as exc:
                     log("ws.private.open.error", err=str(exc))
                     try:
@@ -85,6 +99,22 @@ class WSPrivateV5:
                     log("ws.private.message.decode_error", err=str(exc))
                     payload = {"raw": message}
 
+                if isinstance(payload, dict):
+                    if payload.get("op") == "auth":
+                        success = bool(payload.get("success"))
+                        if success:
+                            self._authenticated = True
+                            try:
+                                ws.send(json.dumps({"op": "subscribe", "args": list(self._topics)}))
+                            except Exception as exc:
+                                log("ws.private.sub.error", err=str(exc))
+                            else:
+                                log("ws.private.auth.ok")
+                        else:
+                            log("ws.private.auth.error", msg=payload.get("ret_msg"))
+                    elif payload.get("op") == "subscribe" and not payload.get("success", True):
+                        log("ws.private.subscribe.error", msg=payload.get("ret_msg"))
+
                 try:
                     self.on_msg(payload)
                 except Exception as exc:
@@ -95,21 +125,43 @@ class WSPrivateV5:
 
             def handle_close(ws, code, msg) -> None:
                 log("ws.private.close", code=code, msg=msg, requested=self._stop)
+                self._authenticated = False
 
-            ws = websocket.WebSocketApp(
-                self.url,
-                on_open=handle_open,
-                on_message=handle_message,
-                on_error=handle_error,
-                on_close=handle_close,
-            )
+            while not self._stop:
+                ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=handle_open,
+                    on_message=handle_message,
+                    on_error=handle_error,
+                    on_close=handle_close,
+                )
+                with self._ws_lock:
+                    self._ws = ws
+                try:
+                    ws.run_forever(
+                        sslopt={"cert_reqs": ssl.CERT_NONE},
+                        ping_interval=20,
+                        ping_timeout=10,
+                    )
+                finally:
+                    with self._ws_lock:
+                        self._ws = None
+                    self._authenticated = False
+                if self._stop or not self._reconnect:
+                    break
+                sleep_for = min(backoff, 60.0)
+                log("ws.private.reconnect.wait", seconds=round(sleep_for, 2))
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2.0, 60.0)
+                ts_retry = int(time.time() * 1000)
+                sign_retry = self._sign(ts_retry, recv_window_int, api_key, api_secret)
+                retry_auth = {
+                    "op": "auth",
+                    "args": [api_key, str(ts_retry), str(recv_window_int), sign_retry],
+                }
+                auth.update(retry_auth)
 
-            self._ws = ws
-            try:
-                ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-            finally:
-                self._ws = None
-                self._thread = None
+            self._thread = None
 
         self._stop = False
         thread = threading.Thread(target=run, daemon=True)

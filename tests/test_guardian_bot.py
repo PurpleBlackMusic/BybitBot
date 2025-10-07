@@ -17,6 +17,7 @@ import pytest
 import bybit_app.utils.guardian_bot as guardian_bot_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
+from bybit_app.utils.live_signal import LiveSignalError
 
 
 def _make_bot(
@@ -2477,6 +2478,32 @@ def test_guardian_live_only_returns_empty_when_feed_missing(
 
     assert summary["status_source"] == "missing"
     assert summary["symbol"] != "ETHUSDT"
+
+
+def test_guardian_reports_live_fetch_error_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "symbol": "SOLUSDT",
+        "probability": 0.58,
+        "ev_bps": 12.0,
+        "side": "buy",
+        "last_tick_ts": time.time() - (guardian_bot_module.STALE_SIGNAL_SECONDS + 5),
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class RaisingFetcher:
+        def fetch(self) -> Dict[str, object]:
+            raise LiveSignalError("scanner down")
+
+    monkeypatch.setattr(guardian_bot_module, "LiveSignalFetcher", lambda *args, **kwargs: RaisingFetcher())
+
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_enabled=True))
+    summary = bot.status_summary()
+
+    assert summary["status_source"] == "file"
+    assert summary.get("status_error")
+    assert "scanner down" in summary["status_error"].lower()
     assert summary["fallback_used"] is False
     assert summary["actionable"] is False
     assert summary.get("watchlist_total", 0) == 0

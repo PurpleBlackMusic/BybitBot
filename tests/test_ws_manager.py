@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from bybit_app.utils import ws_manager as ws_manager_module
+import bybit_app.utils.pnl as pnl_module
 from bybit_app.utils.ws_manager import WSManager
 
 
@@ -153,18 +154,21 @@ def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(ws_manager_module, "WSPrivateV5", DummyPrivate)
     calls: list[object] = []
+    exec_calls: list[object] = []
     monkeypatch.setattr(manager.priv_store, "append", lambda payload: calls.append(payload))
+    monkeypatch.setattr(pnl_module, "add_execution", lambda payload: exec_calls.append(payload))
 
     assert manager.start_private() is True
     assert captured["started"] is True
     callback = captured["callback"]
     assert callable(callback)
 
-    sample_payload = {"foo": "bar"}
+    sample_payload = {"topic": "execution", "data": [{"execQty": "1.0"}]}
     callback(sample_payload)
 
     assert calls == [sample_payload]
     assert manager.last_beat > 0
+    assert exec_calls == [{"execQty": "1.0"}]
 
 
 def test_start_private_does_not_restart_running_client(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,7 +2,9 @@ import json
 import time
 from pathlib import Path
 
-from bybit_app.utils.market_scanner import scan_market_opportunities
+import pytest
+
+from bybit_app.utils.market_scanner import MarketScannerError, scan_market_opportunities
 
 
 def _write_snapshot(tmp_path: Path, rows: list[dict[str, object]]) -> None:
@@ -129,3 +131,8 @@ def test_market_scanner_honors_blacklist(tmp_path: Path) -> None:
     )
 
     assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
+
+
+def test_market_scanner_raises_when_snapshot_missing(tmp_path: Path) -> None:
+    with pytest.raises(MarketScannerError):
+        scan_market_opportunities(api=None, data_dir=tmp_path)

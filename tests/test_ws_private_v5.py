@@ -52,7 +52,7 @@ def _install_websocket_stub(monkeypatch: pytest.MonkeyPatch, messages: list[str]
         def close(self) -> None:  # pragma: no cover - parity with real interface
             sent.append("__closed__")
 
-        def run_forever(self, sslopt: dict[str, Any] | None = None) -> None:
+        def run_forever(self, sslopt: dict[str, Any] | None = None, **kwargs) -> None:
             if self._on_open:
                 self._on_open(self)
             if self._on_message:
@@ -101,7 +101,7 @@ def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.Mo
         if payload.get("foo") == "bar":
             raise RuntimeError("boom")
 
-    client = WSPrivateV5(on_msg=on_msg)
+    client = WSPrivateV5(on_msg=on_msg, reconnect=False)
     assert client.start(topics=["order"]) is True
 
     assert any(json.loads(msg).get("op") == "auth" for msg in sent[:1])
