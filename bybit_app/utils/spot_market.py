@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_UP, InvalidOperation
+from decimal import Decimal, ROUND_UP, ROUND_HALF_UP, InvalidOperation
 import time
 from typing import Dict, Generic, Mapping, Sequence, Tuple, TypeVar
 
@@ -557,6 +557,57 @@ def prepare_spot_trade_snapshot(
     return SpotTradeSnapshot(symbol=key, price=price, balances=balances, limits=limits)
 
 
+def _resolve_slippage_tolerance(
+    tol_type: str | None,
+    tol_value: object,
+) -> tuple[Decimal, str, str]:
+    """Normalise slippage tolerance inputs for request and balance guards."""
+
+    auto_type: str | None = None
+    raw_value = tol_value
+    if isinstance(tol_value, str):
+        text = tol_value.strip()
+        lowered = text.lower()
+        if lowered.endswith("%"):
+            auto_type = "percent"
+            text = text[:-1]
+        elif lowered.endswith("bps"):
+            auto_type = "bps"
+            text = text[:-3]
+        elif lowered.endswith("bp"):
+            auto_type = "bps"
+            text = text[:-2]
+        raw_value = text
+
+    tolerance_decimal = _to_decimal(raw_value, Decimal("0"))
+    if tolerance_decimal < 0:
+        tolerance_decimal = Decimal("0")
+
+    tolerance_kind = (tol_type or auto_type or "percent").strip().lower()
+
+    multiplier = Decimal("1")
+    request_type = "Percent"
+    if tolerance_kind in {"percent", "percentage"}:
+        multiplier += tolerance_decimal / Decimal("100")
+        request_type = "Percent"
+    elif tolerance_kind in {"bps", "basispoints", "basis_points"}:
+        multiplier += tolerance_decimal / Decimal("10000")
+        request_type = "Bps"
+    else:
+        multiplier += tolerance_decimal
+        request_type = "Value"
+
+    if multiplier <= 0:
+        multiplier = Decimal("1")
+
+    request_value = format(
+        tolerance_decimal.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        "f",
+    )
+
+    return multiplier, request_type, request_value
+
+
 def place_spot_market_with_tolerance(
     api: BybitAPI,
     symbol: str,
@@ -636,10 +687,10 @@ def place_spot_market_with_tolerance(
         qty_value = base_qty
         market_unit = "baseCoin"
 
-    tolerance = max(float(tol_value), 1.0)
-    tolerance_multiplier = _to_decimal(tolerance)
-    if tolerance_multiplier <= 0:
-        tolerance_multiplier = Decimal("1")
+    tolerance_multiplier, tolerance_type, tolerance_value = _resolve_slippage_tolerance(
+        tol_type,
+        tol_value,
+    )
 
     projected_spend: Decimal | None = None
     balance_map: Dict[str, Decimal] | None = _normalise_balances(balances)
@@ -710,8 +761,8 @@ def place_spot_market_with_tolerance(
         "orderType": "Market",
         "qty": qty_text,
         "marketUnit": market_unit,  # "baseCoin" или "quoteCoin"
-        "slippageToleranceType": tol_type,
-        "slippageTolerance": f"{tolerance:.4f}",
+        "slippageToleranceType": tolerance_type,
+        "slippageTolerance": tolerance_value,
     }
 
     response = api.place_order(**body)

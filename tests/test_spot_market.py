@@ -79,7 +79,8 @@ def test_place_spot_market_enforces_min_notional():
 
     assert response["ok"] is True
     assert api.place_calls[0]["qty"] == "10"
-    assert api.place_calls[0]["slippageTolerance"] == "1.0000"
+    assert api.place_calls[0]["slippageTolerance"] == "0.5000"
+    assert api.place_calls[0]["slippageToleranceType"] == "Percent"
     # repeated call should reuse cached instrument data
     place_spot_market_with_tolerance(
         api,
@@ -229,7 +230,69 @@ def test_place_spot_market_balance_guard_includes_tolerance():
             qty=10,
             unit="quoteCoin",
             tol_value=1.2,
-            max_quote=Decimal("11"),
+            max_quote=Decimal("10.05"),
+        )
+
+    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert api.place_calls == []
+
+
+def test_place_spot_market_accepts_percent_string():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_value="0.75%",
+    )
+
+    assert response["ok"] is True
+    placed = api.place_calls[0]
+    assert placed["slippageToleranceType"] == "Percent"
+    assert placed["slippageTolerance"] == "0.7500"
+
+
+def test_place_spot_market_accepts_bps_suffix():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=10,
+            unit="quoteCoin",
+            tol_value="50bps",
+            max_quote=Decimal("10.04"),
         )
 
     assert "Недостаточно свободного баланса" in str(excinfo.value)
@@ -754,7 +817,7 @@ def test_place_spot_market_adjusts_base_qty_with_price_snapshot():
     assert response["ok"] is True
     assert api.place_calls[0]["marketUnit"] == "baseCoin"
     assert api.place_calls[0]["qty"] == "0.01"
-    assert api.place_calls[0]["slippageTolerance"] == "1.0000"
+    assert api.place_calls[0]["slippageTolerance"] == "0.3000"
     # ensure price snapshot queried once and cached
     assert api.ticker_calls == 1
 
