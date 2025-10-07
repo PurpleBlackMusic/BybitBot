@@ -3,13 +3,14 @@ from __future__ import annotations
 import copy
 import math
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
 
-from utils.guardian_bot import GuardianBot
 from utils.envs import creds_ok
+from utils.guardian_bot import GuardianBot
 from utils.ui import rerun
 
 
@@ -45,6 +46,64 @@ def _mode_label(mode: str | None) -> str:
         "wait": "Ждём",
     }
     return mapping.get((mode or "").lower(), "Ждём")
+
+
+def _clean_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+    return text or None
+
+
+def _normalize_strings(items: Iterable[object | None] | object | None) -> list[str]:
+    if items is None:
+        return []
+    if isinstance(items, str):
+        sequence: Iterable[object | None] = [items]
+    elif isinstance(items, Iterable):
+        sequence = items
+    else:
+        sequence = [items]
+    normalized: list[str] = []
+    for item in sequence:
+        text = _clean_text(item)
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _bullet_markdown(items: Iterable[object | None]) -> str:
+    entries = _normalize_strings(items)
+    return "\n".join(f"• {entry}" for entry in entries)
+
+
+def _flatten_details(value: object | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return _normalize_strings(value.splitlines())
+    if isinstance(value, dict):
+        flattened: list[str] = []
+        for key, detail in value.items():
+            prefix = _clean_text(key)
+            details = _flatten_details(detail)
+            if details:
+                if prefix:
+                    flattened.extend(f"{prefix}: {entry}" for entry in details)
+                else:
+                    flattened.extend(details)
+            elif prefix:
+                flattened.append(prefix)
+        return flattened
+    if isinstance(value, Iterable):
+        collected: list[str] = []
+        for item in value:
+            collected.extend(_flatten_details(item))
+        return collected
+    return _normalize_strings([value])
 
 
 def _format_threshold_value(value: float, unit: str) -> str:
@@ -505,25 +564,19 @@ else:
     source_text = "Нет данных"
 detail_cols[2].metric("Источник данных", source_text)
 
-reasons = summary.get("actionable_reasons") or []
+reasons = _normalize_strings(summary.get("actionable_reasons"))
 staleness = summary.get("staleness") or {}
 
 if summary.get("actionable"):
     st.success("Сигнал проходит фильтры риска — бот готов к действию.")
     if reasons:
         st.caption("Напоминание об ограничениях:")
-        st.markdown("\n".join(f"• {reason}" for reason in reasons))
+        st.markdown(_bullet_markdown(reasons))
 else:
     st.caption("Сигнал пока наблюдательный: бот ждёт лучших данных.")
     if reasons:
-        st.warning(
-            "\n".join(
-                [
-                    "Причины паузы:",
-                    *(f"• {reason}" for reason in reasons),
-                ]
-            )
-        )
+        warning_lines = ["Причины паузы:"] + [f"• {reason}" for reason in reasons]
+        st.warning("\n".join(warning_lines))
         st.dataframe(
             pd.DataFrame(
                 [
@@ -542,31 +595,35 @@ st.markdown("#### Автоматизация")
 with st.container(border=True):
     automation_ok = bool(automation_health.get("ok"))
     automation_message = (
-        str(automation_health.get("message") or "AI готов к автоматическим сделкам.").strip()
+        _clean_text(automation_health.get("message"))
+        or "AI готов к автоматическим сделкам."
     )
-    automation_details = automation_health.get("details")
-    reasons = summary.get("actionable_reasons") or []
+    automation_details = _flatten_details(automation_health.get("details"))
+    reasons = _normalize_strings(summary.get("actionable_reasons"))
 
     if automation_ok:
         st.success(automation_message)
     else:
         st.warning(automation_message)
 
-    if isinstance(automation_details, str) and automation_details.strip():
-        st.caption(automation_details.strip())
+    if automation_details:
+        if len(automation_details) == 1:
+            st.caption(automation_details[0])
+        else:
+            st.caption("Детали диагностики:")
+            st.markdown(_bullet_markdown(automation_details))
 
-
-st.session_state["simple_mode_last_refresh"] = time.time()
+    st.session_state["simple_mode_last_refresh"] = time.time()
 
     if not automation_ok and reasons:
         st.caption("Почему бот ждёт:")
-        st.markdown("\n".join(f"• {reason}" for reason in reasons))
+        st.markdown(_bullet_markdown(reasons))
     elif not reasons and not automation_ok:
         st.caption("AI ожидает подходящий сигнал для безопасного входа.")
 
     if execution_feedback:
         status = str(execution_feedback.get("status") or "")
-        reason_text = execution_feedback.get("reason")
+        reason_text = _clean_text(execution_feedback.get("reason"))
         order_info: dict[str, object] | None = None
         candidate_order = execution_feedback.get("order")
         if isinstance(candidate_order, dict):
