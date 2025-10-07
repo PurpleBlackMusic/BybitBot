@@ -148,6 +148,7 @@ class SignalExecutor:
                 unit="quoteCoin",
                 tol_type="Percent",
                 tol_value=slippage_pct,
+                max_quote=usable_after_reserve,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
             return ExecutionResult(

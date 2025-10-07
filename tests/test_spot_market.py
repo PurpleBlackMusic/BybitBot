@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from bybit_app.utils import spot_market as spot_market_module
@@ -69,6 +71,101 @@ def test_place_spot_market_enforces_min_notional():
         unit="quoteCoin",
     )
     assert api.info_calls == 1
+
+
+def test_place_spot_market_respects_available_balance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=3.0,
+            unit="quoteCoin",
+            tol_value=0.5,
+            max_quote=Decimal("6"),
+        )
+
+    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert api.place_calls == []
+
+
+def test_place_spot_market_base_unit_checks_available_balance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "lotSizeFilter": {
+                        "minOrderQty": "0.001",
+                        "qtyStep": "0.001",
+                        "minOrderAmt": "0",
+                    },
+                }
+            ]
+        }
+    }
+    ticker = {"result": {"list": [{"symbol": "ETHUSDT", "bestBidPrice": "2000"}]}}
+    api = DummyAPI(payload, ticker_payload=ticker)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="ETHUSDT",
+            side="Buy",
+            qty=0.01,
+            unit="baseCoin",
+            max_quote=Decimal("10"),
+        )
+
+    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert api.place_calls == []
+    assert api.ticker_calls == 1
+
+
+def test_place_spot_market_balance_guard_includes_tolerance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=10,
+            unit="quoteCoin",
+            tol_value=1.2,
+            max_quote=Decimal("11"),
+        )
+
+    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert api.place_calls == []
 
 
 def test_place_spot_market_raises_when_no_instrument():
