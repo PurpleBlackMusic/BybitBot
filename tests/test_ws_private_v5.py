@@ -104,7 +104,12 @@ def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.Mo
     client = WSPrivateV5(on_msg=on_msg, reconnect=False)
     assert client.start(topics=["order"]) is True
 
-    assert any(json.loads(msg).get("op") == "auth" for msg in sent[:1])
+    auth_msgs = [json.loads(msg) for msg in sent if json.loads(msg).get("op") == "auth"]
+    assert auth_msgs, "auth message was not sent"
+    for auth_msg in auth_msgs:
+        args = auth_msg.get("args")
+        assert isinstance(args, list)
+        assert len(args) == 3
     assert {tuple(msg.keys()) for msg in received if isinstance(msg, dict)} >= {("raw",), ("foo",)}
     assert {evt for evt, _ in events} >= {"ws.private.message.decode_error", "ws.private.callback.error", "ws.private.close"}
     assert client._ws is None

@@ -30,9 +30,23 @@ class WSPrivateV5:
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
 
-    def _sign(self, ts: int, recv_window: int, key: str, secret: str) -> str:
-        to_sign = f"{ts}{key}{recv_window}"
-        return hmac.new(secret.encode("utf-8"), to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    def _sign(self, expires_ms: int, key: str, secret: str) -> str:
+        """Return a Bybit-compatible signature for private WebSocket auth."""
+
+        payload = f"GET/realtime{expires_ms}"
+        return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _auth_args(self, key: str, secret: str, *, leeway: float = 10.0) -> tuple[str, str, str]:
+        """Prepare authentication arguments for the `auth` request.
+
+        Bybit expects the "expires" timestamp (in ms) to be slightly in the future.
+        We add a configurable leeway (defaults to 10 seconds) to reduce the risk of
+        clock skew or scheduling delays causing an immediate "Params Error".
+        """
+
+        expires_ms = int((time.time() + max(leeway, 1.0)) * 1000)
+        signature = self._sign(expires_ms, key, secret)
+        return key, str(expires_ms), signature
 
     def is_running(self) -> bool:
         """Return True if the internal websocket loop is active."""
@@ -64,15 +78,8 @@ class WSPrivateV5:
             log("ws.private.disabled", reason="no websocket-client", err=str(e))
             return False
 
-        recv_window = getattr(settings, "recv_window_ms", 5000) or 5000
-        try:
-            recv_window_int = int(recv_window)
-        except Exception:
-            recv_window_int = 5000
-
-        ts = int(time.time() * 1000)
-        sign = self._sign(ts, recv_window_int, api_key, api_secret)
-        auth = {"op": "auth", "args": [api_key, str(ts), str(recv_window_int), sign]}
+        auth_args = self._auth_args(api_key, api_secret)
+        auth = {"op": "auth", "args": list(auth_args)}
         self._topics = tuple(topics or ["order", "execution"])
 
         def run() -> None:
@@ -153,13 +160,8 @@ class WSPrivateV5:
                 log("ws.private.reconnect.wait", seconds=round(sleep_for, 2))
                 time.sleep(sleep_for)
                 backoff = min(backoff * 2.0, 60.0)
-                ts_retry = int(time.time() * 1000)
-                sign_retry = self._sign(ts_retry, recv_window_int, api_key, api_secret)
-                retry_auth = {
-                    "op": "auth",
-                    "args": [api_key, str(ts_retry), str(recv_window_int), sign_retry],
-                }
-                auth.update(retry_auth)
+                retry_args = self._auth_args(api_key, api_secret)
+                auth.update({"args": list(retry_args)})
 
             self._thread = None
 
