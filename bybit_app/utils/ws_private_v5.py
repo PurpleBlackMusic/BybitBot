@@ -12,6 +12,9 @@ from .envs import get_settings
 from .log import log
 
 
+DEFAULT_TOPICS: tuple[str, ...] = ("order", "execution", "wallet", "position")
+
+
 class WSPrivateV5:
     def __init__(
         self,
@@ -25,7 +28,7 @@ class WSPrivateV5:
         self._ws = None
         self._thread: threading.Thread | None = None
         self._stop = False
-        self._topics: tuple[str, ...] = ("order", "execution")
+        self._topics: tuple[str, ...] = DEFAULT_TOPICS
         self._authenticated = False
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
@@ -53,14 +56,36 @@ class WSPrivateV5:
         thread = self._thread
         return bool(thread and thread.is_alive())
 
+    def _normalise_topics(self, topics: list[str] | None) -> tuple[str, ...]:
+        """Combine default topics with user supplied ones and drop duplicates."""
+
+        combined: list[str] = list(DEFAULT_TOPICS)
+        if topics:
+            combined.extend(topics)
+
+        seen: set[str] = set()
+        normalised: list[str] = []
+        for topic in combined:
+            if topic is None:
+                continue
+            text = str(topic).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalised.append(text)
+        return tuple(normalised)
+
     def start(self, topics: list[str] | None = None) -> bool:
         if self.is_running():
-            if topics:
-                self._topics = tuple(topics)
+            if topics is not None:
+                self._topics = self._normalise_topics(topics)
                 ws = self._ws
                 if ws is not None and self._is_socket_connected(ws):
                     try:
-                        ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                        ws.send(json.dumps({"op": "subscribe", "args": list(self._topics)}))
                     except Exception as exc:
                         log("ws.private.resub.error", err=str(exc))
             return True
@@ -80,7 +105,7 @@ class WSPrivateV5:
 
         auth_args = self._auth_args(api_key, api_secret)
         auth = {"op": "auth", "args": list(auth_args)}
-        self._topics = tuple(topics or ["order", "execution"])
+        self._topics = self._normalise_topics(topics)
 
         def run() -> None:
             import ssl
