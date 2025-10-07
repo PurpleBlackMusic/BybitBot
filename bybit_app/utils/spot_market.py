@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_UP, InvalidOperation
 import time
-from typing import Dict, Generic, Mapping, Tuple, TypeVar
+from typing import Dict, Generic, Mapping, Sequence, Tuple, TypeVar
 
 from .bybit_api import BybitAPI
 from .log import log
@@ -245,11 +245,91 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     return price
 
 
-def _is_unsupported_wallet_account_type_error(message: str) -> bool:
+def _collect_error_metadata(payload: object, *, _seen: set[int] | None = None) -> Tuple[set[str], set[str]]:
+    if _seen is None:
+        _seen = set()
+    if payload is None:
+        return set(), set()
+
+    payload_id = id(payload)
+    if payload_id in _seen:
+        return set(), set()
+    _seen.add(payload_id)
+
+    codes: set[str] = set()
+    messages: set[str] = set()
+
+    if isinstance(payload, BaseException):
+        messages.add(str(payload))
+        for name in ("retCode", "ret_code", "code", "status_code"):
+            value = getattr(payload, name, None)
+            if value is not None:
+                codes.add(str(value))
+        for name in ("retMsg", "ret_msg", "msg", "message", "error", "error_msg"):
+            value = getattr(payload, name, None)
+            if value:
+                messages.add(str(value))
+        args = getattr(payload, "args", ())
+        for arg in args:
+            sub_codes, sub_messages = _collect_error_metadata(arg, _seen=_seen)
+            codes.update(sub_codes)
+            messages.update(sub_messages)
+        return codes, messages
+
+    if isinstance(payload, Mapping):
+        for name in ("retCode", "ret_code", "code", "status_code"):
+            if name in payload and payload[name] is not None:
+                codes.add(str(payload[name]))
+        for name in ("retMsg", "ret_msg", "msg", "message", "error", "error_msg"):
+            if name in payload and payload[name]:
+                messages.add(str(payload[name]))
+        for value in payload.values():
+            if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
+                sub_codes, sub_messages = _collect_error_metadata(value, _seen=_seen)
+                codes.update(sub_codes)
+                messages.update(sub_messages)
+        return codes, messages
+
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            sub_codes, sub_messages = _collect_error_metadata(item, _seen=_seen)
+            codes.update(sub_codes)
+            messages.update(sub_messages)
+        return codes, messages
+
+    messages.add(str(payload))
+    return codes, messages
+
+
+def _has_account_type_only_support_unified_marker(message: str) -> bool:
     if not message:
         return False
-    normalised = message.lower()
-    return "10001" in normalised and "accounttype only support unified" in normalised
+    lowered = message.lower()
+    compact = lowered.replace(" ", "")
+    return (
+        "accounttype" in compact and "onlysupportunified" in compact
+    ) or ("account type" in lowered and "only support unified" in lowered)
+
+
+def _is_unsupported_wallet_account_type_error(error: object) -> bool:
+    codes, messages = _collect_error_metadata(error)
+
+    has_code = any(str(code).strip() == "10001" for code in codes)
+    has_marker = False
+    for message in messages:
+        if not message:
+            continue
+        normalised = message.lower()
+        if "10001" in normalised:
+            has_code = True
+        if _has_account_type_only_support_unified_marker(message):
+            has_marker = True
+            if has_code:
+                return True
+
+    if has_marker and not codes:
+        return True
+    return False
 
 
 def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal]:
@@ -262,7 +342,7 @@ def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal
         # that guard flows gracefully fall back to the unified wallet balances.
         if account_type and account_type.upper() != "UNIFIED":
             message = str(exc)
-            if _is_unsupported_wallet_account_type_error(message):
+            if _is_unsupported_wallet_account_type_error(exc):
                 log(
                     "wallet_balance_unsupported_account_type",
                     account_type=account_type,
