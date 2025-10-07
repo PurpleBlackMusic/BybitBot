@@ -3281,6 +3281,25 @@ class GuardianBot:
 
         return SignalExecutor(self, settings=self.settings)
 
+    def automation_loop(
+        self,
+        *,
+        poll_interval: float = 15.0,
+        success_cooldown: float = 120.0,
+        error_backoff: float = 5.0,
+    ):
+        """Return a continuous executor that keeps trading until stopped."""
+
+        from .signal_executor import AutomationLoop, SignalExecutor
+
+        executor = SignalExecutor(self, settings=self.settings)
+        return AutomationLoop(
+            executor,
+            poll_interval=poll_interval,
+            success_cooldown=success_cooldown,
+            error_backoff=error_backoff,
+        )
+
     # ------------------------------------------------------------------
     # conversation helpers
     @staticmethod

@@ -5,9 +5,10 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass
+import threading
 from typing import Dict, List, Optional, Tuple
 
-from .envs import Settings, get_api_client, get_settings
+from .envs import Settings, get_api_client, get_settings, creds_ok
 from .live_checks import extract_wallet_totals
 from .log import log
 from .spot_market import place_spot_market_with_tolerance
@@ -162,6 +163,30 @@ class SignalExecutor:
 
     # ------------------------------------------------------------------
     # helpers
+    def current_signature(self) -> Optional[str]:
+        """Return a stable identifier for the currently cached signal."""
+
+        fingerprint = getattr(self.bot, "status_fingerprint", None)
+        if callable(fingerprint):
+            try:
+                value = fingerprint()
+            except Exception:
+                return None
+            if value is None:
+                return None
+            if isinstance(value, str):
+                return value or None
+            return str(value)
+        return None
+
+    def settings_marker(self) -> Tuple[bool, bool, bool]:
+        """Return a tuple describing current automation toggles."""
+
+        settings = self._resolve_settings()
+        dry_run = bool(getattr(settings, "dry_run", True))
+        ai_enabled = bool(getattr(settings, "ai_enabled", False))
+        return dry_run, creds_ok(settings), ai_enabled
+
     def _fetch_summary(self) -> Dict[str, object]:
         summary = self.bot.status_summary()
         if isinstance(summary, dict):
@@ -333,4 +358,69 @@ class SignalExecutor:
                 base_factor = min(base_factor, 0.3)
 
         return max(0.2, min(base_factor, 1.0))
+
+
+class AutomationLoop:
+    """Keep executing trading signals until stopped explicitly."""
+
+    _SUCCESSFUL_STATUSES = {"filled", "dry_run", "skipped", "disabled"}
+
+    def __init__(
+        self,
+        executor: SignalExecutor,
+        *,
+        poll_interval: float = 15.0,
+        success_cooldown: float = 120.0,
+        error_backoff: float = 5.0,
+    ) -> None:
+        self.executor = executor
+        self.poll_interval = max(float(poll_interval), 0.0)
+        self.success_cooldown = max(float(success_cooldown), 0.0)
+        self.error_backoff = max(float(error_backoff), 0.0)
+        self._last_key: Optional[Tuple[Optional[str], Tuple[bool, bool, bool]]] = None
+        self._last_status: Optional[str] = None
+
+    def _should_execute(
+        self, signature: Optional[str], settings_marker: Tuple[bool, bool, bool]
+    ) -> bool:
+        key = (signature, settings_marker)
+        if self._last_key != key:
+            return True
+        if self._last_status not in self._SUCCESSFUL_STATUSES:
+            return True
+        return False
+
+    def _tick(self) -> float:
+        signature = self.executor.current_signature()
+        settings_marker = self.executor.settings_marker()
+        key = (signature, settings_marker)
+
+        if self._should_execute(signature, settings_marker):
+            try:
+                result = self.executor.execute_once()
+            except Exception as exc:  # pragma: no cover - defensive
+                log("guardian.auto.loop.error", err=str(exc))
+                self._last_status = "error"
+                self._last_key = key
+                return self.error_backoff or self.poll_interval or 1.0
+
+            self._last_status = result.status
+            self._last_key = key
+
+            if result.status in self._SUCCESSFUL_STATUSES:
+                return self.success_cooldown or self.poll_interval
+            if result.status == "error":
+                return self.error_backoff or self.poll_interval or 1.0
+
+        return self.poll_interval
+
+    def run(self, stop_event: Optional[threading.Event] = None) -> None:
+        """Process trading signals until ``stop_event`` is set."""
+
+        event = stop_event or threading.Event()
+        while not event.is_set():
+            delay = self._tick()
+            if delay <= 0:
+                continue
+            event.wait(delay)
 
