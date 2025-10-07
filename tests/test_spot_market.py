@@ -39,7 +39,11 @@ class DummyAPI:
         self.wallet_calls += 1
         if isinstance(self.wallet_payload, Exception):
             raise self.wallet_payload
-        return self.wallet_payload
+        payload = self.wallet_payload
+        if isinstance(payload, dict) and "result" not in payload:
+            lookup_key = (accountType or "").upper()
+            payload = payload.get(lookup_key, payload.get("default"))
+        return payload
 
 
 def setup_function(_):
@@ -268,6 +272,54 @@ def test_place_spot_market_allows_matching_quote_balance():
     assert response["ok"] is True
     assert api.place_calls
     assert api.wallet_calls >= 1
+
+
+def test_place_spot_market_uses_spot_wallet_when_unified_empty():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {"coin": [{"coin": "USDT", "availableBalance": "0"}]}
+                ]
+            }
+        },
+        "SPOT": {
+            "result": {
+                "list": [
+                    {"coin": [{"coin": "USDT", "availableBalance": "200"}]}
+                ]
+            }
+        },
+    }
+    api = DummyAPI(payload, wallet_payload=wallet_payload)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BBSOLUSDT",
+        side="Buy",
+        qty=10.0,
+        unit="quoteCoin",
+    )
+
+    assert response["ok"] is True
+    assert api.place_calls
+    # wallet is queried twice: once for UNIFIED and once for SPOT fallback
+    assert api.wallet_calls == 2
 
 
 def test_place_spot_market_accepts_prefetched_resources():

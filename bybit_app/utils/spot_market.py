@@ -245,12 +245,7 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     return price
 
 
-def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
-    key = account_type.upper() or "UNIFIED"
-    cached = _BALANCE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
+def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal]:
     try:
         payload = api.wallet_balance(accountType=account_type)
     except Exception as exc:  # pragma: no cover - network/runtime errors
@@ -284,8 +279,39 @@ def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> 
                             continue
                         balances[symbol] = balances.get(symbol, Decimal("0")) + available
 
-    _BALANCE_CACHE.set(key, balances)
     return balances
+
+
+def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
+    key = account_type.upper() or "UNIFIED"
+    cached = _BALANCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    primary_balances = _load_wallet_balances(api, account_type=key)
+
+    combined = dict(primary_balances)
+    # Users often keep spot funds on a dedicated SPOT account while trading
+    # through a unified account.  When the unified wallet response does not
+    # expose these assets we perform a transparent fallback to the SPOT
+    # account and merge the balances so the guard sees the available funds.
+    needs_fallback = False
+    if key in {"UNIFIED", "TRADE"}:
+        if not primary_balances:
+            needs_fallback = True
+        else:
+            needs_fallback = all(amount <= 0 for amount in primary_balances.values())
+    if needs_fallback:
+        spot_key = "SPOT"
+        spot_cached = _BALANCE_CACHE.get(spot_key)
+        if spot_cached is None:
+            spot_cached = _load_wallet_balances(api, account_type=spot_key)
+            _BALANCE_CACHE.set(spot_key, dict(spot_cached))
+        for asset, amount in (spot_cached or {}).items():
+            combined[asset] = combined.get(asset, Decimal("0")) + amount
+
+    _BALANCE_CACHE.set(key, combined)
+    return combined
 
 
 def _normalise_balances(balances: Mapping[str, object] | None) -> Dict[str, Decimal] | None:
