@@ -245,25 +245,30 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     return price
 
 
+def _is_unsupported_wallet_account_type_error(message: str) -> bool:
+    if not message:
+        return False
+    normalised = message.lower()
+    return "10001" in normalised and "accounttype only support unified" in normalised
+
+
 def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal]:
     try:
         payload = api.wallet_balance(accountType=account_type)
-    except RuntimeError as exc:
-        message = str(exc)
+    except Exception as exc:  # pragma: no cover - network/runtime errors
         # Bybit v5 no longer supports non-unified wallet lookups and returns
         # error 10001 when ``accountType`` is anything other than ``UNIFIED``.
         # Treat this as an empty response instead of surfacing an exception so
         # that guard flows gracefully fall back to the unified wallet balances.
         if account_type and account_type.upper() != "UNIFIED":
-            if "10001" in message and "accountType only support UNIFIED" in message:
+            message = str(exc)
+            if _is_unsupported_wallet_account_type_error(message):
                 log(
                     "wallet_balance_unsupported_account_type",
                     account_type=account_type,
                     error=message,
                 )
                 return {}
-        raise RuntimeError(f"Не удалось получить баланс кошелька: {exc}") from exc
-    except Exception as exc:  # pragma: no cover - network/runtime errors
         raise RuntimeError(f"Не удалось получить баланс кошелька: {exc}") from exc
 
     balances: Dict[str, Decimal] = {}
