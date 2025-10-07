@@ -4,16 +4,29 @@ import pytest
 
 import bybit_app.utils.signal_executor as signal_executor_module
 from bybit_app.utils.envs import Settings
-from bybit_app.utils.signal_executor import ExecutionResult, SignalExecutor
+from bybit_app.utils.signal_executor import (
+    AutomationLoop,
+    ExecutionResult,
+    SignalExecutor,
+)
 
 
 class StubBot:
-    def __init__(self, summary: dict, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        summary: dict,
+        settings: Settings | None = None,
+        fingerprint: str | None = None,
+    ) -> None:
         self._summary = summary
         self.settings = settings or Settings()
+        self._fingerprint = fingerprint
 
     def status_summary(self) -> dict:
         return copy.deepcopy(self._summary)
+
+    def status_fingerprint(self) -> str | None:
+        return self._fingerprint
 
 
 class StubAPI:
@@ -146,4 +159,143 @@ def test_signal_executor_scales_position_with_signal_strength(
     assert result.order["symbol"] == "ETHUSDT"
     assert result.order["notional_quote"] < 20.0
     assert result.order["notional_quote"] == pytest.approx(6.62, rel=1e-3)
+
+
+def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-1")
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "get_api_client",
+        lambda: StubAPI(total=1000.0, available=900.0),
+    )
+
+    executor = SignalExecutor(bot)
+
+    call_count = {"value": 0}
+
+    def fake_execute_once() -> ExecutionResult:
+        call_count["value"] += 1
+        return ExecutionResult(status="dry_run")
+
+    executor.execute_once = fake_execute_once  # type: ignore[assignment]
+
+    loop = AutomationLoop(executor, poll_interval=0.0, success_cooldown=0.0)
+
+    first_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert first_delay == 0.0
+
+    second_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert second_delay == 0.0
+
+    bot._fingerprint = "sig-2"
+    third_delay = loop._tick()
+    assert call_count["value"] == 2
+    assert third_delay == 0.0
+
+
+def test_automation_loop_retries_after_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-err")
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "get_api_client",
+        lambda: StubAPI(total=1000.0, available=900.0),
+    )
+
+    executor = SignalExecutor(bot)
+
+    call_count = {"value": 0}
+
+    def fake_execute_once() -> ExecutionResult:
+        call_count["value"] += 1
+        return ExecutionResult(status="error", reason="network")
+
+    executor.execute_once = fake_execute_once  # type: ignore[assignment]
+
+    loop = AutomationLoop(executor, poll_interval=0.0, success_cooldown=1.0, error_backoff=0.0)
+
+    loop._tick()
+    loop._tick()
+    assert call_count["value"] == 2
+
+
+def test_automation_loop_caches_skipped_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": False, "mode": "wait", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-skip")
+
+    executor = SignalExecutor(bot)
+
+    call_count = {"value": 0}
+
+    def fake_execute_once() -> ExecutionResult:
+        call_count["value"] += 1
+        return ExecutionResult(status="skipped", reason="not actionable")
+
+    executor.execute_once = fake_execute_once  # type: ignore[assignment]
+
+    loop = AutomationLoop(
+        executor,
+        poll_interval=3.5,
+        success_cooldown=1.0,
+        error_backoff=0.0,
+    )
+
+    first_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert first_delay == 1.0
+
+    second_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert second_delay == 3.5
+
+    bot._fingerprint = "sig-skip-new"
+    third_delay = loop._tick()
+    assert call_count["value"] == 2
+    assert third_delay == 1.0
+
+
+def test_automation_loop_reacts_to_ai_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=False, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-toggle")
+
+    executor = SignalExecutor(bot)
+
+    call_count = {"value": 0}
+
+    def fake_execute_once() -> ExecutionResult:
+        call_count["value"] += 1
+        if bot.settings.ai_enabled:
+            return ExecutionResult(status="dry_run")
+        return ExecutionResult(status="disabled", reason="AI disabled")
+
+    executor.execute_once = fake_execute_once  # type: ignore[assignment]
+
+    loop = AutomationLoop(
+        executor,
+        poll_interval=2.0,
+        success_cooldown=1.5,
+        error_backoff=0.0,
+    )
+
+    first_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert first_delay == 1.5
+
+    second_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert second_delay == 2.0
+
+    bot.settings.ai_enabled = True
+    third_delay = loop._tick()
+    assert call_count["value"] == 2
+    assert third_delay == 1.5
 
