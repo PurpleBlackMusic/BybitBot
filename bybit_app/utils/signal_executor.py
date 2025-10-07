@@ -106,9 +106,8 @@ class SignalExecutor:
             "total_equity": total_equity,
         }
 
-        slippage_pct = max(
-            float(getattr(settings, "ai_max_slippage_bps", 25) or 0.0) / 100.0, 0.01
-        )
+        raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 25)
+        slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
 
         if notional <= 0 or notional < min_notional:
             order_context["min_notional"] = min_notional

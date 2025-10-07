@@ -560,7 +560,7 @@ def prepare_spot_trade_snapshot(
 def _resolve_slippage_tolerance(
     tol_type: str | None,
     tol_value: object,
-) -> tuple[Decimal, str, str]:
+) -> tuple[Decimal, str, str, Decimal]:
     """Normalise slippage tolerance inputs for request and balance guards."""
 
     auto_type: str | None = None
@@ -605,7 +605,7 @@ def _resolve_slippage_tolerance(
         "f",
     )
 
-    return multiplier, request_type, request_value
+    return multiplier, request_type, request_value, tolerance_decimal
 
 
 def place_spot_market_with_tolerance(
@@ -687,7 +687,12 @@ def place_spot_market_with_tolerance(
         qty_value = base_qty
         market_unit = "baseCoin"
 
-    tolerance_multiplier, tolerance_type, tolerance_value = _resolve_slippage_tolerance(
+    (
+        tolerance_multiplier,
+        tolerance_type,
+        tolerance_value,
+        tolerance_decimal,
+    ) = _resolve_slippage_tolerance(
         tol_type,
         tol_value,
     )
@@ -761,10 +766,12 @@ def place_spot_market_with_tolerance(
         "orderType": "Market",
         "qty": qty_text,
         "marketUnit": market_unit,  # "baseCoin" или "quoteCoin"
-        "slippageToleranceType": tolerance_type,
-        "slippageTolerance": tolerance_value,
         "accountType": "UNIFIED",
     }
+
+    if tolerance_multiplier > Decimal("1") and tolerance_decimal > Decimal("0"):
+        body["slippageToleranceType"] = tolerance_type
+        body["slippageTolerance"] = tolerance_value
 
     response = api.place_order(**body)
     log(

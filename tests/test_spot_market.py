@@ -92,6 +92,37 @@ def test_place_spot_market_enforces_min_notional():
     assert api.info_calls == 1
 
 
+def test_place_spot_market_omits_slippage_when_zero_tolerance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.01",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="ETHUSDT",
+        side="Buy",
+        qty=10.0,
+        unit="quoteCoin",
+        tol_value=0,
+    )
+
+    assert response["ok"] is True
+    placed = api.place_calls[0]
+    assert "slippageTolerance" not in placed
+    assert "slippageToleranceType" not in placed
+
+
 def test_wallet_available_balances_use_wallet_balance_when_withdraw_zero():
     wallet_payload = {
         "result": {
