@@ -44,6 +44,7 @@ class Settings:
     ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
+    ai_live_only: bool = True
     # трейдинг параметры
     ai_max_slippage_bps: int = 25
     ai_fee_bps: float = 5.0
@@ -117,6 +118,7 @@ _ENV_MAP = {
     "ai_blacklist": "AI_BLACKLIST",
     "ai_interval": "AI_INTERVAL",
     "ai_horizon_bars": "AI_HORIZON_BARS",
+    "ai_live_only": "AI_LIVE_ONLY",
     "ai_max_slippage_bps": "AI_MAX_SLIPPAGE_BPS",
     "ai_fee_bps": "AI_FEE_BPS",
     "ai_slippage_bps": "AI_SLIPPAGE_BPS",
@@ -194,6 +196,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
 
     m["ai_enabled"] = _cast_bool(m.get("ai_enabled"))
     m["ai_horizon_bars"] = _cast_int(m.get("ai_horizon_bars"))
+    m["ai_live_only"] = _cast_bool(m.get("ai_live_only"))
     m["ai_max_slippage_bps"] = _cast_int(m.get("ai_max_slippage_bps"))
     m["ai_fee_bps"] = _cast_float(m.get("ai_fee_bps"))
     m["ai_buy_threshold"] = _cast_float(m.get("ai_buy_threshold"))

@@ -19,9 +19,15 @@ from bybit_app.utils.envs import Settings
 from bybit_app.utils.guardian_bot import GuardianBot
 
 
-def _make_bot(tmp_path: Path, settings: Settings | None = None) -> GuardianBot:
-    settings = settings or Settings()
+def _make_bot(
+    tmp_path: Path,
+    settings: Settings | None = None,
+    *,
+    live_only: bool = False,
+) -> GuardianBot:
+    settings = settings or Settings(ai_live_only=False)
     settings.ai_market_scan_enabled = False
+    settings.ai_live_only = live_only
     return GuardianBot(data_dir=tmp_path, settings=settings)
 
 
@@ -49,7 +55,7 @@ def test_guardian_brief_buy_signal(tmp_path: Path) -> None:
 
     bot = _make_bot(
         tmp_path,
-        Settings(ai_symbols="ETHUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
+        Settings(ai_live_only=False, ai_symbols="ETHUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
     )
     brief = bot.generate_brief()
     assert brief.mode == "buy"
@@ -71,7 +77,7 @@ def test_guardian_brief_prefers_status_symbol(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    bot = _make_bot(tmp_path, Settings(ai_symbols=""))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_symbols=""))
     brief = bot.generate_brief()
 
     assert brief.symbol == "SOLUSDT"
@@ -161,7 +167,7 @@ def test_guardian_respects_custom_buy_threshold(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT",
         ai_buy_threshold=0.4,
         ai_min_ev_bps=10.0,
@@ -223,7 +229,7 @@ def test_guardian_summary_reports_effective_thresholds(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT",
         ai_buy_threshold=0.4,
         ai_sell_threshold=0.8,
@@ -279,7 +285,7 @@ def test_guardian_summary_highlights_ev_shortfall(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=12.0,
@@ -307,7 +313,7 @@ def test_guardian_summary_highlights_sell_threshold(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT",
         ai_buy_threshold=0.6,
         ai_sell_threshold=0.5,
@@ -336,7 +342,7 @@ def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=5.0,
@@ -370,7 +376,7 @@ def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = _make_bot(tmp_path, Settings(ai_enabled=True, ai_symbols="BTCUSDT"))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_enabled=True, ai_symbols="BTCUSDT"))
     summary = bot.status_summary()
 
     assert summary["operation_mode"] == "auto"
@@ -378,7 +384,7 @@ def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
 
 
 def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_enabled=True,
         ai_symbols="BTCUSDT, ETHUSDT",
         ai_buy_threshold=0.62,
@@ -407,7 +413,7 @@ def test_guardian_settings_answer_highlights_thresholds(tmp_path: Path) -> None:
 
 
 def test_guardian_settings_answer_explains_safe_mode(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_enabled=False,
         dry_run=True,
         testnet=True,
@@ -426,7 +432,7 @@ def test_guardian_settings_answer_explains_safe_mode(tmp_path: Path) -> None:
 
 
 def test_guardian_plan_and_risk_summary(tmp_path: Path) -> None:
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         dry_run=False,
         spot_cash_reserve_pct=15.0,
         ai_risk_per_trade_pct=0.75,
@@ -799,7 +805,7 @@ def test_guardian_answer_exposure_summary(tmp_path: Path) -> None:
 
 
 def test_guardian_answer_exposure_when_empty(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path, Settings(spot_cash_reserve_pct=25.0, ai_risk_per_trade_pct=1.2))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, spot_cash_reserve_pct=25.0, ai_risk_per_trade_pct=1.2))
     reply = bot.answer("что с загрузкой капитала?")
 
     lowered = reply.lower()
@@ -869,7 +875,7 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
 
 
 def test_guardian_data_health_highlights_disabled_ai(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path, Settings(ai_enabled=False))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_enabled=False))
     health = bot.data_health()
 
     automation = health["automation"]
@@ -988,7 +994,7 @@ def test_guardian_signal_quality_answer(tmp_path: Path) -> None:
 
     bot = _make_bot(
         tmp_path,
-        Settings(
+        Settings(ai_live_only=False, 
             ai_buy_threshold=0.65,
             ai_sell_threshold=0.35,
             ai_min_ev_bps=12.0,
@@ -1021,7 +1027,7 @@ def test_guardian_update_answer_reports_freshness(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    bot = _make_bot(tmp_path, Settings(ai_retrain_minutes=45))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_retrain_minutes=45))
     reply = bot.answer("когда обновлялся сигнал?")
 
     assert "AI сигнал обновился" in reply
@@ -1138,7 +1144,7 @@ def test_guardian_brief_selects_best_watchlist_symbol(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT,ETHUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=10.0,
@@ -1172,7 +1178,7 @@ def test_guardian_watchlist_skips_neutral_leaders(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="BTCUSDT,ETHUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=10.0,
@@ -1223,7 +1229,7 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="ADAUSDT,LTCUSDT,XRPUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=10.0,
@@ -1406,7 +1412,7 @@ def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
     }
     snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
@@ -1464,7 +1470,7 @@ def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None
     }
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
@@ -1516,7 +1522,7 @@ def test_guardian_market_scan_respects_lists(tmp_path: Path) -> None:
     }
     snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
@@ -1567,7 +1573,7 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_buy_threshold=0.55,
         ai_sell_threshold=0.45,
         ai_min_ev_bps=10.0,
@@ -1689,7 +1695,7 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
         for event in events:
             fh.write(json.dumps(event) + "\n")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="SOLUSDT",
         ai_max_concurrent=1,
         ai_enabled=True,
@@ -1904,7 +1910,7 @@ def test_guardian_dynamic_symbols_fallbacks_to_status_symbol(tmp_path: Path) -> 
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(ai_enabled=True, ai_symbols="ETHUSDT")
+    settings = Settings(ai_live_only=False, ai_enabled=True, ai_symbols="ETHUSDT")
     bot = _make_bot(tmp_path, settings)
 
     summary = bot.status_summary()
@@ -1943,7 +1949,7 @@ def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="SOLUSDT,XRPUSDT,DOGEUSDT",
         ai_buy_threshold=0.6,
         ai_sell_threshold=0.45,
@@ -2000,7 +2006,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(
+    settings = Settings(ai_live_only=False, 
         ai_symbols="ETHUSDT",
         ai_buy_threshold=0.7,
         ai_sell_threshold=0.4,
@@ -2286,7 +2292,7 @@ def test_guardian_replaces_demo_with_live_signal(tmp_path: Path, monkeypatch) ->
 
     monkeypatch.setattr(guardian_bot_module, "LiveSignalFetcher", DummyFetcher)
 
-    bot = _make_bot(tmp_path, Settings(ai_enabled=True))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_enabled=True))
     summary = bot.status_summary()
 
     assert summary["symbol"] == "LTCUSDT"
@@ -2307,7 +2313,7 @@ def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    bot = _make_bot(tmp_path, Settings(ai_buy_threshold=0.6, ai_min_ev_bps=10.0))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_buy_threshold=0.6, ai_min_ev_bps=10.0))
     summary = bot.status_summary()
 
     assert summary["actionable"] is False
@@ -2358,7 +2364,7 @@ def test_guardian_status_refreshes_stale_signal_with_live_fetch(
 
     bot = _make_bot(
         tmp_path,
-        Settings(ai_enabled=True, ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
+        Settings(ai_live_only=False, ai_enabled=True, ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
     )
     summary = bot.status_summary()
 
@@ -2368,6 +2374,77 @@ def test_guardian_status_refreshes_stale_signal_with_live_fetch(
     assert not any(
         "устар" in str(reason).lower() for reason in summary["actionable_reasons"]
     )
+
+
+def test_guardian_live_only_prefers_live_feed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    stale_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.9,
+        "ev_bps": 40.0,
+        "side": "buy",
+        "last_tick_ts": time.time() - 60.0,
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(stale_status), encoding="utf-8")
+
+    live_payload = {
+        "symbol": "XRPUSDT",
+        "probability": 0.7,
+        "ev_bps": 28.0,
+        "side": "sell",
+        "last_tick_ts": time.time(),
+        "analysis": "Live feed",  # ensure dict copy
+    }
+
+    class DummyFetcher:
+        def __init__(self, *_, **__):
+            pass
+
+        def fetch(self) -> Dict[str, object]:
+            return copy.deepcopy(live_payload)
+
+    monkeypatch.setattr(guardian_bot_module, "LiveSignalFetcher", DummyFetcher)
+
+    bot = _make_bot(tmp_path, live_only=True)
+    summary = bot.status_summary()
+
+    assert summary["symbol"] == "XRPUSDT"
+    assert summary["status_source"] == "live"
+    assert summary["fallback_used"] is False
+
+
+def test_guardian_live_only_returns_empty_when_feed_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    demo_payload = {
+        "symbol": "ETHUSDT",
+        "probability": 0.85,
+        "ev_bps": 35.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path.write_text(json.dumps(demo_payload), encoding="utf-8")
+
+    class EmptyFetcher:
+        def __init__(self, *_, **__):
+            pass
+
+        def fetch(self) -> Dict[str, object]:
+            return {}
+
+    monkeypatch.setattr(guardian_bot_module, "LiveSignalFetcher", EmptyFetcher)
+
+    bot = _make_bot(tmp_path, live_only=True)
+    summary = bot.status_summary()
+
+    assert summary["status_source"] == "missing"
+    assert summary["symbol"] != "ETHUSDT"
+    assert summary["fallback_used"] is False
+    assert summary["actionable"] is False
+    assert summary.get("watchlist_total", 0) == 0
 
 
 def test_guardian_trade_statistics(tmp_path: Path) -> None:
@@ -2459,7 +2536,7 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
         },
     )
 
-    bot = _make_bot(tmp_path, Settings(api_key="k", api_secret="s"))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     bot.generate_brief()
     health = bot.data_health()
 
@@ -2505,7 +2582,7 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = _make_bot(tmp_path, Settings(api_key="k", api_secret="s"))
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     report = bot.unified_report()
 
     assert report["brief"]["symbol"] == "BTCUSDT"
@@ -2566,7 +2643,7 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = CountingGuardianBot(data_dir=tmp_path, settings=Settings(ai_market_scan_enabled=False))
+    bot = CountingGuardianBot(data_dir=tmp_path, settings=Settings(ai_live_only=False, ai_market_scan_enabled=False))
     first_report = bot.unified_report()
     assert first_report["statistics"]["trades"] == 1
     assert bot.load_calls == 1

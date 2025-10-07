@@ -48,7 +48,7 @@ def test_live_signal_fetcher_reuses_cache_within_ttl(
     monkeypatch.setattr(live_signal_module, "scan_market_opportunities", fake_scan)
 
     fetcher = LiveSignalFetcher(
-        settings=Settings(ai_min_ev_bps=10.0), data_dir=tmp_path, cache_ttl=30.0
+        settings=Settings(ai_live_only=False, ai_min_ev_bps=10.0), data_dir=tmp_path, cache_ttl=30.0
     )
 
     first = fetcher.fetch()
@@ -75,7 +75,7 @@ def test_live_signal_fetcher_serves_stale_cache_on_failure(
     monkeypatch.setattr(live_signal_module, "scan_market_opportunities", first_scan)
 
     fetcher = LiveSignalFetcher(
-        settings=Settings(ai_min_ev_bps=8.0),
+        settings=Settings(ai_live_only=False, ai_min_ev_bps=8.0),
         data_dir=tmp_path,
         cache_ttl=20.0,
     )
@@ -94,3 +94,32 @@ def test_live_signal_fetcher_serves_stale_cache_on_failure(
 
     assert call_order == ["first", "fail"]
     assert fallback == initial
+
+
+def test_live_signal_fetcher_live_only_disables_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    clock = Clock(start=3_000.0)
+    monkeypatch.setattr(live_signal_module, "time", clock)
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    calls = {"count": 0}
+
+    def fake_scan(api, **kwargs):
+        calls["count"] += 1
+        symbol = "SOLUSDT" if calls["count"] == 1 else "DOGEUSDT"
+        return [_make_opportunity(symbol)]
+
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", fake_scan)
+
+    fetcher = LiveSignalFetcher(
+        settings=Settings(ai_live_only=True, ai_min_ev_bps=5.0), data_dir=tmp_path, cache_ttl=45.0
+    )
+
+    first = fetcher.fetch()
+    clock.advance(5.0)
+    second = fetcher.fetch()
+
+    assert calls["count"] == 2
+    assert first["symbol"] == "SOLUSDT"
+    assert second["symbol"] == "DOGEUSDT"
