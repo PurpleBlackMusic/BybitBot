@@ -3265,6 +3265,17 @@ class GuardianBot:
         snapshot = self._get_snapshot()
         return self._copy_dict(snapshot.status_summary)
 
+    def status_fingerprint(self) -> Optional[str]:
+        """Return a stable identifier for the currently cached signal."""
+
+        snapshot = self._get_snapshot()
+        signature = getattr(snapshot, "status_signature", None)
+        if isinstance(signature, tuple):
+            return ":".join(str(part) for part in signature)
+        if signature is None:
+            return None
+        return str(signature)
+
     def auto_executor(self):  # pragma: no cover - simple factory wrapper
         from .signal_executor import SignalExecutor
 

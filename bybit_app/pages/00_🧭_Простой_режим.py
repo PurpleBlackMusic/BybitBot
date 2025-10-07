@@ -3,11 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import copy
+import math
 
 import pandas as pd
 import streamlit as st
 
 from utils.guardian_bot import GuardianBot
+from utils.envs import creds_ok
 from utils.ui import rerun
 
 
@@ -210,6 +212,36 @@ def _recovery_steps(
     return steps
 
 
+def _format_order_caption(order: dict[str, object]) -> str:
+    symbol = str(order.get("symbol") or "—")
+    side = str(order.get("side") or "—")
+
+    notional_value = order.get("notional_quote")
+    amount_text = "—"
+    try:
+        amount = float(notional_value)
+    except (TypeError, ValueError):
+        amount = None
+    if amount is not None and math.isfinite(amount):
+        if abs(amount) >= 100000:
+            amount_text = f"{amount:,.0f} USDT".replace(",", " ")
+        else:
+            amount_text = f"{amount:,.2f} USDT".replace(",", " ")
+    elif notional_value not in (None, ""):
+        amount_text = str(notional_value)
+
+    slippage_value = order.get("slippage_percent")
+    slippage_text = ""
+    try:
+        slip = float(slippage_value)
+    except (TypeError, ValueError):
+        slip = None
+    if slip is not None and slip > 0:
+        slippage_text = f" · Допуск ±{slip:.2f}%"
+
+    return f"{symbol} · {side} · Нотионал {amount_text}{slippage_text}"
+
+
 st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
 
 
@@ -242,6 +274,80 @@ recent_trades = bot.recent_trades()
 trade_stats = bot.trade_statistics()
 health = bot.data_health()
 automation_health = health.get("automation") or {}
+
+if "automation_execution" not in st.session_state or not isinstance(
+    st.session_state.get("automation_execution"), dict
+):
+    st.session_state["automation_execution"] = {}
+
+automation_state: dict[str, object] = st.session_state["automation_execution"]
+settings = bot.settings
+signal_fingerprint = bot.status_fingerprint()
+settings_marker = (
+    bool(getattr(settings, "dry_run", True)),
+    creds_ok(settings),
+)
+
+should_attempt_execution = (
+    bool(automation_health.get("ok"))
+    and bool(summary.get("actionable"))
+    and bool(getattr(settings, "ai_enabled", False))
+    and signal_fingerprint is not None
+)
+
+execution_feedback: dict[str, object] | None = None
+
+if signal_fingerprint is not None and automation_state.get("signature") == signal_fingerprint:
+    stored_result = automation_state.get("result")
+    if isinstance(stored_result, dict):
+        execution_feedback = stored_result
+
+if should_attempt_execution:
+    last_signature = automation_state.get("signature")
+    last_marker = automation_state.get("settings_marker")
+
+    need_attempt = (
+        last_signature != signal_fingerprint or last_marker != settings_marker
+    )
+
+    if need_attempt:
+        if not settings_marker[0] and not settings_marker[1]:
+            execution_feedback = {
+                "status": "error",
+                "reason": (
+                    "API ключи не заданы — добавьте ключи в настройках или включите тренировочный режим (dry_run)."
+                ),
+            }
+        else:
+            try:
+                executor = bot.auto_executor()
+                result = executor.execute_once()
+            except Exception as exc:  # pragma: no cover - defensive UI guard
+                execution_feedback = {
+                    "status": "error",
+                    "reason": f"Не удалось выполнить авто-ордер: {exc}",
+                }
+            else:
+                execution_feedback = {"status": result.status}
+                if result.reason:
+                    execution_feedback["reason"] = result.reason
+                if result.order is not None:
+                    execution_feedback["order"] = result.order
+                if result.response is not None:
+                    execution_feedback["response"] = result.response
+                if result.context is not None:
+                    execution_feedback.setdefault("context", result.context)
+
+        automation_state["signature"] = signal_fingerprint
+        automation_state["settings_marker"] = settings_marker
+        automation_state["result"] = execution_feedback or {}
+
+else:
+    # reset cached execution if signal changed
+    if automation_state.get("signature") != signal_fingerprint:
+        automation_state.pop("result", None)
+        automation_state.pop("signature", None)
+        automation_state.pop("settings_marker", None)
 
 previous_summary = st.session_state.get("previous_summary")
 previous_readiness = st.session_state.get("previous_readiness")
@@ -374,6 +480,39 @@ with st.container(border=True):
         st.markdown("\n".join(f"• {reason}" for reason in reasons))
     elif not reasons and not automation_ok:
         st.caption("AI ожидает подходящий сигнал для безопасного входа.")
+
+    if execution_feedback:
+        status = str(execution_feedback.get("status") or "")
+        reason_text = execution_feedback.get("reason")
+        order_info: dict[str, object] | None = None
+        candidate_order = execution_feedback.get("order")
+        if isinstance(candidate_order, dict):
+            order_info = candidate_order
+        else:
+            context_candidate = execution_feedback.get("context")
+            if isinstance(context_candidate, dict):
+                order_info = context_candidate
+
+        caption_text = _format_order_caption(order_info) if order_info else None
+
+        if status == "filled":
+            st.success(reason_text or "Ордер отправлен автоматически.")
+        elif status == "dry_run":
+            st.info(reason_text or "Dry-run: бот просчитал сделку без отправки ордера.")
+        elif status == "error":
+            st.error(reason_text or "Автоматическое исполнение завершилось ошибкой.")
+        elif status in {"disabled", "skipped"}:
+            st.info(reason_text or "Условия не позволили выполнить сделку автоматически.")
+        elif reason_text:
+            st.caption(reason_text)
+
+        if caption_text:
+            st.caption(caption_text)
+
+        if status == "dry_run" and settings_marker[0]:
+            st.caption(
+                "Режим dry_run активен: сделки не отправляются на биржу, но параметры логируются."
+            )
 
 readiness_checks = []
 staleness_state = (staleness.get("state") or "").lower()
