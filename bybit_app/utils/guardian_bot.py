@@ -25,7 +25,7 @@ from .trade_analytics import (
     normalise_execution_payload,
 )
 from .spot_pnl import spot_inventory_and_pnl
-from .live_checks import bybit_realtime_status
+from .live_checks import api_key_status, bybit_realtime_status
 from .live_signal import LiveSignalError, LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
 
@@ -3158,15 +3158,11 @@ class GuardianBot:
             )
 
         settings = self.settings
-        has_keys = bool(settings.api_key and settings.api_secret)
-        if has_keys:
-            api_message = "API ключи подключены — можно переходить в боевой режим."
-        else:
-            api_message = "API ключи не заданы — бот работает в учебном режиме."
-        api_details = (
-            f"Сеть: {'Testnet' if settings.testnet else 'Mainnet'} · "
-            f"Режим: {'DRY-RUN' if settings.dry_run else 'Live'}"
-        )
+        api_info = api_key_status(settings)
+        has_keys = bool(api_info.get("ok"))
+        api_message = str(api_info.get("message") or "")
+        api_details = api_info.get("details")
+        api_title = str(api_info.get("title") or "Подключение API")
 
         automation_enabled = bool(getattr(settings, "ai_enabled", False))
         actionable = bool(summary.get("actionable"))
@@ -3225,7 +3221,7 @@ class GuardianBot:
                 "last_trade_at": stats.get("last_trade_at"),
             },
             "api_keys": {
-                "title": "Подключение API",
+                "title": api_title,
                 "ok": has_keys,
                 "message": api_message,
                 "details": api_details,

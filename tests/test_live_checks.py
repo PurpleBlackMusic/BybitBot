@@ -4,7 +4,7 @@ import pytest
 
 from bybit_app.utils.envs import Settings
 from bybit_app.utils import live_checks
-from bybit_app.utils.live_checks import bybit_realtime_status
+from bybit_app.utils.live_checks import api_key_status, bybit_realtime_status
 
 
 class DummyAPI:
@@ -39,6 +39,56 @@ class DummyAPI:
         if self.server_time_payload is None:
             return {"result": {"timeSecond": str(live_checks.time.time())}}
         return self.server_time_payload
+
+
+def test_api_key_status_requires_credentials() -> None:
+    settings = Settings()
+    result = api_key_status(settings)
+    assert result["ok"] is False
+    assert "не заданы" in result["message"]
+
+
+def test_api_key_status_success() -> None:
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "totalEquity": "123.45",
+                    "availableBalance": "100.0",
+                    "availableToWithdraw": "90.0",
+                }
+            ]
+        }
+    }
+
+    class WalletOnlyAPI:
+        def wallet_balance(self):  # pragma: no cover - trivial proxy
+            return wallet_payload
+
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False, testnet=False)
+    result = api_key_status(settings, api=WalletOnlyAPI())
+
+    assert result["ok"] is True
+    assert "подтвердил" in result["message"].lower()
+    assert result["details"]["balance_total"] == pytest.approx(123.45)
+    assert result["details"]["balance_available"] == pytest.approx(100.0)
+    assert result["details"]["balance_withdrawable"] == pytest.approx(90.0)
+    assert result["details"]["network"] == "Mainnet"
+    assert result["details"]["mode"] == "Live"
+
+
+def test_api_key_status_handles_errors() -> None:
+    class FailingAPI:
+        def wallet_balance(self):  # pragma: no cover - trivial proxy
+            raise RuntimeError("permission denied")
+
+    settings = Settings(api_key="key", api_secret="secret", dry_run=True, testnet=True)
+    result = api_key_status(settings, api=FailingAPI())
+
+    assert result["ok"] is False
+    assert "отклонил" in result["message"].lower()
+    assert result["details"]["error"] == "permission denied"
+    assert result["details"]["mode"] == "DRY-RUN"
 
 
 @pytest.mark.parametrize(
