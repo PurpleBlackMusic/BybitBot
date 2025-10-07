@@ -58,7 +58,7 @@ class WSPrivateV5:
             if topics:
                 self._topics = tuple(topics)
                 ws = self._ws
-                if ws is not None:
+                if ws is not None and self._is_socket_connected(ws):
                     try:
                         ws.send(json.dumps({"op": "subscribe", "args": topics}))
                     except Exception as exc:
@@ -170,6 +170,18 @@ class WSPrivateV5:
         self._thread = thread
         thread.start()
         return True
+
+    def _is_socket_connected(self, ws: Any) -> bool:
+        """Return True if the websocket has an active socket."""
+
+        if ws is None:
+            return False
+
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return False
+
+        return bool(getattr(sock, "connected", False))
 
     def stop(self) -> None:
         self._stop = True
