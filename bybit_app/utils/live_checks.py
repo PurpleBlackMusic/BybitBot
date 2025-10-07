@@ -52,17 +52,24 @@ _COIN_AVAILABLE_FIELDS: Tuple[str, ...] = (
     "availableFunds",
 )
 
+_WITHDRAWABLE_FIELDS: Tuple[str, ...] = (
+    "availableToWithdraw",
+    "withdrawable",
+    "withdrawableBalance",
+    "availableWithdrawAmount",
+)
+
 
 def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, float]:
     """Return total equity, tradable balance and withdrawable funds."""
 
     result = payload.get("result")
     if not isinstance(result, dict):
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     accounts = result.get("list")
     if not isinstance(accounts, Iterable):
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     total = 0.0
     tradable = 0.0
@@ -136,6 +143,114 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, fl
             tradable += available_val
         withdrawable += withdrawable_val
     return total, tradable, withdrawable
+
+
+def _extract_wallet_withdrawable(payload: Dict[str, object]) -> Optional[float]:
+    """Return explicit withdrawable balance when the API provides it."""
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+
+    accounts = result.get("list")
+    if not isinstance(accounts, Iterable):
+        return None
+
+    total = 0.0
+    found = False
+
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+
+        account_withdrawable = _first_numeric(account, _WITHDRAWABLE_FIELDS)
+        if account_withdrawable is not None:
+            total += account_withdrawable
+            found = True
+            continue
+
+        coins_source = account.get("coin") or account.get("coins")
+        if not isinstance(coins_source, Iterable) or isinstance(coins_source, (str, bytes)):
+            continue
+
+        for row in coins_source:
+            if not isinstance(row, dict):
+                continue
+            row_withdrawable = _first_numeric(row, _WITHDRAWABLE_FIELDS)
+            if row_withdrawable is None:
+                continue
+            total += row_withdrawable
+            found = True
+
+    if not found:
+        return None
+    return total
+
+
+def api_key_status(
+    settings: Settings,
+    api: Optional[BybitAPI] = None,
+) -> Dict[str, object]:
+    """Validate that private Bybit endpoints accept the configured credentials."""
+
+    title = "Подключение API"
+    api_key = getattr(settings, "api_key", "") or ""
+    api_secret = getattr(settings, "api_secret", "") or ""
+    network = "Testnet" if getattr(settings, "testnet", True) else "Mainnet"
+    mode = "DRY-RUN" if getattr(settings, "dry_run", True) else "Live"
+    base_details: Dict[str, object] = {"network": network, "mode": mode}
+
+    if not api_key or not api_secret:
+        return {
+            "title": title,
+            "ok": False,
+            "message": "API ключи не заданы — бот работает в учебном режиме.",
+            "details": base_details,
+        }
+
+    client: BybitAPI
+    if api is None:
+        client = get_api(
+            creds_from_settings(settings),
+            recv_window=int(getattr(settings, "recv_window_ms", 5000) or 5000),
+            timeout=int(getattr(settings, "http_timeout_ms", 10000) or 10000),
+            verify_ssl=bool(getattr(settings, "verify_ssl", True)),
+        )
+    else:
+        client = api
+
+    try:
+        wallet_payload = client.wallet_balance()
+    except Exception as exc:  # pragma: no cover - network errors only in production
+        error_text = str(exc) or exc.__class__.__name__
+        return {
+            "title": title,
+            "ok": False,
+            "message": "Bybit отклонил запрос с указанными API ключами.",
+            "details": {**base_details, "error": error_text},
+        }
+
+    total, tradable, withdrawable = _extract_wallet_totals(wallet_payload)
+    withdrawable_override = _extract_wallet_withdrawable(wallet_payload)
+    details = {
+        **base_details,
+        "balance_total": round(total, 4),
+        "balance_available": round(tradable, 4),
+        "balance_withdrawable": round(
+            withdrawable_override if withdrawable_override is not None else withdrawable, 4
+        ),
+    }
+
+    message = "Bybit подтвердил ключ — частные запросы работают."
+    if mode == "DRY-RUN":
+        message = f"{message} DRY-RUN активен."
+
+    return {
+        "title": title,
+        "ok": True,
+        "message": message,
+        "details": details,
+    }
 
 
 def extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:

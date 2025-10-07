@@ -2598,6 +2598,17 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
         },
     )
 
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "api_key_status",
+        lambda _settings: {
+            "title": "API",
+            "ok": True,
+            "message": "Ключ проверен",
+            "details": {"network": "Testnet", "mode": "Live"},
+        },
+    )
+
     bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     bot.generate_brief()
     health = bot.data_health()
@@ -2644,8 +2655,32 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "api_key_status",
+        lambda _settings: {
+            "title": "API",
+            "ok": True,
+            "message": "Ключ проверен",
+            "details": {"network": "Testnet", "mode": "Live"},
+        },
+    )
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "bybit_realtime_status",
+        lambda _settings: {
+            "title": "RT",
+            "ok": True,
+            "message": "Биржа отвечает",
+            "details": "stub",
+        },
+    )
+
     bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     report = bot.unified_report()
+
+    monkeypatch.undo()
 
     assert report["brief"]["symbol"] == "BTCUSDT"
     assert isinstance(report["portfolio"], dict)
