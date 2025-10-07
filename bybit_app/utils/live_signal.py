@@ -62,14 +62,23 @@ class LiveSignalFetcher:
     ) -> None:
         self._settings: Optional[Settings] = settings
         self.data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
-        self.cache_ttl = max(float(cache_ttl), 0.0)
+        self.live_only = bool(getattr(settings, "ai_live_only", False)) if settings else False
+        base_ttl = max(float(cache_ttl), 0.0)
+        if self.live_only:
+            self.cache_ttl = 0.0
+        else:
+            self.cache_ttl = base_ttl
         if stale_grace is None:
             # allow a wider reuse window for previously good payloads in case the
             # scanner temporarily fails — never smaller than 15 seconds to avoid
             # aggressive churn when cache_ttl is tiny.
-            self.stale_grace = max(self.cache_ttl * 2.0, 15.0)
+            if self.live_only:
+                self.stale_grace = 0.0
+            else:
+                self.stale_grace = max(self.cache_ttl * 2.0, 15.0)
         else:
-            self.stale_grace = max(float(stale_grace), 0.0)
+            grace = max(float(stale_grace), 0.0)
+            self.stale_grace = 0.0 if self.live_only else grace
         self._cached_status: Optional[Dict[str, object]] = None
         self._cache_timestamp: float = 0.0
 
@@ -97,7 +106,11 @@ class LiveSignalFetcher:
 
         opportunities = self._scan_market(settings, api)
         if not opportunities:
-            if self._cached_status is not None and self.stale_grace > 0:
+            if (
+                self._cached_status is not None
+                and self.stale_grace > 0
+                and not self.live_only
+            ):
                 if now - self._cache_timestamp <= self.stale_grace:
                     return copy.deepcopy(self._cached_status)
             return {}
@@ -157,6 +170,7 @@ class LiveSignalFetcher:
                 max_spread_bps=max_spread if max_spread > 0 else 50.0,
                 whitelist=whitelist or (),
                 blacklist=blacklist or (),
+                cache_ttl=0.0 if self.live_only else None,
             )
         except Exception:
             return []

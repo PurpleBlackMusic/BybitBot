@@ -353,6 +353,7 @@ class GuardianBot:
         read_error: Optional[str] = None
         content_hash: Optional[int] = prefetched_hash
         status_source: str = "missing"
+        live_only = bool(getattr(self.settings, "ai_live_only", False))
 
         def _decode_and_parse(data: bytes) -> Dict[str, object]:
             nonlocal read_error, content_hash
@@ -382,58 +383,59 @@ class GuardianBot:
             read_error = f"status payload is {type(parsed).__name__}, expected dict"
             return {}
 
-        if prefetched is not None:
-            data = prefetched
-            if content_hash is None:
-                content_hash = self._hash_bytes(data)
-            raw = _decode_and_parse(data)
-            if raw:
-                status_source = "file"
-        elif path.exists():
-            attempts = 0
-            max_attempts = 3
-            delay = 0.05
-            while attempts < max_attempts:
-                attempts += 1
-                try:
-                    data = path.read_bytes()
-                except OSError as exc:
-                    read_error = str(exc)
-                    data = b""
-
-                if not data.strip():
-                    if attempts < max_attempts:
-                        time.sleep(delay * attempts)
-                        continue
-                    if read_error is None:
-                        read_error = "status file is empty"
-                    break
-
-                content_hash = self._hash_bytes(data)
+        if not live_only:
+            if prefetched is not None:
+                data = prefetched
+                if content_hash is None:
+                    content_hash = self._hash_bytes(data)
                 raw = _decode_and_parse(data)
                 if raw:
                     status_source = "file"
-                    break
+            elif path.exists():
+                attempts = 0
+                max_attempts = 3
+                delay = 0.05
+                while attempts < max_attempts:
+                    attempts += 1
+                    try:
+                        data = path.read_bytes()
+                    except OSError as exc:
+                        read_error = str(exc)
+                        data = b""
 
-                if attempts < max_attempts:
-                    time.sleep(delay * attempts)
+                    if not data.strip():
+                        if attempts < max_attempts:
+                            time.sleep(delay * attempts)
+                            continue
+                        if read_error is None:
+                            read_error = "status file is empty"
+                        break
 
-            if not raw and read_error is None and not path.exists():
-                read_error = "status file disappeared during read"
-        else:
-            read_error = "status file not found"
+                    content_hash = self._hash_bytes(data)
+                    raw = _decode_and_parse(data)
+                    if raw:
+                        status_source = "file"
+                        break
 
-        if not raw and self._last_status:
-            raw = copy.deepcopy(self._last_status)
-            fallback_used = True
-            status_source = "cached"
-            if content_hash is None:
-                content_hash = self._status_content_hash
+                    if attempts < max_attempts:
+                        time.sleep(delay * attempts)
+
+                if not raw and read_error is None and not path.exists():
+                    read_error = "status file disappeared during read"
+            else:
+                read_error = "status file not found"
+
+            if not raw and self._last_status:
+                raw = copy.deepcopy(self._last_status)
+                fallback_used = True
+                status_source = "cached"
+                if content_hash is None:
+                    content_hash = self._status_content_hash
 
         status = dict(raw)
         live_status_used = False
 
-        if self._should_use_live_status(status):
+        if live_only or self._should_use_live_status(status):
             live_candidate = self._fetch_live_status()
             if live_candidate:
                 status = live_candidate
@@ -442,6 +444,11 @@ class GuardianBot:
                 live_status_used = True
                 content_hash = None
                 status_source = "live"
+            elif live_only:
+                status = {}
+                read_error = "live status unavailable"
+                status_source = "missing"
+                fallback_used = False
 
         if status:
             try:
@@ -479,7 +486,7 @@ class GuardianBot:
             content_hash = 0
 
         self._status_content_hash = content_hash
-        self._status_fallback_used = fallback_used
+        self._status_fallback_used = fallback_used and not live_only
         self._status_read_error = None if status and not fallback_used else read_error
         self._status_source = status_source
         return status
@@ -805,20 +812,28 @@ class GuardianBot:
     def _status_staleness(self, age: Optional[float]) -> Tuple[str, str]:
         """Categorise the freshness of the AI status file."""
 
+        live_only = bool(getattr(self.settings, "ai_live_only", False))
+        subject = "Live-сигнал" if live_only else "AI сигнал"
+        suffix = (
+            "проверьте подключение к прямому каналу Bybit."
+            if live_only
+            else "убедитесь, что сервис записи status.json активен."
+        )
+
         if age is None:
-            return "fresh", "AI сигнал обновился только что."
+            return "fresh", f"{subject} обновился только что."
         if age < 60:
-            return "fresh", "AI сигнал обновился менее минуты назад."
+            return "fresh", f"{subject} обновился менее минуты назад."
         if age < WARNING_SIGNAL_SECONDS:
-            return "fresh", f"AI сигнал обновился {int(age // 60)} мин назад."
+            return "fresh", f"{subject} обновился {int(age // 60)} мин назад."
         if age < STALE_SIGNAL_SECONDS:
             return (
                 "warning",
-                f"AI сигнал обновлялся {self._format_duration(age)} назад — дождитесь скорого обновления.",
+                f"{subject} обновлялся {self._format_duration(age)} назад — дождитесь скорого обновления.",
             )
         return (
             "stale",
-            "AI сигнал не обновлялся более 15 минут — убедитесь, что сервис записи status.json активен.",
+            f"{subject} не обновлялся более 15 минут — {suffix}",
         )
 
     # snapshot helpers -------------------------------------------------
