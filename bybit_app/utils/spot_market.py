@@ -61,6 +61,7 @@ _WALLET_AVAILABLE_FIELDS = (
     "cashBalance",
     "availableFunds",
 )
+_WALLET_FALLBACK_FIELDS = ("walletBalance",)
 _WALLET_SYMBOL_FIELDS = ("coin", "asset", "currency")
 _KNOWN_QUOTES = (
     "USDT",
@@ -400,6 +401,40 @@ def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal
                         if not symbol:
                             continue
                         available = _first_decimal(row, _WALLET_AVAILABLE_FIELDS)
+                        if available is None or available <= 0:
+                            # Unified Trading Accounts часто возвращают 0 в полях
+                            # ``availableToWithdraw``/``totalAvailableBalance`` для
+                            # монет, используемых как залог.  При этом
+                            # ``walletBalance`` содержит фактические средства,
+                            # доступные для торговли.  Чтобы избежать ложных
+                            # «магических нулей», используем положительные
+                            # значения из доступных полей, а ``walletBalance``
+                            # подключаем только если других вариантов нет.
+                            best: Decimal | None = available if available is not None else None
+                            positive_found = bool(best and best > 0)
+                            for field in _WALLET_AVAILABLE_FIELDS:
+                                candidate = row.get(field)
+                                if candidate is None:
+                                    continue
+                                amount = _to_decimal(candidate)
+                                if amount > 0:
+                                    if best is None or amount > best:
+                                        best = amount
+                                    positive_found = True
+                                elif best is None:
+                                    best = amount
+                            if not positive_found:
+                                for field in _WALLET_FALLBACK_FIELDS:
+                                    candidate = row.get(field)
+                                    if candidate is None:
+                                        continue
+                                    amount = _to_decimal(candidate)
+                                    if amount > 0:
+                                        if best is None or amount > best:
+                                            best = amount
+                                    elif best is None:
+                                        best = amount
+                            available = best
                         if available is None:
                             continue
                         balances[symbol] = balances.get(symbol, Decimal("0")) + available

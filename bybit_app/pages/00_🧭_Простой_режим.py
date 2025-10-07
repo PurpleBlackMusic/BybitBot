@@ -938,6 +938,38 @@ st.subheader("Риски и защита")
 st.markdown(risk_text)
 
 st.divider()
+wallet_info = health.get("realtime_trading") if isinstance(health, dict) else None
+if isinstance(wallet_info, dict) and (
+    wallet_info.get("balance_total") is not None
+    or wallet_info.get("balance_available") is not None
+    or wallet_info.get("balance_withdrawable") is not None
+):
+    st.subheader("Баланс Bybit")
+
+    def _format_usdt(value: object) -> str:
+        try:
+            return f"{float(value):,.2f} USDT"
+        except (TypeError, ValueError):
+            return "—"
+
+    balance_cols = st.columns(3)
+    balance_cols[0].metric(
+        "Всего на кошельке",
+        _format_usdt(wallet_info.get("balance_total")),
+    )
+    balance_cols[1].metric(
+        "Доступно для сделок",
+        _format_usdt(wallet_info.get("balance_available")),
+    )
+    balance_cols[2].metric(
+        "Можно вывести",
+        _format_usdt(wallet_info.get("balance_withdrawable")),
+    )
+    st.caption(
+        "Доступно для сделок учитывает активы, используемые как залог. «Можно вывести» показывает лимит вывода без закрытия позиций."
+    )
+    st.divider()
+
 st.subheader("Портфель")
 portfolio_totals = portfolio.get("human_totals", {})
 cols = st.columns(3)

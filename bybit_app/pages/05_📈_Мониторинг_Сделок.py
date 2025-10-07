@@ -41,10 +41,20 @@ with st.container(border=True):
                 stats.append(f"Задержка REST: {float(latency):.0f} мс")
             total = info.get("balance_total")
             available = info.get("balance_available")
+            withdrawable = info.get("balance_withdrawable")
             if total is not None and available is not None:
-                stats.append(
-                    f"Баланс: {float(total):.2f} / {float(available):.2f} USDT"
-                )
+                parts = [
+                    f"{float(total):.2f} всего",
+                    f"{float(available):.2f} доступно",
+                ]
+                if withdrawable is not None:
+                    try:
+                        withdraw_val = float(withdrawable)
+                    except (TypeError, ValueError):
+                        withdraw_val = None
+                    if withdraw_val is not None:
+                        parts.append(f"{withdraw_val:.2f} вывести")
+                stats.append("Баланс: " + ", ".join(parts) + " USDT")
             assets = info.get("wallet_assets") or []
             if assets:
                 asset_bits = []

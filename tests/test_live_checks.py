@@ -132,6 +132,7 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["order_count"] == 1
     assert result["balance_total"] == pytest.approx(123.45)
     assert result["balance_available"] == pytest.approx(100.1)
+    assert result["balance_withdrawable"] == pytest.approx(100.1)
     assert result["latency_ms"] == pytest.approx(50.0)
     assert result["order_age_human"] == "30 сек"
     assert "Биржа отвечает" in result["message"]
@@ -232,6 +233,7 @@ def test_wallet_totals_use_withdrawable_amount(monkeypatch: pytest.MonkeyPatch) 
     result = bybit_realtime_status(settings, api=api, ws_status={})
     assert result["balance_total"] == pytest.approx(10.0)
     assert result["balance_available"] == pytest.approx(7.5)
+    assert result["balance_withdrawable"] == pytest.approx(7.5)
 
 
 def test_bybit_realtime_status_warns_when_server_time_skewed(
@@ -332,10 +334,48 @@ def test_wallet_totals_fall_back_to_coin_values(monkeypatch: pytest.MonkeyPatch)
 
     assert result["balance_total"] == pytest.approx(170.5)
     assert result["balance_available"] == pytest.approx(138.25)
+    assert result["balance_withdrawable"] == pytest.approx(138.25)
     assert result["wallet_assets"]
     assert result["wallet_assets"][0]["coin"] == "USDT"
+    assert result["wallet_assets"][0]["withdrawable"] == pytest.approx(120.25)
     assert result["wallet_assets"][0]["reserved"] == pytest.approx(30.25)
     assert any(asset["coin"] == "USDC" for asset in result["wallet_assets"])
+
+
+def test_wallet_totals_include_collateral_balances(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 4_200_000.0
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: 15.0)
+
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "totalEquity": "30000",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "walletBalance": "26603.12",
+                            "availableToWithdraw": "0",
+                            "totalAvailableBalance": "0",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    api = DummyAPI(wallet_payload, {"result": {"list": []}})
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    result = bybit_realtime_status(settings, api=api, ws_status={})
+
+    assert result["balance_total"] == pytest.approx(30000.0)
+    assert result["balance_available"] == pytest.approx(26603.12)
+    assert result["balance_withdrawable"] == pytest.approx(0.0)
+    assert result["wallet_assets"][0]["withdrawable"] == pytest.approx(0.0)
+    assert result["wallet_assets"][0]["reserved"] == pytest.approx(26603.12)
 
 
 def test_bybit_realtime_status_detects_stale_orders(monkeypatch: pytest.MonkeyPatch) -> None:

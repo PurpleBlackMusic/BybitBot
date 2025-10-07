@@ -91,6 +91,56 @@ def test_place_spot_market_enforces_min_notional():
     assert api.info_calls == 1
 
 
+def test_wallet_available_balances_use_wallet_balance_when_withdraw_zero():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "totalAvailableBalance": "0",
+                            "availableToWithdraw": "0",
+                            "walletBalance": "26603.12",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("26603.12")
+
+
+def test_wallet_available_balances_pick_positive_amount_if_present():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "availableToWithdraw": "0",
+                            "availableBalance": "-5",
+                            "walletBalance": "10",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("10")
+
+
 def test_place_spot_market_respects_available_balance():
     payload = {
         "result": {
