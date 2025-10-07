@@ -18,7 +18,7 @@ from utils.background import (
 )
 from utils.envs import creds_ok
 from utils.guardian_bot import GuardianBot
-from utils.ui import rerun
+from utils.ui import auto_refresh, rerun
 
 
 def _format_age(seconds: float) -> str:
@@ -386,7 +386,7 @@ if st.session_state.get("simple_mode_auto_enabled", True):
     interval_seconds = max(
         5, int(st.session_state.get("simple_mode_auto_interval", DEFAULT_REFRESH_SECONDS))
     )
-    st.autorefresh(interval=interval_seconds * 1000, key="simple_mode_auto_refresh")
+    auto_refresh(interval_seconds, key="simple_mode_auto_refresh")
 
 st.markdown("#### Фоновые службы")
 with st.container(border=True):
