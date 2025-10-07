@@ -2040,6 +2040,41 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
     assert bot.unified_report()["status"]["symbol"] == "ETHUSDT"
 
 
+def test_guardian_status_fingerprint_tracks_changes(tmp_path: Path) -> None:
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+
+    first_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.6,
+        "ev_bps": 15.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    status_path.write_text(json.dumps(first_status), encoding="utf-8")
+
+    bot = _make_bot(
+        tmp_path,
+        Settings(ai_live_only=False, ai_symbols="BTCUSDT", ai_enabled=True),
+    )
+
+    fingerprint_one = bot.status_fingerprint()
+    assert fingerprint_one is not None
+    assert isinstance(fingerprint_one, str)
+
+    bot.status_summary()
+
+    updated_status = dict(first_status)
+    updated_status["probability"] = 0.8
+    status_path.write_text(json.dumps(updated_status), encoding="utf-8")
+
+    bot.refresh()
+    fingerprint_two = bot.status_fingerprint()
+    assert fingerprint_two is not None
+    assert isinstance(fingerprint_two, str)
+    assert fingerprint_two != fingerprint_one
+
+
 def test_guardian_status_recovers_from_partial_write(tmp_path: Path, monkeypatch) -> None:
     status_payload = {
         "symbol": "BTCUSDT",
