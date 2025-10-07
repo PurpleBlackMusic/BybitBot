@@ -322,6 +322,305 @@ def test_place_spot_market_uses_spot_wallet_when_unified_empty():
     assert api.wallet_calls == 2
 
 
+def test_place_spot_market_ignores_spot_wallet_account_type_error():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class FallbackErrorAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise RuntimeError(
+                    "Bybit error 10001: accountType only support UNIFIED (/v5/account/wallet-balance)"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = FallbackErrorAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only support UNIFIED" not in message
+    # unified balance queried successfully, spot fallback failure is ignored
+    assert api.wallet_calls == 2
+
+
+def test_place_spot_market_ignores_account_type_error_from_non_runtime_exception():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class ValueErrorFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise ValueError(
+                    "Bybit error 10001: accountType only support UNIFIED. (/v5/account/wallet-balance)!"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = ValueErrorFallbackAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only support UNIFIED" not in message
+    assert api.wallet_calls == 2
+
+
+def test_place_spot_market_ignores_account_type_error_with_supports_phrase():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class ValueErrorSupportsFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise ValueError(
+                    "Bybit error 10001: accountType only supports UNIFIED trading account."
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = ValueErrorSupportsFallbackAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only supports UNIFIED" not in message
+    assert api.wallet_calls == 2
+
+
+def test_place_spot_market_ignores_account_type_error_with_http_status_code():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class HTTPStatusAccountTypeError(Exception):
+        def __init__(self):
+            super().__init__(
+                "400 Client Error: Bad Request for url: https://api.bybit.com/v5/account/wallet-balance"
+                " - accountType only supports UNIFIED trading account"
+            )
+            self.status_code = 400
+
+    class HTTPStatusFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise HTTPStatusAccountTypeError()
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = HTTPStatusFallbackAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only supports UNIFIED" not in message
+    assert api.wallet_calls == 2
+
+
+def test_place_spot_market_ignores_structured_account_type_error():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class StructuredAccountTypeError(Exception):
+        def __init__(self):
+            super().__init__()
+            self.retCode = 10001
+            self.retMsg = "accountType only support UNIFIED"
+
+        def __str__(self):
+            return "Bybit structured error"
+
+    class StructuredFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise StructuredAccountTypeError()
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = StructuredFallbackAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only support UNIFIED" not in message
+    assert api.wallet_calls == 2
+
+
 def test_place_spot_market_accepts_prefetched_resources():
     limits = {
         "min_order_amt": Decimal("5"),
