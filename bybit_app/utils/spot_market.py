@@ -1,16 +1,79 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_UP, InvalidOperation
 import time
-from typing import Dict, Tuple
+from typing import Dict, Generic, Mapping, Tuple, TypeVar
 
 from .bybit_api import BybitAPI
 from .log import log
 
 _MIN_QUOTE = Decimal("5")
-_INSTRUMENT_CACHE: Dict[str, Tuple[float, Dict[str, Decimal]]] = {}
-_PRICE_CACHE: Dict[str, Tuple[float, Decimal]] = {}
 _PRICE_CACHE_TTL = 5.0
+_BALANCE_CACHE_TTL = 5.0
+_INSTRUMENT_CACHE_TTL = 600.0
+
+
+T = TypeVar("T")
+
+
+class TTLCache(Generic[T]):
+    """A minimal TTL cache for repeated API lookups."""
+
+    __slots__ = ("_ttl", "_store")
+
+    def __init__(self, ttl: float):
+        self._ttl = max(float(ttl), 0.0)
+        self._store: Dict[str, Tuple[float, T]] = {}
+
+    def get(self, key: str) -> T | None:
+        entry = self._store.get(key)
+        if not entry:
+            return None
+        ts, value = entry
+        if self._ttl and time.time() - ts > self._ttl:
+            self._store.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: str, value: T) -> None:
+        self._store[key] = (time.time(), value)
+
+    def invalidate(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+_INSTRUMENT_CACHE: TTLCache[Dict[str, object]] = TTLCache(_INSTRUMENT_CACHE_TTL)
+_PRICE_CACHE: TTLCache[Decimal] = TTLCache(_PRICE_CACHE_TTL)
+_BALANCE_CACHE: TTLCache[Dict[str, Decimal]] = TTLCache(_BALANCE_CACHE_TTL)
+
+_WALLET_AVAILABLE_FIELDS = (
+    "totalAvailableBalance",
+    "availableToWithdraw",
+    "availableBalance",
+    "available",
+    "availableMargin",
+    "free",
+    "transferBalance",
+    "cashBalance",
+    "availableFunds",
+)
+_WALLET_SYMBOL_FIELDS = ("coin", "asset", "currency")
+_KNOWN_QUOTES = (
+    "USDT",
+    "USDC",
+    "USDD",
+    "BUSD",
+    "DAI",
+    "USD",
+    "EUR",
+    "BTC",
+    "ETH",
+    "JPY",
+)
 
 
 def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
@@ -20,6 +83,25 @@ def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
         return Decimal(default)
 
 
+def _first_decimal(payload: object, fields: Tuple[str, ...]) -> Decimal | None:
+    if not isinstance(payload, dict):
+        return None
+
+    for field in fields:
+        if field not in payload:
+            continue
+        candidate = payload[field]
+        if candidate is None:
+            continue
+        if isinstance(candidate, str) and not candidate.strip():
+            continue
+        try:
+            return _to_decimal(candidate)
+        except Exception:  # pragma: no cover - defensive
+            continue
+    return None
+
+
 def _round_up(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
@@ -27,12 +109,20 @@ def _round_up(value: Decimal, step: Decimal) -> Decimal:
     return multiplier * step
 
 
-def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, Decimal]:
+def _split_symbol(symbol: str) -> Tuple[str, str]:
+    upper = (symbol or "").upper()
+    for quote in _KNOWN_QUOTES:
+        if upper.endswith(quote):
+            base = upper[: -len(quote)] or upper
+            return base, quote
+    return upper, ""
+
+
+def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     key = symbol.upper()
-    now = time.time()
     cached = _INSTRUMENT_CACHE.get(key)
-    if cached and now - cached[0] < 600:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     try:
         response = api.instruments_info(category="spot", symbol=key)
@@ -82,22 +172,43 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, Decimal]:
     if qty_step <= 0:
         qty_step = Decimal("0.00000001")
 
-    limits = {
+    base_coin = str(
+        instrument.get("baseCoin")
+        or instrument.get("baseAsset")
+        or instrument.get("baseCurrency")
+        or ""
+    ).upper()
+    quote_coin = str(
+        instrument.get("quoteCoin")
+        or instrument.get("quoteAsset")
+        or instrument.get("settleCoin")
+        or ""
+    ).upper()
+
+    if not quote_coin:
+        guessed_base, guessed_quote = _split_symbol(key)
+        if guessed_quote:
+            quote_coin = guessed_quote
+        if not base_coin and guessed_base:
+            base_coin = guessed_base
+
+    limits: Dict[str, object] = {
         "min_order_amt": max(min_amount, _MIN_QUOTE),
         "quote_step": quote_step,
         "min_order_qty": min_qty,
         "qty_step": qty_step,
+        "base_coin": base_coin,
+        "quote_coin": quote_coin,
     }
-    _INSTRUMENT_CACHE[key] = (now, limits)
+    _INSTRUMENT_CACHE.set(key, limits)
     return limits
 
 
 def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     key = symbol.upper()
-    now = time.time()
     cached = _PRICE_CACHE.get(key)
-    if cached and now - cached[0] < _PRICE_CACHE_TTL:
-        return cached[1]
+    if cached is not None:
+        return cached
 
     try:
         response = api.tickers(category="spot", symbol=key)
@@ -130,8 +241,66 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     if price <= 0:
         raise RuntimeError(f"Биржа не вернула котировку для {key}")
 
-    _PRICE_CACHE[key] = (now, price)
+    _PRICE_CACHE.set(key, price)
     return price
+
+
+def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
+    key = account_type.upper() or "UNIFIED"
+    cached = _BALANCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        payload = api.wallet_balance(accountType=account_type)
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        raise RuntimeError(f"Не удалось получить баланс кошелька: {exc}") from exc
+
+    balances: Dict[str, Decimal] = {}
+    if isinstance(payload, dict):
+        result = payload.get("result")
+        if isinstance(result, dict):
+            accounts = result.get("list")
+            if isinstance(accounts, (list, tuple)):
+                for account in accounts:
+                    if not isinstance(account, dict):
+                        continue
+                    coins = account.get("coin") or account.get("coins")
+                    if not isinstance(coins, (list, tuple)):
+                        continue
+                    for row in coins:
+                        if not isinstance(row, dict):
+                            continue
+                        symbol = None
+                        for field in _WALLET_SYMBOL_FIELDS:
+                            raw_symbol = row.get(field)
+                            if isinstance(raw_symbol, str) and raw_symbol.strip():
+                                symbol = raw_symbol.strip().upper()
+                                break
+                        if not symbol:
+                            continue
+                        available = _first_decimal(row, _WALLET_AVAILABLE_FIELDS)
+                        if available is None:
+                            continue
+                        balances[symbol] = balances.get(symbol, Decimal("0")) + available
+
+    _BALANCE_CACHE.set(key, balances)
+    return balances
+
+
+def _normalise_balances(balances: Mapping[str, object] | None) -> Dict[str, Decimal] | None:
+    if balances is None:
+        return None
+
+    normalised: Dict[str, Decimal] = {}
+    for asset, amount in balances.items():
+        if not isinstance(asset, str):
+            continue
+        symbol = asset.strip().upper()
+        if not symbol:
+            continue
+        normalised[symbol] = _to_decimal(amount)
+    return normalised
 
 
 def _format_decimal(value: Decimal) -> str:
@@ -146,6 +315,62 @@ def _format_decimal(value: Decimal) -> str:
     return text if text else "0"
 
 
+@dataclass(frozen=True)
+class SpotTradeSnapshot:
+    """Reusable container for cached spot trading resources."""
+
+    symbol: str
+    price: Decimal | None = None
+    balances: Dict[str, Decimal] | None = None
+    limits: Mapping[str, object] | None = None
+
+    def as_kwargs(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {}
+        if self.price is not None:
+            payload["price_snapshot"] = self.price
+        if self.balances is not None:
+            payload["balances"] = self.balances
+        if self.limits is not None:
+            payload["limits"] = self.limits
+        return payload
+
+
+def prepare_spot_trade_snapshot(
+    api: BybitAPI,
+    symbol: str,
+    *,
+    account_type: str = "UNIFIED",
+    include_limits: bool = True,
+    include_price: bool = True,
+    include_balances: bool = True,
+    force_refresh: bool = False,
+) -> SpotTradeSnapshot:
+    """Fetch reusable inputs for a subsequent spot market order."""
+
+    key = symbol.upper()
+
+    limits: Mapping[str, object] | None = None
+    if include_limits:
+        if force_refresh:
+            _INSTRUMENT_CACHE.invalidate(key)
+        limits = _instrument_limits(api, key)
+
+    price: Decimal | None = None
+    if include_price:
+        if force_refresh:
+            _PRICE_CACHE.invalidate(key)
+        price = _latest_price(api, key)
+
+    balances: Dict[str, Decimal] | None = None
+    if include_balances:
+        account_key = account_type.upper() or "UNIFIED"
+        if force_refresh:
+            _BALANCE_CACHE.invalidate(account_key)
+        balances = _wallet_available_balances(api, account_type=account_type)
+
+    return SpotTradeSnapshot(symbol=key, price=price, balances=balances, limits=limits)
+
+
 def place_spot_market_with_tolerance(
     api: BybitAPI,
     symbol: str,
@@ -155,14 +380,27 @@ def place_spot_market_with_tolerance(
     tol_type: str = "Percent",
     tol_value: float = 0.5,
     max_quote: object | None = None,
+    *,
+    price_snapshot: object | None = None,
+    balances: Mapping[str, object] | None = None,
+    limits: Mapping[str, object] | None = None,
 ):
     """Создать маркет-ордер со slippageTolerance под подпись пользователя."""
 
-    limits = _instrument_limits(api, symbol)
-    min_amount = limits["min_order_amt"]
-    quote_step = limits["quote_step"]
-    min_qty = limits.get("min_order_qty", Decimal("0"))
-    qty_step = limits.get("qty_step", Decimal("0"))
+    limit_map = limits if limits is not None else _instrument_limits(api, symbol)
+    min_amount = limit_map["min_order_amt"]  # type: ignore[index]
+    quote_step = limit_map["quote_step"]  # type: ignore[index]
+    min_qty = limit_map.get("min_order_qty", Decimal("0"))  # type: ignore[assignment]
+    qty_step = limit_map.get("qty_step", Decimal("0"))  # type: ignore[assignment]
+    quote_coin = str(limit_map.get("quote_coin") or "").upper()
+    base_coin = str(limit_map.get("base_coin") or "").upper()
+
+    if not quote_coin or not base_coin:
+        guessed_base, guessed_quote = _split_symbol(symbol)
+        if not quote_coin and guessed_quote:
+            quote_coin = guessed_quote
+        if not base_coin and guessed_base:
+            base_coin = guessed_base
 
     unit_normalised = (unit or "quoteCoin").strip().lower()
     if unit_normalised not in {"basecoin", "quotecoin"}:
@@ -174,7 +412,11 @@ def place_spot_market_with_tolerance(
         if max_available < 0:
             max_available = Decimal("0")
 
-    price_snapshot: Decimal | None = None
+    price_hint: Decimal | None = None
+    if price_snapshot is not None:
+        price_hint = _to_decimal(price_snapshot)
+        if price_hint <= 0:
+            price_hint = None
 
     if unit_normalised == "quotecoin":
         quote_amount = _to_decimal(qty)
@@ -192,15 +434,15 @@ def place_spot_market_with_tolerance(
         base_qty = _round_up(base_qty, qty_step)
 
         needs_price = min_amount > 0 or max_available is not None
-        if needs_price:
-            price_snapshot = _latest_price(api, symbol)
+        if needs_price and price_hint is None:
+            price_hint = _latest_price(api, symbol)
 
-        if price_snapshot is not None:
-            notional = base_qty * price_snapshot
+        if price_hint is not None:
+            notional = base_qty * price_hint
             if min_amount > 0 and notional < min_amount:
-                required = _round_up(min_amount / price_snapshot, qty_step)
+                required = _round_up(min_amount / price_hint, qty_step)
                 base_qty = max(base_qty, required)
-                notional = base_qty * price_snapshot
+                notional = base_qty * price_hint
             effective_notional = notional
         else:
             effective_notional = base_qty
@@ -214,6 +456,38 @@ def place_spot_market_with_tolerance(
         tolerance_multiplier = Decimal("1")
 
     projected_spend: Decimal | None = None
+    balance_map: Dict[str, Decimal] | None = _normalise_balances(balances)
+
+    def _ensure_balance(asset: str, required: Decimal) -> None:
+        nonlocal balance_map
+        asset_normalised = asset.strip().upper()
+        if not asset_normalised or required <= 0:
+            return
+
+        if balance_map is None:
+            balance_map = _wallet_available_balances(api)
+
+        available = balance_map.get(asset_normalised, Decimal("0"))
+        margin = Decimal("0.00000001")
+        if available + margin >= required:
+            return
+
+        available_text = _format_decimal(available)
+        required_text = _format_decimal(required)
+
+        alt_message = ""
+        if asset_normalised != "USDT":
+            alt_balance = balance_map.get("USDT")
+            if alt_balance and alt_balance > 0:
+                alt_message = (
+                    " На счету есть "
+                    f"{_format_decimal(alt_balance)} USDT, но биржа не конвертирует автоматически для спот-ордеров."
+                )
+
+        raise RuntimeError(
+            "Недостаточно средств: "
+            f"{asset_normalised} доступно ~{available_text}, требуется минимум ~{required_text}.{alt_message}"
+        )
 
     if max_available is not None:
         tolerance_margin = Decimal("0.00000001")
@@ -225,6 +499,21 @@ def place_spot_market_with_tolerance(
                 "Недостаточно свободного баланса для сделки: "
                 f"доступно ~{available}, требуется минимум ~{required}."
             )
+
+    tolerance_adjusted = effective_notional * tolerance_multiplier
+
+    side_normalised = side.strip().lower()
+    if side_normalised == "buy":
+        if market_unit == "quoteCoin":
+            _ensure_balance(quote_coin or "", tolerance_adjusted)
+        elif price_hint is not None:
+            _ensure_balance(quote_coin or "", tolerance_adjusted)
+    elif side_normalised == "sell":
+        if market_unit == "baseCoin":
+            _ensure_balance(base_coin or "", qty_value)
+        elif price_hint is not None and price_hint > 0:
+            required_base = (effective_notional / price_hint).copy_abs()
+            _ensure_balance(base_coin or "", required_base)
 
     qty_text = format(qty_value.normalize(), "f") if qty_value != 0 else "0"
 
@@ -249,7 +538,7 @@ def place_spot_market_with_tolerance(
         min_notional=str(min_amount),
         min_qty=str(min_qty),
         effective_notional=str(effective_notional),
-        price_snapshot=str(price_snapshot) if price_snapshot is not None else None,
+        price_snapshot=str(price_hint) if price_hint is not None else None,
         projected_spend=str(projected_spend) if max_available is not None else None,
         max_available=str(max_available) if max_available is not None else None,
     )
