@@ -169,6 +169,58 @@ def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) ->
     assert calls == [sample_payload]
     assert manager.last_beat > 0
     assert exec_calls == [{"execQty": "1.0"}]
+    execution = manager.latest_execution()
+    assert execution is not None
+    assert execution["execQty"] == "1.0"
+
+
+def test_ws_manager_captures_order_update() -> None:
+    manager = WSManager()
+    payload = {
+        "topic": "order",
+        "data": [
+            {
+                "symbol": "BTCUSDT",
+                "orderStatus": "Cancelled",
+                "orderLinkId": "test-123",
+                "cancelType": "INSUFFICIENT_BALANCE",
+                "rejectReason": "INSUFFICIENT_BALANCE",
+                "updatedTime": "1700000000000",
+            }
+        ],
+    }
+
+    manager._process_private_payload(payload)
+    update = manager.latest_order_update()
+    assert update is not None
+    assert update["cancelType"] == "INSUFFICIENT_BALANCE"
+    assert update["rejectReason"] == "INSUFFICIENT_BALANCE"
+    assert update["updatedTime"] == "1700000000000"
+    assert update["raw"]["orderStatus"] == "Cancelled"
+
+
+def test_ws_manager_captures_execution_update() -> None:
+    manager = WSManager()
+    payload = {
+        "topic": "execution",
+        "data": [
+            {
+                "symbol": "ETHUSDT",
+                "execQty": "0.5",
+                "execPrice": "2000",
+                "orderLinkId": "abc",
+                "execTime": "1690000000000",
+            }
+        ],
+    }
+
+    manager._process_private_payload(payload)
+    execution = manager.latest_execution()
+    assert execution is not None
+    assert execution["execQty"] == "0.5"
+    assert execution["execPrice"] == "2000"
+    assert execution["orderLinkId"] == "abc"
+    assert execution["raw"]["symbol"] == "ETHUSDT"
 
 
 def test_start_private_does_not_restart_running_client(monkeypatch: pytest.MonkeyPatch) -> None:

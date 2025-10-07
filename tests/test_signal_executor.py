@@ -1,4 +1,5 @@
 import copy
+from typing import Optional
 
 import pytest
 
@@ -298,4 +299,40 @@ def test_automation_loop_reacts_to_ai_toggle(monkeypatch: pytest.MonkeyPatch) ->
     third_delay = loop._tick()
     assert call_count["value"] == 2
     assert third_delay == 1.5
+
+
+def test_automation_loop_emits_results_via_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-callback")
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "get_api_client",
+        lambda: StubAPI(total=1000.0, available=900.0),
+    )
+
+    executor = SignalExecutor(bot)
+    captured: list[tuple[str, Optional[str], tuple[bool, bool, bool]]] = []
+
+    def on_cycle(result: ExecutionResult, signature, marker) -> None:
+        captured.append((result.status, signature, marker))
+
+    loop = AutomationLoop(
+        executor,
+        poll_interval=0.0,
+        success_cooldown=0.0,
+        error_backoff=0.0,
+        on_cycle=on_cycle,
+    )
+
+    delay = loop._tick()
+    assert delay == 0.0
+    assert captured
+    status, signature, marker = captured[-1]
+    assert status == "dry_run"
+    assert signature == "sig-callback"
+    assert isinstance(marker, tuple)
+    assert loop._last_result is not None
+    assert loop._last_result.status == "dry_run"
 
