@@ -134,6 +134,18 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
     return price
 
 
+def _format_decimal(value: Decimal) -> str:
+    """Render Decimal without scientific notation for logging/messages."""
+
+    try:
+        normalised = value.normalize()
+    except InvalidOperation:  # pragma: no cover - defensive branch
+        normalised = Decimal("0")
+
+    text = format(normalised, "f")
+    return text if text else "0"
+
+
 def place_spot_market_with_tolerance(
     api: BybitAPI,
     symbol: str,
@@ -142,6 +154,7 @@ def place_spot_market_with_tolerance(
     unit: str = "quoteCoin",
     tol_type: str = "Percent",
     tol_value: float = 0.5,
+    max_quote: object | None = None,
 ):
     """Создать маркет-ордер со slippageTolerance под подпись пользователя."""
 
@@ -154,6 +167,14 @@ def place_spot_market_with_tolerance(
     unit_normalised = (unit or "quoteCoin").strip().lower()
     if unit_normalised not in {"basecoin", "quotecoin"}:
         unit_normalised = "quotecoin"
+
+    max_available: Decimal | None = None
+    if max_quote is not None:
+        max_available = _to_decimal(max_quote)
+        if max_available < 0:
+            max_available = Decimal("0")
+
+    price_snapshot: Decimal | None = None
 
     if unit_normalised == "quotecoin":
         quote_amount = _to_decimal(qty)
@@ -170,13 +191,16 @@ def place_spot_market_with_tolerance(
             base_qty = min_qty
         base_qty = _round_up(base_qty, qty_step)
 
-        if min_amount > 0:
-            price = _latest_price(api, symbol)
-            notional = base_qty * price
-            if notional < min_amount:
-                required = _round_up(min_amount / price, qty_step)
+        needs_price = min_amount > 0 or max_available is not None
+        if needs_price:
+            price_snapshot = _latest_price(api, symbol)
+
+        if price_snapshot is not None:
+            notional = base_qty * price_snapshot
+            if min_amount > 0 and notional < min_amount:
+                required = _round_up(min_amount / price_snapshot, qty_step)
                 base_qty = max(base_qty, required)
-                notional = base_qty * price
+                notional = base_qty * price_snapshot
             effective_notional = notional
         else:
             effective_notional = base_qty
@@ -185,6 +209,22 @@ def place_spot_market_with_tolerance(
         market_unit = "baseCoin"
 
     tolerance = max(float(tol_value), 1.0)
+    tolerance_multiplier = _to_decimal(tolerance)
+    if tolerance_multiplier <= 0:
+        tolerance_multiplier = Decimal("1")
+
+    projected_spend: Decimal | None = None
+
+    if max_available is not None:
+        tolerance_margin = Decimal("0.00000001")
+        projected_spend = effective_notional * tolerance_multiplier
+        if max_available <= 0 or projected_spend - max_available > tolerance_margin:
+            required = _format_decimal(projected_spend)
+            available = _format_decimal(max_available if max_available > 0 else Decimal("0"))
+            raise RuntimeError(
+                "Недостаточно свободного баланса для сделки: "
+                f"доступно ~{available}, требуется минимум ~{required}."
+            )
 
     qty_text = format(qty_value.normalize(), "f") if qty_value != 0 else "0"
 
@@ -209,5 +249,8 @@ def place_spot_market_with_tolerance(
         min_notional=str(min_amount),
         min_qty=str(min_qty),
         effective_notional=str(effective_notional),
+        price_snapshot=str(price_snapshot) if price_snapshot is not None else None,
+        projected_spend=str(projected_spend) if max_available is not None else None,
+        max_available=str(max_available) if max_available is not None else None,
     )
     return response
