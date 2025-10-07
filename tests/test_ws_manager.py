@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from bybit_app.utils import ws_manager as ws_manager_module
 import bybit_app.utils.pnl as pnl_module
 from bybit_app.utils.ws_manager import WSManager
+from bybit_app.utils.ws_private_v5 import WSPrivateV5
 
 
 def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -332,3 +334,52 @@ def test_start_private_restarts_when_environment_changes(monkeypatch: pytest.Mon
     assert priv_second is not priv_first
     assert priv_second.started == 1
     assert manager._priv_url == "wss://stream.bybit.com/v5/private"
+
+
+def test_start_public_resubscribes_only_when_socket_connected() -> None:
+    manager = WSManager()
+
+    class DummyWS:
+        def __init__(self, connected: bool) -> None:
+            self.sock = SimpleNamespace(connected=connected)
+            self.sent: list[dict] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    manager._pub_running = True
+
+    ws_disconnected = DummyWS(False)
+    manager._pub_ws = ws_disconnected
+    assert manager.start_public(("tickers.ETHUSDT",)) is True
+    assert ws_disconnected.sent == []
+
+    ws_connected = DummyWS(True)
+    manager._pub_ws = ws_connected
+    assert manager.start_public(("tickers.XRPUSDT",)) is True
+    assert ws_connected.sent == [
+        {"op": "subscribe", "args": ["tickers.XRPUSDT"]}
+    ]
+
+
+def test_ws_private_v5_resubscribe_requires_connected_socket() -> None:
+    ws_client = WSPrivateV5(reconnect=False)
+    ws_client._thread = SimpleNamespace(is_alive=lambda: True)
+
+    class DummyWS:
+        def __init__(self, connected: bool) -> None:
+            self.sock = SimpleNamespace(connected=connected)
+            self.sent: list[dict] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    ws_client._ws = DummyWS(False)
+    assert ws_client.start(["position"])
+    assert ws_client._ws.sent == []
+
+    ws_client._ws = DummyWS(True)
+    assert ws_client.start(["wallet"])
+    assert ws_client._ws.sent == [
+        {"op": "subscribe", "args": ["wallet"]}
+    ]

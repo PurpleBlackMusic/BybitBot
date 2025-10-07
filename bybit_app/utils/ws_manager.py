@@ -74,13 +74,14 @@ class WSManager:
         subs = tuple(subs)
         self._pub_subs = subs
 
-        # Если уже запущен — просто убедимся в подписке
+        # Если уже запущен — просто убедимся в подписке (если соединение активно)
         if self._pub_running and self._pub_ws is not None:
-            try:
-                for t in subs:
-                    self._pub_ws.send(json.dumps({"op": "subscribe", "args": [t]}))
-            except Exception as e:
-                log("ws.public.resub.error", err=str(e))
+            if self._is_socket_connected(self._pub_ws):
+                try:
+                    for t in subs:
+                        self._pub_ws.send(json.dumps({"op": "subscribe", "args": [t]}))
+                except Exception as e:
+                    log("ws.public.resub.error", err=str(e))
             return True
 
         url = self._public_url()
@@ -111,8 +112,9 @@ class WSManager:
 
             # первичная подписка
             try:
-                if subs:
-                    req = {"op": "subscribe", "args": list(subs)}
+                current_subs = tuple(self._pub_subs)
+                if current_subs:
+                    req = {"op": "subscribe", "args": list(current_subs)}
                     ws.send(json.dumps(req))
             except Exception as e:
                 log("ws.public.sub.error", err=str(e))
@@ -214,6 +216,18 @@ class WSManager:
             self._priv = None
             self._priv_url = None
             return False
+
+    def _is_socket_connected(self, ws: Optional[websocket.WebSocketApp]) -> bool:
+        """Return True if the given websocket has an active socket."""
+
+        if ws is None:
+            return False
+
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return False
+
+        return bool(getattr(sock, "connected", False))
 
     def start(self, subs: Iterable[str] | None = None, include_private: bool = True) -> bool:
         """Start public and (optionally) private WebSocket channels."""
