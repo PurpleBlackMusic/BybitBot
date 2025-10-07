@@ -494,6 +494,69 @@ def test_place_spot_market_ignores_account_type_error_with_supports_phrase():
     assert api.wallet_calls == 2
 
 
+def test_place_spot_market_ignores_account_type_error_with_http_status_code():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class HTTPStatusAccountTypeError(Exception):
+        def __init__(self):
+            super().__init__(
+                "400 Client Error: Bad Request for url: https://api.bybit.com/v5/account/wallet-balance"
+                " - accountType only supports UNIFIED trading account"
+            )
+            self.status_code = 400
+
+    class HTTPStatusFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise HTTPStatusAccountTypeError()
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = HTTPStatusFallbackAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only supports UNIFIED" not in message
+    assert api.wallet_calls == 2
+
+
 def test_place_spot_market_ignores_structured_account_type_error():
     payload = {
         "result": {

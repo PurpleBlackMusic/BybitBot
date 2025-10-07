@@ -315,24 +315,45 @@ def _has_account_type_only_support_unified_marker(message: str) -> bool:
     return "onlysupportunified" in compact or "onlysupportsunified" in compact
 
 
+def _looks_like_http_status_code(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped.isdigit():
+        return False
+    if len(stripped) != 3:
+        return False
+    number = int(stripped)
+    return 100 <= number <= 599
+
+
 def _is_unsupported_wallet_account_type_error(error: object) -> bool:
     codes, messages = _collect_error_metadata(error)
 
-    has_code = any(str(code).strip() == "10001" for code in codes)
+    normalised_codes = {str(code).strip() for code in codes if str(code).strip()}
+    has_unsupported_code = any(code == "10001" for code in normalised_codes)
     has_marker = False
     for message in messages:
         if not message:
             continue
         normalised = message.lower()
         if "10001" in normalised:
-            has_code = True
+            has_unsupported_code = True
         if _has_account_type_only_support_unified_marker(message):
             has_marker = True
-            if has_code:
+            if has_unsupported_code:
                 return True
 
-    if has_marker and not codes:
+    if not has_marker:
+        return False
+
+    if has_unsupported_code:
         return True
+
+    if not normalised_codes:
+        return True
+
+    if all(_looks_like_http_status_code(code) for code in normalised_codes):
+        return True
+
     return False
 
 
