@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import unicodedata
 from importlib import import_module, util
+import json
 from pathlib import Path, PurePosixPath
 from textwrap import dedent
 from typing import Any, Callable
@@ -114,6 +115,35 @@ def rerun() -> None:
         if callable(candidate):
             candidate()
             return
+
+
+def auto_refresh(interval_seconds: float, *, key: str | None = None) -> None:
+    """Request a periodic page refresh compatible with multiple Streamlit versions."""
+
+    if interval_seconds is None or interval_seconds <= 0:
+        return
+
+    refresh = getattr(st, "autorefresh", None)
+    if callable(refresh):
+        kwargs: dict[str, int | str] = {"interval": int(interval_seconds * 1000)}
+        if key is not None:
+            kwargs["key"] = key
+        refresh(**kwargs)
+        return
+
+    html_key = key or f"auto_refresh_{int(interval_seconds * 1000)}"
+    interval_ms = int(interval_seconds * 1000)
+    script = f"""
+    <script>
+    const refreshKey = {json.dumps(html_key)};
+    const intervalMs = {interval_ms};
+    window._bybitAutoRefresh = window._bybitAutoRefresh || {{}};
+    if (!window._bybitAutoRefresh[refreshKey]) {{
+        window._bybitAutoRefresh[refreshKey] = setInterval(() => window.location.reload(), intervalMs);
+    }}
+    </script>
+    """
+    st.markdown(script, unsafe_allow_html=True)
 
 
 def _normalise_query_params(params: Mapping[str, Iterable[str] | str]) -> dict[str, list[str]]:
