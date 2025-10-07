@@ -322,6 +322,64 @@ def test_place_spot_market_uses_spot_wallet_when_unified_empty():
     assert api.wallet_calls == 2
 
 
+def test_place_spot_market_ignores_spot_wallet_account_type_error():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class FallbackErrorAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise RuntimeError(
+                    "Bybit error 10001: accountType only support UNIFIED (/v5/account/wallet-balance)"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+
+    api = FallbackErrorAPI(payload, wallet_payload=wallet_payload)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDT",
+            side="Buy",
+            qty=10.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "Недостаточно" in message
+    assert "accountType only support UNIFIED" not in message
+    # unified balance queried successfully, spot fallback failure is ignored
+    assert api.wallet_calls == 2
+
+
 def test_place_spot_market_accepts_prefetched_resources():
     limits = {
         "min_order_amt": Decimal("5"),
