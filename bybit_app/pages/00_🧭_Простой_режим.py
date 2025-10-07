@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -243,6 +244,34 @@ def _format_order_caption(order: dict[str, object]) -> str:
 
 st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
 
+DEFAULT_REFRESH_SECONDS = 30
+previous_refresh_ts = float(st.session_state.get("simple_mode_last_refresh") or 0.0)
+
+with st.sidebar:
+    st.subheader("⏱️ Автообновление")
+    auto_enabled = st.toggle(
+        "Обновлять автоматически",
+        value=st.session_state.get("simple_mode_auto_enabled", True),
+        key="simple_mode_auto_enabled",
+        help="При включении страница и автоцикл обновляются каждые N секунд.",
+    )
+    refresh_interval = st.slider(
+        "Интервал, сек",
+        min_value=5,
+        max_value=180,
+        value=int(st.session_state.get("simple_mode_auto_interval", DEFAULT_REFRESH_SECONDS)),
+        key="simple_mode_auto_interval",
+    )
+
+    if previous_refresh_ts > 0 and auto_enabled:
+        seconds_since = max(0.0, time.time() - previous_refresh_ts)
+        eta = max(0.0, refresh_interval - seconds_since)
+        st.caption(f"Следующее автообновление примерно через {eta:.0f} с.")
+    elif auto_enabled:
+        st.caption("Автообновление включено. Первая перезагрузка через пару секунд.")
+    else:
+        st.caption("Автообновление выключено — используйте кнопку «Обновить данные».")
+
 
 @st.cache_resource(show_spinner=False)
 def _get_guardian() -> GuardianBot:
@@ -262,6 +291,13 @@ refresh = st.button("🔄 Обновить данные", use_container_width=Tr
 if refresh:
     bot.refresh()
     rerun()
+
+if st.session_state.get("simple_mode_auto_enabled", True):
+    interval_ms = int(max(5, int(st.session_state.get("simple_mode_auto_interval", DEFAULT_REFRESH_SECONDS)))) * 1000
+    st.markdown(
+        "<script>window.setTimeout(function(){window.location.reload();}, %d);</script>" % interval_ms,
+        unsafe_allow_html=True,
+    )
 
 summary = bot.status_summary()
 brief = bot.generate_brief()
@@ -518,6 +554,9 @@ with st.container(border=True):
 
     if isinstance(automation_details, str) and automation_details.strip():
         st.caption(automation_details.strip())
+
+
+st.session_state["simple_mode_last_refresh"] = time.time()
 
     if not automation_ok and reasons:
         st.caption("Почему бот ждёт:")

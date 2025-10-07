@@ -2,7 +2,12 @@
 from __future__ import annotations
 import streamlit as st, pandas as pd
 from utils.envs import get_api_client, get_settings, update_settings
-from utils.universe import build_universe, load_universe, apply_universe_to_settings
+from utils.universe import (
+    apply_universe_to_settings,
+    build_universe,
+    filter_usdt_pairs,
+    load_universe,
+)
 
 st.title("🌐 Universe Builder (Spot) — топ по обороту 24h")
 
@@ -18,11 +23,12 @@ if st.button("🔎 Собрать топ USDT‑пар по 24h обороту")
 
 if st.button("💾 Применить в настройки (ai_symbols)"):
     syms = load_universe()
-    if syms:
-        apply_universe_to_settings(syms)
-        st.success("Сохранено в ai_symbols.")
+    filtered_syms = filter_usdt_pairs(syms)
+    if filtered_syms:
+        apply_universe_to_settings(filtered_syms)
+        st.success("Сохранено в ai_symbols (только USDT-пары).")
     else:
-        st.info("Сначала соберите юниверс.")
+        st.info("Сначала соберите юниверс из USDT-пар.")
 
 
 st.divider()
@@ -34,9 +40,12 @@ if st.button("🔁 Авто‑ротация сейчас"):
     from utils.envs import update_settings
     wl_list = [x.strip().upper() for x in (wl or "").split(',') if x.strip()]
     bl_list = [x.strip().upper() for x in (bl or "").split(',') if x.strip()]
-    syms = auto_rotate_universe(api, size=int(size), min_turnover=float(min_turn), max_spread_bps=25.0, whitelist=wl_list, blacklist=bl_list)
+    wl_usdt = filter_usdt_pairs(wl_list)
+    if wl_usdt != wl_list:
+        st.warning("Whitelist очищен от не-USDT пар перед сохранением.")
+    syms = auto_rotate_universe(api, size=int(size), min_turnover=float(min_turn), max_spread_bps=25.0, whitelist=wl_usdt, blacklist=bl_list)
     if syms:
         st.success(', '.join(syms))
-        update_settings(ai_symbols=','.join(syms), ai_whitelist=wl, ai_blacklist=bl)
+        update_settings(ai_symbols=','.join(syms), ai_whitelist=','.join(wl_usdt), ai_blacklist=bl)
     else:
         st.info("Недавно уже крутили. Пройдёт ~сутки — обновим.")

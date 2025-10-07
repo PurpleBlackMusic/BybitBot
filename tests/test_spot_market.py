@@ -3,16 +3,23 @@ from decimal import Decimal
 import pytest
 
 from bybit_app.utils import spot_market as spot_market_module
-from bybit_app.utils.spot_market import place_spot_market_with_tolerance
+from bybit_app.utils.spot_market import (
+    place_spot_market_with_tolerance,
+    prepare_spot_trade_snapshot,
+)
 
 
 class DummyAPI:
-    def __init__(self, instrument_payload, ticker_payload=None):
+    def __init__(self, instrument_payload, ticker_payload=None, wallet_payload=None):
         self.instrument_payload = instrument_payload
         self.ticker_payload = ticker_payload
+        self.wallet_payload = wallet_payload or {
+            "result": {"list": [{"coin": [{"coin": "USDT", "availableBalance": "100"}]}]}
+        }
         self.place_calls: list[dict] = []
         self.info_calls = 0
         self.ticker_calls = 0
+        self.wallet_calls = 0
 
     def instruments_info(self, category="spot", symbol: str | None = None):
         self.info_calls += 1
@@ -28,10 +35,17 @@ class DummyAPI:
             raise self.ticker_payload
         return self.ticker_payload or {}
 
+    def wallet_balance(self, accountType="UNIFIED"):
+        self.wallet_calls += 1
+        if isinstance(self.wallet_payload, Exception):
+            raise self.wallet_payload
+        return self.wallet_payload
+
 
 def setup_function(_):
     spot_market_module._INSTRUMENT_CACHE.clear()
     spot_market_module._PRICE_CACHE.clear()
+    spot_market_module._BALANCE_CACHE.clear()
 
 
 def test_place_spot_market_enforces_min_notional():
@@ -168,6 +182,124 @@ def test_place_spot_market_balance_guard_includes_tolerance():
     assert api.place_calls == []
 
 
+def test_place_spot_market_requires_quote_currency_balance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDC",
+                    "quoteCoin": "USDC",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "USDT", "availableBalance": "120"},
+                    ]
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload, wallet_payload=wallet)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BBSOLUSDC",
+            side="Buy",
+            qty=15.0,
+            unit="quoteCoin",
+        )
+
+    message = str(excinfo.value)
+    assert "USDC" in message
+    assert "USDT" in message
+    assert api.place_calls == []
+    assert api.wallet_calls >= 1
+
+
+def test_place_spot_market_allows_matching_quote_balance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDC",
+                    "quoteCoin": "USDC",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "USDC", "availableBalance": "50"},
+                        {"coin": "USDT", "availableBalance": "10"},
+                    ]
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload, wallet_payload=wallet)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BBSOLUSDC",
+        side="Buy",
+        qty=15.0,
+        unit="quoteCoin",
+    )
+
+    assert response["ok"] is True
+    assert api.place_calls
+    assert api.wallet_calls >= 1
+
+
+def test_place_spot_market_accepts_prefetched_resources():
+    limits = {
+        "min_order_amt": Decimal("5"),
+        "quote_step": Decimal("0.01"),
+        "min_order_qty": Decimal("0"),
+        "qty_step": Decimal("0.00000001"),
+        "base_coin": "BBSOL",
+        "quote_coin": "USDT",
+    }
+    balances = {"USDT": Decimal("50")}
+    api = DummyAPI({}, ticker_payload=RuntimeError("ticker should not be called"), wallet_payload=RuntimeError("wallet should not be called"))
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BBSOLUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_value=0.5,
+        price_snapshot=Decimal("15"),
+        balances=balances,
+        limits=limits,
+    )
+
+    assert response["ok"] is True
+    assert api.info_calls == 0
+    assert api.ticker_calls == 0
+    assert api.wallet_calls == 0
+
+
 def test_place_spot_market_raises_when_no_instrument():
     payload = {"result": {"list": []}}
     api = DummyAPI(payload)
@@ -263,3 +395,125 @@ def test_place_spot_market_base_unit_requires_price():
             qty=0.01,
             unit="baseCoin",
         )
+
+
+def test_prepare_spot_trade_snapshot_prefetches_resources():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    ticker = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "bestAskPrice": "2.5",
+                }
+            ]
+        }
+    }
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "USDT", "availableBalance": "75"},
+                    ]
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload, ticker_payload=ticker, wallet_payload=wallet)
+
+    snapshot = prepare_spot_trade_snapshot(api, "BBSOLUSDT")
+
+    assert snapshot.symbol == "BBSOLUSDT"
+    assert snapshot.price == Decimal("2.5")
+    assert snapshot.balances == {"USDT": Decimal("75")}
+    assert snapshot.limits is not None
+    assert api.info_calls == 1
+    assert api.ticker_calls == 1
+    assert api.wallet_calls == 1
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BBSOLUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        **snapshot.as_kwargs(),
+    )
+
+    assert response["ok"] is True
+    assert api.info_calls == 1
+    assert api.ticker_calls == 1
+    assert api.wallet_calls == 1
+
+
+def test_prepare_spot_trade_snapshot_force_refresh_invalidates_cache():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BTC",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    ticker = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lastPrice": "30000",
+                }
+            ]
+        }
+    }
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "USDT", "availableBalance": "120"},
+                    ]
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload, ticker_payload=ticker, wallet_payload=wallet)
+
+    first_snapshot = prepare_spot_trade_snapshot(api, "BTCUSDT")
+    assert first_snapshot.price == Decimal("30000")
+    assert api.info_calls == 1
+    assert api.ticker_calls == 1
+    assert api.wallet_calls == 1
+
+    second_snapshot = prepare_spot_trade_snapshot(api, "BTCUSDT")
+    assert second_snapshot.price == Decimal("30000")
+    assert api.info_calls == 1
+    assert api.ticker_calls == 1
+    assert api.wallet_calls == 1
+
+    refreshed_snapshot = prepare_spot_trade_snapshot(api, "BTCUSDT", force_refresh=True)
+    assert refreshed_snapshot.price == Decimal("30000")
+    assert api.info_calls == 2
+    assert api.ticker_calls == 2
+    assert api.wallet_calls == 2
