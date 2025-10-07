@@ -763,6 +763,7 @@ def place_spot_market_with_tolerance(
         "marketUnit": market_unit,  # "baseCoin" или "quoteCoin"
         "slippageToleranceType": tolerance_type,
         "slippageTolerance": tolerance_value,
+        "accountType": "UNIFIED",
     }
 
     response = api.place_order(**body)

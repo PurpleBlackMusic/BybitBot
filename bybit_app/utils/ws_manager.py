@@ -9,6 +9,8 @@ from typing import Iterable, Optional
 
 import websocket  # websocket-client
 
+from copy import deepcopy
+
 from .envs import get_settings
 from .paths import DATA_DIR
 from .store import JLStore
@@ -41,6 +43,11 @@ class WSManager:
         self.last_beat: float = 0.0
         self.last_public_beat: float = 0.0
         self.last_private_beat: float = 0.0
+
+        # cached payloads for UI/diagnostics
+        self._state_lock = threading.Lock()
+        self._last_order_update: Optional[dict] = None
+        self._last_execution: Optional[dict] = None
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -338,6 +345,80 @@ class WSManager:
                     add_execution(row)
                 except Exception as exc:  # pragma: no cover - ledger write failures
                     log("ws.private.execution.persist.error", err=str(exc))
+                else:
+                    self._record_execution(row)
+        elif "order" in topic:
+            for row in rows:
+                self._record_order_update(row)
+
+    def _record_order_update(self, row: dict) -> None:
+        if not isinstance(row, dict):
+            return
+
+        update = {
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "status": row.get("orderStatus") or row.get("status"),
+            "orderLinkId": row.get("orderLinkId") or row.get("orderId"),
+            "cancelType": row.get("cancelType") or row.get("cancelTypeV2"),
+            "rejectReason": row.get("rejectReason")
+            or row.get("triggerRejectReason")
+            or row.get("rejectReasonV2"),
+            "updatedTime": row.get("updatedTime")
+            or row.get("updateTime")
+            or row.get("transactTime"),
+            "category": row.get("category"),
+        }
+
+        for key in ("orderLinkId", "cancelType", "rejectReason", "updatedTime"):
+            value = update.get(key)
+            if value is not None:
+                update[key] = str(value)
+
+        update["raw"] = deepcopy(row)
+
+        with self._state_lock:
+            self._last_order_update = update
+
+    def _record_execution(self, row: dict) -> None:
+        if not isinstance(row, dict):
+            return
+
+        update = {
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "orderLinkId": row.get("orderLinkId") or row.get("orderId"),
+            "execType": row.get("execType"),
+            "orderStatus": row.get("orderStatus") or row.get("status"),
+            "execQty": row.get("execQty"),
+            "execPrice": row.get("execPrice"),
+            "execTime": row.get("execTime")
+            or row.get("tradeTime")
+            or row.get("transactionTime"),
+            "category": row.get("category"),
+        }
+
+        for key in ("orderLinkId", "execQty", "execPrice", "execTime"):
+            value = update.get(key)
+            if value is not None:
+                update[key] = str(value)
+
+        update["raw"] = deepcopy(row)
+
+        with self._state_lock:
+            self._last_execution = update
+
+    def latest_order_update(self) -> Optional[dict]:
+        with self._state_lock:
+            if self._last_order_update is None:
+                return None
+            return deepcopy(self._last_order_update)
+
+    def latest_execution(self) -> Optional[dict]:
+        with self._state_lock:
+            if self._last_execution is None:
+                return None
+            return deepcopy(self._last_execution)
 
 
 manager = WSManager()

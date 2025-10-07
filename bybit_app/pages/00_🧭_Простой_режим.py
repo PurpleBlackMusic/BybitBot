@@ -9,6 +9,13 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 
+from utils.background import (
+    ensure_background_services,
+    get_automation_status,
+    get_ws_snapshot,
+    restart_automation,
+    restart_websockets,
+)
 from utils.envs import creds_ok
 from utils.guardian_bot import GuardianBot
 from utils.ui import rerun
@@ -37,6 +44,27 @@ def _format_timestamp(ts: float | None) -> str:
     except (OSError, OverflowError, ValueError, TypeError):
         return "—"
     return dt.strftime("%d.%m.%Y %H:%M:%S UTC")
+
+
+def _age_from_timestamp(ts: object | None) -> float | None:
+    try:
+        numeric = float(ts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return max(0.0, time.time() - numeric)
+
+
+def _format_ws_timestamp(value: object | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return _clean_text(value)
+
+    if numeric > 1_000_000_000_000:
+        numeric /= 1000.0
+    return _format_timestamp(numeric)
 
 
 def _mode_label(mode: str | None) -> str:
@@ -339,7 +367,10 @@ def _get_guardian() -> GuardianBot:
     return GuardianBot()
 
 
+ensure_background_services()
 bot = _get_guardian()
+automation_status = get_automation_status()
+ws_snapshot = get_ws_snapshot()
 
 st.title("🧭 Простой режим")
 st.caption(
@@ -352,11 +383,128 @@ if refresh:
     rerun()
 
 if st.session_state.get("simple_mode_auto_enabled", True):
-    interval_ms = int(max(5, int(st.session_state.get("simple_mode_auto_interval", DEFAULT_REFRESH_SECONDS)))) * 1000
-    st.markdown(
-        "<script>window.setTimeout(function(){window.location.reload();}, %d);</script>" % interval_ms,
-        unsafe_allow_html=True,
+    interval_seconds = max(
+        5, int(st.session_state.get("simple_mode_auto_interval", DEFAULT_REFRESH_SECONDS))
     )
+    st.autorefresh(interval=interval_seconds * 1000, key="simple_mode_auto_refresh")
+
+st.markdown("#### Фоновые службы")
+with st.container(border=True):
+    feedback = st.session_state.pop("simple_mode_restart_feedback", None)
+
+    auto_alive = bool(automation_status.get("thread_alive"))
+    auto_restart_count = int(automation_status.get("restart_count") or 0)
+    auto_last_ts = (
+        automation_status.get("last_run_at")
+        or automation_status.get("last_cycle_at")
+        or automation_status.get("started_at")
+    )
+    auto_age = _age_from_timestamp(auto_last_ts)
+
+    ws_status = ws_snapshot.get("status") or {}
+    ws_public = ws_status.get("public") or {}
+    ws_private = ws_status.get("private") or {}
+    ws_public_running = bool(ws_public.get("running"))
+    ws_private_running = bool(ws_private.get("running")) if ws_private else True
+    ws_running = ws_public_running and ws_private_running
+    ws_restart_count = int(ws_snapshot.get("restart_count") or 0)
+    ws_started_age = _age_from_timestamp(ws_snapshot.get("last_started_at"))
+
+    metrics_cols = st.columns(2)
+    metrics_cols[0].metric(
+        "Цикл автоматизации",
+        "Активен" if auto_alive else "Остановлен",
+    )
+    auto_caption_bits: list[str] = []
+    if auto_restart_count:
+        auto_caption_bits.append(f"Перезапусков: {auto_restart_count}")
+    if auto_age is not None:
+        auto_caption_bits.append(f"Последняя итерация {_format_age(auto_age)} назад")
+    if auto_caption_bits:
+        metrics_cols[0].caption(" · ".join(auto_caption_bits))
+
+    metrics_cols[1].metric(
+        "WS менеджер",
+        "Подключён" if ws_running else "Отключён",
+    )
+    ws_caption_bits: list[str] = []
+    if ws_restart_count:
+        ws_caption_bits.append(f"Перезапусков: {ws_restart_count}")
+    if ws_started_age is not None:
+        ws_caption_bits.append(f"Последний старт {_format_age(ws_started_age)} назад")
+    if ws_caption_bits:
+        metrics_cols[1].caption(" · ".join(ws_caption_bits))
+
+    warnings: list[str] = []
+    if automation_status.get("stale"):
+        threshold = automation_status.get("stale_after")
+        threshold_text = (
+            _format_age(float(threshold))
+            if isinstance(threshold, (int, float)) and threshold > 0
+            else "слишком долго"
+        )
+        if auto_age is not None:
+            warnings.append(
+                f"Автоцикл молчит {_format_age(auto_age)} (порог {threshold_text})."
+            )
+        else:
+            warnings.append(
+                f"Автоцикл не присылает обновления дольше порога {threshold_text}."
+            )
+
+    public_age = ws_public.get("age_seconds")
+    private_age = ws_private.get("age_seconds")
+    if ws_snapshot.get("public_stale"):
+        age_text = (
+            _format_age(float(public_age))
+            if isinstance(public_age, (int, float))
+            else "слишком долго"
+        )
+        warnings.append(f"Публичный канал WS молчит {age_text}.")
+    if ws_snapshot.get("private_stale"):
+        age_text = (
+            _format_age(float(private_age))
+            if isinstance(private_age, (int, float))
+            else "слишком долго"
+        )
+        warnings.append(f"Приватный канал WS молчит {age_text}.")
+
+    if warnings:
+        st.warning("\n".join(warnings))
+
+    automation_error = _clean_text(automation_status.get("error"))
+    if automation_error:
+        st.error(f"Автоцикл: {automation_error}")
+    ws_error = _clean_text(ws_snapshot.get("last_error"))
+    if ws_error:
+        st.error(f"WebSocket: {ws_error}")
+
+    if feedback:
+        target, ok = feedback
+        if target == "automation":
+            if ok:
+                st.success("Автоцикл перезапущен.")
+            else:
+                st.error("Не удалось перезапустить автоцикл.")
+        elif target == "ws":
+            if ok:
+                st.success("WebSocket перезапущен.")
+            else:
+                st.error("Не удалось перезапустить WebSocket.")
+
+    button_cols = st.columns(2)
+    if button_cols[0].button(
+        "Перезапустить автоматику", use_container_width=True
+    ):
+        success = restart_automation()
+        st.session_state["simple_mode_restart_feedback"] = ("automation", success)
+        rerun()
+    if button_cols[1].button(
+        "Перезапустить WebSocket", use_container_width=True
+    ):
+        success = restart_websockets()
+        st.session_state["simple_mode_restart_feedback"] = ("ws", success)
+        rerun()
 
 summary = bot.status_summary()
 brief = bot.generate_brief()
@@ -414,12 +562,6 @@ with st.container():
     if info_bits:
         st.caption(" · ".join(info_bits))
 
-if "automation_execution" not in st.session_state or not isinstance(
-    st.session_state.get("automation_execution"), dict
-):
-    st.session_state["automation_execution"] = {}
-
-automation_state: dict[str, object] = st.session_state["automation_execution"]
 settings = bot.settings
 signal_fingerprint = bot.status_fingerprint()
 settings_marker = (
@@ -427,66 +569,20 @@ settings_marker = (
     creds_ok(settings),
 )
 
-should_attempt_execution = (
-    bool(automation_health.get("ok"))
-    and bool(summary.get("actionable"))
-    and bool(getattr(settings, "ai_enabled", False))
-    and signal_fingerprint is not None
-)
-
 execution_feedback: dict[str, object] | None = None
+automation_signature = automation_status.get("signature")
+if (
+    signal_fingerprint is not None
+    and automation_signature is not None
+    and automation_signature == signal_fingerprint
+):
+    candidate = automation_status.get("last_result")
+    if isinstance(candidate, dict):
+        execution_feedback = candidate
 
-if signal_fingerprint is not None and automation_state.get("signature") == signal_fingerprint:
-    stored_result = automation_state.get("result")
-    if isinstance(stored_result, dict):
-        execution_feedback = stored_result
-
-if should_attempt_execution:
-    last_signature = automation_state.get("signature")
-    last_marker = automation_state.get("settings_marker")
-
-    need_attempt = (
-        last_signature != signal_fingerprint or last_marker != settings_marker
-    )
-
-    if need_attempt:
-        if not settings_marker[0] and not settings_marker[1]:
-            execution_feedback = {
-                "status": "error",
-                "reason": (
-                    "API ключи не заданы — добавьте ключи в настройках или включите тренировочный режим (dry_run)."
-                ),
-            }
-        else:
-            try:
-                executor = bot.auto_executor()
-                result = executor.execute_once()
-            except Exception as exc:  # pragma: no cover - defensive UI guard
-                execution_feedback = {
-                    "status": "error",
-                    "reason": f"Не удалось выполнить авто-ордер: {exc}",
-                }
-            else:
-                execution_feedback = {"status": result.status}
-                if result.reason:
-                    execution_feedback["reason"] = result.reason
-                if result.order is not None:
-                    execution_feedback["order"] = result.order
-                if result.response is not None:
-                    execution_feedback["response"] = result.response
-                if result.context is not None:
-                    execution_feedback.setdefault("context", result.context)
-
-        automation_state["signature"] = signal_fingerprint
-        automation_state["settings_marker"] = settings_marker
-        automation_state["result"] = execution_feedback or {}
-
-else:
-    # reset cached execution if signal changed
-    if automation_state.get("signature") != signal_fingerprint:
-        automation_state.pop("result", None)
-        automation_state.pop("signature", None)
-        automation_state.pop("settings_marker", None)
+automation_last_run = automation_status.get("last_run_at")
+automation_thread_alive = bool(automation_status.get("thread_alive"))
+automation_error = _clean_text(automation_status.get("error"))
 
 previous_summary = st.session_state.get("previous_summary")
 previous_readiness = st.session_state.get("previous_readiness")
@@ -615,6 +711,16 @@ with st.container(border=True):
 
     st.session_state["simple_mode_last_refresh"] = time.time()
 
+    if automation_last_run:
+        st.caption(
+            f"Последний запуск автоматики: {_format_timestamp(float(automation_last_run))}"
+        )
+    elif not automation_thread_alive:
+        st.caption("Фоновый цикл автоматизации ещё не стартовал — проверяем подключение.")
+
+    if automation_error:
+        st.error(f"Фоновый сервис сообщает об ошибке: {automation_error}")
+
     if not automation_ok and reasons:
         st.caption("Почему бот ждёт:")
         st.markdown(_bullet_markdown(reasons))
@@ -653,6 +759,26 @@ with st.container(border=True):
             st.caption(
                 "Режим dry_run активен: сделки не отправляются на биржу, но параметры логируются."
             )
+
+    order_update = ws_snapshot.get("last_order")
+    if isinstance(order_update, dict):
+        status_text = _clean_text(order_update.get("status"))
+        cancel_type = _clean_text(order_update.get("cancelType"))
+        reject_reason = _clean_text(order_update.get("rejectReason"))
+        updated_at = _format_ws_timestamp(order_update.get("updatedTime"))
+
+        info_bits = []
+        if status_text:
+            info_bits.append(f"Статус: {status_text}")
+        if cancel_type:
+            info_bits.append(f"cancelType: {cancel_type}")
+        if reject_reason:
+            info_bits.append(f"Причина: {reject_reason}")
+        if updated_at:
+            info_bits.append(f"Обновлено: {updated_at}")
+
+        if info_bits:
+            st.caption(" · ".join(info_bits))
 
 readiness_checks = []
 staleness_state = (staleness.get("state") or "").lower()

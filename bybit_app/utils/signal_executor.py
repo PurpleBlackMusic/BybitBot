@@ -6,7 +6,7 @@ import copy
 import math
 from dataclasses import dataclass
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .envs import Settings, get_api_client, get_settings, creds_ok
 from .live_checks import extract_wallet_totals
@@ -239,6 +239,10 @@ class SignalExecutor:
         except (TypeError, ValueError):
             reserve_pct = 0.0
 
+        # Минимальный страховой буфер 2% помогает избежать отмен из-за комиссий
+        # и мелких движений цены даже если пользователь указал более низкое значение
+        reserve_pct = max(reserve_pct, 2.0)
+
         try:
             risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -373,6 +377,8 @@ class AutomationLoop:
         poll_interval: float = 15.0,
         success_cooldown: float = 120.0,
         error_backoff: float = 5.0,
+        on_cycle: Callable[[ExecutionResult, Optional[str], Tuple[bool, bool, bool]], None]
+        | None = None,
     ) -> None:
         self.executor = executor
         self.poll_interval = max(float(poll_interval), 0.0)
@@ -380,6 +386,8 @@ class AutomationLoop:
         self.error_backoff = max(float(error_backoff), 0.0)
         self._last_key: Optional[Tuple[Optional[str], Tuple[bool, bool, bool]]] = None
         self._last_status: Optional[str] = None
+        self._last_result: Optional[ExecutionResult] = None
+        self._on_cycle = on_cycle
 
     def _should_execute(
         self, signature: Optional[str], settings_marker: Tuple[bool, bool, bool]
@@ -401,12 +409,17 @@ class AutomationLoop:
                 result = self.executor.execute_once()
             except Exception as exc:  # pragma: no cover - defensive
                 log("guardian.auto.loop.error", err=str(exc))
-                self._last_status = "error"
-                self._last_key = key
-                return self.error_backoff or self.poll_interval or 1.0
+                result = ExecutionResult(status="error", reason=str(exc))
 
             self._last_status = result.status
             self._last_key = key
+            self._last_result = result
+
+            if self._on_cycle is not None:
+                try:
+                    self._on_cycle(result, signature, settings_marker)
+                except Exception:  # pragma: no cover - defensive callback guard
+                    log("guardian.auto.loop.callback.error")
 
             if result.status in self._SUCCESSFUL_STATUSES:
                 return self.success_cooldown or self.poll_interval

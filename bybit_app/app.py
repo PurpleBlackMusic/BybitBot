@@ -20,10 +20,12 @@ from bybit_app.utils.ui import (
     navigation_link,
     safe_set_page_config,
 )
+from bybit_app.utils.background import ensure_background_services
 from bybit_app.utils.envs import get_settings
 from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
+ensure_background_services()
 
 MINIMAL_CSS = """
 :root { color-scheme: dark; }
