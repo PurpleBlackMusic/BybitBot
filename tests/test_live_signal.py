@@ -6,7 +6,7 @@ import pytest
 
 import bybit_app.utils.live_signal as live_signal_module
 from bybit_app.utils.envs import Settings
-from bybit_app.utils.live_signal import LiveSignalFetcher
+from bybit_app.utils.live_signal import LiveSignalError, LiveSignalFetcher
 
 
 class Clock:
@@ -59,7 +59,7 @@ def test_live_signal_fetcher_reuses_cache_within_ttl(
     assert second["status_source"] == "live"
 
 
-def test_live_signal_fetcher_serves_stale_cache_on_failure(
+def test_live_signal_fetcher_reports_failure_when_scan_empty(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     clock = Clock(start=2_000.0)
@@ -89,11 +89,29 @@ def test_live_signal_fetcher_serves_stale_cache_on_failure(
 
     monkeypatch.setattr(live_signal_module, "scan_market_opportunities", failing_scan)
 
-    clock.advance(30.0)  # exceed cache ttl but stay within stale grace window
-    fallback = fetcher.fetch()
+    clock.advance(30.0)
 
+    with pytest.raises(LiveSignalError) as exc:
+        fetcher.fetch()
+
+    assert "не вернул" in str(exc.value).lower()
     assert call_order == ["first", "fail"]
-    assert fallback == initial
+    assert fetcher._cached_status == initial
+
+
+def test_live_signal_fetcher_raises_when_api_missing(monkeypatch, tmp_path) -> None:
+
+    def _raise():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(live_signal_module, "get_api_client", _raise)
+
+    fetcher = LiveSignalFetcher(settings=Settings(ai_live_only=False), data_dir=tmp_path, cache_ttl=0.0)
+
+    with pytest.raises(LiveSignalError) as exc:
+        fetcher.fetch()
+
+    assert "api" in str(exc.value).lower()
 
 
 def test_live_signal_fetcher_live_only_disables_cache(

@@ -49,6 +49,10 @@ class LiveSignal:
     payload: Dict[str, object]
 
 
+class LiveSignalError(RuntimeError):
+    """Raised when a live signal snapshot could not be produced."""
+
+
 class LiveSignalFetcher:
     """Build a Guardian-compatible status snapshot from fresh market data."""
 
@@ -101,19 +105,20 @@ class LiveSignalFetcher:
 
         try:
             api = get_api_client()
-        except Exception:
-            api = None
+        except Exception as exc:
+            raise LiveSignalError(f"API клиент недоступен: {exc}") from exc
 
-        opportunities = self._scan_market(settings, api)
+        try:
+            opportunities = self._scan_market(settings, api)
+        except LiveSignalError:
+            raise
+        except Exception as exc:
+            raise LiveSignalError(f"Не удалось получить рыночные данные: {exc}") from exc
+
         if not opportunities:
-            if (
-                self._cached_status is not None
-                and self.stale_grace > 0
-                and not self.live_only
-            ):
-                if now - self._cache_timestamp <= self.stale_grace:
-                    return copy.deepcopy(self._cached_status)
-            return {}
+            raise LiveSignalError(
+                "Рыночный сканер не вернул подходящих возможностей."
+            )
 
         status = self._build_status_from_opportunities(opportunities, settings)
         if status:
@@ -172,8 +177,8 @@ class LiveSignalFetcher:
                 blacklist=blacklist or (),
                 cache_ttl=0.0 if self.live_only else None,
             )
-        except Exception:
-            return []
+        except Exception as exc:
+            raise LiveSignalError(str(exc)) from exc
 
         return opportunities
 

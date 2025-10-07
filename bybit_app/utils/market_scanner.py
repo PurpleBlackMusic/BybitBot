@@ -13,6 +13,10 @@ SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
 
 
+class MarketScannerError(RuntimeError):
+    """Raised when the market snapshot cannot be loaded."""
+
+
 def _snapshot_path(data_dir: Path) -> Path:
     return Path(data_dir) / "ai" / SNAPSHOT_FILENAME
 
@@ -165,7 +169,9 @@ def scan_market_opportunities(
             save_market_snapshot(snapshot, data_dir=data_dir)
 
     if snapshot is None:
-        return []
+        raise MarketScannerError(
+            "Рыночный снапшот недоступен — проверьте подключение к API."
+        )
 
     rows = snapshot.get("rows")
     if not isinstance(rows, list):

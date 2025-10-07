@@ -26,7 +26,7 @@ from .trade_analytics import (
 )
 from .spot_pnl import spot_inventory_and_pnl
 from .live_checks import bybit_realtime_status
-from .live_signal import LiveSignalFetcher
+from .live_signal import LiveSignalError, LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
 
 
@@ -263,24 +263,26 @@ class GuardianBot:
 
         return False
 
-    def _fetch_live_status(self) -> Dict[str, object]:
+    def _fetch_live_status(self) -> tuple[Dict[str, object], Optional[str]]:
         try:
             fetcher = self._get_live_fetcher()
-        except Exception:
-            return {}
+        except Exception as exc:
+            return {}, f"Не удалось инициализировать live-источник: {exc}"
 
         try:
             status = fetcher.fetch()
-        except Exception:
-            return {}
+        except LiveSignalError as exc:
+            return {}, str(exc)
+        except Exception as exc:
+            return {}, f"Неожиданная ошибка live-сканера: {exc}"
 
         if not isinstance(status, dict):
-            return {}
+            return {}, "Live-источник вернул некорректный ответ"
 
         status = copy.deepcopy(status)
         if status:
             status.setdefault("status_source", "live")
-        return status
+        return status, None
 
     def _persist_live_status(self, status: Dict[str, object]) -> None:
         path = self._status_path()
@@ -415,6 +417,7 @@ class GuardianBot:
                     raw = _decode_and_parse(data)
                     if raw:
                         status_source = "file"
+                        read_error = None
                         break
 
                     if attempts < max_attempts:
@@ -435,8 +438,10 @@ class GuardianBot:
         status = dict(raw)
         live_status_used = False
 
+        live_error: Optional[str] = None
+
         if live_only or self._should_use_live_status(status):
-            live_candidate = self._fetch_live_status()
+            live_candidate, live_error = self._fetch_live_status()
             if live_candidate:
                 status = live_candidate
                 fallback_used = False
@@ -446,9 +451,15 @@ class GuardianBot:
                 status_source = "live"
             elif live_only:
                 status = {}
-                read_error = "live status unavailable"
+                read_error = live_error or "live status unavailable"
                 status_source = "missing"
                 fallback_used = False
+
+        if live_error and not live_status_used:
+            if read_error:
+                read_error = f"{live_error}; {read_error}"
+            else:
+                read_error = live_error
 
         if status:
             try:
@@ -487,7 +498,7 @@ class GuardianBot:
 
         self._status_content_hash = content_hash
         self._status_fallback_used = fallback_used and not live_only
-        self._status_read_error = None if status and not fallback_used else read_error
+        self._status_read_error = read_error if read_error else None
         self._status_source = status_source
         return status
 

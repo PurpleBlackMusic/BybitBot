@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 import copy
 import math
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -274,6 +273,51 @@ recent_trades = bot.recent_trades()
 trade_stats = bot.trade_statistics()
 health = bot.data_health()
 automation_health = health.get("automation") or {}
+
+status_error = summary.get("status_error") if isinstance(summary, dict) else None
+fallback_used = bool(summary.get("fallback_used")) if isinstance(summary, dict) else False
+status_source = str(summary.get("status_source") or "missing") if isinstance(summary, dict) else "missing"
+staleness = summary.get("staleness") if isinstance(summary, dict) else {}
+staleness_message = (
+    staleness.get("message")
+    if isinstance(staleness, dict)
+    else None
+)
+
+source_labels = {
+    "live": "Живые данные",
+    "file": "Локальный status.json",
+    "cached": "Кэшированный снимок",
+    "missing": "Источник не определён",
+    "seed": "Демо-данные",
+}
+
+source_label = source_labels.get(status_source.lower(), status_source)
+
+with st.container():
+    info_bits: list[str] = []
+    if source_label:
+        info_bits.append(f"Источник статуса: **{source_label}**")
+    if fallback_used:
+        info_bits.append(
+            "Используется кэш последнего успешного обновления."
+        )
+    if staleness_message:
+        info_bits.append(staleness_message)
+
+    if status_error:
+        st.error(f"Live-источник недоступен: {status_error}")
+    elif fallback_used:
+        st.warning(
+            "Показаны кэшированные данные — проверьте подключение GuardianBot к бирже или нажмите «Обновить данные»."
+        )
+    elif status_source.lower() != "live":
+        st.info(
+            "GuardianBot использует резервный источник — запросите обновление, чтобы получить свежие данные."
+        )
+
+    if info_bits:
+        st.caption(" · ".join(info_bits))
 
 if "automation_execution" not in st.session_state or not isinstance(
     st.session_state.get("automation_execution"), dict
