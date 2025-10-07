@@ -30,8 +30,31 @@ def _first_numeric(source: dict, keys: Iterable[str]) -> Optional[float]:
     return fallback
 
 
-def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
-    """Return total and available equity from wallet payload."""
+_ACCOUNT_AVAILABLE_FIELDS: Tuple[str, ...] = (
+    "totalAvailableBalance",
+    "availableBalance",
+    "availableMargin",
+    "availableToWithdraw",
+    "cashBalance",
+    "free",
+    "availableFunds",
+)
+
+_COIN_AVAILABLE_FIELDS: Tuple[str, ...] = (
+    "totalAvailableBalance",
+    "availableToWithdraw",
+    "availableBalance",
+    "available",
+    "availableMargin",
+    "free",
+    "transferBalance",
+    "cashBalance",
+    "availableFunds",
+)
+
+
+def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, float]:
+    """Return total equity, tradable balance and withdrawable funds."""
 
     result = payload.get("result")
     if not isinstance(result, dict):
@@ -42,7 +65,8 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
         return 0.0, 0.0
 
     total = 0.0
-    available = 0.0
+    tradable = 0.0
+    withdrawable = 0.0
     for account in accounts:
         if not isinstance(account, dict):
             continue
@@ -76,52 +100,49 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
         if total_val is not None:
             total += total_val
 
-        available_val = _first_numeric(
-            account,
-            (
-                "totalAvailableBalance",
-                "availableBalance",
-                "availableMargin",
-                "availableToWithdraw",
-                "cashBalance",
-                "free",
-                "availableFunds",
-            ),
-        )
+        available_val = _first_numeric(account, _ACCOUNT_AVAILABLE_FIELDS)
+        withdrawable_val = available_val
 
+        coin_wallet_total = 0.0
+        has_coin_wallet = False
         if (available_val in (None, 0.0)) and coin_rows:
             coin_available = 0.0
             has_coin_available = False
             for row in coin_rows:
-                row_available = _first_numeric(
-                    row,
-                    (
-                        "totalAvailableBalance",
-                        "availableToWithdraw",
-                        "availableBalance",
-                        "available",
-                        "availableMargin",
-                        "free",
-                        "transferBalance",
-                        "cashBalance",
-                        "availableFunds",
-                    ),
-                )
+                row_available = _first_numeric(row, _COIN_AVAILABLE_FIELDS)
                 if row_available is None:
                     continue
                 coin_available += row_available
                 has_coin_available = True
+                wallet_candidate = _first_numeric(row, ("walletBalance", "equity", "balance"))
+                if wallet_candidate is not None:
+                    coin_wallet_total += wallet_candidate
+                    has_coin_wallet = True
             if has_coin_available:
                 available_val = coin_available
+                withdrawable_val = coin_available
+        if (available_val in (None, 0.0)) and has_coin_wallet:
+            available_val = coin_wallet_total
+
+        if withdrawable_val is None:
+            withdrawable_val = 0.0
+
+        if available_val in (None, 0.0):
+            wallet_available = _first_numeric(account, ("walletBalance",))
+            if wallet_available not in (None, 0.0):
+                available_val = wallet_available
+
         if available_val is not None:
-            available += available_val
-    return total, available
+            tradable += available_val
+        withdrawable += withdrawable_val
+    return total, tradable, withdrawable
 
 
 def extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float]:
     """Public helper that exposes wallet totals for other modules."""
 
-    return _extract_wallet_totals(payload)
+    total, tradable, _ = _extract_wallet_totals(payload)
+    return total, tradable
 
 
 def _extract_wallet_assets(
@@ -167,29 +188,26 @@ def _extract_wallet_assets(
                     "total",
                 ),
             )
-            available = _first_numeric(
-                row,
-                (
-                    "totalAvailableBalance",
-                    "availableToWithdraw",
-                    "availableBalance",
-                    "available",
-                    "availableMargin",
-                    "free",
-                    "transferBalance",
-                    "cashBalance",
-                    "availableFunds",
-                ),
-            )
+            available_primary = _first_numeric(row, _COIN_AVAILABLE_FIELDS)
+            withdrawable_amount = available_primary if available_primary is not None else 0.0
+            tradable_amount = available_primary
+            if tradable_amount in (None, 0.0):
+                wallet_available = _first_numeric(row, ("walletBalance",))
+                if wallet_available not in (None, 0.0):
+                    tradable_amount = wallet_available
 
-            if total is None and available is None:
+            if total is None and tradable_amount is None and withdrawable_amount == 0.0:
                 continue
 
-            asset = combined.setdefault(symbol, {"coin": symbol, "total": 0.0, "available": 0.0})
+            asset = combined.setdefault(
+                symbol,
+                {"coin": symbol, "total": 0.0, "tradable": 0.0, "withdrawable": 0.0},
+            )
             if total is not None:
                 asset["total"] += float(total)
-            if available is not None:
-                asset["available"] += float(available)
+            if tradable_amount is not None:
+                asset["tradable"] += float(tradable_amount)
+            asset["withdrawable"] += float(withdrawable_amount)
 
     if not combined:
         return tuple()
@@ -203,13 +221,15 @@ def _extract_wallet_assets(
     trimmed = []
     for asset in sorted_assets[: max(1, limit)]:
         total_val = float(asset.get("total") or 0.0)
-        available_val = float(asset.get("available") or 0.0)
-        reserved = max(0.0, total_val - available_val)
+        tradable_val = float(asset.get("tradable") or 0.0)
+        withdrawable_val = float(asset.get("withdrawable") or 0.0)
+        reserved = max(0.0, total_val - withdrawable_val)
         trimmed.append(
             {
                 "coin": asset.get("coin"),
                 "total": total_val,
-                "available": available_val,
+                "available": tradable_val,
+                "withdrawable": withdrawable_val,
                 "reserved": reserved,
             }
         )
@@ -451,7 +471,7 @@ def bybit_realtime_status(
         }
     latency_ms = (time.perf_counter() - started) * 1000.0
 
-    total_equity, available_equity = _extract_wallet_totals(wallet)
+    total_equity, available_equity, withdrawable_equity = _extract_wallet_totals(wallet)
     wallet_assets = _extract_wallet_assets(wallet)
 
     try:
@@ -673,7 +693,8 @@ def bybit_realtime_status(
 
     detail_parts = [
         f"Суммарный баланс: {total_equity:.2f} USDT",
-        f"Доступно: {available_equity:.2f} USDT",
+        f"Доступно для сделок: {available_equity:.2f} USDT",
+        f"Можно вывести: {withdrawable_equity:.2f} USDT",
         f"Открытых ордеров: {order_count}",
         f"Исполнений: {execution_count}",
     ]
@@ -731,22 +752,32 @@ def bybit_realtime_status(
         for asset in wallet_assets:
             coin = asset.get("coin")
             total = asset.get("total")
-            available = asset.get("available")
+            tradable = asset.get("available")
+            withdrawable = asset.get("withdrawable")
             if not isinstance(coin, str):
                 continue
             try:
                 total_val = float(total)
             except (TypeError, ValueError):
                 continue
-            available_val: Optional[float]
+            tradable_text = None
+            withdrawable_text = None
             try:
-                available_val = float(available)
+                tradable_val = float(tradable)
             except (TypeError, ValueError):
-                available_val = None
-            if available_val is not None:
-                asset_bits.append(
-                    f"{coin} {total_val:.4f} (доступно {available_val:.4f})"
-                )
+                tradable_val = None
+            if tradable_val is not None:
+                tradable_text = f"для сделок {tradable_val:.4f}"
+            try:
+                withdrawable_val = float(withdrawable)
+            except (TypeError, ValueError):
+                withdrawable_val = None
+            if withdrawable_val is not None:
+                withdrawable_text = f"вывести {withdrawable_val:.4f}"
+
+            hints = ", ".join(hint for hint in (tradable_text, withdrawable_text) if hint)
+            if hints:
+                asset_bits.append(f"{coin} {total_val:.4f} ({hints})")
             else:
                 asset_bits.append(f"{coin} {total_val:.4f}")
         if asset_bits:
@@ -775,6 +806,7 @@ def bybit_realtime_status(
         "latency_ms": round(latency_ms, 2),
         "balance_total": round(total_equity, 4),
         "balance_available": round(available_equity, 4),
+        "balance_withdrawable": round(withdrawable_equity, 4),
         "order_count": order_count,
         "order_age_sec": order_age,
         "order_age_human": order_age_human,
