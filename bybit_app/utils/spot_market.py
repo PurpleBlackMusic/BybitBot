@@ -306,9 +306,13 @@ def _has_account_type_only_support_unified_marker(message: str) -> bool:
         return False
     lowered = message.lower()
     compact = lowered.replace(" ", "")
-    return (
-        "accounttype" in compact and "onlysupportunified" in compact
-    ) or ("account type" in lowered and "only support unified" in lowered)
+    if "accounttype" not in compact and "account type" not in lowered:
+        return False
+
+    if "only support unified" in lowered or "only supports unified" in lowered:
+        return True
+
+    return "onlysupportunified" in compact or "onlysupportsunified" in compact
 
 
 def _is_unsupported_wallet_account_type_error(error: object) -> bool:
