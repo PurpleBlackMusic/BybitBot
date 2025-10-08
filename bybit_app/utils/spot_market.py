@@ -11,6 +11,7 @@ from .bybit_api import BybitAPI
 from .log import log
 from . import validators
 from .envs import Settings
+from .precision import format_to_step
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -385,59 +386,8 @@ def _round_down(value: Decimal, step: Decimal) -> Decimal:
     return multiplier * step
 
 
-def _decimal_step_places(step: Decimal) -> int:
-    if not isinstance(step, Decimal):
-        try:
-            step = Decimal(str(step))
-        except Exception:
-            step = Decimal('0')
-    if step <= 0:
-        return 0
-    normalised = step.normalize()
-    exponent = normalised.as_tuple().exponent
-    if exponent >= 0:
-        return 0
-    return -exponent
-
-
 def _format_step_decimal(value: Decimal, step: Decimal) -> str:
-    if not isinstance(value, Decimal):
-        try:
-            value = Decimal(str(value))
-        except Exception:
-            value = Decimal("0")
-    if not isinstance(step, Decimal):
-        try:
-            step = Decimal(str(step))
-        except Exception:
-            step = Decimal("0")
-
-    if step > 0:
-        value = _round_down(value, step)
-
-    if value == 0:
-        return "0"
-
-    places = _decimal_step_places(step)
-    if places > 0:
-        quantizer = Decimal(1).scaleb(-places)
-        quantized = value.quantize(quantizer, rounding=ROUND_DOWN)
-        text = f"{quantized:.{places}f}"
-    else:
-        quantized = (
-            value.quantize(Decimal("1"), rounding=ROUND_DOWN)
-            if value == value.to_integral_value()
-            else value.normalize()
-        )
-        text = f"{quantized:f}"
-
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    if text.startswith("."):
-        text = "0" + text
-    if text == "-0":
-        text = "0"
-    return text
+    return format_to_step(value, step, rounding=ROUND_DOWN)
 
 
 def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tuple[Decimal, Decimal]]:

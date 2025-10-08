@@ -261,13 +261,13 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert first["orderType"] == "Limit"
     assert second["orderType"] == "Limit"
     assert first["qty"] == "0.45"
-    assert second["qty"] == "0.3"
-    assert first["price"] == "100.5"
-    assert second["price"] == "101"
+    assert second["qty"] == "0.30"
+    assert first["price"] == "100.50000000"
+    assert second["price"] == "101.00000000"
     assert result.order is not None
     assert result.order.get("take_profit_orders")
     assert result.context is not None
-    assert result.context.get("execution", {}).get("avg_price") == "100"
+    assert result.context.get("execution", {}).get("avg_price") == "100.00000000"
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -322,14 +322,14 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
     assert result.status == "filled"
     assert len(api.orders) == 1
     order = api.orders[0]
-    assert order["qty"] == "1"
-    assert order["price"] == "100"
+    assert order["qty"] == "1.0"
+    assert order["price"] == "100.0"
     assert result.order is not None
     ladder = result.order.get("take_profit_orders")
     assert ladder is not None
     assert ladder[0]["profit_bps"] == "5,9"
     assert ladder[0]["orderId"] == "stub-1"
-    assert result.order["execution"]["sell_budget_base"] == "1"
+    assert result.order["execution"]["sell_budget_base"] == "1.0"
 
 
 def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,9 +386,9 @@ def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyP
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
-    assert execution.get("sell_budget_base") == "0"
-    assert execution.get("open_sell_reserved") == "0.5"
-    assert execution.get("filled_base_total") == "0.5"
+    assert execution.get("sell_budget_base") == "0.00"
+    assert execution.get("open_sell_reserved") == "0.50"
+    assert execution.get("filled_base_total") == "0.50"
 
 
 def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
@@ -463,7 +463,7 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     assert len(api.orders) == 2
     first, second = api.orders
     assert first["qty"] == "0.45"
-    assert second["qty"] == "0.3"
+    assert second["qty"] == "0.30"
 
 
 def test_signal_executor_open_sell_reserved_prefers_latest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -577,12 +577,12 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
     qtys = [order["qty"] for order in api.orders]
     prices = [order["price"] for order in api.orders]
     assert qtys == ["0.37", "0.22", "0.16"]
-    assert prices == ["100.35", "100.7", "101.1"]
+    assert prices == ["100.35000000", "100.70000000", "101.10000000"]
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
     assert execution.get("executed_base") == "0.75"
-    assert execution.get("avg_price") == "100"
+    assert execution.get("avg_price") == "100.00000000"
     assert execution.get("sell_budget_base") == "0.75"
     assert execution.get("filled_base_total") == "0.75"
 
@@ -745,9 +745,9 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
     assert result.status == "filled"
     assert "text" in captured
     message = captured["text"]
-    assert message.startswith("куплено 0.5 BTC по 101")
-    assert "цель 105" in message
-    assert "продано 0.3" in message
+    assert message.startswith("куплено 0.5000 BTC по 101.00000000")
+    assert "цель 105.00000000" in message
+    assert "продано 0.3000" in message
     assert "PnL" in message and "+2.00" in message
 
 
@@ -818,7 +818,7 @@ def test_signal_executor_uses_execution_stats_for_notifications(
     assert result.status == "filled"
     assert "text" in captured
     message = captured["text"]
-    assert message.startswith("куплено 0.25 ETH") or message.startswith("куплено 0.25 ET")
+    assert message.startswith("куплено 0.250 ETH по 50.00000000") or message.startswith("куплено 0.250 ET")
     assert "по 50" in message
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
