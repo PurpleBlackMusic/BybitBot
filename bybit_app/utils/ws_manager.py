@@ -5,18 +5,22 @@ import threading
 import time
 import ssl
 import random
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Iterable, Optional
 
 import websocket  # websocket-client
 
 from copy import deepcopy
 
-from .envs import get_settings
+from .envs import get_settings, get_api_client
+from .helpers import ensure_link_id
 from .paths import DATA_DIR
 from .store import JLStore
 from .log import log
 from .ws_private_v5 import WSPrivateV5
 from .realtime_cache import get_realtime_cache
+from .spot_pnl import spot_inventory_and_pnl
+from .spot_market import _instrument_limits
 
 
 class WSManager:
@@ -50,6 +54,7 @@ class WSManager:
         self._last_order_update: Optional[dict] = None
         self._last_execution: Optional[dict] = None
         self._realtime_cache = get_realtime_cache()
+        self._fill_lock = threading.Lock()
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -366,6 +371,10 @@ class WSManager:
                     log("ws.private.execution.persist.error", err=str(exc))
                 else:
                     self._record_execution(row)
+            try:
+                self._handle_execution_fill(rows)
+            except Exception as exc:  # pragma: no cover - defensive
+                log("ws.private.execution.fill.error", err=str(exc))
         elif "order" in topic:
             for row in rows:
                 self._record_order_update(row)
@@ -458,6 +467,380 @@ class WSManager:
             if self._last_execution is None:
                 return None
             return deepcopy(self._last_execution)
+
+    def _handle_execution_fill(self, rows: list[dict]) -> None:
+        fills = [row for row in rows if self._is_fill_row(row)]
+        if not fills:
+            return
+
+        with self._fill_lock:
+            inventory: dict[str, dict[str, object]] = {}
+            try:
+                inventory = spot_inventory_and_pnl()
+            except Exception as exc:
+                log("ws.private.inventory.error", err=str(exc))
+            else:
+                snapshot = {
+                    "ts": int(time.time() * 1000),
+                    "positions": inventory,
+                }
+                try:
+                    self._realtime_cache.update_private("inventory", snapshot)
+                except Exception as exc:
+                    log("ws.private.inventory.cache.error", err=str(exc))
+
+            buy_fill_rows: dict[str, dict[str, object]] = {}
+            for row in fills:
+                raw_symbol = row.get("symbol")
+                symbol = str(raw_symbol or "").strip().upper()
+                if not symbol:
+                    continue
+                side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
+                if side != "buy":
+                    continue
+                buy_fill_rows[symbol] = row
+
+            if not buy_fill_rows:
+                return
+
+            settings = get_settings()
+            config = self._resolve_tp_config(settings)
+            if not config:
+                return
+
+            try:
+                api = get_api_client()
+            except Exception as exc:
+                log(
+                    "ws.private.tp_ladder.api.error",
+                    err=str(exc),
+                    symbols=sorted(buy_fill_rows),
+                )
+                return
+
+            limits_cache: dict[str, dict[str, object]] = {}
+            for symbol, row in buy_fill_rows.items():
+                try:
+                    self._regenerate_tp_ladder(
+                        row,
+                        inventory,
+                        config=config,
+                        api=api,
+                        limits_cache=limits_cache,
+                    )
+                except Exception as exc:
+                    log(
+                        "ws.private.tp_ladder.error",
+                        err=str(exc),
+                        symbol=symbol,
+                    )
+
+    def _is_fill_row(self, row: dict) -> bool:
+        if not isinstance(row, dict):
+            return False
+        qty = self._decimal_from(row.get("execQty"))
+        if qty > 0:
+            return True
+        qty = self._decimal_from(row.get("lastExecQty"))
+        if qty > 0:
+            return True
+        exec_type = str(row.get("execType") or "").strip().lower()
+        if exec_type in {"trade", "fill"}:
+            return True
+        status = str(row.get("orderStatus") or row.get("status") or "").strip().lower()
+        if status in {"filled", "partiallyfilled", "partially_filled"}:
+            return True
+        return False
+
+    def _regenerate_tp_ladder(
+        self,
+        row: dict,
+        inventory: dict[str, dict[str, object]] | None,
+        *,
+        config: list[tuple[Decimal, Decimal]] | None = None,
+        api=None,
+        limits_cache: dict[str, dict[str, object]] | None = None,
+    ) -> None:
+        if not isinstance(row, dict):
+            return
+        raw_symbol = row.get("symbol")
+        symbol = str(raw_symbol or "").strip().upper()
+        if not symbol:
+            return
+        side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
+        if side != "buy":
+            return
+
+        symbol_inventory = None
+        if isinstance(inventory, dict):
+            symbol_inventory = inventory.get(symbol)
+            if symbol_inventory is None and raw_symbol not in (None, symbol):
+                symbol_inventory = inventory.get(raw_symbol)
+        if not isinstance(symbol_inventory, dict):
+            return
+
+        qty = self._decimal_from(symbol_inventory.get("position_qty"))
+        avg_cost = self._decimal_from(symbol_inventory.get("avg_cost"))
+        if qty <= 0 or avg_cost <= 0:
+            return
+
+        if config is None:
+            settings = get_settings()
+            config = self._resolve_tp_config(settings)
+        if not config:
+            return
+
+        if api is None:
+            try:
+                api = get_api_client()
+            except Exception as exc:
+                log("ws.private.tp_ladder.api.error", err=str(exc), symbol=symbol)
+                return
+
+        try:
+            if limits_cache is not None and symbol in limits_cache:
+                limits = limits_cache[symbol]
+            else:
+                limits = _instrument_limits(api, symbol)
+                if limits_cache is not None and isinstance(limits, dict):
+                    limits_cache[symbol] = limits
+        except Exception as exc:
+            log("ws.private.tp_ladder.instrument.error", err=str(exc), symbol=symbol)
+            return
+
+        if not isinstance(limits, dict):
+            log("ws.private.tp_ladder.instrument.error", err="invalid limits", symbol=symbol)
+            return
+
+        qty_step = self._decimal_from(limits.get("qty_step"), Decimal("0.00000001"))
+        if qty_step <= 0:
+            qty_step = Decimal("0.00000001")
+        price_step = self._decimal_from(limits.get("tick_size"), Decimal("0.00000001"))
+        if price_step <= 0:
+            price_step = Decimal("0.00000001")
+        min_qty = self._decimal_from(limits.get("min_order_qty"))
+        if min_qty < 0:
+            min_qty = Decimal("0")
+
+        self._cancel_existing_tp_orders(api, symbol)
+        self._place_tp_orders(
+            api,
+            symbol,
+            qty,
+            avg_cost,
+            config,
+            qty_step,
+            price_step,
+            min_qty,
+        )
+
+    def _cancel_existing_tp_orders(self, api, symbol: str) -> None:
+        try:
+            response = api.open_orders(category="spot", symbol=symbol, openOnly=1)
+        except Exception as exc:
+            log("ws.private.tp_ladder.open_orders.error", err=str(exc), symbol=symbol)
+            return
+
+        rows = ((response.get("result") or {}).get("list") or []) if isinstance(response, dict) else []
+        requests: list[dict[str, object]] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            link = str(item.get("orderLinkId") or item.get("orderLinkID") or "").strip()
+            if not link.upper().startswith("AI-TP-"):
+                continue
+            payload = {
+                "symbol": item.get("symbol") or symbol,
+                "orderId": item.get("orderId"),
+                "orderLinkId": ensure_link_id(link),
+            }
+            if payload["orderId"] is None and payload["orderLinkId"] is None:
+                continue
+            requests.append(payload)
+
+        for idx in range(0, len(requests), 10):
+            chunk = requests[idx : idx + 10]
+            try:
+                api.cancel_batch(category="spot", request=chunk)
+            except Exception as exc:
+                log(
+                    "ws.private.tp_ladder.cancel.error",
+                    err=str(exc),
+                    symbol=symbol,
+                    count=len(chunk),
+                )
+            else:
+                log(
+                    "ws.private.tp_ladder.cancelled",
+                    symbol=symbol,
+                    count=len(chunk),
+                )
+
+    def _place_tp_orders(
+        self,
+        api,
+        symbol: str,
+        total_qty: Decimal,
+        avg_cost: Decimal,
+        config: list[tuple[Decimal, Decimal]],
+        qty_step: Decimal,
+        price_step: Decimal,
+        min_qty: Decimal,
+    ) -> None:
+        total_qty = max(total_qty, Decimal("0"))
+        if total_qty <= 0:
+            return
+
+        allocations: list[tuple[Decimal, Decimal]] = []
+        remaining = total_qty
+
+        for idx, (profit_bps, fraction) in enumerate(config):
+            if idx == len(config) - 1:
+                target = remaining
+            else:
+                target = total_qty * fraction
+            qty = self._round_to_step(target, qty_step, rounding=ROUND_DOWN)
+            if qty <= 0:
+                continue
+            if qty > remaining:
+                qty = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+            if qty <= 0:
+                continue
+            if min_qty > 0 and qty < min_qty:
+                continue
+            remaining -= qty
+            allocations.append((profit_bps, qty))
+
+        if remaining > Decimal("0") and allocations:
+            extra = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+            if extra > 0:
+                profit_bps, qty = allocations[-1]
+                new_qty = qty + extra
+                if min_qty <= 0 or new_qty >= min_qty:
+                    allocations[-1] = (profit_bps, new_qty)
+                    remaining -= extra
+
+        if not allocations:
+            return
+
+        timestamp = int(time.time() * 1000)
+        rung_index = 0
+
+        for profit_bps, qty in allocations:
+            rung_index += 1
+            price = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
+            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+            if price <= 0:
+                continue
+            qty_text = self._format_decimal_step(qty, qty_step)
+            price_text = self._format_decimal_step(price, price_step)
+            link_seed = f"AI-TP-{symbol}-{timestamp}-{rung_index}"
+            link_id = ensure_link_id(link_seed) or link_seed
+            payload = {
+                "category": "spot",
+                "symbol": symbol,
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": qty_text,
+                "price": price_text,
+                "timeInForce": "GTC",
+                "orderLinkId": link_id,
+                "orderFilter": "Order",
+            }
+            try:
+                api.place_order(**payload)
+            except Exception as exc:
+                log(
+                    "ws.private.tp_ladder.place.error",
+                    err=str(exc),
+                    symbol=symbol,
+                    rung=rung_index,
+                )
+                continue
+            log(
+                "ws.private.tp_ladder.place",
+                symbol=symbol,
+                rung=rung_index,
+                qty=qty_text,
+                price=price_text,
+                profit_bps=str(profit_bps),
+            )
+
+    def _resolve_tp_config(self, settings) -> list[tuple[Decimal, Decimal]]:
+        levels_raw = getattr(settings, "spot_tp_ladder_bps", "") or ""
+        splits_raw = getattr(settings, "spot_tp_ladder_split_pct", "") or ""
+
+        levels: list[Decimal] = []
+        for chunk in str(levels_raw).replace(";", ",").split(","):
+            text = chunk.strip()
+            if not text:
+                continue
+            try:
+                levels.append(Decimal(text))
+            except (InvalidOperation, ValueError):
+                continue
+
+        fractions: list[Decimal] = []
+        for chunk in str(splits_raw).replace(";", ",").split(","):
+            text = chunk.strip()
+            if not text:
+                continue
+            try:
+                fractions.append(Decimal(text) / Decimal("100"))
+            except (InvalidOperation, ValueError):
+                continue
+
+        if not levels or not fractions:
+            return []
+
+        while len(fractions) < len(levels):
+            fractions.append(fractions[-1] if fractions else Decimal("0"))
+        if len(fractions) > len(levels):
+            fractions = fractions[: len(levels)]
+
+        total_fraction = sum(fractions)
+        if total_fraction <= 0:
+            return []
+
+        normalised = [fraction / total_fraction for fraction in fractions]
+        return list(zip(levels[: len(normalised)], normalised))
+
+    @staticmethod
+    def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
+        if value is None:
+            return default
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _round_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decimal:
+        if step <= 0:
+            return value
+        multiplier = (value / step).to_integral_value(rounding=rounding)
+        return multiplier * step
+
+    @staticmethod
+    def _format_decimal_step(value: Decimal, step: Decimal) -> str:
+        if step > 0:
+            exponent = step.normalize().as_tuple().exponent
+            places = abs(exponent) if exponent < 0 else 0
+        else:
+            exponent = value.normalize().as_tuple().exponent
+            places = abs(exponent) if exponent < 0 else 0
+        if places > 0:
+            text = f"{value:.{places}f}"
+        else:
+            text = format(
+                value.quantize(Decimal("1")) if value == value.to_integral_value() else value.normalize(),
+                "f",
+            )
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
 
 
 manager = WSManager()

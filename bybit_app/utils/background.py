@@ -5,7 +5,9 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from .envs import get_api_client, get_settings, creds_ok
 from .guardian_bot import GuardianBot
+from .hygiene import cancel_twap_leftovers
 from .log import log
 from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
 from .ws_manager import manager as ws_manager
@@ -59,12 +61,17 @@ class BackgroundServices:
         self._automation_success_cooldown = 120.0
         self._automation_error_backoff = 5.0
 
+        self._hygiene_lock = threading.Lock()
+        self._hygiene_performed = False
+
     # ------------------------------------------------------------------
     # Lifecycle
     def ensure_started(self) -> None:
         ws_ok = self.ensure_ws_started()
         if not ws_ok:
             return
+
+        self._run_startup_hygiene()
 
         if not self._await_private_ready():
             return
@@ -167,6 +174,7 @@ class BackgroundServices:
                 except Exception as exc:  # pragma: no cover - defensive guard
                     log("background.ws.stop.error", err=str(exc))
                 self._ws_started = False
+                self._hygiene_performed = False
 
             previous_started = self._ws_started
             try:
@@ -187,6 +195,47 @@ class BackgroundServices:
                 self._ws_started = False
                 self._ws_error = "manager.start returned False"
             return self._ws_started
+
+    def _run_startup_hygiene(self) -> None:
+        with self._hygiene_lock:
+            if self._hygiene_performed:
+                return
+
+            try:
+                settings = get_settings()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("background.hygiene.settings.error", err=str(exc))
+                return
+
+            if not creds_ok(settings):
+                self._hygiene_performed = True
+                return
+
+            try:
+                api = get_api_client()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("background.hygiene.api.error", err=str(exc))
+                return
+
+            try:
+                result = cancel_twap_leftovers(api, category="spot")
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("background.hygiene.twap.error", err=str(exc))
+                self._hygiene_performed = True
+                return
+
+            total = 0
+            try:
+                total = int(result.get("total", 0))
+            except Exception:
+                total = 0
+
+            if total > 0:
+                log("background.hygiene.twap.cleaned", total=total)
+            else:
+                log("background.hygiene.twap.cleaned", total=0)
+
+            self._hygiene_performed = True
 
     def restart_ws(self) -> bool:
         return self.ensure_ws_started(force=True)
