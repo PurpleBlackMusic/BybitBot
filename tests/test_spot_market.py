@@ -510,6 +510,42 @@ def test_place_spot_market_clamps_bps_tolerance_range():
     assert audit_low.get("tolerance_value") == "5.0000"
 
 
+def test_place_spot_market_guard_reduces_qty_on_tolerance():
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0.0001",
+                    "qtyStep": "0.0001",
+                },
+                "priceFilter": {"tickSize": "0.1"},
+            }
+        ]
+    )
+    orderbook = {"result": {"a": [["100.03", "5"]], "b": [["99.5", "5"]]}}
+    api = DummyAPI(payload, orderbook_payload=orderbook)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=100,
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0.0,
+    )
+
+    assert response["ok"] is True
+    placed = api.place_calls[0]
+    assert placed["qty"] == "99.99"
+    audit = response.get("_local", {}).get("order_audit", {})
+    assert Decimal(audit.get("order_notional")) <= Decimal("100")
+
+
 def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)

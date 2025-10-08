@@ -20,6 +20,7 @@ _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
 _TWAP_DEFAULT_MAX_SLICES = 10
+_TOLERANCE_MARGIN = Decimal("0.00000001")
 
 
 T = TypeVar("T")
@@ -1588,70 +1589,117 @@ def prepare_spot_market_order(
                 qty_base = affordable_qty
                 limit_notional = qty_base * limit_price
 
-    tolerance_margin = Decimal("0.00000001")
+    tolerance_margin = _TOLERANCE_MARGIN
+    tolerance_guard_reduction: Decimal | None = None
+
+    def _shrink_order_to_ceiling(max_quote_allowed: Decimal) -> bool:
+        nonlocal qty_base, limit_notional, tolerance_guard_reduction
+
+        if limit_price <= 0 or max_quote_allowed <= 0:
+            return False
+
+        max_qty_allowed = max_quote_allowed / limit_price
+        if qty_step > 0:
+            max_qty_allowed = _round_down(max_qty_allowed, qty_step)
+        if max_qty_allowed <= 0:
+            return False
+
+        qty_candidate = qty_base if qty_base <= max_qty_allowed else max_qty_allowed
+        if qty_candidate <= 0:
+            return False
+
+        step_fallback = qty_step if qty_step > 0 else _TOLERANCE_MARGIN
+        last_qty: Decimal | None = None
+        attempts = 0
+
+        while qty_candidate > 0 and attempts < 32:
+            attempts += 1
+            validated_loop = validators.validate_spot_rules(
+                instrument=instrument_raw,
+                price=limit_price,
+                qty=qty_candidate,
+            )
+            candidate_qty = validated_loop.qty
+            candidate_notional = validated_loop.notional
+
+            if min_amount > 0 and candidate_notional < min_amount:
+                raise OrderValidationError(
+                    "Минимальный объём ордера не достигнут.",
+                    code="min_notional",
+                    details={
+                        "requested": _format_decimal(target_quote or requested_qty),
+                        "rounded": _format_decimal(candidate_notional),
+                        "min_notional": _format_decimal(min_amount),
+                        "unit": "quote",
+                    },
+                )
+
+            if min_qty > 0 and candidate_qty < min_qty:
+                raise OrderValidationError(
+                    "Количество меньше минимального лота для базовой валюты.",
+                    code="min_qty",
+                    details={
+                        "requested": _format_decimal(target_quote or requested_qty),
+                        "rounded": _format_decimal(candidate_qty),
+                        "min_qty": _format_decimal(min_qty),
+                        "unit": "base",
+                    },
+                )
+
+            if candidate_notional - max_quote_allowed <= _TOLERANCE_MARGIN:
+                reduction = qty_base - candidate_qty
+                tolerance_guard_reduction = reduction if reduction > 0 else None
+                qty_base = candidate_qty
+                limit_notional = candidate_notional
+                return True
+
+            overshoot = candidate_notional - max_quote_allowed
+            if overshoot <= 0:
+                break
+
+            if qty_step > 0:
+                steps_to_trim = (overshoot / (limit_price * qty_step)).to_integral_value(rounding=ROUND_UP)
+                if steps_to_trim <= 0:
+                    steps_to_trim = 1
+                next_qty = _round_down(candidate_qty - (qty_step * steps_to_trim), qty_step)
+            else:
+                decrement = overshoot / limit_price
+                if decrement <= 0:
+                    decrement = step_fallback
+                elif decrement < step_fallback:
+                    decrement = step_fallback
+                next_qty = candidate_qty - decrement
+
+            if next_qty <= 0:
+                break
+            if last_qty is not None and next_qty >= last_qty:
+                break
+
+            last_qty = candidate_qty
+            qty_candidate = next_qty
+
+        return False
+
     if target_quote is not None:
         tolerance_target = target_quote * tolerance_multiplier
         if tolerance_target > 0 and limit_notional - tolerance_target > tolerance_margin:
-            qty_candidate = qty_base
-            last_qty = None
-            while limit_notional - tolerance_target > tolerance_margin:
-                if qty_step > 0:
-                    qty_candidate = _round_down(qty_candidate - qty_step, qty_step)
-                else:
-                    qty_candidate -= Decimal("0.00000001")
-                if qty_candidate <= 0 or qty_candidate == last_qty:
-                    raise OrderValidationError(
-                        "Расчётный объём превышает допустимый предел с учётом толеранса.",
-                        code="tolerance_exceeded",
-                        details={
-                            "requested_quote": _format_decimal(target_quote),
-                            "effective_notional": _format_decimal(limit_notional),
-                            "tolerance_ceiling": _format_decimal(tolerance_target),
-                            "tolerance_multiplier": _format_decimal(tolerance_multiplier),
-                            "tolerance_type": tolerance_type,
-                            "tolerance_value": tolerance_value,
-                        },
-                    )
-                last_qty = qty_candidate
-                validated_loop = validators.validate_spot_rules(
-                    instrument=instrument_raw,
-                    price=limit_price,
-                    qty=qty_candidate,
+            if not _shrink_order_to_ceiling(tolerance_target):
+                raise OrderValidationError(
+                    "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                    code="tolerance_exceeded",
+                    details={
+                        "requested_quote": _format_decimal(target_quote),
+                        "effective_notional": _format_decimal(limit_notional),
+                        "tolerance_ceiling": _format_decimal(tolerance_target),
+                        "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                        "tolerance_type": tolerance_type,
+                        "tolerance_value": tolerance_value,
+                    },
                 )
-                qty_candidate = validated_loop.qty
-                if qty_candidate <= 0 or qty_candidate == last_qty:
-                    raise OrderValidationError(
-                        "Расчётный объём превышает допустимый предел с учётом толеранса.",
-                        code="tolerance_exceeded",
-                        details={
-                            "requested_quote": _format_decimal(target_quote),
-                            "effective_notional": _format_decimal(limit_notional),
-                            "tolerance_ceiling": _format_decimal(tolerance_target),
-                            "tolerance_multiplier": _format_decimal(tolerance_multiplier),
-                            "tolerance_type": tolerance_type,
-                            "tolerance_value": tolerance_value,
-                        },
-                    )
-                qty_base = qty_candidate
-                limit_notional = limit_price * qty_base
-                if min_amount > 0 and limit_notional < min_amount:
-                    raise OrderValidationError(
-                        "Минимальный объём ордера не достигнут.",
-                        code="min_notional",
-                        details={
-                            "requested": _format_decimal(target_quote or requested_qty),
-                            "rounded": _format_decimal(limit_notional),
-                            "min_notional": _format_decimal(min_amount),
-                            "unit": "quote",
-                        },
-                    )
 
-    if market_unit == "quoteCoin" and target_quote is not None:
-        effective_notional = limit_notional
-    else:
-        effective_notional = limit_notional
+    effective_notional = limit_notional
 
-    tolerance_margin = Decimal("0.00000001")
+    tolerance_margin = _TOLERANCE_MARGIN
     tolerance_adjusted = effective_notional * tolerance_multiplier
 
     quote_ceiling: Decimal | None = None
@@ -1668,20 +1716,48 @@ def prepare_spot_market_order(
         tick_allowance = tick_gap if (tolerance_decimal > 0 and market_unit != "quoteCoin") else Decimal("0")
         quote_ceiling = quote_ceiling_raw + rounding_allowance + tick_allowance
         if effective_quote - quote_ceiling > tolerance_margin:
-            raise OrderValidationError(
-                "Расчётный объём превышает допустимый предел с учётом толеранса.",
-                code="tolerance_exceeded",
-                details={
-                    "requested_quote": _format_decimal(target_quote),
-                    "effective_notional": _format_decimal(effective_quote),
-                    "tolerance_ceiling": _format_decimal(quote_ceiling_raw),
-                    "rounding_allowance": _format_decimal(rounding_allowance),
-                    "tick_gap": _format_decimal(tick_gap),
-                    "tolerance_multiplier": _format_decimal(tolerance_multiplier),
-                    "tolerance_type": tolerance_type,
-                    "tolerance_value": tolerance_value,
-                },
-            )
+            if not _shrink_order_to_ceiling(quote_ceiling_raw or tolerance_target):
+                raise OrderValidationError(
+                    "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                    code="tolerance_exceeded",
+                    details={
+                        "requested_quote": _format_decimal(target_quote),
+                        "effective_notional": _format_decimal(effective_quote),
+                        "tolerance_ceiling": _format_decimal(quote_ceiling_raw),
+                        "rounding_allowance": _format_decimal(rounding_allowance),
+                        "tick_gap": _format_decimal(tick_gap),
+                        "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                        "tolerance_type": tolerance_type,
+                        "tolerance_value": tolerance_value,
+                    },
+                )
+
+            effective_notional = limit_notional
+            if market_unit != "quoteCoin":
+                effective_quote = limit_notional
+            else:
+                effective_quote = effective_notional
+
+            tick_gap = Decimal("0")
+            if market_unit != "quoteCoin" and limit_price > worst_price:
+                tick_gap = (limit_price - worst_price) * qty_base
+            tick_allowance = tick_gap if (tolerance_decimal > 0 and market_unit != "quoteCoin") else Decimal("0")
+            quote_ceiling = (quote_ceiling_raw or Decimal("0")) + rounding_allowance + tick_allowance
+            if effective_quote - quote_ceiling > tolerance_margin:
+                raise OrderValidationError(
+                    "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                    code="tolerance_exceeded",
+                    details={
+                        "requested_quote": _format_decimal(target_quote),
+                        "effective_notional": _format_decimal(effective_quote),
+                        "tolerance_ceiling": _format_decimal(quote_ceiling_raw),
+                        "rounding_allowance": _format_decimal(rounding_allowance),
+                        "tick_gap": _format_decimal(tick_gap),
+                        "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                        "tolerance_type": tolerance_type,
+                        "tolerance_value": tolerance_value,
+                    },
+                )
 
     if max_available is not None:
         if max_available <= 0 or tolerance_adjusted - max_available > tolerance_margin:
@@ -1836,6 +1912,8 @@ def prepare_spot_market_order(
     audit["limit_price"] = _format_decimal(limit_price)
     audit["order_qty_base"] = _format_decimal(qty_base)
     audit["order_notional"] = _format_decimal(limit_notional)
+    if tolerance_guard_reduction is not None:
+        audit["tolerance_guard_reduction"] = _format_decimal(tolerance_guard_reduction)
     if target_quote is not None:
         audit["requested_quote_notional"] = _format_decimal(target_quote)
         if quote_ceiling_raw is not None:
