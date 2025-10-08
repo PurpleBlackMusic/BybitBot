@@ -21,6 +21,22 @@ with st.form("telegram-creds"):
         token = st.text_input("Bot Token", value=settings.telegram_token, type="password")
     with col2:
         chat_id = st.text_input("Chat ID", value=settings.telegram_chat_id)
+
+    st.subheader("Уведомления")
+    trade_notifications = st.toggle(
+        "Уведомления о сделках",
+        value=bool(settings.telegram_notify or settings.tg_trade_notifs),
+        help="Включите, чтобы получать сообщения о совершённых сделках и действиях бота.",
+    )
+    min_notional = st.number_input(
+        "Минимальный объём сделки для уведомлений (USDT)",
+        min_value=0.0,
+        value=float(settings.tg_trade_notifs_min_notional or 0.0),
+        help="Сообщения будут приходить только для сделок с объёмом выше указанного порога.",
+        step=10.0,
+        format="%0.2f",
+    )
+
     heartbeat = st.toggle(
         "Пульс бота",
         value=settings.heartbeat_enabled,
@@ -38,6 +54,9 @@ with st.form("telegram-creds"):
         update_settings(
             telegram_token=token.strip(),
             telegram_chat_id=chat_id.strip(),
+            telegram_notify=bool(trade_notifications),
+            tg_trade_notifs=bool(trade_notifications),
+            tg_trade_notifs_min_notional=float(min_notional),
             heartbeat_enabled=bool(heartbeat),
             heartbeat_minutes=int(interval),
         )

@@ -637,6 +637,22 @@ class SignalExecutor:
             return
 
         executed_base, executed_quote = self._extract_execution_totals(response)
+
+        if isinstance(execution_stats, Mapping):
+            stats_base = self._decimal_from(execution_stats.get("executed_base"))
+            stats_quote = self._decimal_from(execution_stats.get("executed_quote"))
+            stats_filled = self._decimal_from(execution_stats.get("filled_base_total"))
+            stats_avg = self._decimal_from(execution_stats.get("avg_price"))
+
+            if stats_base > 0:
+                executed_base = max(executed_base, stats_base)
+            if stats_filled > 0:
+                executed_base = max(executed_base, stats_filled)
+            if stats_quote > 0:
+                executed_quote = max(executed_quote, stats_quote)
+            if executed_quote <= 0 and executed_base > 0 and stats_avg > 0:
+                executed_quote = executed_base * stats_avg
+
         if executed_base <= 0 or executed_quote <= 0:
             return
 
