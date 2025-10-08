@@ -67,6 +67,73 @@ def _install_websocket_stub(monkeypatch: pytest.MonkeyPatch, messages: list[str]
     return sent
 
 
+def test_ws_private_v5_does_not_duplicate_subscribe_requests() -> None:
+    client = WSPrivateV5()
+
+    class DummyWS:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    ws = DummyWS()
+
+    client._subscribe_missing(ws)
+    assert len(ws.sent) == 1
+
+    # No additional subscribe should be emitted while the first request is pending.
+    client._subscribe_missing(ws)
+    assert len(ws.sent) == 1
+
+    payload = ws.sent[0]
+    assert payload.get("op") == "subscribe"
+    args = payload.get("args")
+    assert isinstance(args, list)
+    keys = {str(topic).lower() for topic in args}
+    client._handle_subscription_ack(keys, success=True)
+
+    # Once the subscription is acknowledged, subsequent calls should be no-ops.
+    client._subscribe_missing(ws)
+    assert len(ws.sent) == 1
+
+
+def test_ws_private_v5_unsubscribes_removed_topics(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = WSPrivateV5()
+
+    class AliveThread:
+        def is_alive(self) -> bool:
+            return True
+
+    class DummyWS:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        def send(self, payload: str) -> None:
+            self.sent.append(json.loads(payload))
+
+    dummy_ws = DummyWS()
+    client._ws = dummy_ws
+    client._thread = AliveThread()
+    monkeypatch.setattr(client, "_is_socket_connected", lambda ws: True)
+
+    client._set_topics(["custom.one"])
+    with client._topics_lock:
+        client._active_topics.update(topic.lower() for topic in client._topics)
+
+    assert client.start(topics=["other.topic"]) is True
+
+    ops = [payload.get("op") for payload in dummy_ws.sent]
+    assert ops.count("unsubscribe") == 1
+    assert ops.count("subscribe") == 1
+
+    unsub_args = next(payload.get("args") for payload in dummy_ws.sent if payload.get("op") == "unsubscribe")
+    assert unsub_args == ["custom.one"]
+
+    sub_args = next(payload.get("args") for payload in dummy_ws.sent if payload.get("op") == "subscribe")
+    assert "other.topic" in sub_args
+
+
 def test_ws_private_v5_validates_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(ws_private_v5, "log", lambda event, **payload: events.append((event, payload)))

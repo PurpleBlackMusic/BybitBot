@@ -6,7 +6,7 @@ import hmac
 import json
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .envs import get_settings
 from .log import log
@@ -16,7 +16,6 @@ DEFAULT_TOPICS: tuple[str, ...] = (
     "order.spot",
     "execution.spot",
     "wallet",
-    "balance",
     "position",
 )
 
@@ -35,6 +34,11 @@ class WSPrivateV5:
         self._thread: threading.Thread | None = None
         self._stop = False
         self._topics: tuple[str, ...] = DEFAULT_TOPICS
+        self._topic_lookup: dict[str, str] = {topic.lower(): topic for topic in self._topics}
+        self._topic_keys: set[str] = set(self._topic_lookup)
+        self._active_topics: set[str] = set()
+        self._pending_topics: set[str] = set()
+        self._topics_lock = threading.Lock()
         self._authenticated = False
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
@@ -90,14 +94,95 @@ class WSPrivateV5:
             normalised.append(text)
         return tuple(normalised)
 
+    def _extract_topic_keys(self, topics: Iterable[str]) -> set[str]:
+        keys: set[str] = set()
+        for topic in topics:
+            if topic is None:
+                continue
+            text = str(topic).strip().lower()
+            if not text:
+                continue
+            keys.add(text)
+        return keys
+
+    def _set_topics(self, topics: list[str] | None) -> list[str]:
+        normalised = self._normalise_topics(topics)
+        lookup = {topic.lower(): topic for topic in normalised}
+        new_keys = set(lookup)
+        with self._topics_lock:
+            old_lookup = getattr(self, "_topic_lookup", {})
+            old_keys = set(old_lookup)
+            removed_keys = old_keys - new_keys
+            removed_topics = [old_lookup[key] for key in removed_keys if key in old_lookup]
+            self._topics = normalised
+            self._topic_lookup = lookup
+            self._topic_keys = new_keys
+            if removed_keys:
+                self._pending_topics.difference_update(removed_keys)
+                self._active_topics.difference_update(removed_keys)
+        return removed_topics
+
+    def _unsubscribe_topics(self, ws, topics: Iterable[str]) -> None:
+        args = [topic for topic in topics if topic]
+        if not args:
+            return
+        try:
+            ws.send(json.dumps({"op": "unsubscribe", "args": args}))
+        except Exception as exc:
+            log("ws.private.unsub.error", err=str(exc))
+
+    def _handle_subscription_ack(self, keys: set[str], *, success: bool) -> None:
+        if not keys:
+            return
+        with self._topics_lock:
+            self._pending_topics.difference_update(keys)
+            if success:
+                self._active_topics.update(key for key in keys if key in self._topic_keys)
+            else:
+                self._active_topics.difference_update(keys)
+
+    def _handle_unsubscribe_ack(self, keys: set[str], *, success: bool) -> None:
+        if not keys:
+            return
+        with self._topics_lock:
+            self._pending_topics.difference_update(keys)
+            if success:
+                self._active_topics.difference_update(keys)
+
+    def _subscribe_missing(self, ws) -> None:
+        with self._topics_lock:
+            pending = self._pending_topics.copy()
+            active = self._active_topics.copy()
+            missing: list[str] = []
+            keys_to_send: list[str] = []
+            for topic in self._topics:
+                if not topic:
+                    continue
+                key = topic.lower()
+                if not key or key in active or key in pending or key in keys_to_send:
+                    continue
+                missing.append(topic)
+                keys_to_send.append(key)
+        if not missing:
+            return
+        try:
+            ws.send(json.dumps({"op": "subscribe", "args": missing}))
+        except Exception as exc:
+            log("ws.private.sub.error", err=str(exc))
+        else:
+            with self._topics_lock:
+                self._pending_topics.update(keys_to_send)
+
     def start(self, topics: list[str] | None = None) -> bool:
         if self.is_running():
             if topics is not None:
-                self._topics = self._normalise_topics(topics)
+                removed_topics = self._set_topics(topics)
                 ws = self._ws
                 if ws is not None and self._is_socket_connected(ws):
+                    if removed_topics:
+                        self._unsubscribe_topics(ws, removed_topics)
                     try:
-                        ws.send(json.dumps({"op": "subscribe", "args": list(self._topics)}))
+                        self._subscribe_missing(ws)
                     except Exception as exc:
                         log("ws.private.resub.error", err=str(exc))
             return True
@@ -117,7 +202,10 @@ class WSPrivateV5:
 
         auth_args = self._auth_args(api_key, api_secret)
         auth = {"op": "auth", "args": list(auth_args)}
-        self._topics = self._normalise_topics(topics)
+        self._set_topics(topics)
+        with self._topics_lock:
+            self._active_topics.clear()
+            self._pending_topics.clear()
 
         def run() -> None:
             import ssl
@@ -148,16 +236,32 @@ class WSPrivateV5:
                         success = bool(payload.get("success"))
                         if success:
                             self._authenticated = True
-                            try:
-                                ws.send(json.dumps({"op": "subscribe", "args": list(self._topics)}))
-                            except Exception as exc:
-                                log("ws.private.sub.error", err=str(exc))
-                            else:
-                                log("ws.private.auth.ok")
+                            self._subscribe_missing(ws)
+                            log("ws.private.auth.ok")
                         else:
                             log("ws.private.auth.error", msg=payload.get("ret_msg"))
-                    elif payload.get("op") == "subscribe" and not payload.get("success", True):
-                        log("ws.private.subscribe.error", msg=payload.get("ret_msg"))
+                    elif payload.get("op") == "subscribe":
+                        success = payload.get("success", True)
+                        args = payload.get("args")
+                        if isinstance(args, list):
+                            keys = self._extract_topic_keys(args)
+                        else:
+                            topic = payload.get("topic")
+                            keys = self._extract_topic_keys([topic] if topic else [])
+                        self._handle_subscription_ack(keys, success=bool(success))
+                        if not success:
+                            log("ws.private.subscribe.error", msg=payload.get("ret_msg"))
+                    elif payload.get("op") == "unsubscribe":
+                        success = payload.get("success", True)
+                        args = payload.get("args")
+                        if isinstance(args, list):
+                            keys = self._extract_topic_keys(args)
+                        else:
+                            topic = payload.get("topic")
+                            keys = self._extract_topic_keys([topic] if topic else [])
+                        self._handle_unsubscribe_ack(keys, success=bool(success))
+                        if not success:
+                            log("ws.private.unsubscribe.error", msg=payload.get("ret_msg"))
 
                 try:
                     self.on_msg(payload)
@@ -170,6 +274,9 @@ class WSPrivateV5:
             def handle_close(ws, code, msg) -> None:
                 log("ws.private.close", code=code, msg=msg, requested=self._stop)
                 self._authenticated = False
+                with self._topics_lock:
+                    self._active_topics.clear()
+                    self._pending_topics.clear()
 
             while not self._stop:
                 ws = websocket.WebSocketApp(
