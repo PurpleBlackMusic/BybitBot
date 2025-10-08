@@ -188,7 +188,7 @@ class WSPrivateV5:
                         log("ws.private.resub.error", err=str(exc))
             return True
 
-        settings = get_settings()
+        settings = get_settings(force_reload=True)
         api_key = getattr(settings, "api_key", "") or ""
         api_secret = getattr(settings, "api_secret", "") or ""
         if not api_key or not api_secret:
@@ -247,7 +247,7 @@ class WSPrivateV5:
                         except Exception as exc:
                             log("ws.private.ping.error", err=str(exc))
                             break
-                        interval = random.uniform(15.0, 20.0)
+                        interval = random.uniform(14.0, 16.0)
                         if ping_stop.wait(interval):
                             break
 

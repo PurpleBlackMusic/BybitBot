@@ -420,10 +420,75 @@ class BybitAPI:
             max_attempts = 5 if action == "place" else 1
             delay_seconds = 0.3
 
-            def _search_open_orders() -> tuple[bool, bool]:
-                params = {"category": category_for_check, "openOnly": 1}
+            def _search_realtime_orders() -> tuple[bool, bool]:
+                params: dict[str, object] = {"category": category_for_check}
                 if symbol:
                     params["symbol"] = symbol
+                if order_link_id:
+                    params["orderLinkId"] = order_link_id
+                if order_id:
+                    params["orderId"] = order_id
+
+                try:
+                    orders_payload = self._safe_req(
+                        "GET",
+                        "/v5/order/realtime",
+                        params=params,
+                        signed=True,
+                    )
+                except Exception as exc:  # pragma: no cover - network/runtime errors
+                    log(
+                        f"order.self_check.{action}.error",
+                        category=category_for_check,
+                        symbol=symbol,
+                        orderLinkId=order_link_id,
+                        orderId=order_id,
+                        err=str(exc),
+                    )
+                    return False, True
+
+                orders_source: object
+                if isinstance(orders_payload, Mapping):
+                    orders_source = orders_payload.get("result")
+                else:
+                    orders_source = None
+
+                if isinstance(orders_source, Mapping):
+                    orders = orders_source.get("list")
+                else:
+                    orders = orders_source
+
+                if isinstance(orders, Iterable):
+                    for row in orders:
+                        if not isinstance(row, Mapping):
+                            continue
+
+                        if order_link_id:
+                            candidate_link = row.get("orderLinkId")
+                            if (
+                                isinstance(candidate_link, str)
+                                and ensure_link_id(candidate_link) == order_link_id
+                            ):
+                                return True, False
+
+                        if order_id:
+                            candidate_id = row.get("orderId")
+                            if (
+                                isinstance(candidate_id, (str, int))
+                                and str(candidate_id).strip() == order_id
+                            ):
+                                return True, False
+
+                return False, False
+
+            def _search_open_orders() -> tuple[bool, bool]:
+                params: dict[str, object] = {"category": category_for_check, "openOnly": 1}
+                if symbol:
+                    params["symbol"] = symbol
+                if order_link_id:
+                    params["orderLinkId"] = order_link_id
+                if order_id:
+                    params["orderId"] = order_id
 
                 cursor: str | None = None
                 seen_cursors: set[str] = set()
@@ -436,7 +501,12 @@ class BybitAPI:
                         params.pop("cursor", None)
 
                     try:
-                        orders_payload = self.open_orders(**params)
+                        orders_payload = self._safe_req(
+                            "GET",
+                            "/v5/order/realtime",
+                            params=params,
+                            signed=True,
+                        )
                     except Exception as exc:  # pragma: no cover - network/runtime errors
                         log(
                             f"order.self_check.{action}.error",
@@ -488,10 +558,12 @@ class BybitAPI:
 
                 return False, False
 
+            search_fn = _search_realtime_orders if action == "place" else _search_open_orders
+
             found = False
             aborted = False
             for attempt in range(max_attempts):
-                found, aborted = _search_open_orders()
+                found, aborted = search_fn()
                 if found or aborted:
                     break
                 if attempt < max_attempts - 1:
