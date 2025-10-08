@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from bybit_app.utils import spot_market as spot_market_module
+from bybit_app.utils.envs import Settings
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     place_spot_market_with_tolerance,
@@ -555,6 +556,145 @@ def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
     details = getattr(err, "details", {}) or {}
     assert details.get("max_allowed") == "101"
     assert details.get("mark_price") == "100"
+
+
+def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=6)
+    api = DummyAPI(_universe_payload([]))
+
+    requested: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        requested.append(qty_decimal)
+        if qty_decimal > Decimal("40"):
+            raise OrderValidationError("too wide", code="price_deviation")
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "1",
+            "timeInForce": "IOC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+            "marketUnit": "quoteCoin",
+        }
+        audit = {"quote_step": "0.01", "qty_step": "0.00000001"}
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    place_payloads: list[dict] = []
+
+    def fake_place_order(**payload):
+        place_payloads.append(payload)
+        qty_value = Decimal(str(payload.get("qty", "0")))
+        return {
+            "result": {
+                "cumExecQty": format(qty_value, "f"),
+                "cumExecValue": format(qty_value, "f"),
+                "avgPrice": "1",
+            }
+        }
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("120"),
+        unit="quoteCoin",
+        settings=settings,
+    )
+
+    assert requested[0] == Decimal("120")
+    # After TWAP activation requests are split evenly across six slices
+    assert all(q == Decimal("20") for q in requested[1:])
+    assert len(place_payloads) == 6
+    assert all(payload.get("qty") == "20" for payload in place_payloads)
+
+    local_meta = response.get("_local", {}) if isinstance(response, dict) else {}
+    twap_meta = local_meta.get("twap", {})
+    assert twap_meta.get("active") is True
+    assert twap_meta.get("target_slices") == 6
+    assert twap_meta.get("orders_sent") == 6
+    adjustments = twap_meta.get("adjustments") or []
+    assert adjustments and adjustments[0].get("action") == "activate"
+
+
+def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=2)
+    api = DummyAPI(_universe_payload([]))
+
+    requested: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        requested.append(qty_decimal)
+        if qty_decimal > Decimal("15"):
+            raise OrderValidationError(
+                "too wide",
+                code="price_deviation",
+                details={"limit_price": "10", "max_allowed": "1"},
+            )
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "1",
+            "timeInForce": "IOC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+            "marketUnit": "quoteCoin",
+        }
+        audit = {"quote_step": "0.01", "qty_step": "0.00000001"}
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    place_payloads: list[dict] = []
+
+    def fake_place_order(**payload):
+        place_payloads.append(payload)
+        qty_value = Decimal(str(payload.get("qty", "0")))
+        return {
+            "result": {
+                "cumExecQty": format(qty_value, "f"),
+                "cumExecValue": format(qty_value, "f"),
+                "avgPrice": "1",
+            }
+        }
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("120"),
+        unit="quoteCoin",
+        settings=settings,
+    )
+
+    assert requested[0] == Decimal("120")
+    # The first reattempt uses the scaled slice count derived from deviation details.
+    assert requested[1] == Decimal("12")
+    assert len(place_payloads) == 10
+    assert all(payload.get("qty") == "12" for payload in place_payloads)
+
+    local_meta = response.get("_local", {}) if isinstance(response, dict) else {}
+    twap_meta = local_meta.get("twap", {})
+    assert twap_meta.get("active") is True
+    assert twap_meta.get("target_slices") == 10
+    adjustments = twap_meta.get("adjustments") or []
+    assert adjustments and adjustments[0].get("action") == "activate"
+    assert adjustments[0].get("target_slices") == 10
+    assert adjustments[0].get("ratio") == "10"
 
 
 def test_place_spot_market_accepts_bps_suffix():

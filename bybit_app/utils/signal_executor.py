@@ -230,6 +230,7 @@ class SignalExecutor:
                 tol_type="Percent",
                 tol_value=slippage_pct,
                 max_quote=usable_after_reserve,
+                settings=settings,
             )
         except OrderValidationError as exc:
             validation_context = dict(order_context)

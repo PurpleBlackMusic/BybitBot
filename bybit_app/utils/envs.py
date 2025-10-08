@@ -56,10 +56,10 @@ class Settings:
     ai_market_scan_enabled: bool = True
 
     # TWAP
-    twap_slices: int = 5
-    twap_aggressiveness_bps: float = 2.0
-    twap_enabled: bool = False
-    twap_interval_sec: int = 30
+    twap_slices: int = 6
+    twap_aggressiveness_bps: float = 20.0
+    twap_enabled: bool = True
+    twap_interval_sec: int = 5
     twap_child_secs: int = 5  # алиас для интервала TWAP
 
     # Universe presets / filters
