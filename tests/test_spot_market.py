@@ -480,7 +480,7 @@ def test_place_spot_market_accepts_bps_suffix():
     assert "Недостаточно свободного капитала" in str(excinfo.value)
 
 
-def test_place_spot_market_rejects_excessive_notional_vs_tolerance():
+def test_place_spot_market_uses_quote_market_unit_with_tick_gap():
     payload = {
         "result": {
             "list": [
@@ -501,19 +501,23 @@ def test_place_spot_market_rejects_excessive_notional_vs_tolerance():
     orderbook = {"result": {"a": [["0.95", "100"]], "b": [["0.90", "100"]]}}
     api = DummyAPI(payload, ticker_payload=ticker, orderbook_payload=orderbook)
 
-    with pytest.raises(OrderValidationError) as excinfo:
-        place_spot_market_with_tolerance(
-            api,
-            symbol="FOOUSDT",
-            side="Buy",
-            qty=Decimal("10"),
-            unit="quoteCoin",
-            tol_value=Decimal("0"),
-        )
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="FOOUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_value=Decimal("0"),
+    )
 
-    assert excinfo.value.code == "tolerance_exceeded"
-    assert "толеранса" in str(excinfo.value)
-    assert api.place_calls == []
+    assert response["ok"] is True
+    assert api.place_calls
+    placed = api.place_calls[0]
+    assert placed.get("marketUnit") == "quoteCoin"
+    assert placed["qty"] == "10"
+    audit = response.get("_local", {}).get("order_audit", {})
+    assert audit.get("market_unit_qty") == "10"
+    assert Decimal(audit.get("limit_notional")) >= Decimal("9")
 
 
 def test_place_spot_market_requires_quote_currency_balance():
