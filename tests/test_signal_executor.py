@@ -211,7 +211,7 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     settings = Settings(
         ai_enabled=True,
         dry_run=False,
-        ai_max_slippage_bps=250,
+        ai_max_slippage_bps=800,
         ai_risk_per_trade_pct=1.0,
         spot_cash_reserve_pct=0.0,
     )
@@ -242,7 +242,7 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     assert result.status == "filled"
     assert captured is not None
     assert captured["tol_type"] == "Percent"
-    assert captured["tol_value"] == pytest.approx(1.0)
+    assert captured["tol_value"] == pytest.approx(5.0)
 
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:

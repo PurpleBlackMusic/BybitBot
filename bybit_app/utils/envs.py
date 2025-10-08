@@ -43,7 +43,7 @@ class Settings:
     ai_horizon_bars: int = 48
     ai_live_only: bool = True
     # трейдинг параметры
-    ai_max_slippage_bps: int = 300
+    ai_max_slippage_bps: int = 500
     ai_fee_bps: float = 5.0
     ai_slippage_bps: float = 10.0
     ai_buy_threshold: float = 0.55

@@ -40,11 +40,20 @@ def _install_websocket_stub(monkeypatch: pytest.MonkeyPatch, messages: list[str]
     sent: list[str] = []
 
     class FakeWebSocketApp:
-        def __init__(self, url: str, on_open=None, on_message=None, on_error=None, on_close=None):
+        def __init__(
+            self,
+            url: str,
+            on_open=None,
+            on_message=None,
+            on_error=None,
+            on_close=None,
+            on_pong=None,
+        ):
             self.url = url
             self._on_open = on_open
             self._on_message = on_message
             self._on_close = on_close
+            self._on_pong = on_pong
 
         def send(self, payload: str) -> None:
             sent.append(payload)
@@ -58,6 +67,8 @@ def _install_websocket_stub(monkeypatch: pytest.MonkeyPatch, messages: list[str]
             if self._on_message:
                 for message in list(messages):
                     self._on_message(self, message)
+            if self._on_pong:
+                self._on_pong(self, None)
             if self._on_close:
                 self._on_close(self, 1000, "normal")
 
@@ -249,4 +260,26 @@ def test_ws_private_v5_stop_closes_socket(monkeypatch: pytest.MonkeyPatch) -> No
     assert dummy_ws.closed is True
     assert client._ws is None
     assert client._thread is None
+
+
+def test_ws_private_v5_emits_heartbeat_on_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ws_private_v5,
+        "get_settings",
+        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+    )
+    _install_thread_stub(monkeypatch)
+
+    messages = [json.dumps({"op": "auth", "success": True})]
+    _install_websocket_stub(monkeypatch, messages)
+
+    captured: list[dict[str, Any]] = []
+
+    def on_msg(payload: dict[str, Any]) -> None:
+        captured.append(payload)
+
+    client = WSPrivateV5(on_msg=on_msg, reconnect=False)
+    assert client.start() is True
+
+    assert any(payload.get("op") == "pong" for payload in captured)
 

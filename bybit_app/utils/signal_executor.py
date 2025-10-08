@@ -21,7 +21,7 @@ from .symbols import ensure_usdt_symbol
 from .ws_manager import manager as ws_manager
 
 _PERCENT_TOLERANCE_MIN = 0.05
-_PERCENT_TOLERANCE_MAX = 1.0
+_PERCENT_TOLERANCE_MAX = 5.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -182,7 +182,7 @@ class SignalExecutor:
         if symbol_meta:
             order_context["symbol_meta"] = symbol_meta
 
-        raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 25)
+        raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
         slippage_pct = _normalise_slippage_percent(slippage_pct)
 
