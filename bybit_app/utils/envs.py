@@ -25,10 +25,14 @@ class Settings:
     # safety
     dry_run: bool = True
     spot_cash_only: bool = True  # запрет заимствований на споте
+    order_time_in_force: str = 'GTC'
+    allow_partial_fills: bool = True
+    reprice_unfilled_after_sec: int = 15
+    max_amendments: int = 3
     spot_tpsl_sl_order_type: str = 'Market'
     spot_tpsl_tp_order_type: str = 'Market'
     spot_server_tpsl: bool = False
-    spot_limit_tif: str = 'PostOnly'
+    spot_limit_tif: str = 'GTC'
     spot_max_cap_per_symbol_pct: float = 20.0
     spot_max_cap_per_trade_pct: float = 5.0
     spot_cash_reserve_pct: float = 10.0
@@ -43,7 +47,7 @@ class Settings:
     ai_horizon_bars: int = 48
     ai_live_only: bool = True
     # трейдинг параметры
-    ai_max_slippage_bps: int = 500
+    ai_max_slippage_bps: int = 400
     ai_fee_bps: float = 5.0
     ai_slippage_bps: float = 10.0
     ai_buy_threshold: float = 0.55
@@ -56,11 +60,11 @@ class Settings:
     ai_market_scan_enabled: bool = True
 
     # TWAP
-    twap_slices: int = 6
+    twap_slices: int = 8
     twap_aggressiveness_bps: float = 20.0
     twap_enabled: bool = True
-    twap_interval_sec: int = 5
-    twap_child_secs: int = 5  # алиас для интервала TWAP
+    twap_interval_sec: int = 7
+    twap_child_secs: int = 7  # алиас для интервала TWAP
 
     # Universe presets / filters
     ai_universe_preset: str = "Стандарт"
@@ -140,6 +144,10 @@ _ENV_MAP = {
     "spot_tpsl_tp_order_type": "SPOT_TPSL_TP_ORDER_TYPE",
     "spot_tpsl_sl_order_type": "SPOT_TPSL_SL_ORDER_TYPE",
     "spot_cash_only": "SPOT_CASH_ONLY",
+    "order_time_in_force": "ORDER_TIME_IN_FORCE",
+    "allow_partial_fills": "ALLOW_PARTIAL_FILLS",
+    "reprice_unfilled_after_sec": "REPRICE_UNFILLED_AFTER_SEC",
+    "max_amendments": "MAX_AMENDMENTS",
     "telegram_token": "TG_BOT_TOKEN",
     "telegram_chat_id": "TG_CHAT_ID",
     "telegram_notify": "TG_NOTIFY",
@@ -225,15 +233,43 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_cash_reserve_pct"] = _cast_float(m.get("spot_cash_reserve_pct", 10.0))
     m["spot_max_cap_per_trade_pct"] = _cast_float(m.get("spot_max_cap_per_trade_pct", 5.0))
     m["spot_max_cap_per_symbol_pct"] = _cast_float(m.get("spot_max_cap_per_symbol_pct", 20.0))
-    m["spot_limit_tif"] = m.get("spot_limit_tif") or "PostOnly"
+    m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
     m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"
     m["spot_cash_only"] = _cast_bool(m.get("spot_cash_only", True))
 
+    tif_raw = m.get("order_time_in_force")
+    if isinstance(tif_raw, str):
+        cleaned = tif_raw.strip()
+        if cleaned:
+            m["order_time_in_force"] = cleaned.upper()
+        else:
+            m.pop("order_time_in_force", None)
+    elif tif_raw is None:
+        m.pop("order_time_in_force", None)
+
+    allow_partial = _cast_bool(m.get("allow_partial_fills"))
+    if allow_partial is not None:
+        m["allow_partial_fills"] = allow_partial
+    else:
+        m.pop("allow_partial_fills", None)
+
+    reprice_after = _cast_int(m.get("reprice_unfilled_after_sec"))
+    if reprice_after is not None:
+        m["reprice_unfilled_after_sec"] = reprice_after
+    else:
+        m.pop("reprice_unfilled_after_sec", None)
+
+    max_amend = _cast_int(m.get("max_amendments"))
+    if max_amend is not None:
+        m["max_amendments"] = max_amend
+    else:
+        m.pop("max_amendments", None)
+
     # TWAP aliases: keep twap_child_secs and twap_interval_sec in sync
     if not m.get("twap_interval_sec"):
-        m["twap_interval_sec"] = m.get("twap_child_secs") or 5
+        m["twap_interval_sec"] = m.get("twap_child_secs") or 7
     if not m.get("twap_child_secs"):
         m["twap_child_secs"] = m.get("twap_interval_sec")
 

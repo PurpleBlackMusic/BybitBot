@@ -36,7 +36,7 @@ def test_twap_spot_batch_builds_orders(monkeypatch):
             "orderType": "Limit",
             "qty": "5.0000000000",
             "price": "101.0202000000",
-            "timeInForce": "IOC",
+            "timeInForce": "GTC",
             "orderLinkId": "TWAPB-1234567-0",
         },
         {
@@ -45,7 +45,7 @@ def test_twap_spot_batch_builds_orders(monkeypatch):
             "orderType": "Limit",
             "qty": "5.0000000000",
             "price": "101.0202000000",
-            "timeInForce": "IOC",
+            "timeInForce": "GTC",
             "orderLinkId": "TWAPB-1234567-1",
         },
     ]
