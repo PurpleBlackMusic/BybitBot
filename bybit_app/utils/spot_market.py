@@ -1319,12 +1319,17 @@ def prepare_spot_market_order(
 
     limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
     limit_price = _apply_tick(worst_price, limit_map_tick, side_normalised)
-    effective_notional = qty_base * limit_price
+    limit_notional = qty_base * limit_price
 
     if unit_normalised == "quotecoin":
         market_unit = "quoteCoin"
     else:
         market_unit = "baseCoin"
+
+    if market_unit == "quoteCoin" and target_quote is not None:
+        effective_notional = target_quote
+    else:
+        effective_notional = limit_notional
 
     tolerance_margin = Decimal("0.00000001")
     tolerance_adjusted = effective_notional * tolerance_multiplier
@@ -1335,20 +1340,20 @@ def prepare_spot_market_order(
     tick_gap = Decimal("0")
     if target_quote is not None:
         quote_ceiling_raw = target_quote * tolerance_multiplier
-        if qty_step > 0:
+        effective_quote = limit_notional if market_unit != "quoteCoin" else effective_notional
+        if market_unit != "quoteCoin" and qty_step > 0:
             rounding_allowance = (qty_step * limit_price).copy_abs()
-        if limit_price > worst_price:
+        if market_unit != "quoteCoin" and limit_price > worst_price:
             tick_gap = (limit_price - worst_price) * qty_base
-        if quote_ceiling_raw is None:
-            quote_ceiling_raw = target_quote
-        quote_ceiling = quote_ceiling_raw + rounding_allowance
-        if effective_notional - quote_ceiling > tolerance_margin:
+        tick_allowance = tick_gap if (tolerance_decimal > 0 and market_unit != "quoteCoin") else Decimal("0")
+        quote_ceiling = quote_ceiling_raw + rounding_allowance + tick_allowance
+        if effective_quote - quote_ceiling > tolerance_margin:
             raise OrderValidationError(
                 "Расчётный объём превышает допустимый предел с учётом толеранса.",
                 code="tolerance_exceeded",
                 details={
                     "requested_quote": _format_decimal(target_quote),
-                    "effective_notional": _format_decimal(effective_notional),
+                    "effective_notional": _format_decimal(effective_quote),
                     "tolerance_ceiling": _format_decimal(quote_ceiling_raw),
                     "rounding_allowance": _format_decimal(rounding_allowance),
                     "tick_gap": _format_decimal(tick_gap),
@@ -1411,7 +1416,12 @@ def prepare_spot_market_order(
     else:
         _ensure_balance(base_coin or "", qty_base)
 
-    qty_text = format(qty_base.normalize(), "f") if qty_base != 0 else "0"
+    if market_unit == "quoteCoin":
+        qty_value = target_quote if target_quote is not None else requested_qty
+    else:
+        qty_value = qty_base
+
+    qty_text = format(qty_value.normalize(), "f") if qty_value != 0 else "0"
     price_text = format(limit_price.normalize(), "f") if limit_price != 0 else "0"
 
     payload: Dict[str, object] = {
@@ -1425,6 +1435,9 @@ def prepare_spot_market_order(
         "orderFilter": "Order",
         "accountType": "UNIFIED",
     }
+
+    if market_unit == "quoteCoin":
+        payload["marketUnit"] = market_unit
 
     audit: Dict[str, object] = {
         "symbol": symbol.upper(),
@@ -1445,6 +1458,10 @@ def prepare_spot_market_order(
         "quote_coin": quote_coin or None,
         "base_coin": base_coin or None,
     }
+
+    audit["limit_notional"] = _format_decimal(limit_notional)
+    if market_unit == "quoteCoin":
+        audit["market_unit_qty"] = _format_decimal(qty_value)
 
     if max_available is not None:
         audit["max_available"] = _format_decimal(max_available)
