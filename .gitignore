@@ -10,4 +10,5 @@ __pycache__/
 !.env.example
 .DS_Store
 bybit_app/_data/ws/
+bybit_app/_data/cache/
 
