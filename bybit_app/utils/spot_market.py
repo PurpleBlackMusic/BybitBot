@@ -1812,12 +1812,8 @@ def prepare_spot_market_order(
     else:
         _ensure_balance(base_coin or "", qty_base)
 
-    if market_unit == "quoteCoin":
-        qty_value = limit_notional
-        qty_step_for_payload = quote_step
-    else:
-        qty_value = qty_base
-        qty_step_for_payload = qty_step
+    qty_value = qty_base
+    qty_step_for_payload = qty_step
 
     if qty_step_for_payload > 0:
         qty_value = _round_down(_to_decimal(qty_value), qty_step_for_payload)
@@ -1860,9 +1856,6 @@ def prepare_spot_market_order(
         "accountType": "UNIFIED",
     }
 
-    if market_unit == "quoteCoin":
-        payload["marketUnit"] = market_unit
-
     audit: Dict[str, object] = {
         "symbol": symbol.upper(),
         "side": side.capitalize(),
@@ -1892,9 +1885,6 @@ def prepare_spot_market_order(
         audit["validator_reasons"] = list(validated.reasons)
 
     audit["limit_notional"] = _format_decimal(limit_notional)
-    if market_unit == "quoteCoin":
-        audit["market_unit_qty"] = _format_decimal(qty_value)
-
     if reprice_after_sec is not None:
         audit["reprice_unfilled_after_sec"] = reprice_after_sec
     if max_amendments_setting is not None:
