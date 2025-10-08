@@ -563,7 +563,7 @@ def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
         limits=_basic_limits(),
     )
 
-    assert prepared.payload["price"] == "104"
+    assert prepared.payload["price"] == "104.0"
     audit = prepared.audit
     assert audit.get("price_used") == "100"
     assert audit.get("limit_price") == "104"

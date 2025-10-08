@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .envs import Settings, get_api_client, get_settings, creds_ok
 from .helpers import ensure_link_id
+from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
 from .log import log
 from .spot_market import (
@@ -470,6 +471,8 @@ class SignalExecutor:
         for entry in aggregated:
             qty = self._round_to_step(entry["qty"], qty_step, rounding=ROUND_DOWN)
             if qty <= 0:
+                continue
+            if min_qty > 0 and qty < min_qty:
                 continue
             rung_index += 1
             price = self._round_to_step(entry["price"], price_step, rounding=ROUND_DOWN)
@@ -1034,34 +1037,11 @@ class SignalExecutor:
 
     @staticmethod
     def _round_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decimal:
-        if step <= 0:
-            return value
-        multiplier = (value / step).to_integral_value(rounding=rounding)
-        return multiplier * step
+        return quantize_to_step(value, step, rounding=rounding)
 
     @staticmethod
     def _format_decimal_step(value: Decimal, step: Decimal) -> str:
-        if not isinstance(step, Decimal):
-            try:
-                step = Decimal(str(step))
-            except Exception:
-                step = Decimal("0")
-
-        if step > 0:
-            value = SignalExecutor._round_to_step(value, step, rounding=ROUND_DOWN)
-
-        exponent = step.normalize().as_tuple().exponent if step > 0 else value.normalize().as_tuple().exponent
-        places = abs(exponent) if exponent < 0 else 0
-
-        if places > 0:
-            text = f"{value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_DOWN):.{places}f}"
-        else:
-            quantized = value.quantize(Decimal("1"), rounding=ROUND_DOWN) if value == value.to_integral_value() else value.normalize()
-            text = format(quantized, "f")
-
-        if "." in text:
-            text = text.rstrip("0").rstrip(".")
-        return text or "0"
+        return format_to_step(value, step, rounding=ROUND_DOWN)
 
     @staticmethod
     def _extract_execution_totals(response: Mapping[str, object] | None) -> tuple[Decimal, Decimal]:
