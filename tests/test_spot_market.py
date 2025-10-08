@@ -13,11 +13,23 @@ from bybit_app.utils.spot_market import (
 
 
 class DummyAPI:
-    def __init__(self, instrument_payload, ticker_payload=None, wallet_payload=None):
+    def __init__(
+        self,
+        instrument_payload,
+        ticker_payload=None,
+        wallet_payload=None,
+        orderbook_payload=None,
+    ):
         self.instrument_payload = instrument_payload
         self.ticker_payload = ticker_payload
         self.wallet_payload = wallet_payload or {
             "result": {"list": [{"coin": [{"coin": "USDT", "availableBalance": "100"}]}]}
+        }
+        self.orderbook_payload = orderbook_payload or {
+            "result": {
+                "a": [["101.0", "2"], ["102.0", "3"]],
+                "b": [["100.0", "2"], ["99.0", "3"]],
+            }
         }
         self.place_calls: list[dict] = []
         self.info_calls = 0
@@ -32,11 +44,28 @@ class DummyAPI:
         self.place_calls.append(kwargs)
         return {"ok": True, "body": kwargs}
 
+    def orderbook(self, category="spot", symbol: str | None = None, limit: int = 50):
+        return self.orderbook_payload
+
     def tickers(self, category="spot", symbol: str | None = None):
         self.ticker_calls += 1
         if isinstance(self.ticker_payload, Exception):
             raise self.ticker_payload
-        return self.ticker_payload or {}
+        if self.ticker_payload is None:
+            mark = self._default_mark_price()
+            requested = symbol or "BTCUSDT"
+            return {"result": {"list": [{"symbol": requested, "markPrice": mark}]}}
+        return self.ticker_payload
+
+    def _default_mark_price(self) -> str:
+        result = self.orderbook_payload.get("result") if isinstance(self.orderbook_payload, dict) else {}
+        asks = (result.get("a") or []) if isinstance(result, dict) else []
+        bids = (result.get("b") or []) if isinstance(result, dict) else []
+        if asks and isinstance(asks[0], (list, tuple)) and asks[0]:
+            return str(asks[0][0])
+        if bids and isinstance(bids[0], (list, tuple)) and bids[0]:
+            return str(bids[0][0])
+        return "100.0"
 
     def wallet_balance(self, accountType="UNIFIED"):
         self.wallet_calls += 1
@@ -291,7 +320,8 @@ def test_place_spot_market_base_unit_checks_available_balance():
         }
     }
     ticker = {"result": {"list": [{"symbol": "ETHUSDT", "bestBidPrice": "2000"}]}}
-    api = DummyAPI(payload, ticker_payload=ticker)
+    orderbook = {"result": {"a": [["2000", "5"]], "b": [["1999", "5"]]}}
+    api = DummyAPI(payload, ticker_payload=ticker, orderbook_payload=orderbook)
 
     with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
@@ -366,8 +396,11 @@ def test_place_spot_market_accepts_percent_string():
 
     assert response["ok"] is True
     placed = api.place_calls[0]
-    assert placed["slippageToleranceType"] == "Percent"
-    assert placed["slippageTolerance"] == "0.7500"
+    assert placed["orderType"] == "Limit"
+    assert placed["timeInForce"] == "IOC"
+    audit = response.get("_local", {}).get("order_audit", {})
+    assert audit.get("tolerance_value") == "0.7500"
+    assert "slippageTolerance" not in placed
 
 
 def test_place_spot_market_clamps_percent_tolerance_range():
@@ -396,8 +429,7 @@ def test_place_spot_market_clamps_percent_tolerance_range():
     )
 
     placed_high = api.place_calls[-1]
-    assert placed_high["slippageToleranceType"] == "Percent"
-    assert placed_high["slippageTolerance"] == "1.0000"
+    assert placed_high["orderType"] == "Limit"
     audit_high = response_high.get("_local", {}).get("order_audit", {})
     assert audit_high.get("tolerance_value") == "1.0000"
 
@@ -413,8 +445,7 @@ def test_place_spot_market_clamps_percent_tolerance_range():
     )
 
     placed_low = api.place_calls[-1]
-    assert placed_low["slippageToleranceType"] == "Percent"
-    assert placed_low["slippageTolerance"] == "0.0500"
+    assert placed_low["orderType"] == "Limit"
     audit_low = response_low.get("_local", {}).get("order_audit", {})
     assert audit_low.get("tolerance_value") == "0.0500"
 
@@ -447,6 +478,41 @@ def test_place_spot_market_accepts_bps_suffix():
         )
 
     assert "Недостаточно свободного капитала" in str(excinfo.value)
+
+
+def test_place_spot_market_rejects_excessive_notional_vs_tolerance():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "FOOUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.01",
+                        "minOrderQty": "0.001",
+                        "qtyStep": "0.001",
+                    },
+                    "priceFilter": {"tickSize": "1"},
+                }
+            ]
+        }
+    }
+    ticker = {"result": {"list": [{"symbol": "FOOUSDT", "markPrice": "1"}]}}
+    orderbook = {"result": {"a": [["0.95", "100"]], "b": [["0.90", "100"]]}}
+    api = DummyAPI(payload, ticker_payload=ticker, orderbook_payload=orderbook)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="FOOUSDT",
+            side="Buy",
+            qty=Decimal("10"),
+            unit="quoteCoin",
+            tol_value=Decimal("0"),
+        )
+
+    assert excinfo.value.code == "tolerance_exceeded"
+    assert "толеранса" in str(excinfo.value)
     assert api.place_calls == []
 
 
@@ -898,7 +964,13 @@ def test_place_spot_market_accepts_prefetched_resources():
         "quote_coin": "USDT",
     }
     balances = {"USDT": Decimal("50")}
-    api = DummyAPI({}, ticker_payload=RuntimeError("ticker should not be called"), wallet_payload=RuntimeError("wallet should not be called"))
+    orderbook = {"result": {"a": [["15", "5"]], "b": [["14.9", "5"]]}}
+    api = DummyAPI(
+        {},
+        ticker_payload=RuntimeError("ticker should not be called"),
+        wallet_payload=RuntimeError("wallet should not be called"),
+        orderbook_payload=orderbook,
+    )
 
     response = place_spot_market_with_tolerance(
         api,
@@ -1038,7 +1110,8 @@ def test_prepare_spot_trade_snapshot_prefetches_resources():
             ]
         }
     }
-    api = DummyAPI(payload, ticker_payload=ticker, wallet_payload=wallet)
+    orderbook = {"result": {"a": [["2.5", "10"]], "b": [["2.49", "10"]]}}
+    api = DummyAPI(payload, ticker_payload=ticker, wallet_payload=wallet, orderbook_payload=orderbook)
 
     snapshot = prepare_spot_trade_snapshot(api, "BBSOLUSDT")
 
