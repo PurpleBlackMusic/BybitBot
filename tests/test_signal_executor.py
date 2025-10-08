@@ -589,6 +589,93 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     assert captured["tol_value"] == pytest.approx(5.0)
 
 
+def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        telegram_notify=True,
+        tg_trade_notifs=True,
+        tg_trade_notifs_min_notional=10.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "ok": True,
+        "result": {
+            "orderId": "filled-order",
+            "cumExecQty": "0.5",
+            "cumExecValue": "50.5",
+            "avgPrice": "101.0",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.0001",
+                "price_payload": "101.0",
+                "limit_price": "101.0",
+            },
+            "order_payload": {
+                "qty": "0.5",
+                "price": "101.0",
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: response_payload,
+    )
+
+    def fake_tp(self, api_obj, settings_obj, symbol, side, response):
+        return (
+            [{"price": "105.0", "qty": "0.3", "profit_bps": "35"}],
+            {
+                "executed_base": "0.5",
+                "executed_quote": "50.5",
+                "avg_price": "101.0",
+                "sell_budget_base": "0.3",
+            },
+        )
+
+    monkeypatch.setattr(SignalExecutor, "_place_tp_ladder", fake_tp)
+
+    ledger_rows = [
+        {"symbol": "BTCUSDT", "category": "spot", "side": "Buy", "execPrice": 100.0, "execQty": 0.2, "execFee": 0.0},
+        {"symbol": "BTCUSDT", "category": "spot", "side": "Sell", "execPrice": 120.0, "execQty": 0.1, "execFee": 0.0},
+    ]
+    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000: ledger_rows)
+
+    captured: dict[str, str] = {}
+
+    def fake_send(text: str):
+        captured["text"] = text
+        return {"ok": True}
+
+    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert "text" in captured
+    message = captured["text"]
+    assert message.startswith("куплено 0.5 BTC по 101")
+    assert "цель 105" in message
+    assert "продано 0.3" in message
+    assert "PnL" in message and "+2.00" in message
+
+
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(
