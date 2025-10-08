@@ -89,6 +89,18 @@ def _universe_payload(entries: list[dict]) -> dict:
     return {"result": {"list": entries}}
 
 
+def _basic_limits() -> dict:
+    return {
+        "min_order_amt": "5",
+        "quote_step": "0.01",
+        "min_order_qty": "0.00000001",
+        "qty_step": "0.00000001",
+        "quote_coin": "USDT",
+        "base_coin": "BTC",
+        "tick_size": "0.1",
+    }
+
+
 def test_resolve_trade_symbol_handles_delimiters():
     payload = _universe_payload([
         {"symbol": "SOLUSDT", "quoteCoin": "USDT", "status": "Trading"},
@@ -495,6 +507,54 @@ def test_place_spot_market_clamps_bps_tolerance_range():
     audit_low = response_low.get("_local", {}).get("order_audit", {})
     assert audit_low.get("tolerance_type") == "Bps"
     assert audit_low.get("tolerance_value") == "5.0000"
+
+
+def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
+    orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("100"),
+        unit="quoteCoin",
+        tol_type="Bps",
+        tol_value=500,
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("200")},
+        limits=_basic_limits(),
+    )
+
+    assert prepared.payload["price"] == "104"
+    audit = prepared.audit
+    assert audit.get("price_used") == "100"
+    assert audit.get("limit_price") == "104"
+
+
+def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
+    orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("100"),
+            unit="quoteCoin",
+            tol_type="Bps",
+            tol_value=100,
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("200")},
+            limits=_basic_limits(),
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "price_deviation"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("max_allowed") == "101"
+    assert details.get("mark_price") == "100"
 
 
 def test_place_spot_market_accepts_bps_suffix():
