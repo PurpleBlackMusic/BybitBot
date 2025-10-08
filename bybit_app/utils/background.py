@@ -52,7 +52,7 @@ class BackgroundServices:
 
         self._bot_factory: BotFactory = bot_factory or GuardianBot
         self._executor_factory: ExecutorFactory = executor_factory or (
-            lambda bot: SignalExecutor(bot, settings=bot.settings)
+            lambda bot: SignalExecutor(bot)
         )
         self._loop_factory = loop_factory
         self._automation_poll_interval = 15.0

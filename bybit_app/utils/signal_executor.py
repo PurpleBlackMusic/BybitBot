@@ -18,6 +18,7 @@ from .spot_market import (
     resolve_trade_symbol,
 )
 from .symbols import ensure_usdt_symbol
+from .ws_manager import manager as ws_manager
 
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 1.0
@@ -74,7 +75,7 @@ class SignalExecutor:
 
     def __init__(self, bot, settings: Optional[Settings] = None) -> None:
         self.bot = bot
-        self._settings = settings
+        self._settings_override = settings
 
     def _decision(
         self,
@@ -115,6 +116,10 @@ class SignalExecutor:
                 "disabled",
                 reason="Автоматизация выключена — включите AI сигналы в настройках.",
             )
+
+        guard_result = self._apply_runtime_guards(settings)
+        if guard_result is not None:
+            return guard_result
 
         mode = str(summary.get("mode") or "").lower()
         if mode not in {"buy", "sell"}:
@@ -231,16 +236,37 @@ class SignalExecutor:
             validation_context["validation_code"] = exc.code
             if exc.details:
                 validation_context["validation_details"] = exc.details
-            log("guardian.auto.order.validation_failed", error=exc.to_dict(), context=validation_context)
+            log(
+                "guardian.auto.order.validation_failed",
+                error=exc.to_dict(),
+                context=validation_context,
+            )
+
+            skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
+            if exc.code in skip_codes:
+                return self._decision(
+                    "skipped",
+                    reason=f"Ордер пропущен ({exc.code}): {exc}",
+                    context=validation_context,
+                )
+
             return ExecutionResult(
                 status="rejected",
                 reason=f"Ордер отклонён биржей ({exc.code}): {exc}",
                 context=validation_context,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
+            formatted_error = _format_bybit_error(exc)
+            lowered = formatted_error.lower()
+            if "priceboundrate" in lowered or "price bound" in lowered:
+                return self._decision(
+                    "skipped",
+                    reason=formatted_error,
+                    context=order_context,
+                )
             return self._decision(
                 "error",
-                reason=_format_bybit_error(exc),
+                reason=formatted_error,
                 context=order_context,
             )
 
@@ -289,17 +315,84 @@ class SignalExecutor:
         return {}
 
     def _resolve_settings(self) -> Settings:
-        if isinstance(self._settings, Settings):
-            return self._settings
+        if isinstance(self._settings_override, Settings):
+            return self._settings_override
 
         candidate = getattr(self.bot, "settings", None)
         if isinstance(candidate, Settings):
-            self._settings = candidate
             return candidate
 
-        resolved = get_settings()
-        self._settings = resolved
-        return resolved
+        return get_settings(force_reload=True)
+
+    def _apply_runtime_guards(self, settings: Settings) -> Optional[ExecutionResult]:
+        guard = self._private_ws_guard(settings)
+        if guard is not None:
+            message, context = guard
+            return self._decision("disabled", reason=message, context=context)
+        return None
+
+    def _private_ws_guard(
+        self, settings: Settings
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        if not getattr(settings, "ws_watchdog_enabled", False):
+            return None
+
+        threshold = _safe_float(getattr(settings, "ws_watchdog_max_age_sec", None))
+        if threshold is None or threshold <= 0:
+            return None
+
+        try:
+            status = ws_manager.status()
+        except Exception:  # pragma: no cover - defensive guard
+            return None
+
+        private_info = status.get("private") if isinstance(status, Mapping) else None
+        if not isinstance(private_info, Mapping):
+            return None
+
+        age = _safe_float(private_info.get("age_seconds"))
+        running = bool(private_info.get("running"))
+        connected = bool(private_info.get("connected"))
+
+        if age is None:
+            return None
+
+        if age <= threshold:
+            return None
+
+        context: Dict[str, object] = {
+            "guard": "private_ws_stale",
+            "age_seconds": age,
+            "threshold_seconds": threshold,
+            "running": running,
+            "connected": connected,
+        }
+
+        log(
+            "guardian.auto.guard.private_ws",
+            age=round(age, 2),
+            threshold=threshold,
+            running=running,
+            connected=connected,
+        )
+
+        pretty_age = self._format_seconds(age)
+        pretty_threshold = self._format_seconds(threshold)
+        message = (
+            "Приватный WebSocket не присылал событий {age} — автоматика приостановлена до восстановления соединения"
+        ).format(age=pretty_age)
+        context["message"] = message + f" (порог {pretty_threshold})"
+        return message, context
+
+    @staticmethod
+    def _format_seconds(value: float) -> str:
+        if value < 60:
+            return f"{value:.0f} сек"
+        minutes = value / 60.0
+        if minutes < 60:
+            return f"{minutes:.1f} мин"
+        hours = minutes / 60.0
+        return f"{hours:.1f} ч"
 
     def _resolve_wallet(
         self, *, require_success: bool
