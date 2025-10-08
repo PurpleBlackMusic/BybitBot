@@ -378,11 +378,11 @@ class SignalExecutor:
             price_step = Decimal("0.00000001")
 
         open_sell_reserved = self._resolve_open_sell_reserved(symbol)
-        safety_buffer = qty_step if qty_step > 0 else Decimal("0")
-        sell_budget_base = filled_base_total - open_sell_reserved - safety_buffer
-        if sell_budget_base < 0:
-            sell_budget_base = Decimal("0")
+        available_base = filled_base_total - open_sell_reserved
+        if available_base < 0:
+            available_base = Decimal("0")
 
+        sell_budget_base = self._round_to_step(available_base, qty_step, rounding=ROUND_DOWN)
         total_qty = sell_budget_base if sell_budget_base > 0 else Decimal("0")
         if total_qty <= 0:
             execution_stats = self._build_tp_execution_stats(
@@ -603,7 +603,7 @@ class SignalExecutor:
         order_link_id: Optional[str],
         executed_base: Decimal,
     ) -> Decimal:
-        best_total = Decimal("0")
+        best_total = executed_base if executed_base > 0 else Decimal("0")
 
         ws_total = self._filled_base_from_private_ws(
             symbol, order_id=order_id, order_link_id=order_link_id
