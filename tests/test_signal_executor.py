@@ -79,6 +79,11 @@ def test_signal_executor_dry_run_preview(monkeypatch: pytest.MonkeyPatch) -> Non
         "get_api_client",
         lambda: StubAPI(total=1000.0, available=800.0),
     )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
     executor = SignalExecutor(bot)
     result = executor.execute_once()
     assert result.status == "dry_run"
@@ -104,6 +109,11 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
 
     api = StubAPI(total=1000.0, available=800.0)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
 
     captured: dict | None = None
 
@@ -140,6 +150,11 @@ def test_signal_executor_allows_zero_slippage(monkeypatch: pytest.MonkeyPatch) -
 
     api = StubAPI(total=1000.0, available=800.0)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
 
     captured: dict | None = None
 
@@ -185,6 +200,11 @@ def test_signal_executor_scales_position_with_signal_strength(
 
     api = StubAPI(total=1000.0, available=600.0)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -205,6 +225,11 @@ def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch)
         signal_executor_module,
         "get_api_client",
         lambda: StubAPI(total=1000.0, available=900.0),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
 
     executor = SignalExecutor(bot)
@@ -242,6 +267,11 @@ def test_automation_loop_retries_after_error(monkeypatch: pytest.MonkeyPatch) ->
         signal_executor_module,
         "get_api_client",
         lambda: StubAPI(total=1000.0, available=900.0),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
 
     executor = SignalExecutor(bot)
@@ -344,6 +374,11 @@ def test_automation_loop_emits_results_via_callback(monkeypatch: pytest.MonkeyPa
         signal_executor_module,
         "get_api_client",
         lambda: StubAPI(total=1000.0, available=900.0),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
 
     executor = SignalExecutor(bot)
