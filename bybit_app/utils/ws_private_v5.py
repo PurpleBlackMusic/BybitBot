@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import random
 import threading
 import time
 from typing import Any, Callable, Iterable
@@ -246,7 +247,8 @@ class WSPrivateV5:
                         except Exception as exc:
                             log("ws.private.ping.error", err=str(exc))
                             break
-                        if ping_stop.wait(20.0):
+                        interval = random.uniform(15.0, 20.0)
+                        if ping_stop.wait(interval):
                             break
 
                 ping_thread = threading.Thread(target=_ping_loop, daemon=True)
@@ -303,6 +305,16 @@ class WSPrivateV5:
                         self._handle_unsubscribe_ack(keys, success=bool(success))
                         if not success:
                             log("ws.private.unsubscribe.error", msg=payload.get("ret_msg"))
+                    elif payload.get("op") == "ping":
+                        response = {
+                            "op": "pong",
+                            "req_id": payload.get("req_id")
+                            or str(int(time.time() * 1000)),
+                        }
+                        try:
+                            ws.send(json.dumps(response))
+                        except Exception as exc:
+                            log("ws.private.pong.error", err=str(exc))
 
                 try:
                     self.on_msg(payload)
@@ -351,8 +363,8 @@ class WSPrivateV5:
                 try:
                     ws.run_forever(
                         sslopt={"cert_reqs": ssl.CERT_NONE},
-                        ping_interval=20,
-                        ping_timeout=10,
+                        ping_interval=0,
+                        ping_timeout=None,
                     )
                 finally:
                     with self._ws_lock:
@@ -361,7 +373,9 @@ class WSPrivateV5:
                     stop_ping_loop()
                 if self._stop or not self._reconnect:
                     break
-                sleep_for = min(backoff, 60.0)
+                sleep_base = min(backoff, 60.0)
+                jitter = random.uniform(0.0, sleep_base * 0.3 if sleep_base > 0 else 0.5)
+                sleep_for = sleep_base + jitter
                 log("ws.private.reconnect.wait", seconds=round(sleep_for, 2))
                 time.sleep(sleep_for)
                 backoff = min(backoff * 2.0, 60.0)
