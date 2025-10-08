@@ -218,6 +218,7 @@ else:
 
     if rows:
         df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
         df = df.sort_values("ts", ascending=False)
         df = df.rename(
             columns={
