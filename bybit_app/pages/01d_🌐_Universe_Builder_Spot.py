@@ -5,6 +5,7 @@ from utils.envs import get_api_client, get_settings, update_settings
 from utils.universe import (
     apply_universe_to_settings,
     build_universe,
+    filter_available_spot_pairs,
     filter_usdt_pairs,
     load_universe,
 )
@@ -23,7 +24,7 @@ if st.button("🔎 Собрать топ USDT‑пар по 24h обороту")
 
 if st.button("💾 Применить в настройки (ai_symbols)"):
     syms = load_universe()
-    filtered_syms = filter_usdt_pairs(syms)
+    filtered_syms = filter_available_spot_pairs(syms)
     if filtered_syms:
         apply_universe_to_settings(filtered_syms)
         st.success("Сохранено в ai_symbols (только USDT-пары).")
@@ -40,9 +41,9 @@ if st.button("🔁 Авто‑ротация сейчас"):
     from utils.envs import update_settings
     wl_list = [x.strip().upper() for x in (wl or "").split(',') if x.strip()]
     bl_list = [x.strip().upper() for x in (bl or "").split(',') if x.strip()]
-    wl_usdt = filter_usdt_pairs(wl_list)
+    wl_usdt = filter_available_spot_pairs(wl_list)
     if wl_usdt != wl_list:
-        st.warning("Whitelist очищен от не-USDT пар перед сохранением.")
+        st.warning("Whitelist очищен от недоступных или не-USDT пар перед сохранением.")
     syms = auto_rotate_universe(api, size=int(size), min_turnover=float(min_turn), max_spread_bps=25.0, whitelist=wl_usdt, blacklist=bl_list)
     if syms:
         st.success(', '.join(syms))

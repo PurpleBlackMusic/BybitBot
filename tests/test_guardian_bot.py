@@ -137,6 +137,32 @@ def test_guardian_brief_handles_sell_mode_hint(tmp_path: Path) -> None:
     assert any("уверенность" in reason.lower() for reason in summary["actionable_reasons"])
 
 
+def test_guardian_watchlist_drops_unlisted_symbols(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    status = {
+        "watchlist": [
+            {"symbol": "BTCUSDT", "score": 0.5, "trend": "buy"},
+            {"symbol": "FAKEUSDT", "score": 0.1, "trend": "sell"},
+            {"symbol": "", "score": 0.2},
+        ]
+    }
+    status_path = tmp_path / "ai" / "status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "get_listed_spot_symbols",
+        lambda **kwargs: {"BTCUSDT"},
+    )
+
+    bot = _make_bot(tmp_path)
+    watchlist = bot.market_watchlist()
+
+    assert [item["symbol"] for item in watchlist] == ["BTCUSDT"]
+
+
 def test_guardian_brief_understands_russian_buy_hint(tmp_path: Path) -> None:
     status = {
         "symbol": "ETHUSDT",

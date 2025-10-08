@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import time
 from typing import Iterable, List, Dict
+
 from .bybit_api import BybitAPI, BybitCreds
 from .envs import get_settings, update_settings
+from .instruments import filter_listed_spot_symbols
 from .paths import DATA_DIR
 
 UNIVERSE_FILE = DATA_DIR / "config" / "universe.json"
@@ -19,6 +21,14 @@ def filter_usdt_pairs(symbols: Iterable[str]) -> list[str]:
         if symbol.endswith("USDT"):
             filtered.append(symbol)
     return filtered
+
+
+def filter_available_spot_pairs(symbols: Iterable[str]) -> list[str]:
+    """Return USDT pairs that are currently listed on the exchange."""
+
+    usdt_only = filter_usdt_pairs(symbols)
+    listed = filter_listed_spot_symbols(usdt_only)
+    return listed if listed else usdt_only
 
 def build_universe(api: BybitAPI, size: int = 8, min_turnover: float = 2_000_000.0, max_spread_bps: float = 20.0) -> list[str]:
     r = api._req("GET", "/v5/market/tickers", params={"category":"spot"})
@@ -37,7 +47,7 @@ def build_universe(api: BybitAPI, size: int = 8, min_turnover: float = 2_000_000
         except Exception:
             continue
     scored.sort(reverse=True)
-    top = filter_usdt_pairs([s for _,s in scored[:int(size)]])
+    top = filter_available_spot_pairs([s for _, s in scored[: int(size)]])
     # save
     UNIVERSE_FILE.parent.mkdir(parents=True, exist_ok=True)
     UNIVERSE_FILE.write_text(json.dumps({"ts": int(time.time()*1000), "symbols": top}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -47,13 +57,13 @@ def load_universe() -> list[str]:
     if not UNIVERSE_FILE.exists(): return []
     try:
         d = json.loads(UNIVERSE_FILE.read_text(encoding="utf-8"))
-        return filter_usdt_pairs(d.get("symbols") or [])
+        return filter_available_spot_pairs(d.get("symbols") or [])
     except Exception:
         return []
 
 def apply_universe_to_settings(symbols: list[str]):
     s = get_settings()
-    filtered = filter_usdt_pairs(symbols)
+    filtered = filter_available_spot_pairs(symbols)
     update_settings(ai_symbols=",".join(filtered))
 
 
@@ -93,7 +103,7 @@ def auto_rotate_universe(api: BybitAPI, size: int, min_turnover: float, max_spre
     if time.time() - float(last) < 22*3600:  # не чаще раза в ~сутки
         return None
     top = build_universe_scored(api, size=size, min_turnover=min_turnover, max_spread_bps=max_spread_bps, whitelist=whitelist, blacklist=blacklist)
-    syms = filter_usdt_pairs([s for s,_ in top])
+    syms = filter_available_spot_pairs([s for s, _ in top])
     UNIVERSE_FILE.parent.mkdir(parents=True, exist_ok=True)
     UNIVERSE_FILE.write_text(json.dumps({"ts": int(time.time()*1000), "symbols": syms}, ensure_ascii=False, indent=2), encoding="utf-8")
     kv.set("last_rotate_ts", time.time())

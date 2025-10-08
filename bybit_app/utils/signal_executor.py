@@ -65,27 +65,50 @@ class SignalExecutor:
         self.bot = bot
         self._settings = settings
 
+    def _decision(
+        self,
+        status: str,
+        *,
+        reason: Optional[str] = None,
+        context: Optional[Dict[str, object]] = None,
+        order: Optional[Dict[str, object]] = None,
+    ) -> ExecutionResult:
+        payload: Dict[str, object] = {"status": status}
+        if reason:
+            payload["reason"] = reason
+        if order:
+            payload["order"] = copy.deepcopy(order)
+        if context:
+            payload["context"] = copy.deepcopy(context)
+        log("guardian.auto.decision", **payload)
+        return ExecutionResult(
+            status=status,
+            reason=reason,
+            order=copy.deepcopy(order) if order else None,
+            context=copy.deepcopy(context) if context else None,
+        )
+
     # ------------------------------------------------------------------
     # public API
     def execute_once(self) -> ExecutionResult:
         summary = self._fetch_summary()
         if not summary.get("actionable"):
-            return ExecutionResult(
-                status="skipped",
+            return self._decision(
+                "skipped",
                 reason="Signal is not actionable according to current thresholds.",
             )
 
         settings = self._resolve_settings()
         if not getattr(settings, "ai_enabled", False):
-            return ExecutionResult(
-                status="disabled",
+            return self._decision(
+                "disabled",
                 reason="Автоматизация выключена — включите AI сигналы в настройках.",
             )
 
         mode = str(summary.get("mode") or "").lower()
         if mode not in {"buy", "sell"}:
-            return ExecutionResult(
-                status="skipped",
+            return self._decision(
+                "skipped",
                 reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
             )
 
@@ -101,8 +124,8 @@ class SignalExecutor:
                     )
                 elif meta_reason:
                     reason = f"Инструмент недоступен для сделки ({meta_reason})."
-            return ExecutionResult(
-                status="skipped",
+            return self._decision(
+                "skipped",
                 reason=reason,
                 context={"symbol_meta": symbol_meta} if symbol_meta else None,
             )
@@ -114,9 +137,14 @@ class SignalExecutor:
                 require_success=not settings.dry_run
             )
         except Exception as exc:
-            return ExecutionResult(
-                status="error",
-                reason=f"Не удалось получить баланс: {exc}",
+            reason_text = f"Не удалось получить баланс: {exc}"
+            if not creds_ok(settings) and not getattr(settings, "dry_run", True):
+                reason_text = (
+                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
+                )
+            return self._decision(
+                "error",
+                reason=reason_text,
             )
         total_equity, available_equity = wallet_totals
 
@@ -151,8 +179,8 @@ class SignalExecutor:
                 return ExecutionResult(
                     status="dry_run", order=order, context=order_context
                 )
-            return ExecutionResult(
-                status="skipped",
+            return self._decision(
+                "skipped",
                 reason="Недостаточно свободного капитала для безопасной сделки.",
                 context=order_context,
             )
@@ -161,11 +189,16 @@ class SignalExecutor:
             order = copy.deepcopy(order_context)
             order["slippage_percent"] = slippage_pct
             log("guardian.auto.preview", order=order)
-            return ExecutionResult(status="dry_run", order=order, context=order_context)
+            return self._decision(
+                "dry_run",
+                reason="Режим dry-run активен — ордер не отправлен.",
+                context=order_context,
+                order=order,
+            )
 
         if api is None:
-            return ExecutionResult(
-                status="error",
+            return self._decision(
+                "error",
                 reason="API клиент недоступен для выполнения сделки.",
                 context=order_context,
             )
@@ -193,8 +226,8 @@ class SignalExecutor:
                 context=validation_context,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
-            return ExecutionResult(
-                status="error",
+            return self._decision(
+                "error",
                 reason=_format_bybit_error(exc),
                 context=order_context,
             )

@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 
 WARNING_SIGNAL_SECONDS = 300.0
@@ -29,6 +29,8 @@ from .symbols import ensure_usdt_symbol
 from .live_checks import api_key_status, bybit_realtime_status
 from .live_signal import LiveSignalError, LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
+from .instruments import get_listed_spot_symbols
+from .log import log
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class GuardianBot:
         self._watchlist_breakdown_cache_signature: Optional[int] = None
         self._watchlist_breakdown_cache: Optional[Dict[str, object]] = None
         self._live_fetcher: Optional[LiveSignalFetcher] = None
+        self._listed_spot_symbols: Optional[Set[str]] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -320,6 +323,22 @@ class GuardianBot:
         self._watchlist_breakdown_cache = None
         self._live_fetcher = None
         self._status_source = "missing"
+        self._listed_spot_symbols = None
+
+    def _fetch_listed_spot_symbols(self) -> Set[str]:
+        cached = self._listed_spot_symbols
+        if cached is not None:
+            return cached
+
+        testnet = bool(getattr(self.settings, "testnet", True))
+        try:
+            listed = get_listed_spot_symbols(testnet=testnet)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("guardian.listed_symbols.error", err=str(exc), testnet=testnet)
+            listed = set()
+
+        self._listed_spot_symbols = set(listed)
+        return self._listed_spot_symbols
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -1710,6 +1729,25 @@ class GuardianBot:
                 entry_copy.setdefault("source", "market_scanner")
                 filtered.append(entry_copy)
                 seen_symbols.add(upper_symbol)
+
+        listed_symbols = set()
+        if filtered:
+            listed_symbols = self._fetch_listed_spot_symbols()
+            if listed_symbols:
+                before = len(filtered)
+                filtered = [
+                    entry
+                    for entry in filtered
+                    if isinstance(entry.get("symbol"), str)
+                    and entry["symbol"].strip().upper() in listed_symbols
+                ]
+                removed = before - len(filtered)
+                if removed > 0:
+                    log(
+                        "guardian.watchlist.filtered_unlisted",
+                        removed=removed,
+                        remaining=len(filtered),
+                    )
 
         if not filtered:
             return filtered
@@ -3244,6 +3282,7 @@ class GuardianBot:
         self._digest_cache = None
         self._watchlist_breakdown_cache_signature = None
         self._watchlist_breakdown_cache = None
+        self._listed_spot_symbols = None
         return self._get_snapshot(force=True)
 
     def unified_report(self) -> Dict[str, object]:

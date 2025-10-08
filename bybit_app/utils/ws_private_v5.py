@@ -12,7 +12,13 @@ from .envs import get_settings
 from .log import log
 
 
-DEFAULT_TOPICS: tuple[str, ...] = ("order", "execution", "wallet", "position")
+DEFAULT_TOPICS: tuple[str, ...] = (
+    "order.spot",
+    "execution.spot",
+    "wallet",
+    "balance",
+    "position",
+)
 
 
 class WSPrivateV5:
@@ -72,6 +78,12 @@ class WSPrivateV5:
             if not text:
                 continue
             key = text.lower()
+            if key == "order":
+                text = "order.spot"
+                key = text.lower()
+            elif key == "execution":
+                text = "execution.spot"
+                key = text.lower()
             if key in seen:
                 continue
             seen.add(key)
