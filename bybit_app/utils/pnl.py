@@ -174,7 +174,20 @@ def daily_pnl():
     rows = read_ledger(100000)
     by_day = {}
     for r in rows:
-        day = time.strftime("%Y-%m-%d", time.gmtime((r.get("execTime") or r.get("ts") or 0)/1000 if r.get("execTime") else time.time()))
+        raw_ts = r.get("execTime") or r.get("ts")
+        ts = None
+        if raw_ts is not None:
+            try:
+                ts = float(raw_ts)
+            except (TypeError, ValueError):
+                ts = None
+
+        if ts is None:
+            ts = time.time()
+        elif ts > 1e11:  # assume millisecond precision
+            ts /= 1000.0
+
+        day = time.strftime("%Y-%m-%d", time.gmtime(ts))
         sym = r.get("symbol","?")
         side = (r.get("side") or "").lower()
         px = r.get("execPrice") or 0.0
