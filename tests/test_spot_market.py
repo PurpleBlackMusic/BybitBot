@@ -425,13 +425,13 @@ def test_place_spot_market_clamps_percent_tolerance_range():
         side="Buy",
         qty=10,
         unit="quoteCoin",
-        tol_value=3.0,
+        tol_value=8.0,
     )
 
     placed_high = api.place_calls[-1]
     assert placed_high["orderType"] == "Limit"
     audit_high = response_high.get("_local", {}).get("order_audit", {})
-    assert audit_high.get("tolerance_value") == "1.0000"
+    assert audit_high.get("tolerance_value") == "5.0000"
 
     api.place_calls.clear()
 
@@ -448,6 +448,53 @@ def test_place_spot_market_clamps_percent_tolerance_range():
     assert placed_low["orderType"] == "Limit"
     audit_low = response_low.get("_local", {}).get("order_audit", {})
     assert audit_low.get("tolerance_value") == "0.0500"
+
+
+def test_place_spot_market_clamps_bps_tolerance_range():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    response_high = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_type="Bps",
+        tol_value=800,
+    )
+
+    audit_high = response_high.get("_local", {}).get("order_audit", {})
+    assert audit_high.get("tolerance_type") == "Bps"
+    assert audit_high.get("tolerance_value") == "500.0000"
+
+    api.place_calls.clear()
+
+    response_low = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_type="Bps",
+        tol_value=1,
+    )
+
+    audit_low = response_low.get("_local", {}).get("order_audit", {})
+    assert audit_low.get("tolerance_type") == "Bps"
+    assert audit_low.get("tolerance_value") == "5.0000"
 
 
 def test_place_spot_market_accepts_bps_suffix():

@@ -1060,9 +1060,9 @@ def prepare_spot_trade_snapshot(
 
 
 _MIN_PERCENT_TOLERANCE = Decimal("0.05")
-_MAX_PERCENT_TOLERANCE = Decimal("1.0")
+_MAX_PERCENT_TOLERANCE = Decimal("5.0")
 _MIN_BPS_TOLERANCE = Decimal("5")
-_MAX_BPS_TOLERANCE = Decimal("100")
+_MAX_BPS_TOLERANCE = Decimal("500")
 
 
 def _resolve_slippage_tolerance(

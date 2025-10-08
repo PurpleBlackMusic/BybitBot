@@ -212,6 +212,45 @@ class WSPrivateV5:
             import websocket  # type: ignore
 
             backoff = 1.0
+            ping_thread: threading.Thread | None = None
+            ping_stop: threading.Event | None = None
+
+            def stop_ping_loop() -> None:
+                nonlocal ping_thread, ping_stop
+                if ping_stop is not None:
+                    ping_stop.set()
+                thread = ping_thread
+                if thread and thread.is_alive():
+                    try:
+                        thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+                ping_thread = None
+                ping_stop = None
+
+            def start_ping_loop(ws) -> None:
+                nonlocal ping_thread, ping_stop
+                stop_ping_loop()
+                ping_stop = threading.Event()
+
+                def _ping_loop() -> None:
+                    while not self._stop and not ping_stop.is_set():
+                        if not self._is_socket_connected(ws):
+                            break
+                        try:
+                            payload = {
+                                "op": "ping",
+                                "req_id": str(int(time.time() * 1000)),
+                            }
+                            ws.send(json.dumps(payload))
+                        except Exception as exc:
+                            log("ws.private.ping.error", err=str(exc))
+                            break
+                        if ping_stop.wait(20.0):
+                            break
+
+                ping_thread = threading.Thread(target=_ping_loop, daemon=True)
+                ping_thread.start()
 
             def handle_open(ws) -> None:
                 try:
@@ -222,6 +261,8 @@ class WSPrivateV5:
                         ws.close()
                     except Exception:
                         pass
+                else:
+                    start_ping_loop(ws)
 
             def handle_message(ws, message: str) -> None:
                 payload: Any
@@ -271,12 +312,30 @@ class WSPrivateV5:
             def handle_error(ws, error) -> None:
                 log("ws.private.error", err=str(error))
 
+            def handle_pong(ws, message) -> None:
+                text: str | None
+                if isinstance(message, (bytes, bytearray)):
+                    try:
+                        text = message.decode("utf-8")
+                    except Exception:
+                        text = None
+                else:
+                    text = str(message) if message else None
+                payload: dict[str, Any] = {"op": "pong", "source": "control"}
+                if text:
+                    payload["raw"] = text
+                try:
+                    self.on_msg(payload)
+                except Exception as exc:
+                    log("ws.private.callback.error", err=str(exc))
+
             def handle_close(ws, code, msg) -> None:
                 log("ws.private.close", code=code, msg=msg, requested=self._stop)
                 self._authenticated = False
                 with self._topics_lock:
                     self._active_topics.clear()
                     self._pending_topics.clear()
+                stop_ping_loop()
 
             while not self._stop:
                 ws = websocket.WebSocketApp(
@@ -285,6 +344,7 @@ class WSPrivateV5:
                     on_message=handle_message,
                     on_error=handle_error,
                     on_close=handle_close,
+                    on_pong=handle_pong,
                 )
                 with self._ws_lock:
                     self._ws = ws
@@ -298,6 +358,7 @@ class WSPrivateV5:
                     with self._ws_lock:
                         self._ws = None
                     self._authenticated = False
+                    stop_ping_loop()
                 if self._stop or not self._reconnect:
                     break
                 sleep_for = min(backoff, 60.0)
