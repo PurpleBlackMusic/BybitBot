@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from dataclasses import dataclass
 import threading
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
@@ -16,6 +17,7 @@ from .spot_market import (
     place_spot_market_with_tolerance,
     resolve_trade_symbol,
 )
+from .symbols import ensure_usdt_symbol
 
 
 def _safe_symbol(value: object) -> Optional[str]:
@@ -41,6 +43,19 @@ class ExecutionResult:
     order: Optional[Dict[str, object]] = None
     response: Optional[Dict[str, object]] = None
     context: Optional[Dict[str, object]] = None
+
+
+_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
+
+
+def _format_bybit_error(exc: Exception) -> str:
+    text = str(exc)
+    match = _BYBIT_ERROR.search(text)
+    if match:
+        code = match.group("code")
+        message = match.group("message").strip()
+        return f"Bybit отказал ({code}): {message}"
+    return f"Не удалось отправить ордер: {text}"
 
 
 class SignalExecutor:
@@ -77,9 +92,14 @@ class SignalExecutor:
         symbol, symbol_meta = self._select_symbol(summary, settings)
         if symbol is None:
             reason = "Не удалось определить инструмент для сделки."
-            if symbol_meta:
-                meta_reason = symbol_meta.get("reason") if isinstance(symbol_meta, Mapping) else None
-                if meta_reason:
+            if symbol_meta and isinstance(symbol_meta, Mapping):
+                meta_reason = str(symbol_meta.get("reason") or "")
+                if meta_reason == "unsupported_quote":
+                    requested = symbol_meta.get("requested") or summary.get("symbol")
+                    reason = (
+                        f"Инструмент {requested or ''} недоступен — поддерживаются только спотовые пары USDT."
+                    )
+                elif meta_reason:
                     reason = f"Инструмент недоступен для сделки ({meta_reason})."
             return ExecutionResult(
                 status="skipped",
@@ -169,13 +189,13 @@ class SignalExecutor:
             log("guardian.auto.order.validation_failed", error=exc.to_dict(), context=validation_context)
             return ExecutionResult(
                 status="rejected",
-                reason=str(exc),
+                reason=f"Ордер отклонён биржей ({exc.code}): {exc}",
                 context=validation_context,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
             return ExecutionResult(
                 status="error",
-                reason=f"Не удалось отправить ордер: {exc}",
+                reason=_format_bybit_error(exc),
                 context=order_context,
             )
 
@@ -340,8 +360,29 @@ class SignalExecutor:
         if not cleaned:
             return None, None
 
+        normalised, quote_source = ensure_usdt_symbol(cleaned)
+        if not normalised:
+            meta: Dict[str, object] = {"reason": "unsupported_quote", "requested": cleaned}
+            if quote_source:
+                meta["quote"] = quote_source
+            return None, meta
+
+        quote_meta: Optional[Dict[str, object]] = None
+        if quote_source:
+            quote_meta = {
+                "requested": cleaned,
+                "normalised": normalised,
+                "from_quote": quote_source,
+                "to_quote": "USDT",
+            }
+
+        cleaned = normalised
+
         if not getattr(settings, "testnet", True):
-            return cleaned, None
+            meta_payload: Dict[str, object] = {}
+            if quote_meta:
+                meta_payload["quote_conversion"] = quote_meta
+            return cleaned, meta_payload or None
 
         try:
             api = get_api_client()
@@ -350,8 +391,20 @@ class SignalExecutor:
 
         resolved, meta = resolve_trade_symbol(cleaned, api=api, allow_nearest=True)
         if resolved is None:
+            if quote_meta:
+                extra: Dict[str, object] = {}
+                if isinstance(meta, Mapping):
+                    extra.update(meta)
+                extra["quote_conversion"] = quote_meta
+                return None, extra
             return None, meta
-        return resolved, meta
+
+        final_meta: Dict[str, object] = {}
+        if isinstance(meta, Mapping):
+            final_meta.update(meta)
+        if quote_meta:
+            final_meta.setdefault("quote_conversion", quote_meta)
+        return resolved, final_meta or None
 
     def _signal_sizing_factor(
         self, summary: Dict[str, object], settings: Settings

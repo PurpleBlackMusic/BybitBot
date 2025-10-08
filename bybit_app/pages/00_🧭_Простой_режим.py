@@ -745,8 +745,16 @@ with st.container(border=True):
             st.success(reason_text or "Ордер отправлен автоматически.")
         elif status == "dry_run":
             st.info(reason_text or "Dry-run: бот просчитал сделку без отправки ордера.")
+        elif status == "rejected":
+            message = reason_text or "Ордер отклонён биржей."
+            if reason_text:
+                message = f"Причина отказа: {reason_text}"
+            st.error(message)
         elif status == "error":
-            st.error(reason_text or "Автоматическое исполнение завершилось ошибкой.")
+            message = reason_text or "Автоматическое исполнение завершилось ошибкой."
+            if reason_text:
+                message = f"Причина отказа: {reason_text}"
+            st.error(message)
         elif status in {"disabled", "skipped"}:
             st.info(reason_text or "Условия не позволили выполнить сделку автоматически.")
         elif reason_text:

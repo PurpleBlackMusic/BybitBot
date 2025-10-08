@@ -25,6 +25,7 @@ from .trade_analytics import (
     normalise_execution_payload,
 )
 from .spot_pnl import spot_inventory_and_pnl
+from .symbols import ensure_usdt_symbol
 from .live_checks import api_key_status, bybit_realtime_status
 from .live_signal import LiveSignalError, LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
@@ -2912,11 +2913,12 @@ class GuardianBot:
 
     @staticmethod
     def _normalise_symbol_value(symbol: object) -> Optional[str]:
-        if isinstance(symbol, str):
-            cleaned = symbol.strip().upper()
-            if cleaned and cleaned != "?":
-                return cleaned
-        return None
+        if isinstance(symbol, Mapping):
+            return None
+        if isinstance(symbol, (list, tuple, set, frozenset)):
+            return None
+        normalised, _ = ensure_usdt_symbol(symbol)
+        return normalised
 
     @classmethod
     def _extend_unique_symbols(
