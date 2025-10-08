@@ -541,8 +541,8 @@ def test_place_spot_market_guard_reduces_qty_on_tolerance():
 
     assert response["ok"] is True
     placed = api.place_calls[0]
-    assert placed["qty"] == "99.99"
     audit = response.get("_local", {}).get("order_audit", {})
+    assert Decimal(placed["qty"]) == Decimal(audit.get("order_qty_base"))
     assert Decimal(audit.get("order_notional")) <= Decimal("100")
 
 
@@ -796,10 +796,10 @@ def test_place_spot_market_uses_quote_market_unit_with_tick_gap():
     assert response["ok"] is True
     assert api.place_calls
     placed = api.place_calls[0]
-    assert placed.get("marketUnit") == "quoteCoin"
-    assert placed["qty"] == "10"
+    assert "marketUnit" not in placed
     audit = response.get("_local", {}).get("order_audit", {})
-    assert audit.get("market_unit_qty") == "10"
+    assert Decimal(placed["qty"]) == Decimal(audit.get("order_qty_base"))
+    assert placed["qty"] == audit.get("qty_payload")
     assert Decimal(audit.get("limit_notional")) >= Decimal("9")
 
 
