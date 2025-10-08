@@ -15,7 +15,7 @@ _BALANCE_CACHE_TTL = 5.0
 _INSTRUMENT_CACHE_TTL = 600.0
 _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
-_MAX_MARK_DEVIATION = Decimal("0.01")
+_DEFAULT_MARK_DEVIATION = Decimal("0.01")
 
 
 T = TypeVar("T")
@@ -532,12 +532,20 @@ def _plan_limit_ioc_order(
     return worst_price, qty_rounded, quote_total, consumed
 
 
-def _max_mark_price(price: Decimal | None, *, side: str) -> tuple[Decimal | None, Decimal | None]:
+def _max_mark_price(
+    price: Decimal | None,
+    *,
+    side: str,
+    deviation: Decimal | None = None,
+) -> tuple[Decimal | None, Decimal | None]:
     if price is None or price <= 0:
         return None, None
+
+    effective_deviation = deviation if deviation and deviation > 0 else _DEFAULT_MARK_DEVIATION
+
     if side == "buy":
-        return price * (Decimal("1") + _MAX_MARK_DEVIATION), None
-    return None, price * (Decimal("1") - _MAX_MARK_DEVIATION)
+        return price * (Decimal("1") + effective_deviation), None
+    return None, price * (Decimal("1") - effective_deviation)
 
 
 def _extract_order_fields(payload: Mapping[str, object]) -> Mapping[str, object]:
@@ -1201,6 +1209,14 @@ def prepare_spot_market_order(
         tol_value,
     )
 
+    price_deviation: Decimal | None = None
+    if tolerance_decimal > 0 and isinstance(tolerance_type, str):
+        tolerance_kind = tolerance_type.strip().lower()
+        if tolerance_kind in {"percent", "percentage"}:
+            price_deviation = tolerance_decimal / Decimal("100")
+        elif tolerance_kind in {"bps", "basispoints", "basis_points"}:
+            price_deviation = tolerance_decimal / Decimal("10000")
+
     max_available: Optional[Decimal] = None
     if max_quote is not None:
         max_available = _to_decimal(max_quote)
@@ -1375,7 +1391,7 @@ def prepare_spot_market_order(
                 },
             )
 
-    max_price, min_price = _max_mark_price(price_hint, side=side_normalised)
+    max_price, min_price = _max_mark_price(price_hint, side=side_normalised, deviation=price_deviation)
     if max_price is not None and limit_price > max_price:
         raise OrderValidationError(
             "Ожидаемая цена превышает допустимое отклонение от mark.",
