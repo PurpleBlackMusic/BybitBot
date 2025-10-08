@@ -2831,12 +2831,70 @@ class GuardianBot:
         loss_limit = float(getattr(s, "ai_daily_loss_limit_pct", 0.0))
         concurrent = int(getattr(s, "ai_max_concurrent", 0))
         cash_only = bool(getattr(s, "spot_cash_only", True))
+        slippage = int(getattr(s, "ai_max_slippage_bps", 0) or 0)
+
+        def _strip_trailing(value: str) -> str:
+            if "." in value:
+                value = value.rstrip("0").rstrip(".")
+            return value
+
+        def fmt_pct(
+            value: float, decimals: int = 2, *, keep_trailing: bool = False
+        ) -> str:
+            formatted = f"{value:.{decimals}f}"
+            if not keep_trailing:
+                formatted = _strip_trailing(formatted)
+            return formatted
+
+        def fmt_bps(value: int) -> str:
+            return f"{value:,}".replace(",", " ") if value else "0"
+
+        slip_low, slip_high = (300, 500) if s.testnet else (100, 200)
+        slip_env = "тестнет" if s.testnet else "мейннет"
+        slip_target = f"{slip_low}–{slip_high}"
+        current_slip = fmt_bps(slippage)
+        slip_line = (
+            f"• Слиппедж: ориентир {slip_target} б.п. для {slip_env}"
+            f" (сейчас {current_slip} б.п.)."
+        )
+        if slippage == 0:
+            slip_line += " Настрой диапазон, чтобы бот учитывал рыночное проскальзывание."
+        elif not (slip_low <= slippage <= slip_high):
+            slip_line += " Подстрой значение, чтобы не переплачивать за вход."
+
+        risk_target = 0.25
+        per_trade_txt = fmt_pct(per_trade)
+        risk_line = (
+            f"• Риск на сделку: до {per_trade_txt}% капитала"
+            f" (ориентир {fmt_pct(risk_target)}%)."
+        )
+        if per_trade > risk_target:
+            risk_line += " Снизь долю, если стратегия ещё проходит обкатку."
+        elif per_trade == 0:
+            risk_line += " Задай лимит ~0,25%, чтобы удерживать риски под контролем."
+
+        if loss_limit > 0:
+            risk_line += f" Дневной лимит убытка: {fmt_pct(loss_limit)}%."
+        else:
+            risk_line += " Добавь дневной лимит убытка, чтобы бот умел вовремя остановиться."
+
+        if concurrent <= 0:
+            concurrent_line = (
+                "• Одновременно открывается 0 сделок — установи лимит 1–2 для постепенного разгона."
+            )
+        else:
+            concurrent_line = f"• Одновременно открывается не более {concurrent} сделок."
+            if concurrent > 2:
+                concurrent_line += " Для стабилизации придерживайся лимита 1–2 позиций."
+            elif concurrent in (1, 2):
+                concurrent_line += " Это соответствует рекомендуемому диапазону 1–2."
 
         lines = [
             f"• Режим: {mode}.",
-            f"• Резерв безопасности: {reserve:.1f}% депозита хранится в кэше.",
-            f"• Риск на сделку: до {per_trade:.2f}% капитала, дневной лимит убытка {loss_limit:.2f}%.",
-            f"• Одновременно открывается не более {concurrent} сделок.",
+            f"• Резерв безопасности: {fmt_pct(reserve, 1, keep_trailing=True)}% депозита хранится в кэше.",
+            risk_line,
+            slip_line,
+            concurrent_line,
         ]
         if cash_only:
             lines.append("• Используем только собственные средства, без кредитного плеча.")
