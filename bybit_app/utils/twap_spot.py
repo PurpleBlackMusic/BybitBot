@@ -29,7 +29,17 @@ def twap_spot(api: BybitAPI, symbol: str, side: str, total_qty: float, slices: i
             px = best_bid * (1 - _bps(aggressiveness_bps))
         qty = f"{q_child:.10f}"
         try:
-            r = api.place_order(category="spot", symbol=symbol, side=side.upper(), orderType="Limit", price=f"{px:.10f}", qty=qty, timeInForce="GTC", orderFilter="Order", orderLinkId=ensure_link_id(f"TWAP-{i}-{int(time.time())}"))
+            r = api.place_order(
+                category="spot",
+                symbol=symbol,
+                side=side.upper(),
+                orderType="Limit",
+                price=f"{px:.10f}",
+                qty=qty,
+                timeInForce="IOC",
+                orderFilter="Order",
+                orderLinkId=ensure_link_id(f"TWAP-{i}-{int(time.time())}"),
+            )
             replies.append(r)
             log("twap.child", i=i, price=px, qty=qty, side=side, symbol=symbol, resp=r)
         except Exception as e:

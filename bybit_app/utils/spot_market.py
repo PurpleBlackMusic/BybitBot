@@ -9,6 +9,7 @@ from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Tuple,
 
 from .bybit_api import BybitAPI
 from .log import log
+from . import validators
 from .envs import Settings
 
 _MIN_QUOTE = Decimal("5")
@@ -744,6 +745,7 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
         "max_price": max_price,
         "status": status,
     }
+    limits["_instrument"] = instrument
     _INSTRUMENT_CACHE.set(key, limits)
     return limits
 
@@ -1309,6 +1311,18 @@ def prepare_spot_market_order(
     """Проверить параметры маркет-ордера и подготовить запрос к REST API."""
 
     limit_map = limits if limits is not None else _instrument_limits(api, symbol)
+    instrument_raw = limit_map.get("_instrument") if isinstance(limit_map, Mapping) else None
+    if instrument_raw is None and isinstance(limit_map, Mapping):
+        lot_filter = {
+            "qtyStep": str(limit_map.get("qty_step") or limit_map.get("qtyStep") or "0"),
+            "minOrderQty": str(limit_map.get("min_order_qty") or limit_map.get("minQty") or "0"),
+            "minNotional": str(limit_map.get("min_order_amt") or limit_map.get("minNotional") or "0"),
+            "minOrderAmt": str(limit_map.get("min_order_amt") or limit_map.get("minOrderAmt") or "0"),
+        }
+        price_filter = {
+            "tickSize": str(limit_map.get("tick_size") or limit_map.get("tickSize") or "0"),
+        }
+        instrument_raw = {"priceFilter": price_filter, "lotSizeFilter": lot_filter}
 
     min_amount = _to_decimal(limit_map.get("min_order_amt") or _MIN_QUOTE)
     if min_amount <= 0:
@@ -1497,6 +1511,47 @@ def prepare_spot_market_order(
     qty_base = _round_down(qty_base, qty_step) if qty_step > 0 else qty_base
     limit_notional = qty_base * limit_price
 
+    price_used = limit_price
+    qty_base_raw = qty_base
+    if target_quote is not None and price_used > 0:
+        qty_base_raw = target_quote / price_used
+    elif target_base is not None:
+        qty_base_raw = target_base
+
+    validated = validators.validate_spot_rules(
+        instrument=instrument_raw,
+        price=price_used,
+        qty=qty_base_raw,
+    )
+
+    validated_price = validated.price
+    validated_qty = validated.qty
+    if validated_price <= 0 or validated_qty <= 0:
+        raise OrderValidationError(
+            "Валидация объёма вернула некорректные значения.",
+            code="validation_failed",
+            details={
+                "price": str(validated_price),
+                "qty": str(validated_qty),
+            },
+        )
+
+    limit_price = validated_price
+    qty_base = validated_qty
+    limit_notional = validated.notional
+
+    if min_amount > 0 and limit_notional < min_amount and limit_price > 0:
+        qty_needed = min_amount / limit_price
+        if qty_step > 0:
+            qty_needed = _round_up(qty_needed, qty_step)
+        validated_min = validators.validate_spot_rules(
+            instrument=instrument_raw,
+            price=limit_price,
+            qty=qty_needed,
+        )
+        qty_base = validated_min.qty
+        limit_notional = validated_min.notional
+
     if unit_normalised == "quotecoin":
         market_unit = "quoteCoin"
     else:
@@ -1527,11 +1582,72 @@ def prepare_spot_market_order(
                 },
             )
         if affordable_qty < qty_base:
-            qty_base = affordable_qty
-            limit_notional = qty_base * limit_price
+            if min_amount > 0 and (affordable_qty * limit_price) < min_amount:
+                pass
+            else:
+                qty_base = affordable_qty
+                limit_notional = qty_base * limit_price
+
+    tolerance_margin = Decimal("0.00000001")
+    if target_quote is not None:
+        tolerance_target = target_quote * tolerance_multiplier
+        if tolerance_target > 0 and limit_notional - tolerance_target > tolerance_margin:
+            qty_candidate = qty_base
+            last_qty = None
+            while limit_notional - tolerance_target > tolerance_margin:
+                if qty_step > 0:
+                    qty_candidate = _round_down(qty_candidate - qty_step, qty_step)
+                else:
+                    qty_candidate -= Decimal("0.00000001")
+                if qty_candidate <= 0 or qty_candidate == last_qty:
+                    raise OrderValidationError(
+                        "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                        code="tolerance_exceeded",
+                        details={
+                            "requested_quote": _format_decimal(target_quote),
+                            "effective_notional": _format_decimal(limit_notional),
+                            "tolerance_ceiling": _format_decimal(tolerance_target),
+                            "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                            "tolerance_type": tolerance_type,
+                            "tolerance_value": tolerance_value,
+                        },
+                    )
+                last_qty = qty_candidate
+                validated_loop = validators.validate_spot_rules(
+                    instrument=instrument_raw,
+                    price=limit_price,
+                    qty=qty_candidate,
+                )
+                qty_candidate = validated_loop.qty
+                if qty_candidate <= 0 or qty_candidate == last_qty:
+                    raise OrderValidationError(
+                        "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                        code="tolerance_exceeded",
+                        details={
+                            "requested_quote": _format_decimal(target_quote),
+                            "effective_notional": _format_decimal(limit_notional),
+                            "tolerance_ceiling": _format_decimal(tolerance_target),
+                            "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                            "tolerance_type": tolerance_type,
+                            "tolerance_value": tolerance_value,
+                        },
+                    )
+                qty_base = qty_candidate
+                limit_notional = limit_price * qty_base
+                if min_amount > 0 and limit_notional < min_amount:
+                    raise OrderValidationError(
+                        "Минимальный объём ордера не достигнут.",
+                        code="min_notional",
+                        details={
+                            "requested": _format_decimal(target_quote or requested_qty),
+                            "rounded": _format_decimal(limit_notional),
+                            "min_notional": _format_decimal(min_amount),
+                            "unit": "quote",
+                        },
+                    )
 
     if market_unit == "quoteCoin" and target_quote is not None:
-        effective_notional = target_quote
+        effective_notional = limit_notional
     else:
         effective_notional = limit_notional
 
@@ -1621,7 +1737,7 @@ def prepare_spot_market_order(
         _ensure_balance(base_coin or "", qty_base)
 
     if market_unit == "quoteCoin":
-        qty_value = target_quote if target_quote is not None else requested_qty
+        qty_value = limit_notional
         qty_step_for_payload = quote_step
     else:
         qty_value = qty_base
@@ -1676,7 +1792,7 @@ def prepare_spot_market_order(
         "side": side.capitalize(),
         "unit": market_unit,
         "requested_qty": _format_decimal(requested_qty),
-        "rounded_qty": _format_decimal(qty_base if unit_normalised == "basecoin" else (target_quote or requested_qty)),
+        "rounded_qty": _format_decimal(qty_base if unit_normalised == "basecoin" else limit_notional),
         "requested_unit": "quote" if unit_normalised == "quotecoin" else "base",
         "min_order_amt": _format_decimal(min_amount),
         "min_order_qty": _format_decimal(min_qty),
@@ -1694,6 +1810,10 @@ def prepare_spot_market_order(
         "qty_payload": qty_text,
         "price_payload": price_text,
     }
+
+    audit["validator_ok"] = validated.ok
+    if validated.reasons:
+        audit["validator_reasons"] = list(validated.reasons)
 
     audit["limit_notional"] = _format_decimal(limit_notional)
     if market_unit == "quoteCoin":

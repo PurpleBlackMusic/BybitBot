@@ -1,72 +1,167 @@
-
 from __future__ import annotations
-def quantize_price(price: float, tick: float) -> float:
-    if tick<=0: return price
-    return round(price / tick) * tick
 
-def quantize_qty(qty: float, step: float) -> float:
-    if step<=0: return qty
-    return round(qty / step) * step
-
-def validate_spot_rules(instr: dict, price: float, qty: float) -> dict:
-    """Проверяет minNotional, minQty, шаги tick/qtyStep. Возвращает {ok, price_q, qty_q, reasons[]}"""
-    res = {"ok": True, "price_q": price, "qty_q": qty, "reasons": []}
-    pf = (instr.get("priceFilter") or {})
-    lf = (instr.get("lotSizeFilter") or {})
-    tick = float(pf.get("tickSize") or 0.0)
-    step = float(lf.get("qtyStep") or 0.0)
-    min_not = float(lf.get("minOrderAmt") or lf.get("minNotional") or 0.0)
-    min_qty = float(lf.get("minOrderQty") or 0.0)
-    # quantize
-    p_q = quantize_price(price, tick) if tick else price
-    q_q = quantize_qty(qty, step) if step else qty
-    notional = p_q * q_q
-    if min_not and notional < min_not: 
-        res["ok"] = False; res["reasons"].append(f"notional {notional:.8f} < minNotional {min_not}")
-    if min_qty and q_q < min_qty:
-        res["ok"] = False; res["reasons"].append(f"qty {q_q:.8f} < minQty {min_qty}")
-    res["price_q"] = p_q; res["qty_q"] = q_q
-    return res
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from typing import Mapping, Sequence
 
 
-from decimal import Decimal
-from .precision import quantize_price, quantize_qty, ceil_qty_to_min_notional
-from .log import log
+__all__ = ["SpotValidationResult", "validate_spot_rules"]
 
-MIN_ORDER_VALUE_USDT = Decimal('5')
 
-def _validate_spot_rules_flex(*args, **kwargs):
-    """
-    Flexible adapter:
-    - Old style: validate_spot_rules(instrument, price=, qty=)
-    - New style: validate_spot_rules(category, symbol, side, price, qty, instrument)
-    Returns dict {'price': str, 'qty': str, 'min_notional_applied': str}
-    """
-    instrument = None
+@dataclass(frozen=True)
+class SpotValidationResult:
+    """Result of applying exchange spot trading rules to a price/quantity pair."""
+
+    price: Decimal
+    qty: Decimal
+    tick_size: Decimal
+    qty_step: Decimal
+    min_qty: Decimal
+    min_notional: Decimal
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.reasons
+
+    @property
+    def notional(self) -> Decimal:
+        return self.price * self.qty
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a serialisable view compatible with older callers."""
+
+        return {
+            "ok": self.ok,
+            "price": self.price,
+            "qty": self.qty,
+            "price_q": self.price,
+            "qty_q": self.qty,
+            "tick_size": self.tick_size,
+            "qty_step": self.qty_step,
+            "min_qty": self.min_qty,
+            "min_notional": self.min_notional,
+            "reasons": list(self.reasons),
+        }
+
+
+def _to_decimal(value: object, *, field: str) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid {field} value for spot validation: {value!r}") from exc
+
+
+def _instrument_decimal(
+    instrument: Mapping[str, object],
+    paths: Sequence[Sequence[str]],
+    *,
+    default: str = "0",
+) -> Decimal:
+    for path in paths:
+        current: object = instrument
+        for key in path:
+            if not isinstance(current, Mapping):
+                current = None
+                break
+            current = current.get(key)
+        if current is None:
+            continue
+        try:
+            return Decimal(str(current))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return Decimal(default)
+
+
+def _quantize(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    quantised = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if quantised <= 0 and value > 0:
+        # Preserve at least one step when the raw value was positive but rounded down to zero.
+        return step
+    return quantised
+
+
+def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
+    """Quantise price and quantity according to instrument spot trading rules."""
+
+    instrument: Mapping[str, object] | None = None
     price = kwargs.get("price")
     qty = kwargs.get("qty")
-    if len(args) == 1 and isinstance(args[0], dict):
+
+    if len(args) == 1 and isinstance(args[0], Mapping):
         instrument = args[0]
     elif len(args) >= 6:
-        # category, symbol, side, price, qty, instrument
-        price = args[3]; qty = args[4]; instrument = args[5]
+        price = args[3]
+        qty = args[4]
+        candidate = args[5]
+        if isinstance(candidate, Mapping):
+            instrument = candidate
     else:
-        # try kw-only
-        instrument = kwargs.get("instrument", instrument)
+        candidate = kwargs.get("instrument")
+        if isinstance(candidate, Mapping):
+            instrument = candidate
+
     if instrument is None:
         raise ValueError("instrument is required for validation")
-    tick = Decimal(str((instrument.get("priceFilter") or {}).get("tickSize") or instrument.get("tickSize") or "0.00000001"))
-    step = Decimal(str((instrument.get("lotSizeFilter") or {}).get("qtyStep") or instrument.get("lotSize") or "0.00000001"))
-    min_qty = Decimal(str((instrument.get("lotSizeFilter") or {}).get("minQty") or instrument.get("minQty") or "0"))
-    min_notional = Decimal(str((instrument.get("lotSizeFilter") or {}).get("minNotional") or instrument.get("minNotional") or "0"))
-    # quantize
-    px_q = quantize_price(price, tick)
-    qty_q = quantize_qty(qty, step)
-    mn = max(min_notional, MIN_ORDER_VALUE_USDT)
-    qty_q = ceil_qty_to_min_notional(qty_q, px_q, str(mn), step)
-    if Decimal(qty_q) < min_qty:
-        qty_q = quantize_qty(min_qty, step)
-    return {"price": px_q, "qty": qty_q, "min_notional_applied": str(mn)}
 
-# expose as main name
-validate_spot_rules = _validate_spot_rules_flex
+    if price is None or qty is None:
+        raise ValueError("price and qty are required for validation")
+
+    price_decimal = _to_decimal(price, field="price")
+    qty_decimal = _to_decimal(qty, field="qty")
+
+    tick_size = _instrument_decimal(
+        instrument,
+        ( ("priceFilter", "tickSize"), ("tickSize",), ),
+        default="0.00000001",
+    )
+    qty_step = _instrument_decimal(
+        instrument,
+        ( ("lotSizeFilter", "qtyStep"), ("qtyStep",), ("lotSize",), ),
+        default="0.00000001",
+    )
+    min_qty = _instrument_decimal(
+        instrument,
+        (
+            ("lotSizeFilter", "minOrderQty"),
+            ("lotSizeFilter", "minQty"),
+            ("minOrderQty",),
+            ("minQty",),
+        ),
+        default="0",
+    )
+    min_notional = _instrument_decimal(
+        instrument,
+        (
+            ("lotSizeFilter", "minOrderAmt"),
+            ("lotSizeFilter", "minNotional"),
+            ("minOrderAmt",),
+            ("minNotional",),
+        ),
+        default="0",
+    )
+
+    price_q = _quantize(price_decimal, tick_size)
+    qty_q = _quantize(qty_decimal, qty_step)
+
+    reasons: list[str] = []
+    notional = price_q * qty_q
+    if min_notional > 0 and notional < min_notional:
+        reasons.append(
+            f"notional {notional:.12f} < minNotional {min_notional:.12f}"
+        )
+    if min_qty > 0 and qty_q < min_qty:
+        reasons.append(f"qty {qty_q:.12f} < minQty {min_qty:.12f}")
+
+    return SpotValidationResult(
+        price=price_q,
+        qty=qty_q,
+        tick_size=tick_size,
+        qty_step=qty_step,
+        min_qty=min_qty,
+        min_notional=min_notional,
+        reasons=tuple(reasons),
+    )
