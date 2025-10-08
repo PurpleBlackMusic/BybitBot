@@ -36,6 +36,8 @@ class Settings:
     spot_max_cap_per_symbol_pct: float = 20.0
     spot_max_cap_per_trade_pct: float = 5.0
     spot_cash_reserve_pct: float = 10.0
+    spot_tp_ladder_bps: str = '35,70,110'
+    spot_tp_ladder_split_pct: str = '50,30,20'
 
     # AI — общие
     ai_enabled: bool = False
@@ -140,6 +142,8 @@ _ENV_MAP = {
     "spot_max_cap_per_trade_pct": "SPOT_MAX_CAP_PER_TRADE_PCT",
     "spot_max_cap_per_symbol_pct": "SPOT_MAX_CAP_PER_SYMBOL_PCT",
     "spot_limit_tif": "SPOT_LIMIT_TIF",
+    "spot_tp_ladder_bps": "SPOT_TP_LADDER_BPS",
+    "spot_tp_ladder_split_pct": "SPOT_TP_LADDER_SPLIT_PCT",
     "spot_server_tpsl": "SPOT_SERVER_TPSL",
     "spot_tpsl_tp_order_type": "SPOT_TPSL_TP_ORDER_TYPE",
     "spot_tpsl_sl_order_type": "SPOT_TPSL_SL_ORDER_TYPE",
@@ -234,6 +238,8 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_max_cap_per_trade_pct"] = _cast_float(m.get("spot_max_cap_per_trade_pct", 5.0))
     m["spot_max_cap_per_symbol_pct"] = _cast_float(m.get("spot_max_cap_per_symbol_pct", 20.0))
     m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
+    m["spot_tp_ladder_bps"] = m.get("spot_tp_ladder_bps") or "35,70,110"
+    m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "50,30,20"
     m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"

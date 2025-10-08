@@ -5,11 +5,14 @@ from __future__ import annotations
 import copy
 import math
 import re
+import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import threading
-from typing import Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .envs import Settings, get_api_client, get_settings, creds_ok
+from .helpers import ensure_link_id
 from .live_checks import extract_wallet_totals
 from .log import log
 from .spot_market import (
@@ -56,6 +59,15 @@ class ExecutionResult:
     response: Optional[Dict[str, object]] = None
     context: Optional[Dict[str, object]] = None
 
+
+@dataclass(frozen=True)
+class _LadderStep:
+    profit_bps: Decimal
+    size_fraction: Decimal
+
+    @property
+    def profit_fraction(self) -> Decimal:
+        return self.profit_bps / Decimal("10000")
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
 
@@ -281,10 +293,381 @@ class SignalExecutor:
                 audit = local.get("order_audit")
         if audit:
             order["order_audit"] = audit
-        return ExecutionResult(status="filled", order=order, response=response)
+        ladder_orders, execution_stats = self._place_tp_ladder(
+            api,
+            settings,
+            symbol,
+            side,
+            response,
+        )
+        if execution_stats:
+            order_context["execution"] = execution_stats
+            order["execution"] = copy.deepcopy(execution_stats)
+        if ladder_orders:
+            order_context["take_profit_orders"] = copy.deepcopy(ladder_orders)
+            order["take_profit_orders"] = copy.deepcopy(ladder_orders)
+        return ExecutionResult(status="filled", order=order, response=response, context=order_context)
 
     # ------------------------------------------------------------------
     # helpers
+    def _place_tp_ladder(
+        self,
+        api: object,
+        settings: Settings,
+        symbol: str,
+        side: str,
+        response: Mapping[str, object] | None,
+    ) -> tuple[list[Dict[str, object]], Dict[str, str]]:
+        """Place post-entry take-profit limit orders as a ladder."""
+
+        if side.lower() != "buy":
+            return [], {}
+        if api is None or not hasattr(api, "place_order"):
+            return [], {}
+
+        steps = self._resolve_tp_ladder(settings)
+        if not steps:
+            return [], {}
+
+        executed_base, executed_quote = self._extract_execution_totals(response)
+        if executed_base <= 0 or executed_quote <= 0:
+            return [], {}
+
+        avg_price = executed_quote / executed_base
+        if avg_price <= 0:
+            return [], {}
+
+        audit: Mapping[str, object] | None = None
+        if isinstance(response, Mapping):
+            local = response.get("_local")
+            if isinstance(local, Mapping):
+                candidate = local.get("order_audit")
+                if isinstance(candidate, Mapping):
+                    audit = candidate
+
+        qty_step = self._decimal_from(audit.get("qty_step") if audit else None, Decimal("0.00000001"))
+        if qty_step <= 0:
+            qty_step = Decimal("0.00000001")
+        min_qty = self._decimal_from(audit.get("min_order_qty") if audit else None, Decimal("0"))
+        quote_step = self._decimal_from(audit.get("quote_step") if audit else None, Decimal("0.01"))
+        price_step = self._infer_price_step(audit)
+        if price_step <= 0:
+            price_step = Decimal("0.00000001")
+
+        total_qty = executed_base
+        remaining = total_qty
+        allocations: list[tuple[_LadderStep, Decimal]] = []
+
+        for idx, step_cfg in enumerate(steps):
+            if idx == len(steps) - 1:
+                target_qty = remaining
+            else:
+                target_qty = total_qty * step_cfg.size_fraction
+            qty = self._round_to_step(target_qty, qty_step, rounding=ROUND_DOWN)
+            if qty <= 0:
+                continue
+            if qty > remaining:
+                qty = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+            if qty <= 0:
+                continue
+            remaining -= qty
+            allocations.append((step_cfg, qty))
+
+        if remaining > Decimal("0") and allocations:
+            extra = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+            if extra > 0:
+                step_cfg, qty = allocations[-1]
+                allocations[-1] = (step_cfg, qty + extra)
+                remaining -= extra
+
+        if min_qty > 0 and allocations:
+            adjusted: list[tuple[_LadderStep, Decimal]] = []
+            carry = Decimal("0")
+            for step_cfg, qty in allocations:
+                if qty + carry < min_qty:
+                    carry += qty
+                    continue
+                if carry > 0:
+                    qty += carry
+                    carry = Decimal("0")
+                adjusted.append((step_cfg, qty))
+            if carry > 0 and adjusted:
+                last_step, last_qty = adjusted[-1]
+                adjusted[-1] = (last_step, last_qty + carry)
+            allocations = [(step_cfg, qty) for step_cfg, qty in adjusted if qty > 0]
+
+        if not allocations:
+            return [], {}
+
+        tif_candidate = getattr(settings, "spot_limit_tif", None) or getattr(settings, "order_time_in_force", None) or "GTC"
+        time_in_force = "GTC"
+        if isinstance(tif_candidate, str) and tif_candidate.strip():
+            tif_upper = tif_candidate.strip().upper()
+            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
+            time_in_force = mapping.get(tif_upper, tif_upper)
+
+        aggregated: list[Dict[str, object]] = []
+        for step_cfg, qty in allocations:
+            price = avg_price * (Decimal("1") + step_cfg.profit_fraction)
+            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+            if aggregated and aggregated[-1]["price"] == price:
+                aggregated[-1]["qty"] += qty
+                aggregated[-1]["steps"].append(step_cfg)
+            else:
+                aggregated.append({"price": price, "qty": qty, "steps": [step_cfg]})
+
+        base_timestamp = int(time.time() * 1000)
+        placed: list[Dict[str, object]] = []
+        rung_index = 0
+
+        for entry in aggregated:
+            qty = self._round_to_step(entry["qty"], qty_step, rounding=ROUND_DOWN)
+            if qty <= 0:
+                continue
+            rung_index += 1
+            price = entry["price"]
+            qty_text = self._format_decimal_step(qty, qty_step)
+            price_text = self._format_decimal_step(price, price_step)
+            profit_labels = [str(step.profit_bps.normalize()) for step in entry["steps"]]
+            profit_text = ",".join(profit_labels)
+            link_seed = f"AI-TP-{symbol}-{base_timestamp}-{rung_index}"
+            link_id = ensure_link_id(link_seed) or link_seed
+            payload = {
+                "category": "spot",
+                "symbol": symbol,
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": qty_text,
+                "price": price_text,
+                "timeInForce": time_in_force,
+                "orderLinkId": link_id,
+                "orderFilter": "Order",
+            }
+            try:
+                response_payload = api.place_order(**payload)  # type: ignore[call-arg]
+            except Exception as exc:  # pragma: no cover - network/runtime errors
+                log(
+                    "guardian.auto.tp_ladder.error",
+                    symbol=symbol,
+                    rung=rung_index,
+                    qty=qty_text,
+                    price=price_text,
+                    profit_bps=profit_text,
+                    error=str(exc),
+                )
+                continue
+
+            order_id: Optional[str] = None
+            if isinstance(response_payload, Mapping):
+                order_id_candidate = response_payload.get("orderId")
+                if isinstance(order_id_candidate, str) and order_id_candidate.strip():
+                    order_id = order_id_candidate.strip()
+                else:
+                    result_payload = response_payload.get("result")
+                    if isinstance(result_payload, Mapping):
+                        for key in ("orderId", "orderLinkId"):
+                            candidate = result_payload.get(key)
+                            if isinstance(candidate, str) and candidate.strip():
+                                order_id = candidate.strip()
+                                break
+
+            log(
+                "guardian.auto.tp_ladder",
+                symbol=symbol,
+                rung=rung_index,
+                qty=qty_text,
+                price=price_text,
+                profit_bps=profit_text,
+                response=response_payload,
+            )
+            record: Dict[str, object] = {
+                "orderLinkId": link_id,
+                "qty": qty_text,
+                "price": price_text,
+                "profit_bps": profit_text,
+            }
+            if order_id:
+                record["orderId"] = order_id
+            placed.append(record)
+
+        execution_stats = {
+            "executed_base": self._format_decimal_step(executed_base, qty_step),
+            "executed_quote": self._format_decimal_step(executed_quote, quote_step),
+            "avg_price": self._format_decimal_step(avg_price, price_step),
+        }
+
+        execution_payload = execution_stats if execution_stats else {}
+        return placed, execution_payload
+
+    @staticmethod
+    def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
+        if value is None:
+            return default
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return default
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return default
+            try:
+                return Decimal(text)
+            except (InvalidOperation, ValueError):
+                return default
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return default
+
+    @classmethod
+    def _parse_decimal_sequence(cls, raw: object) -> list[Decimal]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            tokens = [token.strip() for token in re.split(r"[;,]", raw) if token.strip()]
+        elif isinstance(raw, Sequence):
+            tokens = list(raw)
+        else:
+            tokens = [raw]
+        values: list[Decimal] = []
+        for token in tokens:
+            candidate = token
+            if isinstance(candidate, str):
+                candidate = candidate.strip()
+            dec = cls._decimal_from(candidate)
+            if dec > 0:
+                values.append(dec)
+        return values
+
+    def _resolve_tp_ladder(self, settings: Settings) -> list[_LadderStep]:
+        levels_raw = getattr(settings, "spot_tp_ladder_bps", None)
+        sizes_raw = getattr(settings, "spot_tp_ladder_split_pct", None)
+        levels = self._parse_decimal_sequence(levels_raw)
+        if not levels:
+            return []
+        sizes = self._parse_decimal_sequence(sizes_raw)
+        if not sizes:
+            sizes = [Decimal("1")] * len(levels)
+        if len(sizes) == 1 and len(levels) > 1:
+            sizes = [sizes[0]] * len(levels)
+        if len(sizes) < len(levels):
+            sizes.extend([sizes[-1]] * (len(levels) - len(sizes)))
+        if len(sizes) > len(levels):
+            sizes = sizes[: len(levels)]
+
+        total_size = sum(sizes)
+        if total_size <= 0:
+            sizes = [Decimal("1")] * len(levels)
+            total_size = Decimal(len(levels))
+
+        steps: list[_LadderStep] = []
+        for level, size in zip(levels, sizes):
+            if level <= 0 or size <= 0:
+                continue
+            steps.append(_LadderStep(profit_bps=level, size_fraction=size / total_size))
+        return steps
+
+    @staticmethod
+    def _infer_price_step(audit: Mapping[str, object] | None) -> Decimal:
+        candidates: list[str] = []
+        if isinstance(audit, Mapping):
+            for key in ("price_payload", "limit_price"):
+                raw = audit.get(key)
+                if raw is None:
+                    continue
+                if isinstance(raw, str) and raw.strip():
+                    candidates.append(raw.strip())
+                    break
+                candidates.append(str(raw))
+        for text in candidates:
+            try:
+                value = Decimal(text)
+            except (InvalidOperation, ValueError):
+                continue
+            exponent = value.normalize().as_tuple().exponent
+            if exponent < 0:
+                return Decimal("1").scaleb(exponent)
+        return Decimal("0.00000001")
+
+    @staticmethod
+    def _round_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decimal:
+        if step <= 0:
+            return value
+        multiplier = (value / step).to_integral_value(rounding=rounding)
+        return multiplier * step
+
+    @staticmethod
+    def _format_decimal_step(value: Decimal, step: Decimal) -> str:
+        if step > 0:
+            exponent = step.normalize().as_tuple().exponent
+            places = abs(exponent) if exponent < 0 else 0
+        else:
+            exponent = value.normalize().as_tuple().exponent
+            places = abs(exponent) if exponent < 0 else 0
+        if places > 0:
+            text = f"{value:.{places}f}"
+        else:
+            text = format(value.quantize(Decimal("1")) if value == value.to_integral_value() else value.normalize(), "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
+
+    @staticmethod
+    def _extract_execution_totals(response: Mapping[str, object] | None) -> tuple[Decimal, Decimal]:
+        executed_base = Decimal("0")
+        executed_quote = Decimal("0")
+
+        payloads: list[Mapping[str, object]] = []
+        if isinstance(response, Mapping):
+            payloads.append(response)
+            result = response.get("result")
+            if isinstance(result, Mapping):
+                payloads.append(result)
+            elif isinstance(result, Sequence) and result:
+                first = result[0]
+                if isinstance(first, Mapping):
+                    payloads.append(first)
+
+        for payload in payloads:
+            qty = SignalExecutor._decimal_from(payload.get("cumExecQty"))
+            if qty <= 0:
+                qty = SignalExecutor._decimal_from(payload.get("cumExecQtyForCloud"))
+            quote = SignalExecutor._decimal_from(payload.get("cumExecValue"))
+            if qty > 0:
+                executed_base = max(executed_base, qty)
+            if quote <= 0 and qty > 0:
+                avg_price = SignalExecutor._decimal_from(payload.get("avgPrice"))
+                if avg_price <= 0:
+                    avg_price = SignalExecutor._decimal_from(payload.get("orderPrice"))
+                if avg_price > 0:
+                    quote = qty * avg_price
+            if quote > 0:
+                executed_quote = max(executed_quote, quote)
+
+        if (executed_base <= 0 or executed_quote <= 0) and isinstance(response, Mapping):
+            local = response.get("_local")
+            attempts = None
+            if isinstance(local, Mapping):
+                attempts = local.get("attempts")
+            if isinstance(attempts, Sequence):
+                base_total = Decimal("0")
+                quote_total = Decimal("0")
+                for entry in attempts:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    base_total += SignalExecutor._decimal_from(entry.get("executed_base"))
+                    quote_total += SignalExecutor._decimal_from(entry.get("executed_quote"))
+                if base_total > 0:
+                    executed_base = max(executed_base, base_total)
+                if quote_total > 0:
+                    executed_quote = max(executed_quote, quote_total)
+
+        return executed_base, executed_quote
+
     def current_signature(self) -> Optional[str]:
         """Return a stable identifier for the currently cached signal."""
 
