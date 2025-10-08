@@ -31,12 +31,15 @@ class SpotValidationResult:
     def to_dict(self) -> dict[str, object]:
         """Return a serialisable view compatible with older callers."""
 
+        price_text = _format_decimal(self.price, self.tick_size)
+        qty_text = _format_decimal(self.qty, self.qty_step)
+
         return {
             "ok": self.ok,
-            "price": self.price,
-            "qty": self.qty,
-            "price_q": self.price,
-            "qty_q": self.qty,
+            "price": price_text,
+            "qty": qty_text,
+            "price_q": price_text,
+            "qty_q": qty_text,
             "tick_size": self.tick_size,
             "qty_step": self.qty_step,
             "min_qty": self.min_qty,
@@ -77,11 +80,40 @@ def _instrument_decimal(
 def _quantize(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
-    quantised = (value / step).to_integral_value(rounding=ROUND_DOWN) * step
-    if quantised <= 0 and value > 0:
-        # Preserve at least one step when the raw value was positive but rounded down to zero.
-        return step
-    return quantised
+    try:
+        return value.quantize(step, rounding=ROUND_DOWN)
+    except InvalidOperation:
+        exponent = step.normalize().as_tuple().exponent
+        quantum = Decimal("1").scaleb(exponent)
+        return value.quantize(quantum, rounding=ROUND_DOWN)
+
+
+def _format_decimal(value: Decimal, step: Decimal) -> str:
+    if step > 0:
+        try:
+            quantised = value.quantize(step, rounding=ROUND_DOWN)
+        except InvalidOperation:
+            exponent = step.normalize().as_tuple().exponent
+            quantum = Decimal("1").scaleb(exponent)
+            quantised = value.quantize(quantum, rounding=ROUND_DOWN)
+        exponent = step.normalize().as_tuple().exponent
+        places = abs(exponent) if exponent < 0 else 0
+    else:
+        quantised = value
+        exponent = quantised.normalize().as_tuple().exponent
+        places = abs(exponent) if exponent < 0 else 0
+
+    if places > 0:
+        text = f"{quantised:.{places}f}"
+    else:
+        integral = quantised.to_integral_value(rounding=ROUND_DOWN)
+        if quantised == integral:
+            text = format(integral, "f")
+        else:
+            text = format(quantised.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:

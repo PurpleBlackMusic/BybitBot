@@ -20,6 +20,7 @@ from .spot_market import (
     place_spot_market_with_tolerance,
     resolve_trade_symbol,
 )
+from .pnl import read_ledger
 from .symbols import ensure_usdt_symbol
 from .ws_manager import manager as ws_manager
 
@@ -329,11 +330,19 @@ class SignalExecutor:
         if not steps:
             return [], {}
 
-        executed_base, executed_quote = self._extract_execution_totals(response)
-        if executed_base <= 0 or executed_quote <= 0:
+        executed_base_raw, executed_quote = self._extract_execution_totals(response)
+        if executed_base_raw <= 0 or executed_quote <= 0:
             return [], {}
 
-        avg_price = executed_quote / executed_base
+        order_id, order_link_id = self._extract_order_identifiers(response)
+        filled_base_total = self._collect_filled_base_total(
+            symbol,
+            order_id=order_id,
+            order_link_id=order_link_id,
+            executed_base=executed_base_raw,
+        )
+        executed_base = filled_base_total if filled_base_total > 0 else executed_base_raw
+        avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
         if avg_price <= 0:
             return [], {}
 
@@ -354,7 +363,27 @@ class SignalExecutor:
         if price_step <= 0:
             price_step = Decimal("0.00000001")
 
-        total_qty = executed_base
+        open_sell_reserved = self._resolve_open_sell_reserved(symbol)
+        safety_buffer = qty_step if qty_step > 0 else Decimal("0")
+        sell_budget_base = filled_base_total - open_sell_reserved - safety_buffer
+        if sell_budget_base < 0:
+            sell_budget_base = Decimal("0")
+
+        total_qty = sell_budget_base if sell_budget_base > 0 else Decimal("0")
+        if total_qty <= 0:
+            execution_stats = self._build_tp_execution_stats(
+                executed_base=executed_base,
+                executed_quote=executed_quote,
+                avg_price=avg_price,
+                sell_budget_base=total_qty,
+                qty_step=qty_step,
+                quote_step=quote_step,
+                price_step=price_step,
+                open_sell_reserved=open_sell_reserved,
+                filled_base_total=filled_base_total,
+            )
+            return [], execution_stats
+
         remaining = total_qty
         allocations: list[tuple[_LadderStep, Decimal]] = []
 
@@ -370,6 +399,8 @@ class SignalExecutor:
                 qty = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
             if qty <= 0:
                 continue
+            if min_qty > 0 and qty < min_qty:
+                continue
             remaining -= qty
             allocations.append((step_cfg, qty))
 
@@ -377,8 +408,10 @@ class SignalExecutor:
             extra = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
             if extra > 0:
                 step_cfg, qty = allocations[-1]
-                allocations[-1] = (step_cfg, qty + extra)
-                remaining -= extra
+                new_qty = qty + extra
+                if min_qty <= 0 or new_qty >= min_qty:
+                    allocations[-1] = (step_cfg, new_qty)
+                    remaining -= extra
 
         if min_qty > 0 and allocations:
             adjusted: list[tuple[_LadderStep, Decimal]] = []
@@ -490,14 +523,292 @@ class SignalExecutor:
                 record["orderId"] = order_id
             placed.append(record)
 
-        execution_stats = {
-            "executed_base": self._format_decimal_step(executed_base, qty_step),
-            "executed_quote": self._format_decimal_step(executed_quote, quote_step),
-            "avg_price": self._format_decimal_step(avg_price, price_step),
-        }
+        execution_stats = self._build_tp_execution_stats(
+            executed_base=executed_base,
+            executed_quote=executed_quote,
+            avg_price=avg_price,
+            sell_budget_base=total_qty,
+            qty_step=qty_step,
+            quote_step=quote_step,
+            price_step=price_step,
+            open_sell_reserved=open_sell_reserved,
+            filled_base_total=filled_base_total,
+        )
 
         execution_payload = execution_stats if execution_stats else {}
         return placed, execution_payload
+
+    @staticmethod
+    def _extract_order_identifiers(
+        response: Mapping[str, object] | None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        order_id: Optional[str] = None
+        order_link_id: Optional[str] = None
+
+        def _assign(payload: Mapping[str, object]) -> None:
+            nonlocal order_id, order_link_id
+            if order_id is None:
+                for key in ("orderId", "orderID"):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        order_id = candidate.strip()
+                        break
+            if order_link_id is None:
+                for key in ("orderLinkId", "orderLinkID"):
+                    candidate = payload.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        order_link_id = candidate.strip()
+                        break
+
+        if isinstance(response, Mapping):
+            _assign(response)
+            result = response.get("result")
+            if isinstance(result, Mapping):
+                _assign(result)
+            elif isinstance(result, Sequence):
+                for entry in result:
+                    if isinstance(entry, Mapping):
+                        _assign(entry)
+                        if order_id and order_link_id:
+                            break
+            local_payload = response.get("_local")
+            if isinstance(local_payload, Mapping):
+                candidate_payload = local_payload.get("order_payload")
+                if isinstance(candidate_payload, Mapping):
+                    _assign(candidate_payload)
+
+        return order_id, order_link_id
+
+    def _collect_filled_base_total(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str],
+        order_link_id: Optional[str],
+        executed_base: Decimal,
+    ) -> Decimal:
+        best_total = executed_base if executed_base > 0 else Decimal("0")
+
+        ws_total = self._filled_base_from_private_ws(
+            symbol, order_id=order_id, order_link_id=order_link_id
+        )
+        if ws_total > best_total:
+            best_total = ws_total
+
+        ledger_total = self._filled_base_from_ledger(
+            symbol, order_id=order_id, order_link_id=order_link_id
+        )
+        if ledger_total > best_total:
+            best_total = ledger_total
+
+        return best_total
+
+    def _build_tp_execution_stats(
+        self,
+        *,
+        executed_base: Decimal,
+        executed_quote: Decimal,
+        avg_price: Decimal,
+        sell_budget_base: Decimal,
+        qty_step: Decimal,
+        quote_step: Decimal,
+        price_step: Decimal,
+        open_sell_reserved: Decimal,
+        filled_base_total: Decimal,
+    ) -> Dict[str, str]:
+        stats: Dict[str, str] = {
+            "executed_base": self._format_decimal_step(executed_base, qty_step),
+            "executed_quote": self._format_decimal_step(executed_quote, quote_step),
+            "avg_price": self._format_decimal_step(avg_price, price_step),
+            "sell_budget_base": self._format_decimal_step(sell_budget_base, qty_step),
+        }
+
+        if open_sell_reserved > 0:
+            stats["open_sell_reserved"] = self._format_decimal_step(open_sell_reserved, qty_step)
+        if filled_base_total > 0:
+            stats["filled_base_total"] = self._format_decimal_step(filled_base_total, qty_step)
+
+        return stats
+
+    def _filled_base_from_private_ws(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str],
+        order_link_id: Optional[str],
+    ) -> Decimal:
+        if not order_id and not order_link_id:
+            return Decimal("0")
+
+        rows = self._realtime_private_rows("execution")
+        if not rows:
+            return Decimal("0")
+
+        symbol_upper = symbol.upper()
+        total = Decimal("0")
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("symbol") or "").upper() != symbol_upper:
+                continue
+            if not self._row_matches_order(row, order_id, order_link_id):
+                continue
+            side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
+            if side and side != "buy":
+                continue
+
+            cum_qty = self._decimal_from(row.get("cumExecQty"))
+            if cum_qty > 0:
+                total = max(total, cum_qty)
+                continue
+
+            qty = self._decimal_from(row.get("execQty"))
+            if qty > 0:
+                total += qty
+
+        return total
+
+    def _filled_base_from_ledger(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str],
+        order_link_id: Optional[str],
+    ) -> Decimal:
+        if not order_id and not order_link_id:
+            return Decimal("0")
+
+        try:
+            rows = read_ledger(2000)
+        except Exception:
+            return Decimal("0")
+
+        symbol_upper = symbol.upper()
+        total = Decimal("0")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("symbol") or "").upper() != symbol_upper:
+                continue
+            if not self._row_matches_order(row, order_id, order_link_id):
+                continue
+            category = str(row.get("category") or "spot").strip().lower()
+            if category and category != "spot":
+                continue
+            side = str(row.get("side") or "").strip().lower()
+            if side and side != "buy":
+                continue
+            qty = self._decimal_from(row.get("execQty"))
+            if qty > 0:
+                total += qty
+
+        return total
+
+    def _resolve_open_sell_reserved(self, symbol: str) -> Decimal:
+        rows = self._realtime_private_rows("order")
+        if not rows:
+            return Decimal("0")
+
+        symbol_upper = symbol.upper()
+        reserved: Dict[str, Decimal] = {}
+        total_reserved = Decimal("0")
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("symbol") or "").upper() != symbol_upper:
+                continue
+            side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
+            if side != "sell":
+                continue
+            order_type = str(row.get("orderType") or row.get("orderTypeV2") or "").strip().lower()
+            if order_type and order_type != "limit":
+                continue
+            status = str(row.get("orderStatus") or row.get("status") or "").strip().lower()
+            if status:
+                closed_prefixes = ("cancel", "reject", "filled", "trigger", "inactive", "deactivate", "expire")
+                if any(status.startswith(prefix) for prefix in closed_prefixes):
+                    continue
+            qty = self._decimal_from(row.get("leavesQty"))
+            if qty <= 0:
+                qty = self._decimal_from(row.get("qty"))
+            if qty <= 0:
+                qty = self._decimal_from(row.get("orderQty"))
+            if qty <= 0:
+                continue
+            key: Optional[str] = None
+            for candidate_key in ("orderId", "orderID", "orderLinkId", "orderLinkID"):
+                candidate = row.get(candidate_key)
+                if isinstance(candidate, str) and candidate.strip():
+                    key = candidate.strip()
+                    break
+            if key is None:
+                key = f"anon-{id(row)}"
+            previous = reserved.get(key)
+            if previous is not None:
+                total_reserved -= previous
+            reserved[key] = qty
+            total_reserved += qty
+
+        return total_reserved
+
+    @staticmethod
+    def _row_matches_order(
+        row: Mapping[str, object],
+        order_id: Optional[str],
+        order_link_id: Optional[str],
+    ) -> bool:
+        if order_link_id:
+            for key in ("orderLinkId", "orderLinkID"):
+                candidate = row.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    if candidate.strip() == order_link_id:
+                        return True
+        if order_id:
+            for key in ("orderId", "orderID"):
+                candidate = row.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    if candidate.strip() == order_id:
+                        return True
+        return not order_id and not order_link_id
+
+    def _realtime_private_rows(self, topic_keyword: str) -> list[Mapping[str, object]]:
+        cache = getattr(ws_manager, "_realtime_cache", None)
+        if cache is None or not hasattr(cache, "snapshot"):
+            return []
+
+        try:
+            snapshot = cache.snapshot(private_ttl=None)
+        except Exception:
+            return []
+
+        private = snapshot.get("private") if isinstance(snapshot, Mapping) else None
+        if not isinstance(private, Mapping):
+            return []
+
+        rows: list[Mapping[str, object]] = []
+        keyword = topic_keyword.lower()
+        for topic, record in private.items():
+            topic_key = str(topic).lower()
+            if keyword not in topic_key:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            payload = record.get("payload")
+            candidates: Sequence[object] | None = None
+            if isinstance(payload, Mapping):
+                maybe_rows = payload.get("rows")
+                if isinstance(maybe_rows, Sequence):
+                    candidates = maybe_rows
+            elif isinstance(payload, Sequence):
+                candidates = payload
+            if not candidates:
+                continue
+            for entry in candidates:
+                if isinstance(entry, Mapping):
+                    rows.append(entry)
+        return rows
 
     @staticmethod
     def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
