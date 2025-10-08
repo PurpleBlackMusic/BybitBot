@@ -365,8 +365,6 @@ class BybitAPI:
 
             category_raw = payload.get("category")
             category = str(category_raw).strip() if isinstance(category_raw, str) else None
-            if not category:
-                return
 
             result = response.get("result") if isinstance(response, Mapping) else None
             if not isinstance(result, Mapping):
@@ -413,76 +411,91 @@ class BybitAPI:
 
             symbol = str(symbol_value).strip().upper() if isinstance(symbol_value, str) else None
 
-            params = {"category": category, "openOnly": 1}
-            if symbol:
-                params["symbol"] = symbol
+            category_for_check = "spot" if action == "place" else category
+            if not category_for_check:
+                category_for_check = "spot" if action == "place" else None
+            if not category_for_check:
+                return
+
+            max_attempts = 5 if action == "place" else 1
+            delay_seconds = 0.3
+
+            def _search_open_orders() -> tuple[bool, bool]:
+                params = {"category": category_for_check, "openOnly": 1}
+                if symbol:
+                    params["symbol"] = symbol
+
+                cursor: str | None = None
+                seen_cursors: set[str] = set()
+                max_pages = 5
+
+                for _ in range(max_pages):
+                    if cursor:
+                        params["cursor"] = cursor
+                    elif "cursor" in params:
+                        params.pop("cursor", None)
+
+                    try:
+                        orders_payload = self.open_orders(**params)
+                    except Exception as exc:  # pragma: no cover - network/runtime errors
+                        log(
+                            f"order.self_check.{action}.error",
+                            category=category_for_check,
+                            symbol=symbol,
+                            orderLinkId=order_link_id,
+                            orderId=order_id,
+                            err=str(exc),
+                        )
+                        return False, True
+
+                    orders_source = (orders_payload or {}).get("result") if isinstance(orders_payload, Mapping) else None
+                    orders = orders_source.get("list") if isinstance(orders_source, Mapping) else []
+
+                    if isinstance(orders, Iterable):
+                        for row in orders:
+                            if not isinstance(row, Mapping):
+                                continue
+
+                            if order_link_id:
+                                candidate_link = row.get("orderLinkId")
+                                if (
+                                    isinstance(candidate_link, str)
+                                    and ensure_link_id(candidate_link) == order_link_id
+                                ):
+                                    return True, False
+
+                            if order_id:
+                                candidate_id = row.get("orderId")
+                                if (
+                                    isinstance(candidate_id, (str, int))
+                                    and str(candidate_id).strip() == order_id
+                                ):
+                                    return True, False
+
+                    next_cursor_raw = orders_source.get("nextPageCursor") if isinstance(orders_source, Mapping) else None
+                    if not isinstance(next_cursor_raw, str):
+                        break
+
+                    next_cursor = next_cursor_raw.strip()
+                    if not next_cursor:
+                        break
+
+                    if next_cursor in seen_cursors:
+                        break
+
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+
+                return False, False
 
             found = False
-            cursor: str | None = None
-            seen_cursors: set[str] = set()
-            max_pages = 5
-
-            for _ in range(max_pages):
-                if cursor:
-                    params["cursor"] = cursor
-                elif "cursor" in params:
-                    params.pop("cursor", None)
-
-                try:
-                    orders_payload = self.open_orders(**params)
-                except Exception as exc:  # pragma: no cover - network/runtime errors
-                    log(
-                        f"order.self_check.{action}.error",
-                        category=category,
-                        symbol=symbol,
-                        orderLinkId=order_link_id,
-                        orderId=order_id,
-                        err=str(exc),
-                    )
-                    return
-
-                orders_source = (orders_payload or {}).get("result") if isinstance(orders_payload, Mapping) else None
-                orders = orders_source.get("list") if isinstance(orders_source, Mapping) else []
-
-                if isinstance(orders, Iterable):
-                    for row in orders:
-                        if not isinstance(row, Mapping):
-                            continue
-
-                        if order_link_id:
-                            candidate_link = row.get("orderLinkId")
-                            if (
-                                isinstance(candidate_link, str)
-                                and ensure_link_id(candidate_link) == order_link_id
-                            ):
-                                found = True
-                                break
-
-                        if order_id and not found:
-                            candidate_id = row.get("orderId")
-                            if (
-                                isinstance(candidate_id, (str, int))
-                                and str(candidate_id).strip() == order_id
-                            ):
-                                found = True
-                                break
-
-                if found:
+            aborted = False
+            for attempt in range(max_attempts):
+                found, aborted = _search_open_orders()
+                if found or aborted:
                     break
-
-                next_cursor_raw = orders_source.get("nextPageCursor") if isinstance(orders_source, Mapping) else None
-                if not isinstance(next_cursor_raw, str):
-                    break
-
-                next_cursor = next_cursor_raw.strip()
-                if not next_cursor:
-                    break
-
-                if next_cursor in seen_cursors:
-                    break
-
-                seen_cursors.add(next_cursor)
-                cursor = next_cursor
+                if attempt < max_attempts - 1:
+                    time.sleep(delay_seconds)
 
             expect_present = action == "place"
 
@@ -525,6 +538,7 @@ class BybitAPI:
             log(
                 f"order.self_check.{action}",
                 category=category,
+                checkCategory=category_for_check,
                 symbol=symbol,
                 orderLinkId=order_link_id,
                 orderId=order_id,

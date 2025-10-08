@@ -1,14 +1,126 @@
 
 from __future__ import annotations
-from .helpers import ensure_link_id
-from pathlib import Path
-import json, time, threading
-from .paths import DATA_DIR
+
+import hashlib
+import json
+import time
+import threading
+from collections import deque
+from collections.abc import Mapping
+
 from .log import log
+from .paths import DATA_DIR
 
 LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
 _SUMMARY = DATA_DIR / "pnl" / "pnl_daily.json"
 _LOCK = threading.Lock()
+_RECENT_CACHE_SIZE = 2048
+_RECENT_KEYS = deque(maxlen=_RECENT_CACHE_SIZE)
+_RECENT_KEY_SET: set[str] = set()
+_RECENT_WARMED = False
+
+
+def _normalise_id(value) -> str | None:
+    if isinstance(value, (str, int)):
+        candidate = str(value).strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
+    if not isinstance(ev, Mapping):
+        return None
+
+    existing_key = ev.get("execKey")
+    normalised_existing = _normalise_id(existing_key)
+    if normalised_existing:
+        return normalised_existing
+
+    order_id = _normalise_id(ev.get("orderId"))
+    exec_id = _normalise_id(ev.get("execId") or ev.get("executionId"))
+
+    if not order_id:
+        return None
+
+    if exec_id:
+        return f"{order_id}:{exec_id}"
+
+    fill_time = (
+        _normalise_id(ev.get("execTime"))
+        or _normalise_id(ev.get("transactionTime"))
+        or _normalise_id(ev.get("fillTime"))
+        or _normalise_id(ev.get("ts"))
+    )
+    price = _f(ev.get("execPrice"))
+    qty = _f(ev.get("execQty"))
+
+    fingerprint_source = json.dumps(
+        {
+            "orderId": order_id,
+            "fillTime": fill_time,
+            "execPrice": price,
+            "execQty": qty,
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    digest = hashlib.sha1(fingerprint_source).hexdigest()[:8]
+    return f"{order_id}:{fill_time}:{price}:{qty}:{digest}"
+
+
+def _remember_key(key: str) -> bool:
+    _seed_recent_keys()
+
+    if key in _RECENT_KEY_SET:
+        return False
+
+    if len(_RECENT_KEYS) == _RECENT_KEYS.maxlen:
+        expired = _RECENT_KEYS.popleft()
+        _RECENT_KEY_SET.discard(expired)
+
+    _RECENT_KEYS.append(key)
+    _RECENT_KEY_SET.add(key)
+    return True
+
+
+def _seed_recent_keys() -> None:
+    global _RECENT_WARMED
+
+    if _RECENT_WARMED:
+        return
+
+    _RECENT_WARMED = True
+
+    if not LEDGER.exists():
+        return
+
+    tail: deque[str] = deque(maxlen=_RECENT_CACHE_SIZE)
+    try:
+        with LEDGER.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    tail.append(line)
+    except OSError as exc:
+        log("pnl.exec.seed.error", err=str(exc))
+        return
+
+    for entry in tail:
+        try:
+            payload = json.loads(entry)
+        except json.JSONDecodeError:
+            continue
+
+        key = _execution_key(payload)
+        if not key or key in _RECENT_KEY_SET:
+            continue
+
+        if len(_RECENT_KEYS) == _RECENT_KEYS.maxlen:
+            expired = _RECENT_KEYS.popleft()
+            _RECENT_KEY_SET.discard(expired)
+
+        _RECENT_KEYS.append(key)
+        _RECENT_KEY_SET.add(key)
 
 def add_execution(ev: dict):
     """Сохраняем fill (частичный/полный) из топика execution. Ожидаем поля: symbol, side, orderLinkId, execPrice, execQty, execFee, execTime."""
@@ -24,7 +136,20 @@ def add_execution(ev: dict):
         "execTime": ev.get("execTime") or ev.get("transactionTime") or ev.get("ts"),
         "category": ev.get("category") or ev.get("orderCategory") or "spot"
     }
+    key = _execution_key(ev)
     with _LOCK:
+        if key and not _remember_key(key):
+            log(
+                "pnl.exec.duplicate",
+                symbol=rec["symbol"],
+                orderId=rec["orderId"],
+                execKey=key,
+            )
+            return
+
+        if key:
+            rec["execKey"] = key
+
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with LEDGER.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
