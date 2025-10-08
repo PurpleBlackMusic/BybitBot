@@ -14,6 +14,8 @@ _PRICE_CACHE_TTL = 5.0
 _BALANCE_CACHE_TTL = 5.0
 _INSTRUMENT_CACHE_TTL = 600.0
 _SYMBOL_CACHE_TTL = 300.0
+_ORDERBOOK_LIMIT = 200
+_MAX_MARK_DEVIATION = Decimal("0.01")
 
 
 T = TypeVar("T")
@@ -376,6 +378,210 @@ def _round_down(value: Decimal, step: Decimal) -> Decimal:
         return value
     multiplier = (value / step).to_integral_value(rounding=ROUND_DOWN)
     return multiplier * step
+
+
+def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tuple[Decimal, Decimal]]:
+    normalised: list[tuple[Decimal, Decimal]] = []
+    for entry in levels or []:
+        if not isinstance(entry, Sequence) or len(entry) < 2:
+            continue
+        price = _to_decimal(entry[0])
+        qty = _to_decimal(entry[1])
+        if price <= 0 or qty <= 0:
+            continue
+        normalised.append((price, qty))
+    return normalised
+
+
+def _apply_tick(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
+    if tick_size <= 0:
+        return price
+    rounding = ROUND_UP if side == "buy" else ROUND_DOWN
+    multiplier = (price / tick_size).to_integral_value(rounding=rounding)
+    adjusted = multiplier * tick_size
+    if adjusted <= 0:
+        adjusted = tick_size
+    return adjusted
+
+
+def _orderbook_snapshot(api: BybitAPI, symbol: str) -> tuple[list[tuple[Decimal, Decimal]], list[tuple[Decimal, Decimal]]]:
+    try:
+        response = api.orderbook(category="spot", symbol=symbol, limit=_ORDERBOOK_LIMIT)
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        raise RuntimeError(f"Не удалось получить стакан по {symbol}: {exc}") from exc
+
+    result = response.get("result") if isinstance(response, Mapping) else None
+    asks_raw = []
+    bids_raw = []
+    if isinstance(result, Mapping):
+        asks_raw = result.get("a") or []
+        bids_raw = result.get("b") or []
+
+    asks = _normalise_orderbook_levels(asks_raw)
+    bids = _normalise_orderbook_levels(bids_raw)
+    return asks, bids
+
+
+def _plan_limit_ioc_order(
+    *,
+    asks: Sequence[tuple[Decimal, Decimal]],
+    bids: Sequence[tuple[Decimal, Decimal]],
+    side: str,
+    target_quote: Decimal | None,
+    target_base: Decimal | None,
+    qty_step: Decimal,
+    min_qty: Decimal,
+) -> tuple[Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
+    side_normalised = side
+    levels = asks if side_normalised == "buy" else bids
+    if not levels:
+        raise OrderValidationError(
+            "Стакан пуст — нет доступной ликвидности.",
+            code="orderbook_empty",
+            details={"side": side_normalised},
+        )
+
+    consumed: list[tuple[Decimal, Decimal]] = []
+    accumulated_base = Decimal("0")
+    accumulated_quote = Decimal("0")
+    worst_price = levels[0][0]
+
+    if target_base is not None and target_base <= 0:
+        raise OrderValidationError(
+            "Количество должно быть положительным.",
+            code="qty_invalid",
+        )
+
+    if target_quote is not None and target_quote <= 0:
+        raise OrderValidationError(
+            "Количество должно быть положительным.",
+            code="qty_invalid",
+        )
+
+    for price, qty in levels:
+        worst_price = price
+        if target_base is not None:
+            remaining_base = target_base - accumulated_base
+            if remaining_base <= 0:
+                break
+            take_base = qty if qty <= remaining_base else remaining_base
+            accumulated_base += take_base
+            accumulated_quote += take_base * price
+            consumed.append((price, take_base))
+            if accumulated_base >= target_base:
+                break
+        else:
+            remaining_quote = target_quote - accumulated_quote if target_quote is not None else Decimal("0")
+            if remaining_quote <= 0:
+                break
+            level_quote = qty * price
+            if level_quote >= remaining_quote:
+                take_base = remaining_quote / price
+                accumulated_base += take_base
+                accumulated_quote += remaining_quote
+                consumed.append((price, take_base))
+                break
+            accumulated_base += qty
+            accumulated_quote += level_quote
+            consumed.append((price, qty))
+
+    if target_base is not None and accumulated_base < target_base:
+        raise OrderValidationError(
+            "Недостаточная глубина стакана для заданного количества.",
+            code="insufficient_liquidity",
+            details={
+                "requested_base": _format_decimal(target_base),
+                "available_base": _format_decimal(accumulated_base),
+                "side": side_normalised,
+            },
+        )
+
+    if target_quote is not None and accumulated_quote < target_quote:
+        raise OrderValidationError(
+            "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
+            code="insufficient_liquidity",
+            details={
+                "requested_quote": _format_decimal(target_quote),
+                "available_quote": _format_decimal(accumulated_quote),
+                "side": side_normalised,
+            },
+        )
+
+    qty_rounded = _round_up(accumulated_base, qty_step)
+
+    if qty_rounded <= 0:
+        raise OrderValidationError(
+            "Количество меньше минимального шага для базовой валюты.",
+            code="qty_step",
+            details={"requested": _format_decimal(accumulated_base), "step": _format_decimal(qty_step)},
+        )
+
+    if min_qty > 0 and qty_rounded < min_qty:
+        raise OrderValidationError(
+            "Количество меньше минимального лота для базовой валюты.",
+            code="min_qty",
+            details={
+                "requested": _format_decimal(accumulated_base),
+                "rounded": _format_decimal(qty_rounded),
+                "min_qty": _format_decimal(min_qty),
+                "step": _format_decimal(qty_step),
+            },
+        )
+
+    quote_total = qty_rounded * worst_price
+    return worst_price, qty_rounded, quote_total, consumed
+
+
+def _max_mark_price(price: Decimal | None, *, side: str) -> tuple[Decimal | None, Decimal | None]:
+    if price is None or price <= 0:
+        return None, None
+    if side == "buy":
+        return price * (Decimal("1") + _MAX_MARK_DEVIATION), None
+    return None, price * (Decimal("1") - _MAX_MARK_DEVIATION)
+
+
+def _extract_order_fields(payload: Mapping[str, object]) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping):
+        return {}
+    if isinstance(payload.get("result"), Mapping):
+        return payload["result"]  # type: ignore[index]
+    if isinstance(payload.get("body"), Mapping):
+        return payload["body"]  # type: ignore[index]
+    return payload
+
+
+def _execution_stats(
+    response: Mapping[str, object] | None,
+    *,
+    expected_qty: Decimal,
+    limit_price: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    if not isinstance(response, Mapping):
+        return Decimal("0"), Decimal("0"), expected_qty
+
+    fields = _extract_order_fields(response)
+    order_qty = _to_decimal(fields.get("orderQty") or fields.get("qty") or expected_qty)
+    leaves_qty = _to_decimal(fields.get("leavesQty"))
+    cum_exec_qty = _to_decimal(fields.get("cumExecQty"))
+    cum_exec_value = _to_decimal(fields.get("cumExecValue"))
+    avg_price = _to_decimal(fields.get("avgPrice"))
+
+    executed_qty = Decimal("0")
+    if cum_exec_qty > 0:
+        executed_qty = cum_exec_qty
+    elif order_qty > 0 and leaves_qty >= 0:
+        executed_qty = order_qty - leaves_qty
+
+    executed_quote = Decimal("0")
+    if cum_exec_value > 0:
+        executed_quote = cum_exec_value
+    elif executed_qty > 0:
+        ref_price = avg_price if avg_price > 0 else limit_price
+        executed_quote = executed_qty * ref_price
+
+    remaining_qty = leaves_qty if leaves_qty > 0 else max(order_qty - executed_qty, Decimal("0"))
+
+    return executed_qty, executed_quote, remaining_qty
 
 
 def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
@@ -924,7 +1130,7 @@ def prepare_spot_market_order(
     api: BybitAPI,
     symbol: str,
     side: str,
-    qty: float,
+    qty: Decimal | float | int | str,
     unit: str = "quoteCoin",
     tol_type: str = "Percent",
     tol_value: float = 0.5,
@@ -1042,9 +1248,8 @@ def prepare_spot_market_order(
         )
 
     market_unit = "quoteCoin"
-    qty_value = Decimal("0")
-    effective_notional = Decimal("0")
-    price_used: Optional[Decimal] = None
+    target_quote: Optional[Decimal] = None
+    target_base: Optional[Decimal] = None
 
     if unit_normalised == "quotecoin":
         rounded = _round_down(requested_qty, quote_step)
@@ -1070,8 +1275,7 @@ def prepare_spot_market_order(
                     "unit": "quote",
                 },
             )
-        qty_value = rounded
-        effective_notional = qty_value
+        target_quote = rounded
     else:
         rounded = _round_down(requested_qty, qty_step)
         if rounded <= 0:
@@ -1096,79 +1300,138 @@ def prepare_spot_market_order(
                     "unit": "base",
                 },
             )
-
-        needs_price = min_amount > 0 or max_available is not None
-        if needs_price and price_hint is None:
-            price_hint = _latest_price(api, symbol)
-
-        qty_value = rounded
+        target_base = rounded
         market_unit = "baseCoin"
-        if price_hint is not None and price_hint > 0:
-            price_used = price_hint
-            effective_notional = qty_value * price_hint
-            if min_amount > 0 and effective_notional < min_amount:
-                raise OrderValidationError(
-                    "Минимальный объём ордера не достигнут.",
-                    code="min_notional",
-                    details={
-                        "requested": _format_decimal(requested_qty),
-                        "rounded": _format_decimal(qty_value),
-                        "min_notional": _format_decimal(min_amount),
-                        "price": _format_decimal(price_hint),
-                        "unit": "base",
-                    },
-                )
-        else:
-            effective_notional = qty_value
 
-    projected_spend = effective_notional * tolerance_multiplier
+    if price_hint is None:
+        price_hint = _latest_price(api, symbol)
+
+    asks, bids = _orderbook_snapshot(api, symbol)
+    worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
+        asks=asks,
+        bids=bids,
+        side=side_normalised,
+        target_quote=target_quote,
+        target_base=target_base,
+        qty_step=qty_step,
+        min_qty=min_qty,
+    )
+
+    limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
+    limit_price = _apply_tick(worst_price, limit_map_tick, side_normalised)
+    effective_notional = qty_base * limit_price
+
+    if unit_normalised == "quotecoin":
+        market_unit = "quoteCoin"
+    else:
+        market_unit = "baseCoin"
+
+    tolerance_margin = Decimal("0.00000001")
+    tolerance_adjusted = effective_notional * tolerance_multiplier
+
+    quote_ceiling: Decimal | None = None
+    quote_ceiling_raw: Decimal | None = None
+    rounding_allowance = Decimal("0")
+    tick_gap = Decimal("0")
+    if target_quote is not None:
+        quote_ceiling_raw = target_quote * tolerance_multiplier
+        if qty_step > 0:
+            rounding_allowance = (qty_step * limit_price).copy_abs()
+        if limit_price > worst_price:
+            tick_gap = (limit_price - worst_price) * qty_base
+        if quote_ceiling_raw is None:
+            quote_ceiling_raw = target_quote
+        quote_ceiling = quote_ceiling_raw + rounding_allowance
+        if effective_notional - quote_ceiling > tolerance_margin:
+            raise OrderValidationError(
+                "Расчётный объём превышает допустимый предел с учётом толеранса.",
+                code="tolerance_exceeded",
+                details={
+                    "requested_quote": _format_decimal(target_quote),
+                    "effective_notional": _format_decimal(effective_notional),
+                    "tolerance_ceiling": _format_decimal(quote_ceiling_raw),
+                    "rounding_allowance": _format_decimal(rounding_allowance),
+                    "tick_gap": _format_decimal(tick_gap),
+                    "tolerance_multiplier": _format_decimal(tolerance_multiplier),
+                    "tolerance_type": tolerance_type,
+                    "tolerance_value": tolerance_value,
+                },
+            )
 
     if max_available is not None:
-        tolerance_margin = Decimal("0.00000001")
-        if max_available <= 0 or projected_spend - max_available > tolerance_margin:
+        if max_available <= 0 or tolerance_adjusted - max_available > tolerance_margin:
             raise OrderValidationError(
                 "Недостаточно свободного капитала с учётом допуска по проскальзыванию.",
                 code="max_quote",
                 details={
-                    "required": _format_decimal(projected_spend),
+                    "required": _format_decimal(tolerance_adjusted),
                     "available": _format_decimal(max_available if max_available > 0 else Decimal("0")),
                     "tolerance_multiplier": _format_decimal(tolerance_multiplier),
                 },
             )
 
-    tolerance_adjusted = projected_spend
+    max_price, min_price = _max_mark_price(price_hint, side=side_normalised)
+    if max_price is not None and limit_price > max_price:
+        raise OrderValidationError(
+            "Ожидаемая цена превышает допустимое отклонение от mark.",
+            code="price_deviation",
+            details={
+                "limit_price": _format_decimal(limit_price),
+                "mark_price": _format_decimal(price_hint),
+                "max_allowed": _format_decimal(max_price),
+                "side": side_normalised,
+            },
+        )
+    if min_price is not None and limit_price < min_price:
+        raise OrderValidationError(
+            "Ожидаемая цена ниже допустимого отклонения от mark.",
+            code="price_deviation",
+            details={
+                "limit_price": _format_decimal(limit_price),
+                "mark_price": _format_decimal(price_hint),
+                "min_allowed": _format_decimal(min_price),
+                "side": side_normalised,
+            },
+        )
+
+    if min_amount > 0 and effective_notional < min_amount:
+        raise OrderValidationError(
+            "Минимальный объём ордера не достигнут.",
+            code="min_notional",
+            details={
+                "requested": _format_decimal(target_quote or requested_qty),
+                "rounded": _format_decimal(effective_notional),
+                "min_notional": _format_decimal(min_amount),
+                "unit": "quote",
+            },
+        )
 
     if side_normalised == "buy":
         _ensure_balance(quote_coin or "", tolerance_adjusted)
-    else:  # sell
-        if market_unit == "baseCoin":
-            _ensure_balance(base_coin or "", qty_value)
-        elif price_used is not None and price_used > 0:
-            required_base = (effective_notional / price_used).copy_abs()
-            _ensure_balance(base_coin or "", required_base)
+    else:
+        _ensure_balance(base_coin or "", qty_base)
 
-    qty_text = format(qty_value.normalize(), "f") if qty_value != 0 else "0"
+    qty_text = format(qty_base.normalize(), "f") if qty_base != 0 else "0"
+    price_text = format(limit_price.normalize(), "f") if limit_price != 0 else "0"
 
     payload: Dict[str, object] = {
         "category": "spot",
         "symbol": symbol,
         "side": side,
-        "orderType": "Market",
+        "orderType": "Limit",
         "qty": qty_text,
-        "marketUnit": market_unit,
+        "price": price_text,
+        "timeInForce": "IOC",
+        "orderFilter": "Order",
         "accountType": "UNIFIED",
     }
-
-    if tolerance_multiplier > Decimal("1") and tolerance_decimal > Decimal("0"):
-        payload["slippageToleranceType"] = tolerance_type
-        payload["slippageTolerance"] = tolerance_value
 
     audit: Dict[str, object] = {
         "symbol": symbol.upper(),
         "side": side.capitalize(),
         "unit": market_unit,
         "requested_qty": _format_decimal(requested_qty),
-        "rounded_qty": _format_decimal(qty_value),
+        "rounded_qty": _format_decimal(qty_base if unit_normalised == "basecoin" else (target_quote or requested_qty)),
         "requested_unit": "quote" if unit_normalised == "quotecoin" else "base",
         "min_order_amt": _format_decimal(min_amount),
         "min_order_qty": _format_decimal(min_qty),
@@ -1185,12 +1448,29 @@ def prepare_spot_market_order(
 
     if max_available is not None:
         audit["max_available"] = _format_decimal(max_available)
-    if price_used is not None:
-        audit["price_used"] = _format_decimal(price_used)
+    if price_hint is not None:
+        audit["price_used"] = _format_decimal(price_hint)
     if balances_checked:
         audit["balances_checked"] = [
             {"asset": asset, "required": _format_decimal(amount)} for asset, amount in balances_checked
         ]
+
+    audit["limit_price"] = _format_decimal(limit_price)
+    audit["order_qty_base"] = _format_decimal(qty_base)
+    audit["order_notional"] = _format_decimal(effective_notional)
+    if target_quote is not None:
+        audit["requested_quote_notional"] = _format_decimal(target_quote)
+        if quote_ceiling_raw is not None:
+            audit["quote_tolerance_core"] = _format_decimal(quote_ceiling_raw)
+        if rounding_allowance > 0:
+            audit["quote_rounding_allowance"] = _format_decimal(rounding_allowance)
+        if tick_gap > 0:
+            audit["quote_tick_gap"] = _format_decimal(tick_gap)
+        if quote_ceiling is not None:
+            audit["quote_tolerance_ceiling"] = _format_decimal(quote_ceiling)
+    audit["consumed_levels"] = [
+        {"price": _format_decimal(price), "qty": _format_decimal(qty)} for price, qty in consumed_levels
+    ]
 
     return PreparedSpotMarketOrder(payload=payload, audit=audit)
 
@@ -1199,7 +1479,7 @@ def place_spot_market_with_tolerance(
     api: BybitAPI,
     symbol: str,
     side: str,
-    qty: float,
+    qty: Decimal | float | int | str,
     unit: str = "quoteCoin",
     tol_type: str = "Percent",
     tol_value: float = 0.5,
@@ -1210,47 +1490,118 @@ def place_spot_market_with_tolerance(
     limits: Mapping[str, object] | None = None,
 ):
     """Создать маркет-ордер со строгой валидацией объёма и балансов."""
+    unit_normalised = (unit or "quoteCoin").strip().lower()
+    original_qty = _to_decimal(qty)
+    if original_qty <= 0:
+        raise OrderValidationError(
+            "Количество должно быть положительным.",
+            code="qty_invalid",
+            details={"requested": str(qty)},
+        )
 
-    prepared = prepare_spot_market_order(
-        api,
-        symbol,
-        side,
-        qty,
-        unit=unit,
-        tol_type=tol_type,
-        tol_value=tol_value,
-        max_quote=max_quote,
-        price_snapshot=price_snapshot,
-        balances=balances,
-        limits=limits,
-    )
+    remaining_qty = original_qty
+    remaining_cap = _to_decimal(max_quote) if max_quote is not None else None
+    attempt_payloads: list[Dict[str, object]] = []
+    attempt_audits: list[Dict[str, object]] = []
+    attempt_logs: list[Dict[str, object]] = []
+    executed_quote_total = Decimal("0")
+    executed_base_total = Decimal("0")
+    chunk_qty = remaining_qty
+    max_attempts = 3
+    last_response_raw: object | None = None
 
-    response = api.place_order(**prepared.payload)
+    for attempt in range(max_attempts):
+        if chunk_qty <= 0:
+            break
 
-    ret_code = None
-    ret_msg = None
-    if isinstance(response, Mapping):
-        ret_code = response.get("retCode")
-        ret_msg = response.get("retMsg")
+        prepared = prepare_spot_market_order(
+            api,
+            symbol,
+            side,
+            chunk_qty,
+            unit=unit,
+            tol_type=tol_type,
+            tol_value=tol_value,
+            max_quote=remaining_cap,
+            price_snapshot=price_snapshot if attempt == 0 else None,
+            balances=balances,
+            limits=limits,
+        )
 
-    log(
-        "spot.market.order_rest",
-        symbol=symbol,
-        side=side,
-        ret_code=ret_code,
-        ret_msg=ret_msg,
-        request=prepared.payload,
-        audit=prepared.audit,
-    )
+        response = api.place_order(**prepared.payload)
+        last_response_raw = response
 
-    if isinstance(response, dict):
-        local = response.get("_local")
-        if isinstance(local, dict):
-            combined = dict(local)
+        ret_code = None
+        ret_msg = None
+        if isinstance(response, Mapping):
+            ret_code = response.get("retCode")
+            ret_msg = response.get("retMsg")
+
+        log(
+            "spot.market.order_rest",
+            symbol=symbol,
+            side=side,
+            attempt=attempt + 1,
+            ret_code=ret_code,
+            ret_msg=ret_msg,
+            request=prepared.payload,
+            audit=prepared.audit,
+        )
+
+        qty_decimal = _to_decimal(prepared.payload.get("qty"))
+        price_decimal = _to_decimal(prepared.payload.get("price"))
+        exec_base, exec_quote, leaves_base = _execution_stats(
+            response if isinstance(response, Mapping) else None,
+            expected_qty=qty_decimal,
+            limit_price=price_decimal,
+        )
+
+        executed_base_total += exec_base
+        executed_quote_total += exec_quote
+        if remaining_cap is not None:
+            remaining_cap = max(Decimal("0"), remaining_cap - exec_quote)
+
+        attempt_payloads.append(prepared.payload)
+        attempt_audits.append(prepared.audit)
+        attempt_logs.append(
+            {
+                "executed_base": _format_decimal(exec_base),
+                "executed_quote": _format_decimal(exec_quote),
+                "leaves_base": _format_decimal(leaves_base),
+            }
+        )
+
+        step_value = _to_decimal(
+            prepared.audit.get("quote_step") if unit_normalised == "quotecoin" else prepared.audit.get("qty_step")
+        )
+        if step_value <= 0:
+            step_value = Decimal("0.00000001")
+
+        if unit_normalised == "quotecoin":
+            remaining_qty = max(Decimal("0"), original_qty - executed_quote_total)
         else:
-            combined = {}
-        combined["order_audit"] = prepared.audit
-        combined["order_payload"] = prepared.payload
-        response["_local"] = combined
+            remaining_qty = max(Decimal("0"), original_qty - executed_base_total)
 
-    return response
+        if remaining_qty <= step_value or leaves_base <= 0:
+            break
+
+        chunk_qty = min(remaining_qty, chunk_qty)
+        if exec_base <= 0 and exec_quote <= 0:
+            chunk_qty = max(step_value, chunk_qty / Decimal("2"))
+        else:
+            chunk_qty = remaining_qty
+
+    final_response = last_response_raw
+
+    if isinstance(final_response, dict):
+        local = final_response.get("_local")
+        combined = dict(local) if isinstance(local, dict) else {}
+        combined["order_audit"] = attempt_audits[-1] if attempt_audits else {}
+        combined["order_payload"] = attempt_payloads[-1] if attempt_payloads else {}
+        combined["attempts"] = [
+            {"audit": audit, "payload": payload, **log_info}
+            for audit, payload, log_info in zip(attempt_audits, attempt_payloads, attempt_logs)
+        ]
+        final_response["_local"] = combined
+
+    return final_response
