@@ -19,6 +19,17 @@ from .spot_market import (
 )
 from .symbols import ensure_usdt_symbol
 
+_PERCENT_TOLERANCE_MIN = 0.05
+_PERCENT_TOLERANCE_MAX = 1.0
+
+
+def _normalise_slippage_percent(value: float) -> float:
+    """Clamp Bybit percent tolerance to the exchange supported range."""
+
+    if value <= 0.0:
+        return 0.0
+    return max(_PERCENT_TOLERANCE_MIN, min(value, _PERCENT_TOLERANCE_MAX))
+
 
 def _safe_symbol(value: object) -> Optional[str]:
     if not isinstance(value, str):
@@ -168,6 +179,7 @@ class SignalExecutor:
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 25)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
+        slippage_pct = _normalise_slippage_percent(slippage_pct)
 
         if notional <= 0 or notional < min_notional:
             order_context["min_notional"] = min_notional
