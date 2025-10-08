@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,47 @@ brief = bot.generate_brief()
 portfolio = bot.portfolio_overview()
 trade_stats = bot.trade_statistics()
 health = bot.data_health()
+
+
+def _normalise_exec_time(raw: object) -> int | None:
+    """Return unix timestamp in milliseconds for heterogeneous ``execTime`` values."""
+
+    if raw is None:
+        return None
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            parsed = pd.to_datetime(text, utc=True, errors="coerce")
+        except (ValueError, TypeError):
+            parsed = pd.NaT
+        if pd.notna(parsed):
+            return int(parsed.to_pydatetime().timestamp() * 1000)
+        try:
+            raw = float(text)
+        except (TypeError, ValueError):
+            return None
+
+    if isinstance(raw, (int, float)):
+        if isinstance(raw, float) and (math.isnan(raw) or not math.isfinite(raw)):
+            return None
+        value = float(raw)
+        magnitude = abs(value)
+        if magnitude >= 1e18:
+            seconds = value / 1e9
+        elif magnitude >= 1e15:
+            seconds = value / 1e6
+        elif magnitude >= 1e12:
+            seconds = value / 1e3
+        elif magnitude >= 1e9:
+            seconds = value
+        else:
+            return None
+        return int(seconds * 1000)
+
+    return None
 
 with st.container(border=True):
     st.subheader("Диагностика источников данных")
@@ -206,7 +248,7 @@ else:
             continue
         rows.append(
             {
-                "ts": payload.get("execTime"),
+                "ts": _normalise_exec_time(payload.get("execTime")),
                 "symbol": payload.get("symbol"),
                 "side": payload.get("side"),
                 "price": float(payload.get("execPrice") or 0.0),
@@ -218,11 +260,10 @@ else:
 
     if rows:
         df = pd.DataFrame(rows)
-        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", errors="coerce")
         df = df.sort_values("ts", ascending=False)
         df = df.rename(
             columns={
-                "ts": "Время",
                 "symbol": "Символ",
                 "side": "Сторона",
                 "price": "Цена",
@@ -231,6 +272,8 @@ else:
                 "is_maker": "Мейкер?",
             }
         )
+        df["Время"] = df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("—")
+        df = df.drop(columns=["ts"])
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.info("Ещё не было сделок, которые бот записал в журнал.")
