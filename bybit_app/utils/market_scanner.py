@@ -1,14 +1,33 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
+import random
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    TYPE_CHECKING,
+)
 
 from .bybit_api import BybitAPI
+from .log import log
 from .paths import DATA_DIR
 from .symbols import ensure_usdt_symbol
+from .telegram_notify import send_telegram
+
+if TYPE_CHECKING:  # pragma: no cover - for type checking only
+    from .portfolio_manager import PortfolioManager
+    from .symbol_resolver import InstrumentMetadata, SymbolResolver
 
 SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
@@ -287,3 +306,295 @@ def scan_market_opportunities(
 
     return entries
 
+
+def _safe_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_kline_rows(payload: object) -> Sequence[object]:
+    if isinstance(payload, Mapping):
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            rows = result.get("list")
+            if isinstance(rows, Sequence):
+                return rows  # type: ignore[return-value]
+        rows = payload.get("list")
+        if isinstance(rows, Sequence):
+            return rows  # type: ignore[return-value]
+    elif isinstance(payload, Sequence):
+        return payload
+    return []
+
+
+def _normalise_candles(payload: object) -> List[Dict[str, object]]:
+    candles: List[Dict[str, object]] = []
+    for entry in _extract_kline_rows(payload):
+        start: Optional[int]
+        open_: Optional[float]
+        high: Optional[float]
+        low: Optional[float]
+        close: Optional[float]
+        volume: Optional[float]
+        turnover: Optional[float] = None
+
+        if isinstance(entry, Mapping):
+            start = _safe_int(entry.get("start") or entry.get("openTime") or entry.get("timestamp"))
+            open_ = _safe_float(entry.get("open"))
+            high = _safe_float(entry.get("high"))
+            low = _safe_float(entry.get("low"))
+            close = _safe_float(entry.get("close"))
+            volume = _safe_float(entry.get("volume"))
+            turnover = _safe_float(entry.get("turnover"))
+        elif isinstance(entry, Sequence):
+            sequence = list(entry)
+            if not sequence:
+                continue
+            start = _safe_int(sequence[0])
+            open_ = _safe_float(sequence[1]) if len(sequence) > 1 else None
+            high = _safe_float(sequence[2]) if len(sequence) > 2 else None
+            low = _safe_float(sequence[3]) if len(sequence) > 3 else None
+            close = _safe_float(sequence[4]) if len(sequence) > 4 else None
+            volume = _safe_float(sequence[5]) if len(sequence) > 5 else None
+            turnover = _safe_float(sequence[6]) if len(sequence) > 6 else None
+        else:
+            continue
+
+        if start is None:
+            continue
+
+        record: Dict[str, object] = {"start": start}
+        if open_ is not None:
+            record["open"] = open_
+        if high is not None:
+            record["high"] = high
+        if low is not None:
+            record["low"] = low
+        if close is not None:
+            record["close"] = close
+        if volume is not None:
+            record["volume"] = volume
+        if turnover is not None:
+            record["turnover"] = turnover
+        candles.append(record)
+
+    candles.sort(key=lambda row: row.get("start") or 0)
+    return candles
+
+
+class _CandleCache:
+    """Small helper that caches recent kline snapshots per symbol."""
+
+    def __init__(
+        self,
+        api: Optional[BybitAPI],
+        *,
+        category: str = "spot",
+        intervals: Sequence[int] = (1, 5),
+        ttl: float = 45.0,
+        limit: int = 100,
+    ) -> None:
+        self.api = api
+        self.category = category
+        self.intervals = tuple(int(interval) for interval in intervals)
+        self.ttl = max(float(ttl), 1.0)
+        self.limit = max(int(limit), 1)
+        self._cache: Dict[Tuple[str, int], Tuple[float, List[Dict[str, object]]]] = {}
+
+    def fetch(self, symbol: str, now: float) -> Dict[str, List[Dict[str, object]]]:
+        bundle: Dict[str, List[Dict[str, object]]] = {}
+        if self.api is None:
+            return bundle
+
+        for interval in self.intervals:
+            key = (symbol, interval)
+            cached = self._cache.get(key)
+            if cached is not None:
+                ts, candles = cached
+                if now - ts <= self.ttl and candles:
+                    bundle[f"{interval}m"] = candles
+                    continue
+
+            try:
+                payload = self.api.kline(
+                    category=self.category,
+                    symbol=symbol,
+                    interval=interval,
+                    limit=self.limit,
+                )
+            except Exception as exc:  # pragma: no cover - network/runtime guard
+                log("market_scanner.candles.error", symbol=symbol, interval=interval, err=str(exc))
+                continue
+
+            candles = _normalise_candles(payload)
+            self._cache[key] = (now, candles)
+            bundle[f"{interval}m"] = candles
+
+        return bundle
+
+
+class MarketScanner:
+    """Stateful helper that keeps the multi-asset opportunity universe fresh."""
+
+    def __init__(
+        self,
+        api: Optional[BybitAPI],
+        symbol_resolver: Optional["SymbolResolver"] = None,
+        *,
+        data_dir: Path = DATA_DIR,
+        scanner: Callable[..., List[Dict[str, object]]] = scan_market_opportunities,
+        scanner_kwargs: Optional[Mapping[str, object]] = None,
+        refresh_interval: Tuple[float, float] = (60.0, 120.0),
+        candle_ttl: float = 45.0,
+        candle_limit: int = 120,
+        mode: str = "breakout",
+        portfolio_manager: Optional["PortfolioManager"] = None,
+        telegram_sender: Callable[[str], object] = send_telegram,
+        category: str = "spot",
+    ) -> None:
+        self.api = api
+        self.symbol_resolver = symbol_resolver
+        self.data_dir = Path(data_dir)
+        self._scanner = scanner
+        self._scanner_kwargs = dict(scanner_kwargs or {})
+        self._refresh_interval = (
+            max(float(refresh_interval[0]), 5.0),
+            max(float(refresh_interval[1]), float(refresh_interval[0])),
+        )
+        self._next_refresh: float = 0.0
+        self._last_update: float = 0.0
+        self._top_candidates: List[Dict[str, object]] = []
+        self._last_leader_digest: Optional[Tuple[str, ...]] = None
+        self.mode = mode
+        self.portfolio_manager = portfolio_manager
+        self._telegram_sender = telegram_sender
+        self._category = category
+        self._candle_cache = _CandleCache(
+            api,
+            category=category,
+            intervals=(1, 5),
+            ttl=candle_ttl,
+            limit=candle_limit,
+        )
+
+        # Always ensure the scanner uses the configured data directory
+        if "data_dir" not in self._scanner_kwargs:
+            self._scanner_kwargs["data_dir"] = self.data_dir
+
+    # ------------------------------------------------------------------
+    # public API
+    def refresh(self, *, force: bool = False, now: Optional[float] = None) -> List[Dict[str, object]]:
+        """Refresh the ranking when the refresh window elapsed."""
+
+        current_ts = now if now is not None else time.time()
+        if not force and self._next_refresh and current_ts < self._next_refresh and self._top_candidates:
+            return copy.deepcopy(self._top_candidates)
+
+        scan_kwargs = dict(self._scanner_kwargs)
+        scan_kwargs.setdefault("data_dir", self.data_dir)
+        opportunities = self._scanner(self.api, **scan_kwargs)
+
+        enriched: List[Dict[str, object]] = []
+        for entry in opportunities:
+            enriched.append(self._enrich_entry(entry, current_ts))
+
+        self._top_candidates = enriched
+        self._last_update = current_ts
+        self._schedule_next_refresh(current_ts)
+        self._notify_leader_change()
+        return copy.deepcopy(self._top_candidates)
+
+    def top_candidates(self, limit: int = 5) -> List[Dict[str, object]]:
+        entries = self._top_candidates[: max(int(limit), 0)]
+        return copy.deepcopy(entries)
+
+    @property
+    def last_update(self) -> float:
+        return self._last_update
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    def _schedule_next_refresh(self, now: float) -> None:
+        low, high = self._refresh_interval
+        if high <= low:
+            delay = low
+        else:
+            delay = random.uniform(low, high)
+        self._next_refresh = now + delay
+
+    def _resolve_metadata(self, symbol: str) -> Optional["InstrumentMetadata"]:
+        if not self.symbol_resolver:
+            return None
+        metadata = self.symbol_resolver.metadata(symbol)
+        if metadata is None:
+            metadata = self.symbol_resolver.resolve_symbol(symbol)
+        return metadata
+
+    def _enrich_entry(self, entry: Mapping[str, object], now: float) -> Dict[str, object]:
+        enriched = copy.deepcopy(entry)
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        metadata = self._resolve_metadata(symbol)
+        if metadata is not None:
+            enriched["instrument"] = metadata.as_dict()
+            canonical = metadata.symbol
+        else:
+            enriched["instrument"] = None
+            canonical = symbol
+
+        if canonical:
+            enriched["candles"] = self._candle_cache.fetch(canonical, now)
+        else:
+            enriched["candles"] = {}
+        enriched.setdefault("source", "market_scanner")
+        return enriched
+
+    def _notify_leader_change(self) -> None:
+        if not self._top_candidates:
+            return
+
+        symbols = []
+        for entry in self._top_candidates[:5]:
+            instrument = entry.get("instrument")
+            if isinstance(instrument, Mapping):
+                base = instrument.get("base")
+                symbol = str(base or instrument.get("symbol") or instrument.get("base"))
+            else:
+                symbol = str(entry.get("symbol") or "")
+            if symbol:
+                symbols.append(symbol.upper())
+
+        digest = tuple(symbols)
+        if not symbols or digest == self._last_leader_digest:
+            return
+
+        self._last_leader_digest = digest
+        active = 0
+        capacity = len(symbols)
+        if self.portfolio_manager is not None:
+            active = self.portfolio_manager.active_positions
+            capacity = self.portfolio_manager.max_positions
+
+        top_line = _format_top_line(symbols)
+        message = f"🏁 Scanner: TOP5 → {top_line} | режим {self.mode} | активных: {active}/{capacity}."
+        log("market_scanner.leaderboard", top=symbols, mode=self.mode, active=active, capacity=capacity)
+        try:
+            self._telegram_sender(message)
+        except Exception as exc:  # pragma: no cover - safeguard around external IO
+            log("market_scanner.telegram.error", err=str(exc))
+
+
+def _format_top_line(symbols: Sequence[str]) -> str:
+    cleaned = [symbol for symbol in symbols if symbol]
+    if not cleaned:
+        return "—"
+    preview = cleaned[:3]
+    body = ", ".join(preview)
+    if len(cleaned) > len(preview):
+        body = f"{body}, …"
+    return body
