@@ -9,6 +9,7 @@ from .guardian_bot import GuardianBot
 from .log import log
 from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
 from .ws_manager import manager as ws_manager
+from .realtime_cache import get_realtime_cache
 
 BotFactory = Callable[[], GuardianBot]
 ExecutorFactory = Callable[[GuardianBot], SignalExecutor]
@@ -310,6 +311,10 @@ class BackgroundServices:
 
         order_update = ws_manager.latest_order_update()
         execution = ws_manager.latest_execution()
+        realtime = get_realtime_cache().snapshot(
+            public_ttl=self._ws_public_stale_after or None,
+            private_ttl=self._ws_private_stale_after or None,
+        )
 
         public = status.get("public") or {}
         private = status.get("private") or {}
@@ -332,6 +337,7 @@ class BackgroundServices:
             "status": status,
             "last_order": order_update,
             "last_execution": execution,
+            "realtime": realtime,
             "public_stale": bool(public_stale),
             "private_stale": bool(private_stale),
             "public_stale_after": self._ws_public_stale_after,
