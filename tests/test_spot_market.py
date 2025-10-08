@@ -370,6 +370,55 @@ def test_place_spot_market_accepts_percent_string():
     assert placed["slippageTolerance"] == "0.7500"
 
 
+def test_place_spot_market_clamps_percent_tolerance_range():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "10",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+
+    response_high = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_value=3.0,
+    )
+
+    placed_high = api.place_calls[-1]
+    assert placed_high["slippageToleranceType"] == "Percent"
+    assert placed_high["slippageTolerance"] == "1.0000"
+    audit_high = response_high.get("_local", {}).get("order_audit", {})
+    assert audit_high.get("tolerance_value") == "1.0000"
+
+    api.place_calls.clear()
+
+    response_low = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=10,
+        unit="quoteCoin",
+        tol_value=0.01,
+    )
+
+    placed_low = api.place_calls[-1]
+    assert placed_low["slippageToleranceType"] == "Percent"
+    assert placed_low["slippageTolerance"] == "0.0500"
+    audit_low = response_low.get("_local", {}).get("order_audit", {})
+    assert audit_low.get("tolerance_value") == "0.0500"
+
+
 def test_place_spot_market_accepts_bps_suffix():
     payload = {
         "result": {

@@ -853,6 +853,12 @@ def prepare_spot_trade_snapshot(
     return SpotTradeSnapshot(symbol=key, price=price, balances=balances, limits=limits)
 
 
+_MIN_PERCENT_TOLERANCE = Decimal("0.05")
+_MAX_PERCENT_TOLERANCE = Decimal("1.0")
+_MIN_BPS_TOLERANCE = Decimal("5")
+_MAX_BPS_TOLERANCE = Decimal("100")
+
+
 def _resolve_slippage_tolerance(
     tol_type: str | None,
     tol_value: object,
@@ -884,9 +890,19 @@ def _resolve_slippage_tolerance(
     multiplier = Decimal("1")
     request_type = "Percent"
     if tolerance_kind in {"percent", "percentage"}:
+        if tolerance_decimal > 0:
+            if tolerance_decimal < _MIN_PERCENT_TOLERANCE:
+                tolerance_decimal = _MIN_PERCENT_TOLERANCE
+            elif tolerance_decimal > _MAX_PERCENT_TOLERANCE:
+                tolerance_decimal = _MAX_PERCENT_TOLERANCE
         multiplier += tolerance_decimal / Decimal("100")
         request_type = "Percent"
     elif tolerance_kind in {"bps", "basispoints", "basis_points"}:
+        if tolerance_decimal > 0:
+            if tolerance_decimal < _MIN_BPS_TOLERANCE:
+                tolerance_decimal = _MIN_BPS_TOLERANCE
+            elif tolerance_decimal > _MAX_BPS_TOLERANCE:
+                tolerance_decimal = _MAX_BPS_TOLERANCE
         multiplier += tolerance_decimal / Decimal("10000")
         request_type = "Bps"
     else:
