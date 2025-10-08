@@ -4,10 +4,11 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from .bybit_api import BybitAPI
 from .paths import DATA_DIR
+from .symbols import ensure_usdt_symbol
 
 SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
@@ -181,16 +182,26 @@ def scan_market_opportunities(
         else:
             rows = []
 
+    def _normalise_symbol_set(symbols: Iterable[object]) -> Set[str]:
+        normalised: Set[str] = set()
+        for item in symbols:
+            candidate, _ = ensure_usdt_symbol(item)
+            if candidate:
+                normalised.add(candidate)
+        return normalised
+
     entries: List[Dict[str, object]] = []
-    wset = {str(symbol).strip().upper() for symbol in (whitelist or []) if str(symbol).strip()}
-    bset = {str(symbol).strip().upper() for symbol in (blacklist or []) if str(symbol).strip()}
+    wset = _normalise_symbol_set(whitelist or ())
+    bset = _normalise_symbol_set(blacklist or ())
 
     for raw in rows:
         if not isinstance(raw, dict):
             continue
-        symbol = str(raw.get("symbol") or "").strip().upper()
+        raw_symbol = raw.get("symbol")
+        symbol, quote_source = ensure_usdt_symbol(raw_symbol)
         if not symbol:
             continue
+        upper_source = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else None
         if bset and symbol in bset:
             continue
 
@@ -241,6 +252,8 @@ def scan_market_opportunities(
             note_parts.append(f"оборот ${turnover / 1_000_000:.2f}M")
         if spread_bps is not None:
             note_parts.append(f"спред {spread_bps:.1f} б.п.")
+        if quote_source == "USDC":
+            note_parts.append("конвертировано из USDC")
 
         entry = {
             "symbol": symbol,
@@ -256,6 +269,8 @@ def scan_market_opportunities(
             "source": "market_scanner",
             "actionable": actionable,
         }
+        if quote_source == "USDC" and upper_source:
+            entry["quote_conversion"] = {"from": "USDC", "to": "USDT", "original": upper_source}
         entries.append(entry)
 
     entries.sort(

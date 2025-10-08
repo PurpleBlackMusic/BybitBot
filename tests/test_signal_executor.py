@@ -92,6 +92,35 @@ def test_signal_executor_dry_run_preview(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result.order["side"] == "Buy"
 
 
+def test_signal_executor_maps_usdc_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ADAUSDC"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=300.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+
+    captured: dict[str, str] = {}
+
+    def fake_resolve(symbol: str, api, allow_nearest: bool = True):
+        captured["symbol"] = symbol
+        return symbol, {"reason": "exact"}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        fake_resolve,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert captured["symbol"] == "ADAUSDT"
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["symbol"] == "ADAUSDT"
+
+
 def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,

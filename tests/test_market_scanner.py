@@ -136,3 +136,39 @@ def test_market_scanner_honors_blacklist(tmp_path: Path) -> None:
 def test_market_scanner_raises_when_snapshot_missing(tmp_path: Path) -> None:
     with pytest.raises(MarketScannerError):
         scan_market_opportunities(api=None, data_dir=tmp_path)
+
+
+def test_market_scanner_converts_usdc_symbols(tmp_path: Path) -> None:
+    rows = [
+        {
+            "symbol": "SOLUSDC",
+            "turnover24h": "2000000",
+            "price24hPcnt": "1.2",
+            "bestBidPrice": "19.8",
+            "bestAskPrice": "19.85",
+            "volume24h": "3200000",
+        },
+        {
+            "symbol": "BTCEUR",
+            "turnover24h": "5000000",
+            "price24hPcnt": "0.4",
+            "bestBidPrice": "27000",
+            "bestAskPrice": "27010",
+            "volume24h": "1000",
+        },
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=1000.0,
+        min_change_pct=0.5,
+        max_spread_bps=100.0,
+        limit=5,
+    )
+
+    assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
+    conversion = opportunities[0].get("quote_conversion")
+    assert conversion == {"from": "USDC", "to": "USDT", "original": "SOLUSDC"}
