@@ -1,4 +1,5 @@
 import copy
+from decimal import Decimal
 from typing import Optional
 
 import pytest
@@ -59,6 +60,31 @@ class StubAPI:
                 "orderId": order_id,
             },
         }
+
+
+def patch_tp_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    filled: Decimal | None = None,
+    reserved: Decimal = Decimal("0"),
+) -> None:
+    def fake_collect(self, symbol: str, **kwargs: object) -> Decimal:
+        if filled is not None:
+            return filled
+        executed_base = kwargs.get("executed_base")
+        if isinstance(executed_base, Decimal):
+            return executed_base
+        return Decimal("0")
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_filled_base_total",
+        fake_collect,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_open_sell_reserved",
+        lambda self, symbol: reserved,
+    )
 
 
 def test_signal_executor_skips_when_not_actionable() -> None:
@@ -197,6 +223,7 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
         "resolve_trade_symbol",
         lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
+    patch_tp_sources(monkeypatch, Decimal("0.75"))
 
     response_payload = {
         "retCode": 0,
@@ -233,7 +260,7 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert second["side"] == "Sell"
     assert first["orderType"] == "Limit"
     assert second["orderType"] == "Limit"
-    assert first["qty"] == "0.45"
+    assert first["qty"] == "0.44"
     assert second["qty"] == "0.3"
     assert first["price"] == "100.5"
     assert second["price"] == "101"
@@ -262,6 +289,7 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
         "resolve_trade_symbol",
         lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
+    patch_tp_sources(monkeypatch)
 
     response_payload = {
         "retCode": 0,
@@ -294,13 +322,133 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
     assert result.status == "filled"
     assert len(api.orders) == 1
     order = api.orders[0]
-    assert order["qty"] == "1"
+    assert order["qty"] == "0.9"
     assert order["price"] == "100.1"
     assert result.order is not None
     ladder = result.order.get("take_profit_orders")
     assert ladder is not None
     assert ladder[0]["profit_bps"] == "5,9"
     assert ladder[0]["orderId"] == "stub-1"
+    assert result.order["execution"]["sell_budget_base"] == "0.9"
+
+
+def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.5"), reserved=Decimal("0.5"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.5",
+            "cumExecValue": "50",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    def fake_place(api_obj, **kwargs):
+        return response_payload
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert api.orders == []
+    assert result.order is not None
+    execution = result.order.get("execution")
+    assert execution is not None
+    assert execution.get("sell_budget_base") == "0"
+    assert execution.get("open_sell_reserved") == "0.5"
+    assert execution.get("filled_base_total") == "0.5"
+
+
+def test_signal_executor_open_sell_reserved_prefers_latest(monkeypatch: pytest.MonkeyPatch) -> None:
+    executor = SignalExecutor(StubBot({"actionable": False}, Settings(ai_enabled=True)))
+
+    rows = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderType": "Limit",
+            "orderStatus": "New",
+            "orderId": "order-1",
+            "qty": "0.5",
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderType": "Limit",
+            "orderStatus": "New",
+            "orderId": "order-1",
+            "leavesQty": "0.2",
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderType": "Limit",
+            "orderStatus": "New",
+            "orderId": "order-2",
+            "qty": "0.1",
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderType": "Market",
+            "orderStatus": "New",
+            "orderId": "order-3",
+            "qty": "0.3",
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderType": "Limit",
+            "orderStatus": "Cancelled",
+            "orderId": "order-4",
+            "qty": "0.4",
+        },
+    ]
+
+    def fake_rows(self, topic_keyword: str):
+        assert topic_keyword == "order"
+        return rows
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_realtime_private_rows",
+        fake_rows,
+    )
+
+    reserved = executor._resolve_open_sell_reserved("BTCUSDT")
+    assert reserved == Decimal("0.3")
 
 
 def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,6 +468,7 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
         "resolve_trade_symbol",
         lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
+    patch_tp_sources(monkeypatch, Decimal("0.75"))
 
     response_payload = {
         "retCode": 0,
@@ -352,13 +501,15 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
     assert len(api.orders) == 3
     qtys = [order["qty"] for order in api.orders]
     prices = [order["price"] for order in api.orders]
-    assert qtys == ["0.37", "0.22", "0.16"]
+    assert qtys == ["0.37", "0.22", "0.15"]
     assert prices == ["100.35", "100.7", "101.1"]
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
     assert execution.get("executed_base") == "0.75"
     assert execution.get("avg_price") == "100"
+    assert execution.get("sell_budget_base") == "0.74"
+    assert execution.get("filled_base_total") == "0.75"
 
 def test_signal_executor_allows_zero_slippage(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
