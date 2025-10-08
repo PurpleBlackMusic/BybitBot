@@ -22,9 +22,16 @@ if toggle_submitted:
     if ai_enabled_choice != ai_enabled_initial:
         update_settings(ai_enabled=ai_enabled_choice)
         st.success("Настройка автоматизации обновлена.")
-        s = get_settings(force_reload=True)
     else:
         st.info("Настройки автоматизации без изменений.")
+
+s = get_settings(force_reload=True)
+truth_settings = s
+st.caption(
+    "🔍 Движок читает ai_enabled={state}.".format(
+        state="ON" if getattr(truth_settings, "ai_enabled", False) else "OFF"
+    )
+)
 
 bot = GuardianBot(settings=s)
 summary = bot.status_summary()

@@ -1,14 +1,11 @@
 from __future__ import annotations
 import os, json
 from dataclasses import dataclass, asdict
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "_data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-SETTINGS_FILE = DATA_DIR / "settings.json"
+from .paths import DATA_DIR, SETTINGS_FILE
 
 _CACHE: dict[str, Any] = {
     "settings": None,

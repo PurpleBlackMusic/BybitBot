@@ -10,6 +10,7 @@ from bybit_app.utils.signal_executor import (
     ExecutionResult,
     SignalExecutor,
 )
+from bybit_app.utils.spot_market import OrderValidationError
 
 
 class StubBot:
@@ -244,6 +245,39 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     assert captured["tol_value"] == pytest.approx(1.0)
 
 
+def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_place(*_args, **_kwargs):
+        raise OrderValidationError("Минимальный объём ордера не достигнут.", code="min_notional")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None and "min_notional" in result.reason
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -282,6 +316,47 @@ def test_signal_executor_scales_position_with_signal_strength(
     assert result.order["symbol"] == "ETHUSDT"
     assert result.order["notional_quote"] < 20.0
     assert result.order["notional_quote"] == pytest.approx(6.62, rel=1e-3)
+
+
+def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=True,
+        ws_watchdog_max_age_sec=10.0,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    class DummyManager:
+        def status(self) -> dict:
+            return {
+                "private": {
+                    "running": True,
+                    "connected": True,
+                    "age_seconds": 42.0,
+                }
+            }
+
+    dummy_manager = DummyManager()
+    monkeypatch.setattr(signal_executor_module, "ws_manager", dummy_manager)
+
+    api_called = {"value": False}
+
+    def fake_api() -> StubAPI:
+        api_called["value"] = True
+        return StubAPI(total=1000.0, available=900.0)
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", fake_api)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "disabled"
+    assert result.reason is not None and "WebSocket" in result.reason
+    assert api_called["value"] is False
 
 
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:

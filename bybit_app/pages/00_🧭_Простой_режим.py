@@ -709,6 +709,24 @@ with st.container(border=True):
             st.caption("Детали диагностики:")
             st.markdown(_bullet_markdown(automation_details))
 
+    engine_marker = automation_status.get("settings_marker")
+    if isinstance(engine_marker, (list, tuple)) and len(engine_marker) == 3:
+        engine_dry_run = bool(engine_marker[0])
+        engine_creds = bool(engine_marker[1])
+        engine_ai_enabled = bool(engine_marker[2])
+        marker_bits = [
+            "ai_enabled=" + ("ON" if engine_ai_enabled else "OFF"),
+            "dry_run=" + ("ON" if engine_dry_run else "OFF"),
+            "ключи=" + ("OK" if engine_creds else "нет"),
+        ]
+        st.caption("🔍 Движок читает: " + ", ".join(marker_bits))
+    else:
+        st.caption(
+            "🔍 Движок ещё не отчитался — текущая настройка ai_enabled={state}.".format(
+                state="ON" if getattr(settings, "ai_enabled", False) else "OFF"
+            )
+        )
+
     st.session_state["simple_mode_last_refresh"] = time.time()
 
     if automation_last_run:
@@ -731,13 +749,19 @@ with st.container(border=True):
         status = str(execution_feedback.get("status") or "")
         reason_text = _clean_text(execution_feedback.get("reason"))
         order_info: dict[str, object] | None = None
+        context_note: str | None = None
         candidate_order = execution_feedback.get("order")
         if isinstance(candidate_order, dict):
             order_info = candidate_order
         else:
             context_candidate = execution_feedback.get("context")
             if isinstance(context_candidate, dict):
-                order_info = context_candidate
+                context_note = _clean_text(context_candidate.get("message"))
+                if any(
+                    key in context_candidate
+                    for key in ("symbol", "side", "notional_quote", "slippage_percent")
+                ):
+                    order_info = context_candidate
 
         caption_text = _format_order_caption(order_info) if order_info else None
 
@@ -762,6 +786,8 @@ with st.container(border=True):
 
         if caption_text:
             st.caption(caption_text)
+        if context_note:
+            st.caption(context_note)
 
         if status == "dry_run" and settings_marker[0]:
             st.caption(

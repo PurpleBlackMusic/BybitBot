@@ -3327,7 +3327,7 @@ class GuardianBot:
     def auto_executor(self):  # pragma: no cover - simple factory wrapper
         from .signal_executor import SignalExecutor
 
-        return SignalExecutor(self, settings=self.settings)
+        return SignalExecutor(self)
 
     def automation_loop(
         self,
@@ -3340,7 +3340,7 @@ class GuardianBot:
 
         from .signal_executor import AutomationLoop, SignalExecutor
 
-        executor = SignalExecutor(self, settings=self.settings)
+        executor = SignalExecutor(self)
         return AutomationLoop(
             executor,
             poll_interval=poll_interval,
