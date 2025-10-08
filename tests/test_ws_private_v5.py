@@ -151,7 +151,11 @@ def test_ws_private_v5_validates_credentials(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(
         ws_private_v5,
         "get_settings",
-        lambda: SimpleNamespace(api_key="", api_secret="", recv_window_ms=5000),
+        lambda force_reload=False: SimpleNamespace(
+            api_key="",
+            api_secret="",
+            recv_window_ms=5000,
+        ),
     )
 
     client = WSPrivateV5()
@@ -163,7 +167,11 @@ def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         ws_private_v5,
         "get_settings",
-        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+        lambda force_reload=False: SimpleNamespace(
+            api_key="abc",
+            api_secret="def",
+            recv_window_ms=5000,
+        ),
     )
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(ws_private_v5, "log", lambda event, **payload: events.append((event, payload)))
@@ -198,7 +206,11 @@ def test_ws_private_v5_subscribes_to_default_topics(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(
         ws_private_v5,
         "get_settings",
-        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+        lambda force_reload=False: SimpleNamespace(
+            api_key="abc",
+            api_secret="def",
+            recv_window_ms=5000,
+        ),
     )
     events: list[tuple[str, dict[str, Any]]] = []
     monkeypatch.setattr(ws_private_v5, "log", lambda event, **payload: events.append((event, payload)))
@@ -220,7 +232,11 @@ def test_ws_private_v5_merges_custom_topics(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(
         ws_private_v5,
         "get_settings",
-        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+        lambda force_reload=False: SimpleNamespace(
+            api_key="abc",
+            api_secret="def",
+            recv_window_ms=5000,
+        ),
     )
     _install_thread_stub(monkeypatch)
 
@@ -266,7 +282,11 @@ def test_ws_private_v5_emits_heartbeat_on_pong(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         ws_private_v5,
         "get_settings",
-        lambda: SimpleNamespace(api_key="abc", api_secret="def", recv_window_ms=5000),
+        lambda force_reload=False: SimpleNamespace(
+            api_key="abc",
+            api_secret="def",
+            recv_window_ms=5000,
+        ),
     )
     _install_thread_stub(monkeypatch)
 
