@@ -62,8 +62,58 @@ class BackgroundServices:
     # ------------------------------------------------------------------
     # Lifecycle
     def ensure_started(self) -> None:
-        self.ensure_ws_started()
+        ws_ok = self.ensure_ws_started()
+        if not ws_ok:
+            return
+
+        if not self._await_private_ready():
+            return
+
         self.ensure_automation_loop()
+
+    def _await_private_ready(self, timeout: float | None = None) -> bool:
+        """Wait until the private websocket reports a fresh heartbeat."""
+
+        if self._ws_private_stale_after <= 0:
+            return True
+
+        deadline = time.time() + (
+            float(timeout)
+            if isinstance(timeout, (int, float)) and float(timeout) > 0
+            else min(self._ws_private_stale_after, 15.0)
+        )
+
+        def _coerce_float(value: object | None) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        while True:
+            status = self._safe_ws_status()
+            private = status.get("private") if isinstance(status, dict) else None
+            if isinstance(private, dict):
+                running = bool(private.get("running"))
+                connected_field = private.get("connected")
+                connected = True if connected_field is None else bool(connected_field)
+                last_beat = _coerce_float(private.get("last_beat"))
+                age = _coerce_float(private.get("age_seconds"))
+
+                fresh_age = (
+                    age is not None
+                    and (
+                        age <= self._ws_private_stale_after
+                        or (self._ws_private_stale_after == 0 and age == 0)
+                    )
+                )
+
+                if running and connected and (last_beat or fresh_age):
+                    return True
+
+            if time.time() >= deadline:
+                return False
+
+            time.sleep(0.2)
 
     def _safe_ws_status(self) -> Dict[str, Any]:
         try:

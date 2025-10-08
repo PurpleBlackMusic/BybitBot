@@ -173,3 +173,54 @@ def test_automation_snapshot_marks_stale(monkeypatch: pytest.MonkeyPatch) -> Non
     snapshot = svc.automation_snapshot()
     assert snapshot["stale"] is True
     assert snapshot["restart_count"] == 0
+
+
+def test_ensure_started_waits_for_private_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    status_calls = 0
+
+    def fake_status() -> dict:
+        nonlocal status_calls
+        status_calls += 1
+        if status_calls < 3:
+            return {
+                "public": {"running": True, "age_seconds": 0.0},
+                "private": {"running": False, "connected": False, "age_seconds": 120.0},
+            }
+        return {
+            "public": {"running": True, "age_seconds": 0.0},
+            "private": {
+                "running": True,
+                "connected": True,
+                "age_seconds": 0.0,
+                "last_beat": time.time(),
+            },
+        }
+
+    ws_stub = SimpleNamespace(
+        start=lambda *_, **__: True,
+        status=fake_status,
+        stop_all=lambda: None,
+        latest_order_update=lambda: {},
+        latest_execution=lambda: {},
+    )
+
+    svc = _make_service(monkeypatch, ws_stub=ws_stub)
+    monkeypatch.setattr(background_module.time, "sleep", lambda _: None)
+
+    svc.ensure_started()
+
+    assert status_calls >= 3
+    assert svc._automation_restart_count == 1
+
+    thread = svc._automation_thread
+    if thread is not None and hasattr(thread, "join"):
+        thread.join(timeout=1)
+
+
+def test_ensure_started_skips_automation_without_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+    monkeypatch.setattr(svc, "_await_private_ready", lambda timeout=None: False)
+
+    svc.ensure_started()
+
+    assert svc._automation_restart_count == 0
