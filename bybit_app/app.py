@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
@@ -19,13 +20,15 @@ from bybit_app.utils.ui import (
     inject_css,
     navigation_link,
     safe_set_page_config,
+    auto_refresh,
 )
-from bybit_app.utils.background import ensure_background_services
+from bybit_app.utils.background import ensure_background_services, get_ws_snapshot
 from bybit_app.utils.envs import get_settings
 from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
 ensure_background_services()
+auto_refresh(20, key="home_auto_refresh")
 
 MINIMAL_CSS = """
 :root { color-scheme: dark; }
@@ -143,6 +146,123 @@ def render_status(settings) -> None:
                 "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
             )
 
+
+def _format_seconds_ago(value: object | None) -> str:
+    try:
+        seconds = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        seconds = None
+
+    if seconds is None or seconds < 0:
+        return "—"
+    if seconds < 1:
+        return "< 1 с назад"
+    if seconds < 60:
+        return f"{seconds:.0f} с назад"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{minutes:.0f} мин назад"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f} ч назад"
+    days = hours / 24
+    return f"{days:.1f} дн назад"
+
+
+def _pick_freshest(records: Mapping[str, Mapping[str, object]]) -> tuple[str, Mapping[str, object]] | None:
+    freshest: tuple[float, str, Mapping[str, object]] | None = None
+    for topic, payload in records.items():
+        age_raw = payload.get("age_seconds") if isinstance(payload, Mapping) else None
+        try:
+            age = float(age_raw) if age_raw is not None else float("inf")
+        except (TypeError, ValueError):
+            age = float("inf")
+        if freshest is None or age < freshest[0]:
+            freshest = (age, topic, payload)
+    if freshest is None:
+        return None
+    return freshest[1], freshest[2]
+
+
+def _summarise_order(order: Mapping[str, object] | None) -> str:
+    if not isinstance(order, Mapping):
+        return "Нет свежих ордеров"
+    symbol = str(order.get("symbol") or "—")
+    side = str(order.get("side") or "—").upper()
+    status = str(order.get("status") or order.get("orderStatus") or "—")
+    return f"{symbol} · {side} · {status}"
+
+
+def _summarise_execution(execution: Mapping[str, object] | None) -> str:
+    if not isinstance(execution, Mapping):
+        return "Нет свежих исполнений"
+    symbol = str(execution.get("symbol") or "—")
+    side = str(execution.get("side") or "—").upper()
+    qty = execution.get("execQty") or execution.get("qty")
+    price = execution.get("execPrice") or execution.get("price")
+    qty_text = f"{qty}" if qty not in (None, "") else "?"
+    price_text = f"{price}" if price not in (None, "") else "?"
+    return f"{symbol} · {side} · {qty_text}@{price_text}"
+
+
+def render_ws_telemetry(snapshot: Mapping[str, object] | None) -> None:
+    if not snapshot:
+        return
+
+    realtime = snapshot.get("realtime") if isinstance(snapshot, Mapping) else None
+    realtime = realtime if isinstance(realtime, Mapping) else {}
+    generated_at = realtime.get("generated_at") if isinstance(realtime, Mapping) else None
+    try:
+        snapshot_age = time.time() - float(generated_at) if generated_at is not None else None
+    except (TypeError, ValueError):
+        snapshot_age = None
+    public_records = realtime.get("public") if isinstance(realtime, Mapping) else {}
+    if not isinstance(public_records, Mapping):
+        public_records = {}
+    private_records = realtime.get("private") if isinstance(realtime, Mapping) else {}
+    if not isinstance(private_records, Mapping):
+        private_records = {}
+
+    last_order = snapshot.get("last_order") if isinstance(snapshot, Mapping) else None
+    last_execution = snapshot.get("last_execution") if isinstance(snapshot, Mapping) else None
+    public_stale = bool(snapshot.get("public_stale")) if isinstance(snapshot, Mapping) else False
+    private_stale = bool(snapshot.get("private_stale")) if isinstance(snapshot, Mapping) else False
+
+    with st.container(border=True):
+        st.markdown("#### Живой поток данных")
+        cols = st.columns(2)
+
+        latest_public = _pick_freshest(public_records) if public_records else None
+        if latest_public is None:
+            delta = "ожидаем обновление" if not public_stale else "данные устарели"
+            cols[0].metric("Публичный поток", "нет данных", delta)
+        else:
+            topic, payload = latest_public
+            age_text = _format_seconds_ago(payload.get("age_seconds") if isinstance(payload, Mapping) else None)
+            delta = "устарели" if public_stale else age_text
+            cols[0].metric("Публичный поток", topic, delta)
+            cols[0].caption(f"Тем {len(public_records)} · последнее обновление {age_text}")
+
+        latest_private = _pick_freshest(private_records) if private_records else None
+        if latest_private is None:
+            delta = "ожидаем обновление" if not private_stale else "данные устарели"
+            cols[1].metric("Приватный поток", "нет данных", delta)
+        else:
+            topic, payload = latest_private
+            age_text = _format_seconds_ago(payload.get("age_seconds") if isinstance(payload, Mapping) else None)
+            delta = "устарели" if private_stale else age_text
+            cols[1].metric("Приватный поток", topic, delta)
+            cols[1].caption(f"Тем {len(private_records)} · последнее обновление {age_text}")
+
+        info_bits: list[str] = []
+        if last_order:
+            info_bits.append(f"🧾 { _summarise_order(last_order) }")
+        if last_execution:
+            info_bits.append(f"⚡ { _summarise_execution(last_execution) }")
+        if snapshot_age is not None:
+            info_bits.append(f"⏱ Снимок обновлён { _format_seconds_ago(snapshot_age) }")
+        if info_bits:
+            st.markdown("<br />".join(info_bits), unsafe_allow_html=True)
 
 def _mode_meta(mode: str) -> tuple[str, str, str]:
     mapping: dict[str, tuple[str, str, str]] = {
@@ -828,10 +948,12 @@ def render_tips(settings, brief: GuardianBrief) -> None:
 def main() -> None:
     settings = get_settings()
     bot = get_bot()
+    ws_snapshot = get_ws_snapshot()
 
     render_header()
     st.divider()
     render_status(settings)
+    render_ws_telemetry(ws_snapshot)
     st.divider()
     health = _normalise_health(bot.data_health())
     watchlist = _normalise_watchlist(bot.market_watchlist())

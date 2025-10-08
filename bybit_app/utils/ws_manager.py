@@ -16,6 +16,7 @@ from .paths import DATA_DIR
 from .store import JLStore
 from .log import log
 from .ws_private_v5 import WSPrivateV5
+from .realtime_cache import get_realtime_cache
 
 
 class WSManager:
@@ -48,6 +49,7 @@ class WSManager:
         self._state_lock = threading.Lock()
         self._last_order_update: Optional[dict] = None
         self._last_execution: Optional[dict] = None
+        self._realtime_cache = get_realtime_cache()
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -128,6 +130,7 @@ class WSManager:
             except Exception:
                 obj = {"raw": message}
             self.pub_store.append(obj)
+            self._record_public_payload(obj)
             if isinstance(obj, dict) and obj.get("op") == "pong":
                 log("ws.public.pong")
 
@@ -347,6 +350,8 @@ class WSManager:
         if not rows:
             return
 
+        self._realtime_cache.update_private(topic, {"rows": rows})
+
         if "execution" in topic:
             try:
                 from .pnl import add_execution
@@ -364,6 +369,24 @@ class WSManager:
         elif "order" in topic:
             for row in rows:
                 self._record_order_update(row)
+
+    def _record_public_payload(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        topic = payload.get("topic") or payload.get("topicName") or payload.get("requestTopic")
+        if isinstance(topic, str):
+            topic = topic.strip()
+        else:
+            topic = ""
+
+        if not topic:
+            return
+
+        if not payload.get("data") and not payload.get("result"):
+            return
+
+        self._realtime_cache.update_public(str(topic), payload)
 
     def _record_order_update(self, row: dict) -> None:
         if not isinstance(row, dict):
@@ -393,6 +416,7 @@ class WSManager:
 
         with self._state_lock:
             self._last_order_update = update
+        self._realtime_cache.update_private("orders", update)
 
     def _record_execution(self, row: dict) -> None:
         if not isinstance(row, dict):
@@ -421,6 +445,7 @@ class WSManager:
 
         with self._state_lock:
             self._last_execution = update
+        self._realtime_cache.update_private("executions", update)
 
     def latest_order_update(self) -> Optional[dict]:
         with self._state_lock:
