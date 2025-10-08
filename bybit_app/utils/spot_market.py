@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, InvalidOperation
+from math import ceil
 import time
 from threading import RLock
 from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from .bybit_api import BybitAPI
 from .log import log
+from .envs import Settings
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -16,6 +18,7 @@ _INSTRUMENT_CACHE_TTL = 600.0
 _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
+_TWAP_DEFAULT_MAX_SLICES = 10
 
 
 T = TypeVar("T")
@@ -1031,6 +1034,116 @@ class PreparedSpotMarketOrder:
     audit: Dict[str, object]
 
 
+@dataclass(frozen=True)
+class TWAPRuntimeConfig:
+    """Runtime configuration extracted from :class:`Settings`."""
+
+    enabled: bool
+    base_slices: int
+    max_slices: int
+    interval_range: Tuple[int, int]
+    aggressiveness_bps: float
+
+
+def _twap_runtime_config(settings: Settings | None) -> TWAPRuntimeConfig:
+    if not isinstance(settings, Settings):
+        return TWAPRuntimeConfig(False, 1, 1, (0, 0), 0.0)
+
+    enabled = bool(getattr(settings, "twap_enabled", False))
+    base_slices_raw = getattr(settings, "twap_slices", 0) or 0
+    try:
+        base_slices = int(base_slices_raw)
+    except Exception:  # pragma: no cover - defensive
+        base_slices = 0
+    if base_slices <= 0:
+        base_slices = 1
+
+    max_slices_raw = getattr(settings, "twap_slices_max", None)
+    try:
+        max_slices_candidate = int(max_slices_raw) if max_slices_raw is not None else 0
+    except Exception:  # pragma: no cover - defensive
+        max_slices_candidate = 0
+    if max_slices_candidate <= 0:
+        max_slices_candidate = _TWAP_DEFAULT_MAX_SLICES
+    max_slices = max(base_slices, max_slices_candidate)
+
+    interval_base_raw = getattr(settings, "twap_interval_sec", 0) or 0
+    try:
+        interval_min = int(interval_base_raw)
+    except Exception:  # pragma: no cover - defensive
+        interval_min = 0
+    if interval_min <= 0:
+        child_raw = getattr(settings, "twap_child_secs", 0) or 0
+        try:
+            interval_min = int(child_raw)
+        except Exception:  # pragma: no cover - defensive
+            interval_min = 0
+    if interval_min <= 0:
+        interval_min = 5
+
+    interval_max_raw = getattr(settings, "twap_interval_max_sec", None)
+    try:
+        interval_max_candidate = int(interval_max_raw) if interval_max_raw is not None else 0
+    except Exception:  # pragma: no cover - defensive
+        interval_max_candidate = 0
+    if interval_max_candidate <= 0:
+        interval_max_candidate = max(interval_min, 10)
+    interval_max = max(interval_min, interval_max_candidate)
+
+    aggressiveness_raw = getattr(settings, "twap_aggressiveness_bps", 0.0) or 0.0
+    try:
+        aggressiveness = float(aggressiveness_raw)
+    except Exception:  # pragma: no cover - defensive
+        aggressiveness = 0.0
+    if aggressiveness <= 0:
+        aggressiveness = 20.0
+
+    return TWAPRuntimeConfig(enabled, base_slices, max_slices, (interval_min, interval_max), aggressiveness)
+
+
+def _twap_price_deviation_ratio(details: Mapping[str, object] | None) -> Decimal | None:
+    if not isinstance(details, Mapping):
+        return None
+
+    limit_value = details.get("limit_price")
+    if limit_value is None:
+        return None
+
+    limit_price = _to_decimal(limit_value)
+    if limit_price <= 0:
+        return None
+
+    max_allowed_value = details.get("max_allowed")
+    if max_allowed_value is not None:
+        max_allowed = _to_decimal(max_allowed_value)
+        if max_allowed > 0:
+            ratio = limit_price / max_allowed
+            return ratio if ratio > 1 else None
+
+    min_allowed_value = details.get("min_allowed")
+    if min_allowed_value is not None:
+        min_allowed = _to_decimal(min_allowed_value)
+        if min_allowed > 0:
+            ratio = min_allowed / limit_price
+            return ratio if ratio > 1 else None
+
+    return None
+
+
+def _twap_scaled_slices(current: int, ratio: Decimal | None, max_slices: int) -> int:
+    if not isinstance(ratio, Decimal) or ratio <= 1:
+        return current
+
+    candidate = current + 1
+    scaled = Decimal(current) * ratio
+    try:
+        candidate = max(candidate, int(scaled.to_integral_value(rounding=ROUND_UP)))
+    except InvalidOperation:  # pragma: no cover - defensive
+        candidate = max(candidate, int(ceil(float(scaled))))
+    candidate = max(current, candidate)
+    return min(max_slices, candidate)
+
+
 def prepare_spot_trade_snapshot(
     api: BybitAPI,
     symbol: str,
@@ -1521,6 +1634,7 @@ def place_spot_market_with_tolerance(
     price_snapshot: object | None = None,
     balances: Mapping[str, object] | None = None,
     limits: Mapping[str, object] | None = None,
+    settings: Settings | None = None,
 ):
     """Создать маркет-ордер со строгой валидацией объёма и балансов."""
     unit_normalised = (unit or "quoteCoin").strip().lower()
@@ -1539,27 +1653,83 @@ def place_spot_market_with_tolerance(
     attempt_logs: list[Dict[str, object]] = []
     executed_quote_total = Decimal("0")
     executed_base_total = Decimal("0")
-    chunk_qty = remaining_qty
-    max_attempts = 3
     last_response_raw: object | None = None
 
-    for attempt in range(max_attempts):
+    twap_cfg = _twap_runtime_config(settings)
+    twap_active = False
+    target_slices = max(1, twap_cfg.base_slices if twap_cfg.enabled else 1)
+    max_slices = max(1, twap_cfg.max_slices if twap_cfg.enabled else 1)
+    twap_orders_sent = 0
+    twap_adjustments: list[Dict[str, object]] = []
+
+    max_attempts = max(3, max_slices * 5 if twap_cfg.enabled else 3)
+    attempt = 0
+
+    while attempt < max_attempts:
+        if remaining_qty <= 0:
+            break
+
+        if twap_active:
+            slices_left = max(1, target_slices - twap_orders_sent)
+            chunk_qty = remaining_qty / Decimal(slices_left)
+        else:
+            chunk_qty = remaining_qty
+
         if chunk_qty <= 0:
             break
 
-        prepared = prepare_spot_market_order(
-            api,
-            symbol,
-            side,
-            chunk_qty,
-            unit=unit,
-            tol_type=tol_type,
-            tol_value=tol_value,
-            max_quote=remaining_cap,
-            price_snapshot=price_snapshot if attempt == 0 else None,
-            balances=balances,
-            limits=limits,
-        )
+        try:
+            prepared = prepare_spot_market_order(
+                api,
+                symbol,
+                side,
+                chunk_qty,
+                unit=unit,
+                tol_type=tol_type,
+                tol_value=tol_value,
+                max_quote=remaining_cap,
+                price_snapshot=price_snapshot if attempt == 0 else None,
+                balances=balances,
+                limits=limits,
+            )
+        except OrderValidationError as exc:
+            if twap_cfg.enabled and exc.code == "price_deviation":
+                adjustment: Dict[str, object] = {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "remaining_qty": _format_decimal(remaining_qty),
+                    "target_slices": target_slices,
+                }
+                ratio = _twap_price_deviation_ratio(getattr(exc, "details", {}) or {})
+                if isinstance(ratio, Decimal):
+                    adjustment["ratio"] = _format_decimal(ratio)
+                if not twap_active:
+                    twap_active = True
+                    if target_slices < max_slices:
+                        new_target = _twap_scaled_slices(target_slices, ratio, max_slices)
+                        if new_target != target_slices:
+                            target_slices = new_target
+                    adjustment["action"] = "activate"
+                    adjustment["target_slices"] = target_slices
+                    twap_adjustments.append(adjustment)
+                    continue
+                if target_slices < max_slices:
+                    new_target = _twap_scaled_slices(target_slices, ratio, max_slices)
+                    if new_target > target_slices:
+                        target_slices = new_target
+                        adjustment["action"] = "increase"
+                        adjustment["target_slices"] = target_slices
+                        twap_adjustments.append(adjustment)
+                        continue
+            raise
+
+        attempt += 1
+
+        if twap_active:
+            twap_orders_sent += 1
+            prepared.audit["twap_active"] = True
+            prepared.audit["twap_target_slices"] = target_slices
+            prepared.audit["twap_order_index"] = twap_orders_sent
 
         response = api.place_order(**prepared.payload)
         last_response_raw = response
@@ -1574,7 +1744,7 @@ def place_spot_market_with_tolerance(
             "spot.market.order_rest",
             symbol=symbol,
             side=side,
-            attempt=attempt + 1,
+            attempt=attempt,
             ret_code=ret_code,
             ret_msg=ret_msg,
             request=prepared.payload,
@@ -1596,13 +1766,15 @@ def place_spot_market_with_tolerance(
 
         attempt_payloads.append(prepared.payload)
         attempt_audits.append(prepared.audit)
-        attempt_logs.append(
-            {
-                "executed_base": _format_decimal(exec_base),
-                "executed_quote": _format_decimal(exec_quote),
-                "leaves_base": _format_decimal(leaves_base),
-            }
-        )
+        log_entry = {
+            "executed_base": _format_decimal(exec_base),
+            "executed_quote": _format_decimal(exec_quote),
+            "leaves_base": _format_decimal(leaves_base),
+        }
+        if twap_active:
+            log_entry["twap_slices"] = target_slices
+            log_entry["twap_order_index"] = twap_orders_sent
+        attempt_logs.append(log_entry)
 
         step_value = _to_decimal(
             prepared.audit.get("quote_step") if unit_normalised == "quotecoin" else prepared.audit.get("qty_step")
@@ -1615,8 +1787,13 @@ def place_spot_market_with_tolerance(
         else:
             remaining_qty = max(Decimal("0"), original_qty - executed_base_total)
 
-        if remaining_qty <= step_value or leaves_base <= 0:
+        if remaining_qty <= step_value:
             break
+        if leaves_base <= 0 and not twap_active:
+            break
+
+        if twap_active:
+            continue
 
         chunk_qty = min(remaining_qty, chunk_qty)
         if exec_base <= 0 and exec_quote <= 0:
@@ -1635,6 +1812,16 @@ def place_spot_market_with_tolerance(
             {"audit": audit, "payload": payload, **log_info}
             for audit, payload, log_info in zip(attempt_audits, attempt_payloads, attempt_logs)
         ]
+        if twap_cfg.enabled:
+            combined["twap"] = {
+                "active": twap_active,
+                "target_slices": target_slices,
+                "orders_sent": twap_orders_sent,
+                "max_slices": max_slices,
+                "adjustments": twap_adjustments,
+                "interval_range": twap_cfg.interval_range,
+                "aggressiveness_bps": twap_cfg.aggressiveness_bps,
+            }
         final_response["_local"] = combined
 
     return final_response
