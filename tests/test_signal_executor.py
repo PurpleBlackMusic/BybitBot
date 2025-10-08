@@ -35,7 +35,7 @@ class StubAPI:
     def __init__(self, total: float = 0.0, available: float = 0.0) -> None:
         self._total = total
         self._available = available
-        self.orders: list[dict] = []
+        self.orders: list[dict[str, object]] = []
 
     def wallet_balance(self) -> dict:
         return {
@@ -47,6 +47,17 @@ class StubAPI:
                     }
                 ]
             }
+        }
+
+    def place_order(self, **payload: object) -> dict[str, object]:
+        self.orders.append(dict(payload))
+        order_id = f"stub-{len(self.orders)}"
+        return {
+            "retCode": 0,
+            "result": {
+                "orderLinkId": payload.get("orderLinkId"),
+                "orderId": order_id,
+            },
         }
 
 
@@ -166,6 +177,188 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert captured["unit"] == "quoteCoin"
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
+
+def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.75",
+            "cumExecValue": "75",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    def fake_place(api_obj, **kwargs):
+        return response_payload
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(api.orders) == 2
+    first, second = api.orders
+    assert first["side"] == "Sell"
+    assert second["side"] == "Sell"
+    assert first["orderType"] == "Limit"
+    assert second["orderType"] == "Limit"
+    assert first["qty"] == "0.45"
+    assert second["qty"] == "0.3"
+    assert first["price"] == "100.5"
+    assert second["price"] == "101"
+    assert result.order is not None
+    assert result.order.get("take_profit_orders")
+    assert result.context is not None
+    assert result.context.get("execution", {}).get("avg_price") == "100"
+
+
+def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="5,9",
+        spot_tp_ladder_split_pct="50,50",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1500.0, available=1200.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "1",
+            "cumExecValue": "100",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.1",
+                "min_order_qty": "0.1",
+                "quote_step": "0.01",
+                "price_payload": "0.1",
+            }
+        },
+    }
+
+    def fake_place(api_obj, **kwargs):
+        return response_payload
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(api.orders) == 1
+    order = api.orders[0]
+    assert order["qty"] == "1"
+    assert order["price"] == "100.1"
+    assert result.order is not None
+    ladder = result.order.get("take_profit_orders")
+    assert ladder is not None
+    assert ladder[0]["profit_bps"] == "5,9"
+    assert ladder[0]["orderId"] == "stub-1"
+
+
+def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=2000.0, available=1500.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "retCode": 0,
+        "result": {"orderId": "primary"},
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            },
+            "attempts": [
+                {"executed_base": "0.50", "executed_quote": "50"},
+                {"executed_base": "0.25", "executed_quote": "25"},
+            ],
+        },
+    }
+
+    def fake_place(api_obj, **kwargs):
+        return response_payload
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(api.orders) == 3
+    qtys = [order["qty"] for order in api.orders]
+    prices = [order["price"] for order in api.orders]
+    assert qtys == ["0.37", "0.22", "0.16"]
+    assert prices == ["100.35", "100.7", "101.1"]
+    assert result.order is not None
+    execution = result.order.get("execution")
+    assert execution is not None
+    assert execution.get("executed_base") == "0.75"
+    assert execution.get("avg_price") == "100"
 
 def test_signal_executor_allows_zero_slippage(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
