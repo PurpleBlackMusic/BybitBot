@@ -405,23 +405,38 @@ def _format_step_decimal(value: Decimal, step: Decimal) -> str:
         try:
             value = Decimal(str(value))
         except Exception:
-            value = Decimal('0')
+            value = Decimal("0")
+    if not isinstance(step, Decimal):
+        try:
+            step = Decimal(str(step))
+        except Exception:
+            step = Decimal("0")
+
+    if step > 0:
+        value = _round_down(value, step)
+
     if value == 0:
-        return '0'
+        return "0"
+
     places = _decimal_step_places(step)
     if places > 0:
         quantizer = Decimal(1).scaleb(-places)
-        quantized = value.quantize(quantizer)
+        quantized = value.quantize(quantizer, rounding=ROUND_DOWN)
         text = f"{quantized:.{places}f}"
     else:
-        quantized = value.quantize(Decimal('1')) if value == value.to_integral_value() else value.normalize()
+        quantized = (
+            value.quantize(Decimal("1"), rounding=ROUND_DOWN)
+            if value == value.to_integral_value()
+            else value.normalize()
+        )
         text = f"{quantized:f}"
-    if '.' in text:
-        text = text.rstrip('0').rstrip('.')
-    if text.startswith('.'):
-        text = '0' + text
-    if text == '-0':
-        text = '0'
+
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text.startswith("."):
+        text = "0" + text
+    if text == "-0":
+        text = "0"
     return text
 
 
@@ -441,8 +456,7 @@ def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tupl
 def _apply_tick(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
     if tick_size <= 0:
         return price
-    rounding = ROUND_UP if side == "buy" else ROUND_DOWN
-    multiplier = (price / tick_size).to_integral_value(rounding=rounding)
+    multiplier = (price / tick_size).to_integral_value(rounding=ROUND_DOWN)
     adjusted = multiplier * tick_size
     if adjusted <= 0:
         adjusted = tick_size

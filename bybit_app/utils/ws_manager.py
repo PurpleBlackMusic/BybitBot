@@ -5,7 +5,7 @@ import threading
 import time
 import ssl
 import random
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Iterable, Optional
 
 import websocket  # websocket-client
@@ -729,7 +729,7 @@ class WSManager:
         for profit_bps, qty in allocations:
             rung_index += 1
             price = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
-            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+            price = self._round_to_step(price, price_step, rounding=ROUND_DOWN)
             if price <= 0:
                 continue
             qty_text = self._format_decimal_step(qty, qty_step)
@@ -825,19 +825,24 @@ class WSManager:
 
     @staticmethod
     def _format_decimal_step(value: Decimal, step: Decimal) -> str:
+        if not isinstance(step, Decimal):
+            try:
+                step = Decimal(str(step))
+            except Exception:
+                step = Decimal("0")
+
         if step > 0:
-            exponent = step.normalize().as_tuple().exponent
-            places = abs(exponent) if exponent < 0 else 0
-        else:
-            exponent = value.normalize().as_tuple().exponent
-            places = abs(exponent) if exponent < 0 else 0
+            value = WSManager._round_to_step(value, step, rounding=ROUND_DOWN)
+
+        exponent = step.normalize().as_tuple().exponent if step > 0 else value.normalize().as_tuple().exponent
+        places = abs(exponent) if exponent < 0 else 0
+
         if places > 0:
-            text = f"{value:.{places}f}"
+            text = f"{value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_DOWN):.{places}f}"
         else:
-            text = format(
-                value.quantize(Decimal("1")) if value == value.to_integral_value() else value.normalize(),
-                "f",
-            )
+            quantized = value.quantize(Decimal("1"), rounding=ROUND_DOWN) if value == value.to_integral_value() else value.normalize()
+            text = format(quantized, "f")
+
         if "." in text:
             text = text.rstrip("0").rstrip(".")
         return text or "0"

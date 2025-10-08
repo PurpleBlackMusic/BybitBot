@@ -7,7 +7,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 import threading
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -352,7 +352,10 @@ class SignalExecutor:
             order_link_id=order_link_id,
             executed_base=executed_base_raw,
         )
-        executed_base = filled_base_total if filled_base_total > 0 else executed_base_raw
+        if filled_base_total <= 0:
+            return [], {}
+
+        executed_base = filled_base_total
         avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
         if avg_price <= 0:
             return [], {}
@@ -453,7 +456,7 @@ class SignalExecutor:
         aggregated: list[Dict[str, object]] = []
         for step_cfg, qty in allocations:
             price = avg_price * (Decimal("1") + step_cfg.profit_fraction)
-            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+            price = self._round_to_step(price, price_step, rounding=ROUND_DOWN)
             if aggregated and aggregated[-1]["price"] == price:
                 aggregated[-1]["qty"] += qty
                 aggregated[-1]["steps"].append(step_cfg)
@@ -469,7 +472,9 @@ class SignalExecutor:
             if qty <= 0:
                 continue
             rung_index += 1
-            price = entry["price"]
+            price = self._round_to_step(entry["price"], price_step, rounding=ROUND_DOWN)
+            if price <= 0:
+                continue
             qty_text = self._format_decimal_step(qty, qty_step)
             price_text = self._format_decimal_step(price, price_step)
             profit_labels = [str(step.profit_bps.normalize()) for step in entry["steps"]]
@@ -598,7 +603,7 @@ class SignalExecutor:
         order_link_id: Optional[str],
         executed_base: Decimal,
     ) -> Decimal:
-        best_total = executed_base if executed_base > 0 else Decimal("0")
+        best_total = Decimal("0")
 
         ws_total = self._filled_base_from_private_ws(
             symbol, order_id=order_id, order_link_id=order_link_id
@@ -1020,16 +1025,24 @@ class SignalExecutor:
 
     @staticmethod
     def _format_decimal_step(value: Decimal, step: Decimal) -> str:
+        if not isinstance(step, Decimal):
+            try:
+                step = Decimal(str(step))
+            except Exception:
+                step = Decimal("0")
+
         if step > 0:
-            exponent = step.normalize().as_tuple().exponent
-            places = abs(exponent) if exponent < 0 else 0
-        else:
-            exponent = value.normalize().as_tuple().exponent
-            places = abs(exponent) if exponent < 0 else 0
+            value = SignalExecutor._round_to_step(value, step, rounding=ROUND_DOWN)
+
+        exponent = step.normalize().as_tuple().exponent if step > 0 else value.normalize().as_tuple().exponent
+        places = abs(exponent) if exponent < 0 else 0
+
         if places > 0:
-            text = f"{value:.{places}f}"
+            text = f"{value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_DOWN):.{places}f}"
         else:
-            text = format(value.quantize(Decimal("1")) if value == value.to_integral_value() else value.normalize(), "f")
+            quantized = value.quantize(Decimal("1"), rounding=ROUND_DOWN) if value == value.to_integral_value() else value.normalize()
+            text = format(quantized, "f")
+
         if "." in text:
             text = text.rstrip("0").rstrip(".")
         return text or "0"

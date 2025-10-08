@@ -323,7 +323,7 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
     assert len(api.orders) == 1
     order = api.orders[0]
     assert order["qty"] == "0.9"
-    assert order["price"] == "100.1"
+    assert order["price"] == "100"
     assert result.order is not None
     ladder = result.order.get("take_profit_orders")
     assert ladder is not None
