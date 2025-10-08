@@ -157,10 +157,26 @@ class BybitAPI:
     def server_time(self):
         return self._safe_req("GET", "/v5/market/time")
 
-    def instruments_info(self, category: str = "spot", symbol: str | None = None):
+    def instruments_info(
+        self,
+        category: str = "spot",
+        symbol: str | None = None,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+    ):
         params = {"category": category}
         if symbol:
             params["symbol"] = symbol
+        if limit is not None:
+            try:
+                params["limit"] = int(limit)
+            except (TypeError, ValueError):
+                pass
+        if cursor:
+            stripped = cursor.strip()
+            if stripped:
+                params["cursor"] = stripped
         return self._safe_req("GET", "/v5/market/instruments-info", params=params)
 
     def tickers(self, category: str = "spot", symbol: str | None = None):

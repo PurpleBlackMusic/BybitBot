@@ -6,12 +6,16 @@ import copy
 import math
 from dataclasses import dataclass
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from .envs import Settings, get_api_client, get_settings, creds_ok
 from .live_checks import extract_wallet_totals
 from .log import log
-from .spot_market import place_spot_market_with_tolerance
+from .spot_market import (
+    OrderValidationError,
+    place_spot_market_with_tolerance,
+    resolve_trade_symbol,
+)
 
 
 def _safe_symbol(value: object) -> Optional[str]:
@@ -70,11 +74,17 @@ class SignalExecutor:
                 reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
             )
 
-        symbol = self._select_symbol(summary)
+        symbol, symbol_meta = self._select_symbol(summary, settings)
         if symbol is None:
+            reason = "Не удалось определить инструмент для сделки."
+            if symbol_meta:
+                meta_reason = symbol_meta.get("reason") if isinstance(symbol_meta, Mapping) else None
+                if meta_reason:
+                    reason = f"Инструмент недоступен для сделки ({meta_reason})."
             return ExecutionResult(
                 status="skipped",
-                reason="Не удалось определить инструмент для сделки.",
+                reason=reason,
+                context={"symbol_meta": symbol_meta} if symbol_meta else None,
             )
 
         side = "Buy" if mode == "buy" else "Sell"
@@ -105,6 +115,8 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if symbol_meta:
+            order_context["symbol_meta"] = symbol_meta
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 25)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
@@ -149,6 +161,17 @@ class SignalExecutor:
                 tol_value=slippage_pct,
                 max_quote=usable_after_reserve,
             )
+        except OrderValidationError as exc:
+            validation_context = dict(order_context)
+            validation_context["validation_code"] = exc.code
+            if exc.details:
+                validation_context["validation_details"] = exc.details
+            log("guardian.auto.order.validation_failed", error=exc.to_dict(), context=validation_context)
+            return ExecutionResult(
+                status="rejected",
+                reason=str(exc),
+                context=validation_context,
+            )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
             return ExecutionResult(
                 status="error",
@@ -159,6 +182,13 @@ class SignalExecutor:
         order = copy.deepcopy(order_context)
         order["slippage_percent"] = slippage_pct
         log("guardian.auto.execute", order=order, response=response)
+        audit = None
+        if isinstance(response, Mapping):
+            local = response.get("_local")
+            if isinstance(local, Mapping):
+                audit = local.get("order_audit")
+        if audit:
+            order["order_audit"] = audit
         return ExecutionResult(status="filled", order=order, response=response)
 
     # ------------------------------------------------------------------
@@ -274,25 +304,54 @@ class SignalExecutor:
         notional = round(base_notional * sizing, 2)
         return max(notional, 0.0), usable_after_reserve
 
-    def _select_symbol(self, summary: Dict[str, object]) -> Optional[str]:
+    def _select_symbol(
+        self, summary: Dict[str, object], settings: Settings
+    ) -> tuple[Optional[str], Optional[Dict[str, object]]]:
+        candidates: list[str] = []
+
         symbol = _safe_symbol(summary.get("symbol"))
         if symbol:
-            return symbol
+            candidates.append(symbol)
 
         primary = summary.get("primary_watch")
         if isinstance(primary, dict):
-            symbol = _safe_symbol(primary.get("symbol"))
-            if symbol:
-                return symbol
+            primary_symbol = _safe_symbol(primary.get("symbol"))
+            if primary_symbol and primary_symbol not in candidates:
+                candidates.append(primary_symbol)
 
-        candidates = summary.get("candidate_symbols")
-        if isinstance(candidates, (list, tuple)):
-            for candidate in candidates:
-                symbol = _safe_symbol(candidate)
-                if symbol:
-                    return symbol
+        extra = summary.get("candidate_symbols")
+        if isinstance(extra, (list, tuple)):
+            for candidate in extra:
+                cleaned = _safe_symbol(candidate)
+                if cleaned and cleaned not in candidates:
+                    candidates.append(cleaned)
 
-        return None
+        for candidate in candidates:
+            resolved, meta = self._map_symbol(candidate, settings=settings)
+            if resolved:
+                return resolved, meta
+
+        return None, None
+
+    def _map_symbol(
+        self, symbol: str, *, settings: Settings
+    ) -> tuple[Optional[str], Optional[Dict[str, object]]]:
+        cleaned = _safe_symbol(symbol)
+        if not cleaned:
+            return None, None
+
+        if not getattr(settings, "testnet", True):
+            return cleaned, None
+
+        try:
+            api = get_api_client()
+        except Exception as exc:  # pragma: no cover - defensive
+            return None, {"reason": "api_unavailable", "error": str(exc), "requested": cleaned}
+
+        resolved, meta = resolve_trade_symbol(cleaned, api=api, allow_nearest=True)
+        if resolved is None:
+            return None, meta
+        return resolved, meta
 
     def _signal_sizing_factor(
         self, summary: Dict[str, object], settings: Settings
@@ -367,7 +426,7 @@ class SignalExecutor:
 class AutomationLoop:
     """Keep executing trading signals until stopped explicitly."""
 
-    _SUCCESSFUL_STATUSES = {"filled", "dry_run", "skipped", "disabled"}
+    _SUCCESSFUL_STATUSES = {"filled", "dry_run", "skipped", "disabled", "rejected"}
 
     def __init__(
         self,

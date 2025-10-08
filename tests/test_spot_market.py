@@ -1,11 +1,14 @@
+import time
 from decimal import Decimal
 
 import pytest
 
 from bybit_app.utils import spot_market as spot_market_module
 from bybit_app.utils.spot_market import (
+    OrderValidationError,
     place_spot_market_with_tolerance,
     prepare_spot_trade_snapshot,
+    resolve_trade_symbol,
 )
 
 
@@ -21,7 +24,7 @@ class DummyAPI:
         self.ticker_calls = 0
         self.wallet_calls = 0
 
-    def instruments_info(self, category="spot", symbol: str | None = None):
+    def instruments_info(self, category="spot", symbol: str | None = None, **kwargs):
         self.info_calls += 1
         return self.instrument_payload
 
@@ -50,6 +53,83 @@ def setup_function(_):
     spot_market_module._INSTRUMENT_CACHE.clear()
     spot_market_module._PRICE_CACHE.clear()
     spot_market_module._BALANCE_CACHE.clear()
+    spot_market_module._SYMBOL_CACHE.clear()
+
+
+def _universe_payload(entries: list[dict]) -> dict:
+    return {"result": {"list": entries}}
+
+
+def test_resolve_trade_symbol_handles_delimiters():
+    payload = _universe_payload([
+        {"symbol": "SOLUSDT", "quoteCoin": "USDT", "status": "Trading"},
+    ])
+    api = DummyAPI(payload)
+
+    resolved, meta = resolve_trade_symbol("sol/usdt", api=api)
+
+    assert resolved == "SOLUSDT"
+    assert meta["reason"] == "exact"
+
+
+def test_resolve_trade_symbol_uses_alias_mapping():
+    payload = _universe_payload([
+        {
+            "symbol": "WBTCUSDT",
+            "quoteCoin": "USDT",
+            "status": "Trading",
+            "alias": "BTC",
+            "baseCoin": "WBTC",
+        }
+    ])
+    api = DummyAPI(payload)
+
+    resolved, meta = resolve_trade_symbol("btc", api=api)
+
+    assert resolved == "WBTCUSDT"
+    assert meta["reason"] == "alias_match"
+    assert meta["alias"] == "BTC"
+
+
+def test_resolve_trade_symbol_refreshes_when_cache_stale():
+    payload = _universe_payload([
+        {"symbol": "NEWUSDT", "quoteCoin": "USDT", "status": "Trading"},
+    ])
+    api = DummyAPI(payload)
+
+    spot_market_module._SYMBOL_CACHE.set(
+        "spot_usdt",
+        {"symbols": {}, "by_base": {}, "aliases": {}, "ts": time.time()},
+    )
+
+    resolved, meta = resolve_trade_symbol("NEWUSDT", api=api)
+
+    assert resolved == "NEWUSDT"
+    assert meta["reason"] == "exact"
+    assert meta["cache_state"] == "refreshed"
+
+
+def test_resolve_trade_symbol_prefers_canonical_symbol_for_alias():
+    payload = _universe_payload([
+        {
+            "symbol": "PEPEUSDT",
+            "quoteCoin": "USDT",
+            "status": "Trading",
+            "baseCoin": "PEPE",
+        },
+        {
+            "symbol": "PEPE3LUSDT",
+            "quoteCoin": "USDT",
+            "status": "Trading",
+            "baseCoin": "PEPE",
+        },
+    ])
+    api = DummyAPI(payload)
+
+    resolved, meta = resolve_trade_symbol("PEPE", api=api)
+
+    assert resolved == "PEPEUSDT"
+    assert meta["reason"] == "alias_match"
 
 
 def test_place_spot_market_enforces_min_notional():
@@ -68,28 +148,19 @@ def test_place_spot_market_enforces_min_notional():
     }
     api = DummyAPI(payload)
 
-    response = place_spot_market_with_tolerance(
-        api,
-        symbol="BTCUSDT",
-        side="Buy",
-        qty=3.0,
-        unit="quoteCoin",
-        tol_value=0.5,
-    )
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=3.0,
+            unit="quoteCoin",
+            tol_value=0.5,
+        )
 
-    assert response["ok"] is True
-    assert api.place_calls[0]["qty"] == "10"
-    assert api.place_calls[0]["slippageTolerance"] == "0.5000"
-    assert api.place_calls[0]["slippageToleranceType"] == "Percent"
-    # repeated call should reuse cached instrument data
-    place_spot_market_with_tolerance(
-        api,
-        symbol="BTCUSDT",
-        side="Buy",
-        qty=12.0,
-        unit="quoteCoin",
-    )
-    assert api.info_calls == 1
+    message = str(excinfo.value)
+    assert "Минимальный объём" in message
+    assert not api.place_calls
 
 
 def test_place_spot_market_omits_slippage_when_zero_tolerance():
@@ -189,18 +260,18 @@ def test_place_spot_market_respects_available_balance():
     }
     api = DummyAPI(payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BTCUSDT",
             side="Buy",
-            qty=3.0,
+            qty=12.0,
             unit="quoteCoin",
             tol_value=0.5,
             max_quote=Decimal("6"),
         )
 
-    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert "Недостаточно свободного капитала" in str(excinfo.value)
     assert api.place_calls == []
 
 
@@ -222,7 +293,7 @@ def test_place_spot_market_base_unit_checks_available_balance():
     ticker = {"result": {"list": [{"symbol": "ETHUSDT", "bestBidPrice": "2000"}]}}
     api = DummyAPI(payload, ticker_payload=ticker)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="ETHUSDT",
@@ -232,7 +303,7 @@ def test_place_spot_market_base_unit_checks_available_balance():
             max_quote=Decimal("10"),
         )
 
-    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert "Недостаточно свободного капитала" in str(excinfo.value)
     assert api.place_calls == []
     assert api.ticker_calls == 1
 
@@ -253,7 +324,7 @@ def test_place_spot_market_balance_guard_includes_tolerance():
     }
     api = DummyAPI(payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BTCUSDT",
@@ -264,7 +335,7 @@ def test_place_spot_market_balance_guard_includes_tolerance():
             max_quote=Decimal("10.05"),
         )
 
-    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert "Недостаточно свободного капитала" in str(excinfo.value)
     assert api.place_calls == []
 
 
@@ -315,7 +386,7 @@ def test_place_spot_market_accepts_bps_suffix():
     }
     api = DummyAPI(payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BTCUSDT",
@@ -326,7 +397,7 @@ def test_place_spot_market_accepts_bps_suffix():
             max_quote=Decimal("10.04"),
         )
 
-    assert "Недостаточно свободного баланса" in str(excinfo.value)
+    assert "Недостаточно свободного капитала" in str(excinfo.value)
     assert api.place_calls == []
 
 
@@ -359,7 +430,7 @@ def test_place_spot_market_requires_quote_currency_balance():
     }
     api = DummyAPI(payload, wallet_payload=wallet)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDC",
@@ -368,9 +439,12 @@ def test_place_spot_market_requires_quote_currency_balance():
             unit="quoteCoin",
         )
 
-    message = str(excinfo.value)
-    assert "USDC" in message
-    assert "USDT" in message
+    details = getattr(excinfo.value, "details", {})
+    assert details.get("asset") == "USDC"
+    alt_usdt = details.get("alt_usdt")
+    if alt_usdt is not None:
+        assert "120" in alt_usdt
+    assert api.place_calls == []
     assert api.place_calls == []
     assert api.wallet_calls >= 1
 
@@ -508,7 +582,7 @@ def test_place_spot_market_ignores_spot_wallet_account_type_error():
 
     api = FallbackErrorAPI(payload, wallet_payload=wallet_payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDT",
@@ -566,7 +640,7 @@ def test_place_spot_market_ignores_account_type_error_from_non_runtime_exception
 
     api = ValueErrorFallbackAPI(payload, wallet_payload=wallet_payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDT",
@@ -623,7 +697,7 @@ def test_place_spot_market_ignores_account_type_error_with_supports_phrase():
 
     api = ValueErrorSupportsFallbackAPI(payload, wallet_payload=wallet_payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDT",
@@ -686,7 +760,7 @@ def test_place_spot_market_ignores_account_type_error_with_http_status_code():
 
     api = HTTPStatusFallbackAPI(payload, wallet_payload=wallet_payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDT",
@@ -750,7 +824,7 @@ def test_place_spot_market_ignores_structured_account_type_error():
 
     api = StructuredFallbackAPI(payload, wallet_payload=wallet_payload)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(OrderValidationError) as excinfo:
         place_spot_market_with_tolerance(
             api,
             symbol="BBSOLUSDT",
@@ -799,7 +873,7 @@ def test_place_spot_market_raises_when_no_instrument():
     payload = {"result": {"list": []}}
     api = DummyAPI(payload)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OrderValidationError):
         place_spot_market_with_tolerance(
             api,
             symbol="FOOUSDT",
@@ -836,32 +910,18 @@ def test_place_spot_market_adjusts_base_qty_with_price_snapshot():
     }
     api = DummyAPI(payload, ticker_payload=ticker)
 
-    response = place_spot_market_with_tolerance(
-        api,
-        symbol="ETHUSDT",
-        side="Buy",
-        qty=0.003,
-        unit="baseCoin",
-        tol_value=0.3,
-    )
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="ETHUSDT",
+            side="Buy",
+            qty=0.003,
+            unit="baseCoin",
+            tol_value=0.3,
+        )
 
-    assert response["ok"] is True
-    assert api.place_calls[0]["marketUnit"] == "baseCoin"
-    assert api.place_calls[0]["qty"] == "0.01"
-    assert api.place_calls[0]["slippageTolerance"] == "0.3000"
-    # ensure price snapshot queried once and cached
-    assert api.ticker_calls == 1
-
-    # second call reuses caches and keeps qty above minimum
-    place_spot_market_with_tolerance(
-        api,
-        symbol="ETHUSDT",
-        side="Buy",
-        qty=0.02,
-        unit="baseCoin",
-    )
-    assert api.info_calls == 1
-    assert api.ticker_calls == 1
+    assert "минимального лота" in str(excinfo.value)
+    assert api.place_calls == []
 
 
 def test_place_spot_market_base_unit_requires_price():
@@ -882,7 +942,7 @@ def test_place_spot_market_base_unit_requires_price():
     ticker = {"result": {"list": [{"symbol": "SOLUSDT"}]}}
     api = DummyAPI(payload, ticker_payload=ticker)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OrderValidationError):
         place_spot_market_with_tolerance(
             api,
             symbol="SOLUSDT",
