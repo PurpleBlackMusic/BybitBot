@@ -104,7 +104,7 @@ def twap_spot_batch(
             "orderType": "Limit",
             "qty": str(qtys[i]),
             "price": str(px),
-            "timeInForce": "IOC",
+            "timeInForce": "GTC",
             "orderLinkId": ensure_link_id(f"TWAPB-{timestamp_ms}-{i}"),
         }
         for i in range(slices)

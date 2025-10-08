@@ -410,7 +410,7 @@ def test_place_spot_market_accepts_percent_string():
     assert response["ok"] is True
     placed = api.place_calls[0]
     assert placed["orderType"] == "Limit"
-    assert placed["timeInForce"] == "IOC"
+    assert placed["timeInForce"] == "GTC"
     audit = response.get("_local", {}).get("order_audit", {})
     assert audit.get("tolerance_value") == "0.7500"
     assert "slippageTolerance" not in placed
@@ -576,7 +576,7 @@ def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: 
             "orderType": "Limit",
             "qty": format(qty_decimal, "f"),
             "price": "1",
-            "timeInForce": "IOC",
+            "timeInForce": "GTC",
             "orderFilter": "Order",
             "accountType": "UNIFIED",
             "marketUnit": "quoteCoin",
@@ -648,7 +648,7 @@ def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
             "orderType": "Limit",
             "qty": format(qty_decimal, "f"),
             "price": "1",
-            "timeInForce": "IOC",
+            "timeInForce": "GTC",
             "orderFilter": "Order",
             "accountType": "UNIFIED",
             "marketUnit": "quoteCoin",
@@ -1322,6 +1322,59 @@ def test_place_spot_market_base_unit_requires_price():
             qty=0.01,
             unit="baseCoin",
         )
+
+
+def test_place_spot_market_sell_rounds_qty_down_to_step():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "SOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "SOL",
+                    "lotSizeFilter": {
+                        "minOrderQty": "0.1",
+                        "qtyStep": "0.1",
+                        "minOrderAmt": "5",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }
+            ]
+        }
+    }
+    orderbook = {
+        "result": {
+            "a": [["20.10", "5"], ["20.20", "5"]],
+            "b": [["20.00", "1"], ["19.90", "1"]],
+        }
+    }
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "SOL", "availableBalance": "2"},
+                        {"coin": "USDT", "availableBalance": "0"},
+                    ]
+                }
+            ]
+        }
+    }
+    ticker = {"result": {"list": [{"symbol": "SOLUSDT", "bestBidPrice": "20.0"}]}}
+    api = DummyAPI(payload, ticker_payload=ticker, wallet_payload=wallet, orderbook_payload=orderbook)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="SOLUSDT",
+        side="Sell",
+        qty=Decimal("1.234"),
+        unit="baseCoin",
+    )
+
+    assert response["ok"] is True
+    placed = api.place_calls[0]
+    assert placed["qty"] == "1.2"
+    assert "marketUnit" not in placed
 
 
 def test_prepare_spot_trade_snapshot_prefetches_resources():

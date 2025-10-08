@@ -383,6 +383,46 @@ def _round_down(value: Decimal, step: Decimal) -> Decimal:
     return multiplier * step
 
 
+def _decimal_step_places(step: Decimal) -> int:
+    if not isinstance(step, Decimal):
+        try:
+            step = Decimal(str(step))
+        except Exception:
+            step = Decimal('0')
+    if step <= 0:
+        return 0
+    normalised = step.normalize()
+    exponent = normalised.as_tuple().exponent
+    if exponent >= 0:
+        return 0
+    return -exponent
+
+
+def _format_step_decimal(value: Decimal, step: Decimal) -> str:
+    if not isinstance(value, Decimal):
+        try:
+            value = Decimal(str(value))
+        except Exception:
+            value = Decimal('0')
+    if value == 0:
+        return '0'
+    places = _decimal_step_places(step)
+    if places > 0:
+        quantizer = Decimal(1).scaleb(-places)
+        quantized = value.quantize(quantizer)
+        text = f"{quantized:.{places}f}"
+    else:
+        quantized = value.quantize(Decimal('1')) if value == value.to_integral_value() else value.normalize()
+        text = f"{quantized:f}"
+    if '.' in text:
+        text = text.rstrip('0').rstrip('.')
+    if text.startswith('.'):
+        text = '0' + text
+    if text == '-0':
+        text = '0'
+    return text
+
+
 def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tuple[Decimal, Decimal]]:
     normalised: list[tuple[Decimal, Decimal]] = []
     for entry in levels or []:
@@ -510,7 +550,11 @@ def _plan_limit_ioc_order(
             },
         )
 
-    qty_rounded = _round_up(accumulated_base, qty_step)
+    rounding_fn = _round_up
+    if side_normalised != "buy" or target_quote is not None:
+        rounding_fn = _round_down
+
+    qty_rounded = rounding_fn(accumulated_base, qty_step)
 
     if qty_rounded <= 0:
         raise OrderValidationError(
@@ -1260,6 +1304,7 @@ def prepare_spot_market_order(
     price_snapshot: object | None = None,
     balances: Mapping[str, object] | None = None,
     limits: Mapping[str, object] | None = None,
+    settings: Settings | None = None,
 ):
     """Проверить параметры маркет-ордера и подготовить запрос к REST API."""
 
@@ -1446,14 +1491,44 @@ def prepare_spot_market_order(
         min_qty=min_qty,
     )
 
+
     limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
     limit_price = _apply_tick(worst_price, limit_map_tick, side_normalised)
+    qty_base = _round_down(qty_base, qty_step) if qty_step > 0 else qty_base
     limit_notional = qty_base * limit_price
 
     if unit_normalised == "quotecoin":
         market_unit = "quoteCoin"
     else:
         market_unit = "baseCoin"
+
+    if side_normalised == "buy" and target_quote is not None and limit_price > 0:
+        affordable_qty = _round_down(target_quote / limit_price, qty_step)
+        if affordable_qty <= 0:
+            raise OrderValidationError(
+                "Расчётное количество меньше шага инструмента.",
+                code="qty_step",
+                details={
+                    "target_quote": _format_decimal(target_quote),
+                    "limit_price": _format_decimal(limit_price),
+                    "qty_step": _format_decimal(qty_step),
+                },
+            )
+        if min_qty > 0 and affordable_qty < min_qty:
+            raise OrderValidationError(
+                "Количество меньше минимального лота для базовой валюты.",
+                code="min_qty",
+                details={
+                    "requested": _format_decimal(affordable_qty),
+                    "rounded": _format_decimal(affordable_qty),
+                    "min_qty": _format_decimal(min_qty),
+                    "step": _format_decimal(qty_step),
+                    "unit": "base",
+                },
+            )
+        if affordable_qty < qty_base:
+            qty_base = affordable_qty
+            limit_notional = qty_base * limit_price
 
     if market_unit == "quoteCoin" and target_quote is not None:
         effective_notional = target_quote
@@ -1547,11 +1622,39 @@ def prepare_spot_market_order(
 
     if market_unit == "quoteCoin":
         qty_value = target_quote if target_quote is not None else requested_qty
+        qty_step_for_payload = quote_step
     else:
         qty_value = qty_base
+        qty_step_for_payload = qty_step
 
-    qty_text = format(qty_value.normalize(), "f") if qty_value != 0 else "0"
-    price_text = format(limit_price.normalize(), "f") if limit_price != 0 else "0"
+    if qty_step_for_payload > 0:
+        qty_value = _round_down(_to_decimal(qty_value), qty_step_for_payload)
+    qty_text = _format_step_decimal(qty_value, qty_step_for_payload)
+    price_text = _format_step_decimal(limit_price, limit_map_tick)
+    if not qty_text:
+        qty_text = "0"
+    if not price_text:
+        price_text = "0"
+
+    time_in_force = "GTC"
+    allow_partial_fills = True
+    reprice_after_sec: int | None = None
+    max_amendments_setting: int | None = None
+    if isinstance(settings, Settings):
+        tif_candidate = getattr(settings, "order_time_in_force", None)
+        if not tif_candidate:
+            tif_candidate = getattr(settings, "spot_limit_tif", None)
+        if isinstance(tif_candidate, str) and tif_candidate.strip():
+            tif_upper = tif_candidate.strip().upper()
+            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
+            time_in_force = mapping.get(tif_upper, tif_upper)
+        allow_partial_fills = bool(getattr(settings, "allow_partial_fills", True))
+        reprice_after_raw = getattr(settings, "reprice_unfilled_after_sec", None)
+        if isinstance(reprice_after_raw, (int, float)) and reprice_after_raw >= 0:
+            reprice_after_sec = int(reprice_after_raw)
+        max_amendments_raw = getattr(settings, "max_amendments", None)
+        if isinstance(max_amendments_raw, int) and max_amendments_raw >= 0:
+            max_amendments_setting = max_amendments_raw
 
     payload: Dict[str, object] = {
         "category": "spot",
@@ -1560,7 +1663,7 @@ def prepare_spot_market_order(
         "orderType": "Limit",
         "qty": qty_text,
         "price": price_text,
-        "timeInForce": "IOC",
+        "timeInForce": time_in_force,
         "orderFilter": "Order",
         "accountType": "UNIFIED",
     }
@@ -1586,11 +1689,20 @@ def prepare_spot_market_order(
         "tolerance_adjusted_notional": _format_decimal(tolerance_adjusted),
         "quote_coin": quote_coin or None,
         "base_coin": base_coin or None,
+        "time_in_force": time_in_force,
+        "allow_partial_fills": allow_partial_fills,
+        "qty_payload": qty_text,
+        "price_payload": price_text,
     }
 
     audit["limit_notional"] = _format_decimal(limit_notional)
     if market_unit == "quoteCoin":
         audit["market_unit_qty"] = _format_decimal(qty_value)
+
+    if reprice_after_sec is not None:
+        audit["reprice_unfilled_after_sec"] = reprice_after_sec
+    if max_amendments_setting is not None:
+        audit["max_amendments"] = max_amendments_setting
 
     if max_available is not None:
         audit["max_available"] = _format_decimal(max_available)
@@ -1603,7 +1715,7 @@ def prepare_spot_market_order(
 
     audit["limit_price"] = _format_decimal(limit_price)
     audit["order_qty_base"] = _format_decimal(qty_base)
-    audit["order_notional"] = _format_decimal(effective_notional)
+    audit["order_notional"] = _format_decimal(limit_notional)
     if target_quote is not None:
         audit["requested_quote_notional"] = _format_decimal(target_quote)
         if quote_ceiling_raw is not None:
@@ -1691,6 +1803,7 @@ def place_spot_market_with_tolerance(
                 price_snapshot=price_snapshot if attempt == 0 else None,
                 balances=balances,
                 limits=limits,
+                settings=settings,
             )
         except OrderValidationError as exc:
             if twap_cfg.enabled and exc.code == "price_deviation":
