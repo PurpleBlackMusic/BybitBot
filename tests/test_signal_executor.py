@@ -241,6 +241,59 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_buy_scales_for_slippage(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "auto_sizing_factor": 1.0,
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=20.0,
+        spot_cash_reserve_pct=2.0,
+        spot_max_cap_per_trade_pct=0.0,
+        ai_max_slippage_bps=500,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=100.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict | None = None
+
+    def fake_place(api_obj, **kwargs):
+        nonlocal captured
+        captured = kwargs
+        qty = Decimal(str(kwargs["qty"]))
+        guard = Decimal(str(kwargs["max_quote"]))
+        multiplier, _, _, _ = signal_executor_module._resolve_slippage_tolerance(
+            "Percent", settings.ai_max_slippage_bps / 100.0
+        )
+        tolerance_spend = (qty * multiplier).quantize(Decimal("0.00000001"))
+        if tolerance_spend - guard > Decimal("0.0001"):
+            raise OrderValidationError("guard", code="max_quote")
+        return {"status": "ok", "result": {"orderId": "scaled"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured is not None
+    assert captured["qty"] == pytest.approx(80.0 / 1.05, rel=1e-6)
+    assert captured["max_quote"] == pytest.approx(80.0, rel=1e-6)
+
+
 def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(

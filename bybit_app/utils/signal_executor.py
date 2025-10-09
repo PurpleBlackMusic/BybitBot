@@ -25,6 +25,7 @@ from .log import log
 from .spot_market import (
     OrderValidationError,
     _instrument_limits,
+    _resolve_slippage_tolerance,
     place_spot_market_with_tolerance,
     resolve_trade_symbol,
 )
@@ -217,6 +218,35 @@ class SignalExecutor:
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
         slippage_pct = _normalise_slippage_percent(slippage_pct)
+        slippage_multiplier, _, _, _ = _resolve_slippage_tolerance("Percent", slippage_pct)
+
+        max_quote_guard = usable_after_reserve
+        if side == "Buy":
+            notional_decimal = Decimal(str(notional))
+            available_decimal = Decimal(str(usable_after_reserve))
+            multiplier_decimal = slippage_multiplier
+
+            if available_decimal > 0 and multiplier_decimal > 0:
+                affordable = available_decimal / multiplier_decimal
+                if affordable < notional_decimal:
+                    notional_decimal = affordable
+
+                if notional_decimal < 0:
+                    notional_decimal = Decimal("0")
+
+                tolerance_spend = (notional_decimal * multiplier_decimal).quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_UP
+                )
+                if available_decimal > 0:
+                    tolerance_spend = min(tolerance_spend, available_decimal)
+
+                max_quote_guard = float(tolerance_spend)
+                notional = float(notional_decimal)
+            else:
+                notional = float(max(notional_decimal, Decimal("0")))
+                max_quote_guard = float(max(available_decimal, Decimal("0")))
+
+        order_context["notional_quote"] = notional
 
         if notional <= 0 or notional < min_notional:
             order_context["min_notional"] = min_notional
@@ -261,7 +291,7 @@ class SignalExecutor:
                 unit="quoteCoin",
                 tol_type="Percent",
                 tol_value=slippage_pct,
-                max_quote=usable_after_reserve,
+                max_quote=max_quote_guard,
                 settings=settings,
             )
         except OrderValidationError as exc:
