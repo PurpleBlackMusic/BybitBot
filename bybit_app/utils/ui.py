@@ -149,6 +149,37 @@ def _patch_responsive_dataframe() -> None:
 _patch_responsive_dataframe()
 
 
+def _maybe_disable_arrow_warning() -> None:
+    """Fallback to the legacy dataframe serialisation when PyArrow is missing."""
+
+    if pyarrow is not None:
+        return
+
+    config = getattr(st, "config", None)
+    set_option = getattr(config, "set_option", None) if config is not None else None
+    if not callable(set_option):
+        return
+
+    current = None
+    try:
+        current = getattr(config, "get_option", None)
+        if callable(current):
+            current = current("global.dataFrameSerialization")
+    except Exception:
+        current = None
+
+    if current == "legacy":
+        return
+
+    try:
+        set_option("global.dataFrameSerialization", "legacy")
+    except Exception:
+        pass
+
+
+_maybe_disable_arrow_warning()
+
+
 def rerun() -> None:
     """Trigger a Streamlit rerun across supported versions."""
 

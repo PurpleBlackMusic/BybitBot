@@ -18,41 +18,51 @@ _LOCK = threading.Lock()
 
 def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[str]:
     url = _TESTNET_URL if testnet else _MAINNET_URL
-    cursor: str | None = None
-    seen_cursors: Set[str] = set()
-    symbols: Set[str] = set()
 
-    while True:
-        params = {"category": "spot"}
-        if cursor:
-            params["cursor"] = cursor
+    def _fetch(url: str) -> Set[str]:
+        cursor: str | None = None
+        seen_cursors: Set[str] = set()
+        symbols: Set[str] = set()
 
-        response = requests.get(url, params=params, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-        result = payload.get("result") or {}
-        rows = result.get("list") or []
-        for item in rows:
-            symbol = str(item.get("symbol") or "").strip().upper()
-            if not symbol:
-                continue
-            symbols.add(symbol)
+        while True:
+            params = {"category": "spot"}
+            if cursor:
+                params["cursor"] = cursor
 
-        next_cursor_raw = (
-            result.get("nextPageCursor")
-            or result.get("nextPageToken")
-            or payload.get("nextPageCursor")
-            or payload.get("nextPageToken")
-        )
-        next_cursor = str(next_cursor_raw).strip() if next_cursor_raw else ""
-        if not next_cursor:
-            break
-        if next_cursor in seen_cursors:
-            break
-        seen_cursors.add(next_cursor)
-        cursor = next_cursor
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            result = payload.get("result") or {}
+            rows = result.get("list") or []
+            for item in rows:
+                symbol = str(item.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                symbols.add(symbol)
 
-    return symbols
+            next_cursor_raw = (
+                result.get("nextPageCursor")
+                or result.get("nextPageToken")
+                or payload.get("nextPageCursor")
+                or payload.get("nextPageToken")
+            )
+            next_cursor = str(next_cursor_raw).strip() if next_cursor_raw else ""
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        return symbols
+
+    try:
+        return _fetch(url)
+    except requests.exceptions.RequestException as exc:
+        if not testnet:
+            raise
+        log("instruments.fetch.testnet_failed", scope="spot", err=str(exc))
+        return _fetch(_MAINNET_URL)
 
 
 def get_listed_spot_symbols(

@@ -77,7 +77,7 @@ class Settings:
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
-    tg_trade_notifs_min_notional: float = 50.0
+    tg_trade_notifs_min_notional: float = 5.0
 
     # WS Watchdog
     ws_watchdog_enabled: bool = True
@@ -347,13 +347,45 @@ def get_settings(force_reload: bool = False) -> Settings:
     base = asdict(Settings())
     file_payload = _load_file()
     merged = _merge(base, _merge(file_payload, env_overrides))
+
+    dry_env_value = raw_env.get("dry_run")
+    dry_configured = "dry_run" in file_payload
+    if not dry_configured and dry_env_value is not None:
+        if isinstance(dry_env_value, str):
+            dry_configured = bool(dry_env_value.strip())
+        else:
+            dry_configured = True
+    if not dry_configured:
+        if merged.get("dry_run") and merged.get("api_key") and merged.get("api_secret"):
+            merged["dry_run"] = False
     filtered = _filter_fields(merged)
     settings = Settings(**filtered)
     return _set_cache(settings, key)
 
 def update_settings(**kwargs) -> Settings:
     current = asdict(get_settings())
+    explicit_dry_run = "dry_run" in kwargs and kwargs["dry_run"] is not None
+    file_payload = _load_file()
+    raw_env = _read_env()
     current.update({k: v for k, v in kwargs.items() if v is not None})
+
+    dry_configured = "dry_run" in file_payload
+    if not dry_configured:
+        dry_env_value = raw_env.get("dry_run")
+        if dry_env_value is not None:
+            if isinstance(dry_env_value, str):
+                dry_configured = bool(dry_env_value.strip())
+            else:
+                dry_configured = True
+
+    if (
+        not explicit_dry_run
+        and not dry_configured
+        and current.get("dry_run")
+        and current.get("api_key")
+        and current.get("api_secret")
+    ):
+        current["dry_run"] = False
     SETTINGS_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
     _invalidate_cache()
     try:
