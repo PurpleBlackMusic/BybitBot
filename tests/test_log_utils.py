@@ -109,3 +109,40 @@ def test_log_prunes_when_file_exceeds_limit(tmp_path, monkeypatch):
     events = [json.loads(line)["event"] for line in lines]
     assert events[-1] == "new-entry"
     assert all(event.startswith("existing") or event == "new-entry" for event in events)
+
+
+def test_log_infers_severity_and_thread(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+
+    log_module.log("guardian.refresh.error", err="boom")
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["severity"] == "error"
+    assert record["thread"]
+    assert record["payload"]["err"] == "boom"
+
+
+def test_log_respects_explicit_severity(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+
+    log_module.log("custom.event", severity="WARNING", value=1)
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["severity"] == "warning"
+    assert record["payload"]["value"] == 1
+
+
+def test_log_serialises_exception_details(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+
+    try:
+        raise RuntimeError("kaboom")
+    except RuntimeError as exc:
+        log_module.log("runtime.failure", exc=exc)
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["severity"] == "error"
+    exception = record["exception"]
+    assert exception["type"].endswith("RuntimeError")
+    assert "kaboom" in exception["message"]
+    assert "RuntimeError: kaboom" in exception["traceback"]
