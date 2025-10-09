@@ -1437,6 +1437,59 @@ def test_signal_executor_rotates_symbol_after_repeated_price_deviation(
     assert attempts[2] == "XRPUSDT"
 
 
+def test_signal_executor_restores_quarantine_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    call_counter = {"value": 0}
+
+    def fake_place(*_args, **_kwargs):
+        call_counter["value"] += 1
+        raise OrderValidationError("слишком сильное отклонение цены", code="price_deviation")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    base_time = 1700000000.0
+    monkeypatch.setattr(SignalExecutor, "_current_time", lambda self: base_time)
+
+    executor = SignalExecutor(bot)
+    first_attempt = executor.execute_once()
+    second_attempt = executor.execute_once()
+
+    assert first_attempt.status == "skipped"
+    assert second_attempt.status == "skipped"
+    assert executor._is_symbol_quarantined("ETHUSDT")
+
+    state = executor.export_state()
+
+    restored_executor = SignalExecutor(StubBot(summary, settings))
+    restored_executor.restore_state(state)
+
+    assert restored_executor._is_symbol_quarantined("ETHUSDT")
+
+    call_counter["value"] = 0
+    restart_result = restored_executor.execute_once()
+    assert restart_result.status == "skipped"
+    assert call_counter["value"] == 0
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

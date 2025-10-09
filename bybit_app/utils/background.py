@@ -51,6 +51,7 @@ class BackgroundServices:
         self._automation_last_cycle: float = 0.0
         self._automation_restart_count: int = 0
         self._automation_stale_after = max(float(automation_stale_after), 0.0)
+        self._executor_state: Dict[str, Any] = {}
 
         self._bot_factory: BotFactory = bot_factory or GuardianBot
         self._executor_factory: ExecutorFactory = executor_factory or (
@@ -317,6 +318,14 @@ class BackgroundServices:
         bot = self._bot_factory()
         executor = self._executor_factory(bot)
 
+        with self._automation_lock:
+            state_snapshot = copy.deepcopy(self._executor_state)
+        if state_snapshot:
+            try:
+                executor.restore_state(state_snapshot)
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+
         def handle_cycle(
             result: ExecutionResult,
             signature: Optional[str],
@@ -354,6 +363,10 @@ class BackgroundServices:
                 self._automation_error = str(exc)
         finally:
             with self._automation_lock:
+                try:
+                    self._executor_state = executor.export_state()
+                except Exception:  # pragma: no cover - defensive guard
+                    self._executor_state = {}
                 if self._automation_thread is current_thread:
                     self._automation_thread = None
                     self._automation_stop_event = None

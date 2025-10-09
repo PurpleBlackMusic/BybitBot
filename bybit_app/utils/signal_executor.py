@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import threading
 from datetime import datetime, timezone
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .envs import (
     Settings,
@@ -115,6 +115,66 @@ class SignalExecutor:
         self._settings_override = settings
         self._validation_penalties: Dict[str, Dict[str, List[float]]] = {}
         self._symbol_quarantine: Dict[str, float] = {}
+
+    def export_state(self) -> Dict[str, Any]:
+        self._purge_validation_penalties()
+        return {
+            "validation_penalties": copy.deepcopy(self._validation_penalties),
+            "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
+        }
+
+    def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
+        self._validation_penalties = {}
+        self._symbol_quarantine = {}
+        if not state:
+            return
+
+        penalties = state.get("validation_penalties") if isinstance(state, Mapping) else None
+        if isinstance(penalties, Mapping):
+            restored_penalties: Dict[str, Dict[str, List[float]]] = {}
+            for symbol, code_map in penalties.items():
+                if not isinstance(symbol, str) or not isinstance(code_map, Mapping):
+                    continue
+                restored_codes: Dict[str, List[float]] = {}
+                for code, events in code_map.items():
+                    if not isinstance(code, str):
+                        continue
+                    cleaned_events: List[float] = []
+                    if isinstance(events, Sequence) and not isinstance(events, (str, bytes)):
+                        for event in events:
+                            try:
+                                timestamp = float(event)  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                continue
+                            if math.isfinite(timestamp):
+                                cleaned_events.append(timestamp)
+                    if cleaned_events:
+                        restored_codes[code] = cleaned_events
+                if restored_codes:
+                    restored_penalties[symbol] = restored_codes
+            if restored_penalties:
+                self._validation_penalties = restored_penalties
+
+        quarantine = (
+            state.get("symbol_quarantine")
+            if isinstance(state, Mapping)
+            else None
+        )
+        if isinstance(quarantine, Mapping):
+            restored_quarantine: Dict[str, float] = {}
+            for symbol, expiry in quarantine.items():
+                if not isinstance(symbol, str):
+                    continue
+                try:
+                    timestamp = float(expiry)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(timestamp):
+                    restored_quarantine[symbol] = timestamp
+            if restored_quarantine:
+                self._symbol_quarantine = restored_quarantine
+
+        self._purge_validation_penalties()
 
     # ------------------------------------------------------------------
     # state helpers
