@@ -21,6 +21,7 @@ class DummyAPI:
         wallet_payload=None,
         orderbook_payload=None,
         creds=None,
+        exchange_asset_payload=None,
     ):
         self.instrument_payload = instrument_payload
         self.ticker_payload = ticker_payload
@@ -33,10 +34,12 @@ class DummyAPI:
                 "b": [["100.0", "2"], ["99.0", "3"]],
             }
         }
+        self.exchange_asset_payload = exchange_asset_payload
         self.place_calls: list[dict] = []
         self.info_calls = 0
         self.ticker_calls = 0
         self.wallet_calls = 0
+        self.asset_info_calls = 0
         if creds is not None:
             self.creds = creds
 
@@ -80,6 +83,12 @@ class DummyAPI:
             lookup_key = (accountType or "").upper()
             payload = payload.get(lookup_key, payload.get("default"))
         return payload
+
+    def asset_exchange_query_asset_info(self):
+        self.asset_info_calls += 1
+        if isinstance(self.exchange_asset_payload, Exception):
+            raise self.exchange_asset_payload
+        return self.exchange_asset_payload or {}
 
 
 def setup_function(_):
@@ -977,6 +986,37 @@ def test_place_spot_market_uses_spot_wallet_when_unified_empty():
     assert api.wallet_calls == 2
 
 
+def test_load_wallet_balances_returns_empty_when_exchange_fallback_empty():
+    payload = {}
+
+    class SpotUnsupportedAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise RuntimeError(
+                    "Bybit error 10001: accountType only support UNIFIED (/v5/account/wallet-balance)"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {"coin": [{"coin": "USDT", "availableBalance": "0"}]}
+                ]
+            }
+        }
+    }
+
+    api = SpotUnsupportedAPI(payload, wallet_payload=wallet_payload, exchange_asset_payload={})
+
+    balances = spot_market_module._load_wallet_balances(api, account_type="SPOT")
+
+    assert balances == {}
+    assert api.wallet_calls == 1
+    assert api.asset_info_calls >= 1
+
+
 def test_place_spot_market_ignores_spot_wallet_account_type_error():
     payload = {
         "result": {
@@ -1033,6 +1073,76 @@ def test_place_spot_market_ignores_spot_wallet_account_type_error():
     assert "accountType only support UNIFIED" not in message
     # unified balance queried successfully, spot fallback failure is ignored
     assert api.wallet_calls == 2
+    assert api.asset_info_calls >= 1
+
+
+def test_place_spot_market_uses_exchange_asset_info_when_spot_wallet_rejected():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BBSOLUSDT",
+                    "quoteCoin": "USDT",
+                    "baseCoin": "BBSOL",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.1",
+                    },
+                }
+            ]
+        }
+    }
+
+    class FallbackExchangeAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise RuntimeError(
+                    "Bybit error 10001: accountType only support UNIFIED (/v5/account/wallet-balance)"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {"coin": [{"coin": "USDT", "availableBalance": "0"}]}
+                ]
+            }
+        }
+    }
+
+    exchange_asset_payload = {
+        "result": {
+            "spot": [
+                {
+                    "details": [
+                        {"coin": "USDT", "availableToWithdraw": "150", "walletBalance": "150"}
+                    ]
+                }
+            ]
+        }
+    }
+
+    api = FallbackExchangeAPI(
+        payload,
+        wallet_payload=wallet_payload,
+        exchange_asset_payload=exchange_asset_payload,
+    )
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BBSOLUSDT",
+        side="Buy",
+        qty=10.0,
+        unit="quoteCoin",
+    )
+
+    assert response["ok"] is True
+    audit = response.get("_local", {}).get("order_audit", {})
+    assert Decimal(audit.get("order_notional")) > Decimal("0")
+    assert api.wallet_calls == 2
+    assert api.asset_info_calls >= 1
 
 
 def test_place_spot_market_ignores_account_type_error_from_non_runtime_exception():
@@ -1090,6 +1200,7 @@ def test_place_spot_market_ignores_account_type_error_from_non_runtime_exception
     assert "Недостаточно" in message
     assert "accountType only support UNIFIED" not in message
     assert api.wallet_calls == 2
+    assert api.asset_info_calls >= 1
 
 
 def test_place_spot_market_ignores_account_type_error_with_supports_phrase():
@@ -1147,6 +1258,7 @@ def test_place_spot_market_ignores_account_type_error_with_supports_phrase():
     assert "Недостаточно" in message
     assert "accountType only supports UNIFIED" not in message
     assert api.wallet_calls == 2
+    assert api.asset_info_calls >= 1
 
 
 def test_place_spot_market_ignores_account_type_error_with_http_status_code():
@@ -1274,6 +1386,7 @@ def test_place_spot_market_ignores_structured_account_type_error():
     assert "Недостаточно" in message
     assert "accountType only support UNIFIED" not in message
     assert api.wallet_calls == 2
+    assert api.asset_info_calls >= 1
 
 
 def test_place_spot_market_accepts_prefetched_resources():
