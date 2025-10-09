@@ -195,6 +195,54 @@ def test_tradable_universe_cache_scoped_by_network():
     assert meta_mainnet_cached["cache_state"] == "cached"
 
 
+def test_latest_price_cache_scoped_by_network():
+    symbol = "BTCUSDT"
+    mainnet_creds = type("Creds", (), {"testnet": False})()
+    testnet_creds = type("Creds", (), {"testnet": True})()
+
+    mainnet_ticker = {"result": {"list": [{"symbol": symbol, "markPrice": "100"}]}}
+    testnet_ticker = {"result": {"list": [{"symbol": symbol, "markPrice": "200"}]}}
+
+    mainnet_api = DummyAPI({}, ticker_payload=mainnet_ticker, creds=mainnet_creds)
+    testnet_api = DummyAPI({}, ticker_payload=testnet_ticker, creds=testnet_creds)
+
+    mainnet_snapshot = prepare_spot_trade_snapshot(
+        mainnet_api,
+        symbol,
+        include_limits=False,
+        include_balances=False,
+    )
+    assert mainnet_snapshot.price == Decimal("100")
+    assert mainnet_api.ticker_calls == 1
+
+    testnet_snapshot = prepare_spot_trade_snapshot(
+        testnet_api,
+        symbol,
+        include_limits=False,
+        include_balances=False,
+    )
+    assert testnet_snapshot.price == Decimal("200")
+    assert testnet_api.ticker_calls == 1
+
+    cached_mainnet_snapshot = prepare_spot_trade_snapshot(
+        mainnet_api,
+        symbol,
+        include_limits=False,
+        include_balances=False,
+    )
+    assert cached_mainnet_snapshot.price == Decimal("100")
+    assert mainnet_api.ticker_calls == 1
+
+    cached_testnet_snapshot = prepare_spot_trade_snapshot(
+        testnet_api,
+        symbol,
+        include_limits=False,
+        include_balances=False,
+    )
+    assert cached_testnet_snapshot.price == Decimal("200")
+    assert testnet_api.ticker_calls == 1
+
+
 def test_resolve_trade_symbol_prefers_canonical_symbol_for_alias():
     payload = _universe_payload([
         {
