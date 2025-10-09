@@ -39,6 +39,8 @@ from .ws_manager import manager as ws_manager
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
 
+_VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
+
 
 def _normalise_slippage_percent(value: float) -> float:
     """Clamp Bybit percent tolerance to the exchange supported range."""
@@ -109,6 +111,97 @@ class SignalExecutor:
     def __init__(self, bot, settings: Optional[Settings] = None) -> None:
         self.bot = bot
         self._settings_override = settings
+        self._validation_penalties: Dict[str, Dict[str, List[float]]] = {}
+        self._symbol_quarantine: Dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # state helpers
+    def _current_time(self) -> float:
+        return time.time()
+
+    def _penalty_threshold_for_code(self, code: Optional[str]) -> int:
+        if not code:
+            return 1
+        if code == "price_deviation":
+            return 2
+        return 1
+
+    def _purge_validation_penalties(self, now: Optional[float] = None) -> None:
+        timestamp = self._current_time() if now is None else now
+        cutoff = timestamp - _VALIDATION_PENALTY_TTL
+
+        for symbol, code_map in list(self._validation_penalties.items()):
+            updated: Dict[str, List[float]] = {}
+            for code, events in list(code_map.items()):
+                recent = [event for event in events if event > cutoff]
+                if recent:
+                    updated[code] = recent
+            if updated:
+                self._validation_penalties[symbol] = updated
+            else:
+                self._validation_penalties.pop(symbol, None)
+
+        for symbol, expiry in list(self._symbol_quarantine.items()):
+            if expiry <= timestamp:
+                self._symbol_quarantine.pop(symbol, None)
+
+    def _quarantine_symbol(self, symbol: str, now: Optional[float] = None) -> None:
+        if not symbol:
+            return
+        timestamp = self._current_time() if now is None else now
+        expiry = timestamp + _VALIDATION_PENALTY_TTL
+        previous = self._symbol_quarantine.get(symbol)
+        if previous is not None and previous >= expiry:
+            return
+        self._symbol_quarantine[symbol] = expiry
+        log("guardian.auto.symbol.quarantine", symbol=symbol, until=expiry)
+
+    def _record_validation_penalty(self, symbol: str, code: Optional[str]) -> None:
+        if not symbol or not code:
+            return
+        now = self._current_time()
+        self._purge_validation_penalties(now)
+        penalties = self._validation_penalties.setdefault(symbol, {})
+        events = penalties.setdefault(code, [])
+        cutoff = now - _VALIDATION_PENALTY_TTL
+        if events:
+            events[:] = [event for event in events if event > cutoff]
+        events.append(now)
+        threshold = self._penalty_threshold_for_code(code)
+        if len(events) >= threshold:
+            self._quarantine_symbol(symbol, now=now)
+
+    def _is_symbol_quarantined(self, symbol: str, now: Optional[float] = None) -> bool:
+        if not symbol:
+            return False
+        timestamp = self._current_time() if now is None else now
+        expiry = self._symbol_quarantine.get(symbol)
+        if expiry is None:
+            return False
+        if expiry <= timestamp:
+            self._symbol_quarantine.pop(symbol, None)
+            return False
+        return True
+
+    def _clear_symbol_penalties(self, symbol: str) -> None:
+        if not symbol:
+            return
+        self._validation_penalties.pop(symbol, None)
+        self._symbol_quarantine.pop(symbol, None)
+
+    def _filter_quarantined_candidates(
+        self, candidates: List[Tuple[str, Optional[Dict[str, object]]]]
+    ) -> List[Tuple[str, Optional[Dict[str, object]]]]:
+        if not candidates:
+            return []
+        now = self._current_time()
+        self._purge_validation_penalties(now)
+        filtered: List[Tuple[str, Optional[Dict[str, object]]]] = []
+        for symbol, meta in candidates:
+            if self._is_symbol_quarantined(symbol, now=now):
+                continue
+            filtered.append((symbol, meta))
+        return filtered
 
     def _decision(
         self,
@@ -142,6 +235,8 @@ class SignalExecutor:
                 "skipped",
                 reason="Signal is not actionable according to current thresholds.",
             )
+
+        self._purge_validation_penalties()
 
         settings = self._resolve_settings()
         self._ensure_ws_activity(settings)
@@ -303,6 +398,7 @@ class SignalExecutor:
                 settings=settings,
             )
         except OrderValidationError as exc:
+            self._record_validation_penalty(symbol, exc.code)
             validation_context = dict(order_context)
             validation_context["validation_code"] = exc.code
             if exc.details:
@@ -386,6 +482,7 @@ class SignalExecutor:
             audit=audit,
             ledger_rows=ledger_rows,
         )
+        self._clear_symbol_penalties(symbol)
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
 
     # ------------------------------------------------------------------
@@ -1817,7 +1914,7 @@ class SignalExecutor:
 
         _append(summary.get("symbol"), {"source": "summary.symbol"})
 
-        return ordered
+        return self._filter_quarantined_candidates(ordered)
 
     @staticmethod
     def _merge_symbol_meta(
