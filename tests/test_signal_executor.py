@@ -949,13 +949,14 @@ def test_signal_executor_open_sell_reserved_prefers_latest(monkeypatch: pytest.M
         },
     ]
 
-    def fake_rows(self, topic_keyword: str):
+    def fake_rows(topic_keyword: str, *, snapshot=None):
         assert topic_keyword == "order"
+        assert snapshot is None
         return rows
 
     monkeypatch.setattr(
-        signal_executor_module.SignalExecutor,
-        "_realtime_private_rows",
+        signal_executor_module.ws_manager,
+        "realtime_private_rows",
         fake_rows,
     )
 
