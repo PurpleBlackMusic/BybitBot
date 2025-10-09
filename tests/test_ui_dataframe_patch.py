@@ -69,3 +69,33 @@ def test_dataframe_patch_falls_back_to_default_call(monkeypatch: pytest.MonkeyPa
 
     assert result == "default"
     assert dummy.calls == ["stretch", "auto", 0, None]
+
+
+def test_dataframe_patch_converts_arrow_tables(monkeypatch: pytest.MonkeyPatch):
+    class FakeTable:
+        def __init__(self):
+            self.converted = False
+
+        def to_pandas(self):
+            self.converted = True
+            return "converted"
+
+    fake_table = FakeTable()
+
+    monkeypatch.setattr(
+        ui,
+        "pyarrow",
+        types.SimpleNamespace(Table=FakeTable, RecordBatch=None),
+    )
+
+    def original(self, value, **kwargs):
+        self.calls.append(value)
+        return value
+
+    dummy = _patch_with(monkeypatch, original)
+
+    result = ui.st.dataframe(fake_table)
+
+    assert result == "converted"
+    assert dummy.calls == ["converted"]
+    assert fake_table.converted is True

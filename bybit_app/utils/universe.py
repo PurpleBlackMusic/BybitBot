@@ -13,8 +13,15 @@ from .paths import DATA_DIR
 
 UNIVERSE_FILE = DATA_DIR / "config" / "universe.json"
 
-DEFAULT_MIN_TURNOVER = 2_000_000.0
-DEFAULT_MAX_SPREAD_BPS = 25.0
+MAINNET_DEFAULT_MIN_TURNOVER = 1_000_000.0
+MAINNET_TURNOVER_FLOOR = 500_000.0
+MAINNET_DEFAULT_MAX_SPREAD_BPS = 45.0
+MAINNET_MAX_SPREAD_CAP = 90.0
+
+TESTNET_DEFAULT_MIN_TURNOVER = 250_000.0
+TESTNET_TURNOVER_FLOOR = 50_000.0
+TESTNET_DEFAULT_MAX_SPREAD_BPS = 80.0
+TESTNET_MAX_SPREAD_CAP = 150.0
 
 DEBUG_WHITELIST = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
@@ -84,14 +91,29 @@ def _resolve_liquidity_filters(
     max_spread_bps: float | None,
 ):
     settings = get_settings()
+    is_testnet = bool(getattr(settings, "testnet", True))
+
+    if is_testnet:
+        default_turnover = TESTNET_DEFAULT_MIN_TURNOVER
+        turnover_floor = TESTNET_TURNOVER_FLOOR
+        default_spread = TESTNET_DEFAULT_MAX_SPREAD_BPS
+        spread_cap = TESTNET_MAX_SPREAD_CAP
+    else:
+        default_turnover = MAINNET_DEFAULT_MIN_TURNOVER
+        turnover_floor = MAINNET_TURNOVER_FLOOR
+        default_spread = MAINNET_DEFAULT_MAX_SPREAD_BPS
+        spread_cap = MAINNET_MAX_SPREAD_CAP
 
     if min_turnover is None:
-        min_turnover = getattr(settings, "ai_min_turnover_usd", DEFAULT_MIN_TURNOVER)
+        min_turnover = getattr(settings, "ai_min_turnover_usd", default_turnover)
     if max_spread_bps is None:
-        max_spread_bps = getattr(settings, "ai_max_spread_bps", DEFAULT_MAX_SPREAD_BPS)
+        max_spread_bps = getattr(settings, "ai_max_spread_bps", default_spread)
 
-    min_turnover = max(float(min_turnover or 0.0), DEFAULT_MIN_TURNOVER)
-    max_spread_bps = min(float(max_spread_bps or DEFAULT_MAX_SPREAD_BPS), DEFAULT_MAX_SPREAD_BPS)
+    min_turnover = max(float(min_turnover or 0.0), turnover_floor)
+    spread_value = float(max_spread_bps or 0.0)
+    if spread_value <= 0:
+        spread_value = default_spread
+    max_spread_bps = min(max(spread_value, 5.0), spread_cap)
     return min_turnover, max_spread_bps
 
 

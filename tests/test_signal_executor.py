@@ -14,6 +14,15 @@ from bybit_app.utils.signal_executor import (
 from bybit_app.utils.spot_market import OrderValidationError
 
 
+@pytest.fixture(autouse=True)
+def _stub_ws_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "autostart",
+        lambda include_private=True: (False, False),
+    )
+
+
 class StubBot:
     def __init__(
         self,
@@ -662,6 +671,61 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     assert captured is not None
     assert captured["tol_type"] == "Percent"
     assert captured["tol_value"] == pytest.approx(5.0)
+
+
+def test_signal_executor_prefers_trade_candidate_over_holdings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "trade_candidates": [
+            {"symbol": "ADAUSDT", "actionable": True, "holding": True, "priority": 1},
+            {
+                "symbol": "SOLUSDT",
+                "actionable": True,
+                "holding": False,
+                "priority": 2,
+                "edge_score": 4.2,
+            },
+        ],
+        "candidate_symbols": ["ADAUSDT", "SOLUSDT"],
+    }
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=400.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    autostart_calls: dict[str, object] = {}
+
+    def record_autostart(include_private: bool = True):
+        autostart_calls["include_private"] = include_private
+        return True, True
+
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "autostart",
+        record_autostart,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["symbol"] == "SOLUSDT"
+    meta = result.order.get("symbol_meta")
+    assert meta is not None
+    candidate_meta = meta.get("candidate") if isinstance(meta, dict) else None
+    assert isinstance(candidate_meta, dict)
+    assert candidate_meta.get("source") == "trade_candidates"
+    assert autostart_calls.get("include_private") is True
 
 
 def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch) -> None:

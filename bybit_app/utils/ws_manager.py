@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import ssl
@@ -12,7 +13,7 @@ import websocket  # websocket-client
 
 from copy import deepcopy
 
-from .envs import get_settings, get_api_client
+from .envs import get_settings, get_api_client, creds_ok
 from .helpers import ensure_link_id
 from .paths import DATA_DIR
 from .store import JLStore
@@ -21,6 +22,24 @@ from .ws_private_v5 import WSPrivateV5
 from .realtime_cache import get_realtime_cache
 from .spot_pnl import spot_inventory_and_pnl
 from .spot_market import _instrument_limits
+
+
+_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
+_TP_LADDER_SKIP_CODES = {"170194", "170131"}
+
+
+def _extract_error_code(exc: Exception) -> Optional[str]:
+    match = _BYBIT_ERROR.search(str(exc))
+    if match:
+        return match.group("code")
+    return None
+
+
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 class WSManager:
@@ -265,6 +284,94 @@ class WSManager:
     def stop_all(self):
         self.stop_public()
         self.stop_private()
+
+    def autostart(
+        self,
+        include_private: bool = True,
+        *,
+        subs: Iterable[str] | None = None,
+    ) -> tuple[bool, bool]:
+        self._refresh_settings()
+        settings = self.s
+        if not getattr(settings, "ws_autostart", False):
+            return False, False
+
+        status_snapshot: Optional[dict[str, object]]
+        try:
+            status_snapshot = self.status()
+        except Exception:  # pragma: no cover - defensive
+            status_snapshot = None
+
+        threshold = _safe_float(getattr(settings, "ws_watchdog_max_age_sec", None))
+        if threshold is None or threshold <= 0:
+            threshold = None
+
+        def _age(info: object) -> Optional[float]:
+            if isinstance(info, dict):
+                return _safe_float(info.get("age_seconds"))
+            return None
+
+        if threshold is not None and status_snapshot:
+            public_info = status_snapshot.get("public")  # type: ignore[assignment]
+            private_info = status_snapshot.get("private")  # type: ignore[assignment]
+            public_age = _age(public_info)
+            private_age = _age(private_info)
+            if public_age is not None and public_age > threshold:
+                log(
+                    "ws.autostart.public.restart",
+                    age=round(public_age, 2),
+                    threshold=threshold,
+                )
+                self.stop_public()
+                status_snapshot = None
+            if include_private and private_age is not None and private_age > threshold:
+                log(
+                    "ws.autostart.private.restart",
+                    age=round(private_age, 2),
+                    threshold=threshold,
+                )
+                self.stop_private()
+                status_snapshot = None
+
+        if status_snapshot is None:
+            try:
+                status_snapshot = self.status()
+            except Exception:  # pragma: no cover - defensive
+                status_snapshot = None
+
+        def _running(info: object) -> bool:
+            if isinstance(info, dict):
+                return bool(info.get("running"))
+            return False
+
+        public_info = status_snapshot.get("public") if isinstance(status_snapshot, dict) else None
+        private_info = status_snapshot.get("private") if isinstance(status_snapshot, dict) else None
+        public_running = _running(public_info)
+        private_running = _running(private_info)
+
+        started_public = False
+        if not public_running:
+            subscriptions = tuple(subs) if subs is not None else self._pub_subs or ("tickers.BTCUSDT",)
+            try:
+                self.start_public(subs=subscriptions)
+            except Exception as exc:  # pragma: no cover - defensive network guard
+                log(
+                    "ws.autostart.public.error",
+                    err=str(exc),
+                    subs=list(subscriptions),
+                )
+            else:
+                started_public = True
+
+        started_private = False
+        if include_private and creds_ok(settings):
+            if not private_running:
+                try:
+                    started_private = bool(self.start_private())
+                except Exception as exc:  # pragma: no cover - defensive network guard
+                    log("ws.autostart.private.error", err=str(exc))
+
+        return started_public, started_private
 
     def status(self):
         last_beat = self.last_beat if self.last_beat else None
@@ -750,6 +857,17 @@ class WSManager:
             try:
                 api.place_order(**payload)
             except Exception as exc:
+                error_code = _extract_error_code(exc)
+                if error_code in _TP_LADDER_SKIP_CODES:
+                    log(
+                        "ws.private.tp_ladder.skip",
+                        symbol=symbol,
+                        rung=rung_index,
+                        qty=qty_text,
+                        price=price_text,
+                        code=error_code,
+                    )
+                    continue
                 log(
                     "ws.private.tp_ladder.place.error",
                     err=str(exc),
