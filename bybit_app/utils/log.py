@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+import traceback
+from types import TracebackType
 from typing import Any, Iterable, Iterator
 
 from .file_io import atomic_write_text, tail_lines
@@ -18,6 +20,16 @@ MAX_LOG_BYTES = 5_000_000
 RETAIN_LOG_LINES = 5_000
 
 _LOCK = threading.RLock()
+
+_SEVERITY_KEYWORDS = {
+    "critical": "critical",
+    "fatal": "critical",
+    "error": "error",
+    "fail": "error",
+    "exception": "error",
+    "warn": "warning",
+    "warning": "warning",
+}
 
 
 def _normalise_limit(value: int | str | None, fallback: int) -> int:
@@ -99,10 +111,68 @@ def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None)
         _prune_log_file(max_bytes=maximum, retain_lines=keep)
 
 
-def log(event: str, **payload: Any) -> None:
+def _derive_severity(event: str, explicit: str | None) -> str:
+    if explicit:
+        return explicit.lower()
+
+    tokens = [part.lower() for part in event.replace("-", ".").split(".") if part]
+    for token in tokens:
+        mapped = _SEVERITY_KEYWORDS.get(token)
+        if mapped:
+            return mapped
+    # Allow partial matches for phrases like "order_error" that do not split nicely.
+    lowered = event.lower()
+    for keyword, mapped in _SEVERITY_KEYWORDS.items():
+        if keyword in lowered:
+            return mapped
+    return "info"
+
+
+def _normalise_exception(
+    exc: BaseException | tuple[type[BaseException], BaseException, TracebackType] | None,
+) -> dict[str, Any] | None:
+    if exc is None:
+        return None
+
+    if isinstance(exc, tuple):
+        exc_type, exc_value, tb = exc
+    else:
+        exc_type = type(exc)
+        exc_value = exc
+        tb = exc.__traceback__
+
+    if exc_type is None or exc_value is None:
+        return None
+
+    formatted_tb = "".join(traceback.format_exception(exc_type, exc_value, tb))
+    return {
+        "type": f"{exc_type.__module__}.{exc_type.__name__}",
+        "message": str(exc_value),
+        "traceback": formatted_tb,
+    }
+
+
+def log(
+    event: str,
+    *,
+    severity: str | None = None,
+    exc: BaseException | tuple[type[BaseException], BaseException, TracebackType] | None = None,
+    **payload: Any,
+) -> None:
     """Append a JSON record with ``event`` and ``payload`` to the log file."""
 
-    record = {"ts": int(time.time() * 1000), "event": event, "payload": payload}
+    record: dict[str, Any] = {
+        "ts": int(time.time() * 1000),
+        "event": event,
+        "severity": _derive_severity(event, severity),
+        "thread": threading.current_thread().name,
+        "payload": payload,
+    }
+
+    exception_payload = _normalise_exception(exc)
+    if exception_payload is not None:
+        record["exception"] = exception_payload
+
     text = json.dumps(record, ensure_ascii=False)
 
     with _LOCK:
