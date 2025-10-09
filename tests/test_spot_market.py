@@ -330,6 +330,82 @@ def test_wallet_available_balances_pick_positive_amount_if_present():
     assert balances["USDT"] == Decimal("10")
 
 
+def test_wallet_available_balances_cache_scoped_by_network():
+    def wallet_payload(amount: str) -> dict:
+        return {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableBalance": amount,
+                                "availableToWithdraw": amount,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+    def exchange_payload(amount: str) -> dict:
+        return {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableBalance": amount,
+                                "availableToWithdraw": amount,
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+    testnet_creds = type("Creds", (), {"testnet": True})()
+    mainnet_creds = type("Creds", (), {"testnet": False})()
+
+    testnet_api = DummyAPI(
+        {},
+        wallet_payload={"UNIFIED": wallet_payload("0"), "SPOT": {}},
+        creds=testnet_creds,
+        exchange_asset_payload=exchange_payload("50"),
+    )
+    mainnet_api = DummyAPI(
+        {},
+        wallet_payload={"UNIFIED": wallet_payload("0"), "SPOT": {}},
+        creds=mainnet_creds,
+        exchange_asset_payload=exchange_payload("75"),
+    )
+
+    testnet_balances = spot_market_module._wallet_available_balances(
+        testnet_api, account_type="UNIFIED"
+    )
+    assert testnet_balances["USDT"] == Decimal("50")
+
+    mainnet_balances = spot_market_module._wallet_available_balances(
+        mainnet_api, account_type="UNIFIED"
+    )
+    assert mainnet_balances["USDT"] == Decimal("75")
+
+    # alternating requests should continue to serve the network-scoped snapshot
+    testnet_api.exchange_asset_payload = exchange_payload("60")
+    mainnet_api.exchange_asset_payload = exchange_payload("90")
+
+    cached_testnet = spot_market_module._wallet_available_balances(
+        testnet_api, account_type="UNIFIED"
+    )
+    cached_mainnet = spot_market_module._wallet_available_balances(
+        mainnet_api, account_type="UNIFIED"
+    )
+
+    assert cached_testnet["USDT"] == Decimal("50")
+    assert cached_mainnet["USDT"] == Decimal("75")
+
+
 def test_place_spot_market_respects_available_balance():
     payload = {
         "result": {
