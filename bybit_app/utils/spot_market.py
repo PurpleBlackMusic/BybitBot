@@ -933,6 +933,94 @@ def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
     return best_non_positive
 
 
+def _iter_wallet_rows(payload: object, *, _seen: Optional[set[int]] = None) -> List[Mapping[str, object]]:
+    if _seen is None:
+        _seen = set()
+
+    rows: List[Mapping[str, object]] = []
+
+    if isinstance(payload, Mapping):
+        payload_id = id(payload)
+        if payload_id in _seen:
+            return rows
+        _seen.add(payload_id)
+
+        symbol_value: Optional[object] = None
+        for field in _WALLET_SYMBOL_FIELDS:
+            symbol_value = payload.get(field)
+            if isinstance(symbol_value, str) and symbol_value.strip():
+                rows.append(payload)  # payload already contains symbol + balances
+                break
+
+        containers: List[object] = []
+        for key in ("coin", "coins", "details", "assets", "list"):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple)):
+                containers.extend(value)
+
+        for value in payload.values():
+            if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes, bytearray)):
+                containers.append(value)
+
+        for item in containers:
+            rows.extend(_iter_wallet_rows(item, _seen=_seen))
+        return rows
+
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            rows.extend(_iter_wallet_rows(item, _seen=_seen))
+
+    return rows
+
+
+def _parse_wallet_balances(payload: object) -> Dict[str, Decimal]:
+    balances: Dict[str, Decimal] = {}
+
+    for row in _iter_wallet_rows(payload):
+        symbol = None
+        for field in _WALLET_SYMBOL_FIELDS:
+            raw_symbol = row.get(field)
+            if isinstance(raw_symbol, str) and raw_symbol.strip():
+                symbol = raw_symbol.strip().upper()
+                break
+        if not symbol:
+            continue
+
+        available = _extract_available_amount(row)
+        if available is None:
+            continue
+
+        balances[symbol] = balances.get(symbol, Decimal("0")) + available
+
+    return balances
+
+
+def _load_spot_exchange_balances(api: BybitAPI) -> Dict[str, Decimal]:
+    loader = getattr(api, "asset_exchange_query_asset_info", None)
+    try:
+        if callable(loader):
+            payload = loader()
+        else:
+            requester = getattr(api, "_safe_req", None)
+            if not callable(requester):  # pragma: no cover - defensive
+                return {}
+            payload = requester(
+                "GET",
+                "/v5/asset/exchange/query-asset-info",
+                params=None,
+                body=None,
+                signed=True,
+            )
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        log(
+            "wallet_balance_spot_exchange_fallback_error",
+            error=str(exc),
+        )
+        return {}
+
+    return _parse_wallet_balances(payload)
+
+
 def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal]:
     try:
         payload = api.wallet_balance(accountType=account_type)
@@ -949,38 +1037,17 @@ def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal
                     account_type=account_type,
                     error=message,
                 )
-                return {}
+                fallback_balances = _load_spot_exchange_balances(api)
+                if fallback_balances:
+                    log(
+                        "wallet_balance_spot_exchange_fallback_used",
+                        account_type=account_type,
+                        coins=len(fallback_balances),
+                    )
+                return fallback_balances
         raise RuntimeError(f"Не удалось получить баланс кошелька: {exc}") from exc
 
-    balances: Dict[str, Decimal] = {}
-    if isinstance(payload, dict):
-        result = payload.get("result")
-        if isinstance(result, dict):
-            accounts = result.get("list")
-            if isinstance(accounts, (list, tuple)):
-                for account in accounts:
-                    if not isinstance(account, dict):
-                        continue
-                    coins = account.get("coin") or account.get("coins")
-                    if not isinstance(coins, (list, tuple)):
-                        continue
-                    for row in coins:
-                        if not isinstance(row, dict):
-                            continue
-                        symbol = None
-                        for field in _WALLET_SYMBOL_FIELDS:
-                            raw_symbol = row.get(field)
-                            if isinstance(raw_symbol, str) and raw_symbol.strip():
-                                symbol = raw_symbol.strip().upper()
-                                break
-                        if not symbol:
-                            continue
-                        available = _extract_available_amount(row)
-                        if available is None:
-                            continue
-                        balances[symbol] = balances.get(symbol, Decimal("0")) + available
-
-    return balances
+    return _parse_wallet_balances(payload)
 
 
 def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
@@ -1007,7 +1074,14 @@ def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> 
         spot_cached = _BALANCE_CACHE.get(spot_key)
         if spot_cached is None:
             spot_cached = _load_wallet_balances(api, account_type=spot_key)
+            if not spot_cached:
+                spot_cached = _load_spot_exchange_balances(api)
             _BALANCE_CACHE.set(spot_key, dict(spot_cached))
+        elif not spot_cached:
+            exchange_balances = _load_spot_exchange_balances(api)
+            if exchange_balances:
+                spot_cached = exchange_balances
+                _BALANCE_CACHE.set(spot_key, dict(exchange_balances))
         for asset, amount in (spot_cached or {}).items():
             combined[asset] = combined.get(asset, Decimal("0")) + amount
 
