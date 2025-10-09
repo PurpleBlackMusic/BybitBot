@@ -2,6 +2,8 @@ import copy
 from decimal import Decimal
 from typing import Optional
 
+import time
+
 import pytest
 
 import bybit_app.utils.signal_executor as signal_executor_module
@@ -39,6 +41,9 @@ class StubBot:
 
     def status_fingerprint(self) -> str | None:
         return self._fingerprint
+
+    def portfolio_overview(self) -> dict:
+        return {}
 
 
 class StubAPI:
@@ -403,6 +408,98 @@ def test_signal_executor_sell_uses_balance_fallback(
     assert pytest.approx(fallback.get("available_base"), rel=1e-9) == 0.001
     assert pytest.approx(fallback.get("quote_notional"), rel=1e-9) == 25.0
     assert pytest.approx(fallback.get("min_order_amt"), rel=1e-9) == 5.0
+
+
+def test_signal_executor_guard_forces_sell_on_time_and_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = time.time()
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "25000",
+            "execQty": "0.01",
+            "execFee": "0.0",
+            "execTime": now - 7200,
+        }
+    ]
+
+    def fake_read_ledger(
+        n: int = 5000, *, settings: object | None = None, network: object | None = None
+    ) -> list[dict[str, object]]:
+        return list(events)
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+
+    sent_messages: list[str] = []
+
+    def fake_send(text: str):
+        sent_messages.append(text)
+        return {"ok": True}
+
+    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "get_api_client",
+        lambda: StubAPI(total=1000.0, available=800.0),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    summary = {
+        "actionable": False,
+        "mode": "wait",
+        "symbol": "BTCUSDT",
+        "prices": {"BTCUSDT": 24000.0},
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=True,
+        ai_max_hold_minutes=30.0,
+        ai_min_exit_bps=-50.0,
+        ai_risk_per_trade_pct=0.0,
+        spot_cash_reserve_pct=0.0,
+    )
+
+    class ForceExitBot(StubBot):
+        def portfolio_overview(self) -> dict:
+            return {
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "qty": 0.01,
+                        "avg_cost": 25000.0,
+                        "realized_pnl": 0.0,
+                    }
+                ]
+            }
+
+    bot = ForceExitBot(summary, settings)
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["side"] == "Sell"
+    assert result.order["symbol"] == "BTCUSDT"
+    assert pytest.approx(result.order["notional_quote"], rel=1e-3) == 240.0
+
+    assert result.context is not None
+    forced = result.context.get("forced_exit")
+    assert isinstance(forced, dict)
+    assert forced.get("symbol") == "BTCUSDT"
+    assert forced.get("pnl_bps") is not None and forced["pnl_bps"] < 0
+    assert forced.get("hold_minutes") is not None and forced["hold_minutes"] >= 30.0
+    assert any(trigger.get("type") == "pnl" for trigger in forced.get("triggers", []))
+    assert any(trigger.get("type") == "hold_time" for trigger in forced.get("triggers", []))
+
+    assert sent_messages and "BTCUSDT" in sent_messages[0]
 
 
 def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:

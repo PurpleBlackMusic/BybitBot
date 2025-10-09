@@ -6,9 +6,11 @@ import copy
 import math
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import threading
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .envs import (
@@ -228,17 +230,586 @@ class SignalExecutor:
 
     # ------------------------------------------------------------------
     # public API
+    @staticmethod
+    def _coerce_timestamp(value: object) -> Optional[float]:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float)):
+            ts = float(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                ts = float(text)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(text)
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+        elif isinstance(value, datetime):
+            parsed = value
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        else:
+            return None
+
+        if ts > 1e18:
+            ts /= 1e9
+        elif ts > 1e12:
+            ts /= 1e3
+        return ts
+
+    def _build_position_layers(
+        self, events: Iterable[Mapping[str, object]]
+    ) -> Dict[str, Dict[str, object]]:
+        states: Dict[str, Dict[str, object]] = {}
+        processed: List[Tuple[float, int, Mapping[str, object], Optional[float]]] = []
+
+        for idx, raw_event in enumerate(events or []):
+            if not isinstance(raw_event, Mapping):
+                continue
+
+            category = str(raw_event.get("category") or "spot").lower()
+            if category != "spot":
+                continue
+
+            price = _safe_float(raw_event.get("execPrice"))
+            qty = _safe_float(raw_event.get("execQty"))
+            fee = _safe_float(raw_event.get("execFee")) or 0.0
+            side = str(raw_event.get("side") or "").lower()
+            symbol_value = raw_event.get("symbol") or raw_event.get("ticker")
+            symbol = str(symbol_value or "").strip().upper()
+
+            if not symbol or price is None or qty is None or qty <= 0 or price <= 0:
+                continue
+
+            timestamp = None
+            for key in ("execTime", "execTimeNs", "transactTime", "ts", "created_at"):
+                timestamp = self._coerce_timestamp(raw_event.get(key))
+                if timestamp is not None:
+                    break
+
+            sort_key = timestamp if timestamp is not None else float(idx)
+            processed.append((sort_key, idx, raw_event, timestamp))
+
+        processed.sort(key=lambda item: (item[0], item[1]))
+
+        for _, _, event, actual_ts in processed:
+            price = _safe_float(event.get("execPrice")) or 0.0
+            qty = _safe_float(event.get("execQty")) or 0.0
+            fee = _safe_float(event.get("execFee")) or 0.0
+            side = str(event.get("side") or "").lower()
+            symbol_value = event.get("symbol") or event.get("ticker")
+            symbol = str(symbol_value or "").strip().upper()
+
+            if not symbol or price <= 0 or qty <= 0:
+                continue
+
+            state = states.setdefault(
+                symbol, {"layers": deque(), "position_qty": 0.0}
+            )
+            layers = state["layers"]
+            if not isinstance(layers, deque):
+                state["layers"] = layers = deque()
+
+            if side == "buy":
+                effective_cost = (price * qty + fee) / qty
+                layers.append(
+                    {"qty": float(qty), "price": float(effective_cost), "ts": actual_ts}
+                )
+                state["position_qty"] = float(state.get("position_qty", 0.0) + qty)
+                continue
+
+            if side != "sell":
+                continue
+
+            remain = float(qty)
+            while remain > 1e-12 and layers:
+                layer = layers[0]
+                layer_qty = float(layer.get("qty") or 0.0)
+                take = min(layer_qty, remain)
+                layer_qty -= take
+                remain -= take
+                state["position_qty"] = float(
+                    max(0.0, state.get("position_qty", 0.0) - take)
+                )
+                if layer_qty <= 1e-12:
+                    layers.popleft()
+                else:
+                    layer["qty"] = layer_qty
+
+        final_states: Dict[str, Dict[str, object]] = {}
+        for symbol, state in states.items():
+            layers = state.get("layers")
+            if isinstance(layers, deque):
+                final_layers = [dict(layer) for layer in layers]
+            else:
+                final_layers = []
+            final_states[symbol] = {
+                "position_qty": float(state.get("position_qty", 0.0)),
+                "layers": final_layers,
+            }
+
+        return final_states
+
+    @staticmethod
+    def _lookup_price_in_mapping(value: object, symbol: str) -> Optional[float]:
+        if value is None:
+            return None
+
+        upper_symbol = symbol.upper()
+        lower_symbol = upper_symbol.lower()
+        base_symbol = upper_symbol[:-4] if upper_symbol.endswith("USDT") else upper_symbol
+        candidates = [upper_symbol, lower_symbol, base_symbol, base_symbol.lower()]
+
+        if isinstance(value, Mapping):
+            for key in candidates:
+                if not key:
+                    continue
+                price = _safe_float(value.get(key))
+                if price is not None:
+                    return price
+
+        if isinstance(value, Sequence) and not isinstance(
+            value, (str, bytes, bytearray, memoryview)
+        ):
+            for item in value:
+                if not isinstance(item, Mapping):
+                    continue
+                item_symbol = str(item.get("symbol") or item.get("ticker") or "").strip().upper()
+                if item_symbol != upper_symbol:
+                    continue
+                for field in (
+                    "price",
+                    "last_price",
+                    "lastPrice",
+                    "mark_price",
+                    "markPrice",
+                    "close",
+                    "close_price",
+                    "closePrice",
+                ):
+                    price = _safe_float(item.get(field))
+                    if price is not None:
+                        return price
+        return None
+
+    def _extract_market_price(
+        self, summary: Mapping[str, object], symbol: str
+    ) -> Optional[float]:
+        if not isinstance(summary, Mapping):
+            return None
+
+        upper_symbol = symbol.upper()
+        summary_symbol = summary.get("symbol")
+        if isinstance(summary_symbol, str) and summary_symbol.strip().upper() == upper_symbol:
+            for field in ("price", "last_price", "lastPrice", "mark_price", "markPrice"):
+                direct_value = summary.get(field)
+                if isinstance(direct_value, Mapping):
+                    price = self._lookup_price_in_mapping(direct_value, upper_symbol)
+                else:
+                    price = _safe_float(direct_value)
+                if price is not None:
+                    return price
+
+        for key in (
+            "prices",
+            "price_map",
+            "priceMap",
+            "mark_prices",
+            "markPrices",
+            "last_prices",
+            "lastPrices",
+        ):
+            price = self._lookup_price_in_mapping(summary.get(key), upper_symbol)
+            if price is not None:
+                return price
+
+        plan = summary.get("symbol_plan")
+        if isinstance(plan, Mapping):
+            for field in ("positions", "priority_table", "priorityTable", "combined"):
+                price = self._lookup_price_in_mapping(plan.get(field), upper_symbol)
+                if price is not None:
+                    return price
+
+        price = self._lookup_price_in_mapping(summary.get("trade_candidates"), upper_symbol)
+        if price is not None:
+            return price
+
+        price = self._lookup_price_in_mapping(summary.get("watchlist"), upper_symbol)
+        if price is not None:
+            return price
+
+        return None
+
+    def _collect_open_positions(
+        self, settings: Settings, summary: Mapping[str, object]
+    ) -> Dict[str, Dict[str, object]]:
+        try:
+            events = read_ledger(5000, settings=settings)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("guardian.auto.force_exit.ledger.error", err=str(exc))
+            events = []
+
+        inventory = spot_inventory_and_pnl(events=events, settings=settings)
+        states = self._build_position_layers(events)
+
+        portfolio_map: Dict[str, Mapping[str, object]] = {}
+        portfolio_fn = getattr(self.bot, "portfolio_overview", None)
+        if callable(portfolio_fn):
+            try:
+                overview = portfolio_fn()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("guardian.auto.force_exit.portfolio.error", err=str(exc))
+            else:
+                if isinstance(overview, Mapping):
+                    raw_positions = overview.get("positions")
+                    if isinstance(raw_positions, Sequence):
+                        for entry in raw_positions:
+                            if not isinstance(entry, Mapping):
+                                continue
+                            entry_symbol = str(entry.get("symbol") or "").strip().upper()
+                            if not entry_symbol:
+                                continue
+                            portfolio_map[entry_symbol] = entry
+
+        now = self._current_time()
+        positions: Dict[str, Dict[str, object]] = {}
+
+        for raw_symbol, rec in inventory.items():
+            symbol = str(raw_symbol or "").strip().upper()
+            if not symbol:
+                continue
+
+            qty = _safe_float(rec.get("position_qty"))
+            avg_cost = _safe_float(rec.get("avg_cost"))
+            realized = _safe_float(rec.get("realized_pnl")) or 0.0
+            if qty is None or qty <= 0 or avg_cost is None:
+                continue
+
+            state = states.get(symbol)
+            entry_ts: Optional[float] = None
+            if isinstance(state, Mapping):
+                layers = state.get("layers")
+                if isinstance(layers, list):
+                    for layer in layers:
+                        if not isinstance(layer, Mapping):
+                            continue
+                        ts_value = layer.get("ts")
+                        ts_float = (
+                            ts_value
+                            if isinstance(ts_value, (int, float))
+                            else self._coerce_timestamp(ts_value)
+                        )
+                        if ts_float is None:
+                            continue
+                        entry_ts = ts_float if entry_ts is None else min(entry_ts, ts_float)
+
+            hold_seconds = None
+            if entry_ts is not None:
+                hold_seconds = max(0.0, now - entry_ts)
+
+            price = self._extract_market_price(summary, symbol)
+            if price is None:
+                portfolio_entry = portfolio_map.get(symbol)
+                if isinstance(portfolio_entry, Mapping):
+                    price = self._lookup_price_in_mapping(portfolio_entry, symbol)
+                    if price is None:
+                        for key in ("price", "last_price", "mark_price", "close_price"):
+                            price = _safe_float(portfolio_entry.get(key))
+                            if price is not None:
+                                break
+
+            pnl_value = None
+            pnl_bps = None
+            if price is not None and avg_cost > 0:
+                pnl_value = (price - avg_cost) * qty
+                pnl_bps = ((price - avg_cost) / avg_cost) * 10000.0
+
+            quote_notional = None
+            if price is not None:
+                quote_notional = price * qty
+            elif avg_cost > 0:
+                quote_notional = avg_cost * qty
+
+            positions[symbol] = {
+                "qty": float(qty),
+                "avg_cost": float(avg_cost),
+                "realized_pnl": float(realized),
+                "hold_seconds": float(hold_seconds) if hold_seconds is not None else None,
+                "entry_timestamp": entry_ts,
+                "price": float(price) if price is not None else None,
+                "pnl_value": float(pnl_value) if pnl_value is not None else None,
+                "pnl_bps": float(pnl_bps) if pnl_bps is not None else None,
+                "quote_notional": float(quote_notional)
+                if quote_notional is not None
+                else None,
+            }
+
+            portfolio_entry = portfolio_map.get(symbol)
+            if portfolio_entry is not None:
+                positions[symbol]["portfolio"] = copy.deepcopy(portfolio_entry)
+
+        return positions
+
+    def _maybe_force_exit(
+        self, summary: Mapping[str, object], settings: Settings
+    ) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
+        if not isinstance(summary, Mapping):
+            return None, None
+
+        mode = str(summary.get("mode") or "").lower()
+        if mode == "sell":
+            return None, None
+
+        try:
+            hold_limit_minutes = float(getattr(settings, "ai_max_hold_minutes", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            hold_limit_minutes = 0.0
+
+        pnl_limit_raw = getattr(settings, "ai_min_exit_bps", None)
+        try:
+            pnl_limit = float(pnl_limit_raw) if pnl_limit_raw is not None else None
+        except (TypeError, ValueError):
+            pnl_limit = None
+
+        if hold_limit_minutes <= 0 and pnl_limit is None:
+            return None, None
+
+        positions = self._collect_open_positions(settings, summary)
+        if not positions:
+            return None, None
+
+        candidate: Optional[Dict[str, object]] = None
+
+        for symbol, info in positions.items():
+            qty = info.get("qty")
+            if not isinstance(qty, (int, float)) or qty <= 0:
+                continue
+
+            triggers: List[Dict[str, object]] = []
+
+            hold_seconds = info.get("hold_seconds")
+            if (
+                hold_limit_minutes > 0
+                and isinstance(hold_seconds, (int, float))
+                and hold_seconds >= hold_limit_minutes * 60.0
+            ):
+                triggers.append(
+                    {
+                        "type": "hold_time",
+                        "hold_seconds": float(hold_seconds),
+                        "threshold_minutes": float(hold_limit_minutes),
+                    }
+                )
+
+            pnl_bps = info.get("pnl_bps")
+            if (
+                pnl_limit is not None
+                and isinstance(pnl_bps, (int, float))
+                and pnl_bps <= pnl_limit
+            ):
+                triggers.append(
+                    {
+                        "type": "pnl",
+                        "pnl_bps": float(pnl_bps),
+                        "threshold_bps": float(pnl_limit),
+                    }
+                )
+
+            if not triggers:
+                continue
+
+            info_copy = copy.deepcopy(info)
+            info_copy["symbol"] = symbol
+            info_copy["triggers"] = triggers
+
+            if candidate is None:
+                candidate = info_copy
+                continue
+
+            best = candidate
+            cand_pnl = info_copy.get("pnl_bps")
+            best_pnl = best.get("pnl_bps")
+            if isinstance(cand_pnl, (int, float)) and isinstance(best_pnl, (int, float)):
+                if cand_pnl < best_pnl:
+                    candidate = info_copy
+                    continue
+            elif isinstance(cand_pnl, (int, float)) and not isinstance(best_pnl, (int, float)):
+                candidate = info_copy
+                continue
+
+            cand_hold = info_copy.get("hold_seconds")
+            best_hold = best.get("hold_seconds")
+            if isinstance(cand_hold, (int, float)) and isinstance(best_hold, (int, float)):
+                if cand_hold > best_hold:
+                    candidate = info_copy
+                    continue
+            elif isinstance(cand_hold, (int, float)) and not isinstance(best_hold, (int, float)):
+                candidate = info_copy
+
+        if candidate is None:
+            return None, None
+
+        triggers = candidate.get("triggers") or []
+        reason_parts: List[str] = []
+
+        hold_minutes = None
+        hold_trigger = next(
+            (trigger for trigger in triggers if trigger.get("type") == "hold_time"),
+            None,
+        )
+        if hold_trigger:
+            hold_seconds = candidate.get("hold_seconds")
+            if isinstance(hold_seconds, (int, float)):
+                hold_minutes = hold_seconds / 60.0
+                threshold = float(hold_trigger.get("threshold_minutes") or hold_limit_minutes)
+                reason_parts.append(
+                    (
+                        "позиция удерживается {duration:.1f} мин (порог {threshold:.1f})"
+                    ).format(duration=hold_minutes, threshold=threshold)
+                )
+
+        pnl_trigger = next(
+            (trigger for trigger in triggers if trigger.get("type") == "pnl"),
+            None,
+        )
+        pnl_bps = candidate.get("pnl_bps")
+        if pnl_trigger and isinstance(pnl_bps, (int, float)):
+            limit_value = float(pnl_trigger.get("threshold_bps") or 0.0)
+            reason_parts.append(
+                f"PnL {pnl_bps:.1f} б.п. ≤ лимита {limit_value:.1f}"
+            )
+
+        reason_text = (
+            "; ".join(reason_parts)
+            if reason_parts
+            else "Автозащита инициировала выход из позиции."
+        )
+
+        pnl_value = candidate.get("pnl_value")
+        price = candidate.get("price")
+        avg_cost = candidate.get("avg_cost")
+        qty = candidate.get("qty")
+        quote_notional = candidate.get("quote_notional")
+        realized = candidate.get("realized_pnl")
+
+        metadata: Dict[str, object] = {
+            "symbol": candidate["symbol"],
+            "reason": reason_text,
+            "triggers": triggers,
+            "hold_seconds": float(candidate.get("hold_seconds"))
+            if isinstance(candidate.get("hold_seconds"), (int, float))
+            else None,
+            "hold_minutes": float(hold_minutes) if hold_minutes is not None else None,
+            "pnl_bps": float(pnl_bps)
+            if isinstance(pnl_bps, (int, float))
+            else None,
+            "pnl_value": float(pnl_value)
+            if isinstance(pnl_value, (int, float))
+            else None,
+            "price": float(price) if isinstance(price, (int, float)) else None,
+            "avg_cost": float(avg_cost) if isinstance(avg_cost, (int, float)) else None,
+            "qty": float(qty) if isinstance(qty, (int, float)) else None,
+            "quote_notional": float(quote_notional)
+            if isinstance(quote_notional, (int, float))
+            else None,
+            "realized_pnl": float(realized)
+            if isinstance(realized, (int, float))
+            else None,
+            "hold_threshold_minutes": float(hold_limit_minutes)
+            if hold_limit_minutes > 0
+            else None,
+            "exit_threshold_bps": float(pnl_limit)
+            if pnl_limit is not None
+            else None,
+            "generated_at": self._current_time(),
+        }
+
+        metadata = {key: value for key, value in metadata.items() if value is not None}
+
+        log(
+            "guardian.auto.force_exit",
+            symbol=candidate["symbol"],
+            reason=reason_text,
+            hold_minutes=round(metadata.get("hold_minutes", 0.0), 2)
+            if "hold_minutes" in metadata
+            else None,
+            pnl_bps=round(metadata.get("pnl_bps", 0.0), 2)
+            if "pnl_bps" in metadata
+            else None,
+            pnl_value=round(metadata.get("pnl_value", 0.0), 2)
+            if "pnl_value" in metadata
+            else None,
+            triggers=triggers,
+            dry_run=active_dry_run(settings),
+        )
+
+        message_parts = [f"🛡 Автозащита: закрываем {candidate['symbol']}"]
+        if reason_parts:
+            message_parts.append(" — " + "; ".join(reason_parts))
+        if "pnl_value" in metadata and "pnl_bps" in metadata:
+            message_parts.append(
+                " | PnL ≈ {value:.2f} USDT ({bps:.1f} б.п.)".format(
+                    value=metadata["pnl_value"], bps=metadata["pnl_bps"]
+                )
+            )
+        elif "pnl_bps" in metadata:
+            message_parts.append(
+                " | PnL {bps:.1f} б.п.".format(bps=metadata["pnl_bps"])
+            )
+        if "hold_minutes" in metadata:
+            message_parts.append(
+                " | В рынке ≈{duration:.1f} мин".format(
+                    duration=metadata["hold_minutes"]
+                )
+            )
+        if active_dry_run(settings):
+            message_parts.append(" [dry-run]")
+
+        message_text = "".join(message_parts)
+        metadata["message"] = message_text
+
+        try:
+            send_telegram(message_text)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("guardian.auto.force_exit.telegram_error", err=str(exc))
+
+        forced_summary = copy.deepcopy(summary)
+        if not isinstance(forced_summary, dict):
+            forced_summary = dict(forced_summary)
+        forced_summary["mode"] = "sell"
+        forced_summary["symbol"] = candidate["symbol"]
+        forced_summary["actionable"] = True
+        reasons_list = forced_summary.get("actionable_reasons")
+        if not isinstance(reasons_list, list):
+            reasons_list = []
+        reasons_list.append(f"Автозащита: {reason_text}")
+        forced_summary["actionable_reasons"] = reasons_list
+        forced_summary["guardian_force_exit"] = copy.deepcopy(metadata)
+
+        return forced_summary, metadata
+
     def execute_once(self) -> ExecutionResult:
         summary = self._fetch_summary()
-        if not summary.get("actionable"):
+        settings = self._resolve_settings()
+        forced_summary, forced_meta = self._maybe_force_exit(summary, settings)
+        forced_exit_meta = forced_meta
+        if forced_summary is not None:
+            summary = forced_summary
+        elif not summary.get("actionable"):
             return self._decision(
                 "skipped",
                 reason="Signal is not actionable according to current thresholds.",
             )
 
         self._purge_validation_penalties()
-
-        settings = self._resolve_settings()
         self._ensure_ws_activity(settings)
         if not getattr(settings, "ai_enabled", False):
             return self._decision(
@@ -300,6 +871,12 @@ class SignalExecutor:
 
         fallback_context: Optional[Dict[str, object]] = None
         min_notional = 5.0
+        if forced_exit_meta and side == "Sell":
+            forced_notional = forced_exit_meta.get("quote_notional")
+            if isinstance(forced_notional, (int, float)) and forced_notional > 0:
+                notional = float(forced_notional)
+            elif isinstance(forced_exit_meta.get("qty"), (int, float)):
+                notional = 0.0
         if side == "Sell" and notional <= 0:
             fallback_notional, fallback_context, fallback_min_notional = (
                 self._sell_notional_from_holdings(
@@ -348,6 +925,8 @@ class SignalExecutor:
             order_context["requested_notional_quote"] = notional
         if symbol_meta:
             order_context["symbol_meta"] = symbol_meta
+        if forced_exit_meta:
+            order_context["forced_exit"] = copy.deepcopy(forced_exit_meta)
 
         if adjusted_notional <= 0 or adjusted_notional < min_notional:
             order_context["min_notional"] = min_notional

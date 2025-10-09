@@ -121,6 +121,8 @@ class Settings:
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True
+    ai_max_hold_minutes: float = 0.0
+    ai_min_exit_bps: Optional[float] = None
 
     # TWAP
     twap_slices: int = 8
@@ -294,6 +296,8 @@ _ENV_MAP = {
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
+    "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
+    "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
     "twap_slices": "TWAP_SLICES",
     "twap_interval_sec": "TWAP_INTERVAL_SEC",
     "twap_child_secs": "TWAP_CHILD_SECS",
@@ -382,6 +386,8 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
+    m["ai_max_hold_minutes"] = _cast_float(m.get("ai_max_hold_minutes"))
+    m["ai_min_exit_bps"] = _cast_float(m.get("ai_min_exit_bps"))
 
     m["recv_window_ms"] = _cast_int(m.get("recv_window_ms"))
     m["http_timeout_ms"] = _cast_int(m.get("http_timeout_ms"))
