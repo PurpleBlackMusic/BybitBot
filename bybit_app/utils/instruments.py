@@ -62,7 +62,22 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
         if not testnet:
             raise
         log("instruments.fetch.testnet_failed", scope="spot", err=str(exc))
-        return _fetch(_MAINNET_URL)
+        with _LOCK:
+            cached = set(_CACHE.get("spot_testnet") or set())
+        if cached:
+            log(
+                "instruments.fetch.testnet_cache_fallback",
+                scope="spot",
+                count=len(cached),
+            )
+            return cached
+        log(
+            "instruments.fetch.catalogue_unavailable",
+            scope="spot",
+            testnet=True,
+            err=str(exc),
+        )
+        return set()
 
 
 def get_listed_spot_symbols(
