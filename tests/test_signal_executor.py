@@ -1,10 +1,12 @@
 import copy
+import time
 from decimal import Decimal
 from typing import Optional
 
 import pytest
 
 import bybit_app.utils.signal_executor as signal_executor_module
+
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.signal_executor import (
     AutomationLoop,
@@ -130,6 +132,72 @@ def test_signal_executor_skips_when_not_actionable() -> None:
     result = executor.execute_once()
     assert isinstance(result, ExecutionResult)
     assert result.status == "skipped"
+
+
+def test_signal_executor_auto_exit_sells_old_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    ledger_rows = [
+        {
+            "category": "spot",
+            "symbol": "ETHUSDT",
+            "side": "Buy",
+            "execPrice": "2000",
+            "execQty": "1",
+            "execFee": "0",
+            "execTime": now - 7200,
+        }
+    ]
+
+    summary = {"actionable": False, "mode": "wait", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=True,
+        ai_max_hold_minutes=60,
+        ai_min_exit_bps=-50,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "read_ledger",
+        lambda n=2000, **_: list(ledger_rows),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        lambda api_obj, symbol, include_limits=False, include_balances=False, include_price=True: SpotTradeSnapshot(
+            symbol=symbol,
+            price=Decimal("1800"),
+            balances=None,
+            limits=None,
+        ),
+    )
+    monkeypatch.setattr(signal_executor_module, "send_telegram", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api=None, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "status",
+        lambda: {"private": {"age_seconds": 0, "running": True, "connected": True}},
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["side"] == "Sell"
+    assert result.order["symbol"] == "ETHUSDT"
+    assert result.context is not None
+    auto_exit = result.context.get("auto_exit") if isinstance(result.context, dict) else None
+    assert auto_exit is not None
+    assert auto_exit.get("symbol") == "ETHUSDT"
+    assert "pnl_limit" in auto_exit.get("reasons", [])
 
 
 def test_signal_executor_respects_disabled_ai(monkeypatch: pytest.MonkeyPatch) -> None:

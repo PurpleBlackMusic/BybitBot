@@ -8,6 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+from datetime import datetime, timezone
 import threading
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -137,12 +138,6 @@ class SignalExecutor:
     # public API
     def execute_once(self) -> ExecutionResult:
         summary = self._fetch_summary()
-        if not summary.get("actionable"):
-            return self._decision(
-                "skipped",
-                reason="Signal is not actionable according to current thresholds.",
-            )
-
         settings = self._resolve_settings()
         self._ensure_ws_activity(settings)
         if not getattr(settings, "ai_enabled", False):
@@ -154,6 +149,17 @@ class SignalExecutor:
         guard_result = self._apply_runtime_guards(settings)
         if guard_result is not None:
             return guard_result
+
+        auto_exit_context: Optional[Dict[str, object]] = None
+        forced_exit = self._maybe_force_exit(summary, settings)
+        if forced_exit is not None:
+            summary = forced_exit["summary"]
+            auto_exit_context = forced_exit.get("context")
+        elif not summary.get("actionable"):
+            return self._decision(
+                "skipped",
+                reason="Signal is not actionable according to current thresholds.",
+            )
 
         mode = str(summary.get("mode") or "").lower()
         if mode not in {"buy", "sell"}:
@@ -247,6 +253,8 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if auto_exit_context:
+            order_context["auto_exit"] = copy.deepcopy(auto_exit_context)
         if fallback_context:
             order_context["sell_fallback"] = fallback_context
         if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
@@ -1460,6 +1468,302 @@ class SignalExecutor:
 
         return get_settings(force_reload=True)
 
+    def _maybe_force_exit(
+        self, summary: Mapping[str, object], settings: Settings
+    ) -> Optional[Dict[str, object]]:
+        if summary.get("actionable"):
+            return None
+
+        max_hold_raw = getattr(settings, "ai_max_hold_minutes", None)
+        max_hold_minutes = _safe_float(max_hold_raw)
+        if max_hold_minutes is not None and max_hold_minutes <= 0:
+            max_hold_minutes = None
+
+        pnl_threshold_raw = getattr(settings, "ai_min_exit_bps", None)
+        pnl_threshold = _safe_float(pnl_threshold_raw)
+        if pnl_threshold is not None and abs(pnl_threshold) <= 1e-6:
+            pnl_threshold = None
+
+        if max_hold_minutes is None and pnl_threshold is None:
+            return None
+
+        rows = self._ledger_rows_snapshot(settings=settings)
+        if not rows:
+            return None
+
+        inventory = spot_inventory_and_pnl(events=rows, settings=settings)
+        if not inventory:
+            return None
+
+        now = time.time()
+        lots = self._open_position_lots(rows)
+
+        api: Optional[object] = None
+        price_cache: Dict[str, float] = {}
+        if pnl_threshold is not None:
+            try:
+                api = get_api_client()
+            except Exception:
+                api = None
+
+        triggered: List[Dict[str, object]] = []
+        for symbol_key, rec in inventory.items():
+            qty = _safe_float(rec.get("position_qty"))
+            if qty is None or qty <= 0:
+                continue
+
+            avg_cost = _safe_float(rec.get("avg_cost"))
+            symbol = str(symbol_key or "").upper()
+            hold_minutes = self._resolve_hold_minutes(symbol, lots, now)
+
+            price: Optional[float] = None
+            pnl_bps: Optional[float] = None
+            pnl_quote: Optional[float] = None
+            if pnl_threshold is not None and avg_cost and avg_cost > 0:
+                price = price_cache.get(symbol)
+                if price is None and api is not None:
+                    price = self._current_price_for_symbol(api, symbol)
+                    if price is not None:
+                        price_cache[symbol] = price
+                if price is not None:
+                    pnl_quote = (price - avg_cost) * qty
+                    if avg_cost > 0:
+                        pnl_bps = (price / avg_cost - 1.0) * 10000.0
+
+            reasons: List[str] = []
+            reason_messages: List[str] = []
+            if (
+                max_hold_minutes is not None
+                and hold_minutes is not None
+                and hold_minutes >= max_hold_minutes
+            ):
+                reasons.append("hold_timeout")
+                formatted_hold = self._format_seconds(hold_minutes * 60.0)
+                formatted_limit = self._format_seconds(max_hold_minutes * 60.0)
+                reason_messages.append(
+                    f"время удержания {formatted_hold} превышает лимит {formatted_limit}"
+                )
+
+            if (
+                pnl_threshold is not None
+                and pnl_bps is not None
+                and pnl_bps <= pnl_threshold
+            ):
+                reasons.append("pnl_limit")
+                reason_messages.append(
+                    f"PnL {pnl_bps:.1f} б.п. ниже лимита {pnl_threshold:.1f} б.п."
+                )
+
+            if not reasons:
+                continue
+
+            triggered.append(
+                {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "avg_cost": avg_cost,
+                    "hold_minutes": hold_minutes,
+                    "pnl_bps": pnl_bps,
+                    "pnl_quote": pnl_quote,
+                    "price": price,
+                    "reasons": reasons,
+                    "reason_messages": reason_messages,
+                    "thresholds": {
+                        "hold_minutes": max_hold_minutes,
+                        "pnl_bps": pnl_threshold,
+                    },
+                }
+            )
+
+        if not triggered:
+            return None
+
+        def _priority(entry: Mapping[str, object]) -> tuple[int, float, float]:
+            pnl_value = entry.get("pnl_bps")
+            has_pnl = 0 if isinstance(pnl_value, (int, float)) else 1
+            pnl_numeric = float(pnl_value) if isinstance(pnl_value, (int, float)) else 0.0
+            hold_value = entry.get("hold_minutes")
+            hold_numeric = float(hold_value) if isinstance(hold_value, (int, float)) else 0.0
+            return has_pnl, pnl_numeric, -hold_numeric
+
+        triggered.sort(key=_priority)
+        candidate = triggered[0]
+
+        reason_text = "; ".join(candidate["reason_messages"])
+        context = {
+            "symbol": candidate["symbol"],
+            "qty": round(float(candidate["qty"]), 8),
+            "avg_cost": candidate["avg_cost"],
+            "hold_minutes": candidate.get("hold_minutes"),
+            "pnl_bps": candidate.get("pnl_bps"),
+            "pnl_quote": candidate.get("pnl_quote"),
+            "price": candidate.get("price"),
+            "reasons": candidate["reasons"],
+            "thresholds": candidate["thresholds"],
+            "reason_text": reason_text,
+        }
+
+        log(
+            "guardian.auto.decision",
+            status="auto_exit",
+            reason=reason_text,
+            context=context,
+        )
+
+        notify_enabled = bool(
+            getattr(settings, "telegram_notify", False)
+            or getattr(settings, "tg_trade_notifs", False)
+        )
+        if notify_enabled:
+            symbol_text = candidate["symbol"]
+            notify_message = f"⚠️ {symbol_text}: авто-выход — {reason_text}."
+            try:
+                send_telegram(notify_message)
+            except Exception:
+                log(
+                    "telegram.auto_exit.error",
+                    symbol=symbol_text,
+                    reason=reason_text,
+                )
+
+        summary_override = dict(summary)
+        summary_override["symbol"] = candidate["symbol"]
+        summary_override["mode"] = "sell"
+        summary_override["actionable"] = True
+        summary_override["auto_exit"] = True
+        summary_override["auto_exit_reason"] = reason_text
+        summary_override["auto_exit_reasons"] = candidate["reasons"]
+
+        return {"summary": summary_override, "context": context}
+
+    def _open_position_lots(
+        self, rows: Sequence[Mapping[str, object]]
+    ) -> Dict[str, List[Tuple[float, float]]]:
+        decorated: List[Tuple[Optional[float], Mapping[str, object]]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            ts = self._extract_fill_timestamp(row)
+            decorated.append((ts, row))
+
+        decorated.sort(key=lambda item: item[0] if item[0] is not None else float("inf"))
+
+        lots: Dict[str, List[Tuple[float, float]]] = {}
+        for ts, row in decorated:
+            if ts is None:
+                continue
+            category = str(row.get("category") or "spot").lower()
+            if category != "spot":
+                continue
+            symbol = str(row.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            qty = _safe_float(row.get("execQty"))
+            if qty is None or qty <= 0:
+                continue
+            side = str(row.get("side") or "").strip().lower()
+
+            bucket = lots.setdefault(symbol, [])
+            if side == "buy":
+                bucket.append((ts, qty))
+            elif side == "sell":
+                remaining = qty
+                updated: List[Tuple[float, float]] = []
+                for lot_ts, lot_qty in bucket:
+                    if remaining <= 1e-12:
+                        updated.append((lot_ts, lot_qty))
+                        continue
+                    if lot_qty <= remaining + 1e-12:
+                        remaining -= lot_qty
+                        continue
+                    updated.append((lot_ts, lot_qty - remaining))
+                    remaining = 0.0
+                bucket.clear()
+                bucket.extend(updated)
+        return lots
+
+    def _resolve_hold_minutes(
+        self,
+        symbol: str,
+        lots: Mapping[str, Sequence[Tuple[float, float]]],
+        now: float,
+    ) -> Optional[float]:
+        entries = lots.get(str(symbol or "").upper())
+        if not entries:
+            return None
+        earliest: Optional[float] = None
+        for ts, qty in entries:
+            if qty <= 0:
+                continue
+            if earliest is None or ts < earliest:
+                earliest = ts
+        if earliest is None:
+            return None
+        hold_seconds = max(0.0, now - earliest)
+        return hold_seconds / 60.0
+
+    def _current_price_for_symbol(self, api: object, symbol: str) -> Optional[float]:
+        resolved_symbol, _ = ensure_usdt_symbol(symbol)
+        target_symbol = resolved_symbol or str(symbol or "").upper()
+        if not target_symbol:
+            return None
+        try:
+            snapshot = prepare_spot_trade_snapshot(
+                api,
+                target_symbol,
+                include_limits=False,
+                include_balances=False,
+                include_price=True,
+            )
+        except Exception:
+            return None
+
+        price = getattr(snapshot, "price", None)
+        if isinstance(price, Decimal):
+            return float(price)
+        return _safe_float(price)
+
+    @staticmethod
+    def _extract_fill_timestamp(row: Mapping[str, object]) -> Optional[float]:
+        for key in (
+            "execTime",
+            "execTimeNs",
+            "transactTime",
+            "tradeTime",
+            "created_at",
+            "ts",
+        ):
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            numeric: Optional[float] = None
+            if isinstance(value, (int, float)):
+                numeric = float(value)
+            elif isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    continue
+                try:
+                    numeric = float(text)
+                except ValueError:
+                    try:
+                        parsed = datetime.fromisoformat(text)
+                    except ValueError:
+                        continue
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.timestamp()
+            if numeric is None:
+                continue
+            if numeric > 1e18:
+                numeric /= 1e9
+            elif numeric > 1e12:
+                numeric /= 1e3
+            elif numeric > 1e10:
+                numeric /= 1e3
+            return numeric
+        return None
+
     def _apply_runtime_guards(self, settings: Settings) -> Optional[ExecutionResult]:
         guard = self._private_ws_guard(settings)
         if guard is not None:
@@ -1933,6 +2237,8 @@ class SignalExecutor:
     def _signal_sizing_factor(
         self, summary: Dict[str, object], settings: Settings
     ) -> float:
+        if summary.get("auto_exit") is True:
+            return 0.0
         override = _safe_float(summary.get("auto_sizing_factor"))
         if override is not None and override > 0:
             return max(0.05, min(override, 1.0))
