@@ -241,6 +241,80 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_sell_uses_balance_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "BTCUSDT",
+        "trade_candidates": [
+            {
+                "symbol": "BTCUSDT",
+                "position_qty": 0.25,
+                "position_notional": 20.0,
+            }
+        ],
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+        spot_cash_reserve_pct=2.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=100.0, available=0.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    class Snapshot:
+        def __init__(self, symbol: str) -> None:
+            self.symbol = symbol
+            self.price = Decimal("100")
+            self.balances = {"BTC": Decimal("0.5")}
+            self.limits = {"min_order_amt": Decimal("10"), "quote_step": Decimal("0.01")}
+
+    def fake_snapshot(api_obj, symbol: str, **_: object) -> Snapshot:
+        assert symbol == "BTCUSDT"
+        return Snapshot(symbol)
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        fake_snapshot,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "sell"}}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        fake_place,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured["side"] == "Sell"
+    assert pytest.approx(captured["qty"], rel=1e-6) == 50.0
+    assert pytest.approx(captured["max_quote"], rel=1e-6) == 50.0
+    assert result.context is not None
+    assert pytest.approx(result.context["notional_quote"], rel=1e-6) == 50.0
+    assert result.context.get("fallback_sell_available_base") == pytest.approx(0.5)
+    assert result.status != "skipped"
+
+
 def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(

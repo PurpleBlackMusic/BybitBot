@@ -26,6 +26,7 @@ from .spot_market import (
     OrderValidationError,
     _instrument_limits,
     place_spot_market_with_tolerance,
+    prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
 from .pnl import read_ledger
@@ -203,6 +204,29 @@ class SignalExecutor:
 
         min_notional = 5.0
 
+        fallback_info: Optional[Dict[str, object]] = None
+        if side == "Sell" and notional <= 0:
+            fallback_info = self._sell_notional_from_balances(
+                api=api,
+                summary=summary,
+                symbol=symbol,
+                symbol_meta=symbol_meta,
+            )
+            if fallback_info:
+                fallback_notional = float(fallback_info.get("notional", 0.0))
+                if fallback_notional > 0:
+                    notional = fallback_notional
+                    max_quote = float(
+                        fallback_info.get("max_quote", fallback_notional)
+                    )
+                    if max_quote > 0 and max_quote > usable_after_reserve:
+                        usable_after_reserve = max_quote
+                    min_candidate = float(
+                        fallback_info.get("min_notional", min_notional)
+                    )
+                    if min_candidate > min_notional:
+                        min_notional = min_candidate
+
         order_context = {
             "symbol": symbol,
             "side": side,
@@ -211,6 +235,10 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if fallback_info:
+            extra_context = fallback_info.get("context")
+            if isinstance(extra_context, Mapping):
+                order_context.update(extra_context)
         if symbol_meta:
             order_context["symbol_meta"] = symbol_meta
 
@@ -1510,6 +1538,195 @@ class SignalExecutor:
         sizing = max(0.0, min(float(sizing_factor), 1.0))
         notional = round(base_notional * sizing, 2)
         return max(notional, 0.0), usable_after_reserve
+
+    def _sell_notional_from_balances(
+        self,
+        *,
+        api: Optional[object],
+        summary: Mapping[str, object],
+        symbol: str,
+        symbol_meta: Optional[Mapping[str, object]],
+    ) -> Optional[Dict[str, object]]:
+        symbol_upper = _safe_symbol(symbol)
+        if not symbol_upper:
+            return None
+        symbol_upper = symbol_upper.upper()
+        base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else None
+        if not base_asset:
+            return None
+        base_asset = base_asset.upper()
+
+        available_base = Decimal("0")
+        base_source: Optional[str] = None
+        price = Decimal("0")
+        price_source: Optional[str] = None
+        notional_hint = Decimal("0")
+        notional_source: Optional[str] = None
+        min_notional = Decimal("0")
+        quote_step = Decimal("0")
+
+        def _consider_base(candidate: Decimal, source: str) -> None:
+            nonlocal available_base, base_source
+            if candidate > available_base:
+                available_base = candidate
+                base_source = source
+
+        def _consider_price(candidate: Decimal, source: str, *, prefer: bool = False) -> None:
+            nonlocal price, price_source
+            if candidate <= 0:
+                return
+            if price <= 0 or prefer:
+                price = candidate
+                price_source = source
+
+        def _consider_notional(candidate: Decimal, source: str) -> None:
+            nonlocal notional_hint, notional_source
+            if candidate > notional_hint:
+                notional_hint = candidate
+                notional_source = source
+
+        def _consider_min_notional(candidate: Decimal) -> None:
+            nonlocal min_notional
+            if candidate > min_notional:
+                min_notional = candidate
+
+        if isinstance(symbol_meta, Mapping):
+            qty_meta = self._decimal_from(symbol_meta.get("position_qty"))
+            if qty_meta > 0:
+                _consider_base(qty_meta, "symbol_meta")
+            notional_meta = self._decimal_from(symbol_meta.get("position_notional"))
+            if notional_meta > 0:
+                _consider_notional(notional_meta, "symbol_meta")
+            avg_cost_meta = self._decimal_from(symbol_meta.get("position_avg_cost"))
+            if avg_cost_meta > 0:
+                _consider_price(avg_cost_meta, "symbol_meta")
+
+        portfolio = summary.get("portfolio")
+        if isinstance(portfolio, Mapping):
+            positions = portfolio.get("positions")
+            if isinstance(positions, Sequence):
+                for entry in positions:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    entry_symbol = _safe_symbol(entry.get("symbol"))
+                    if entry_symbol != symbol_upper:
+                        continue
+                    qty_entry = self._decimal_from(
+                        entry.get("qty") or entry.get("position_qty")
+                    )
+                    if qty_entry > 0:
+                        _consider_base(qty_entry, "summary_portfolio")
+                    avg_cost_entry = self._decimal_from(entry.get("avg_cost"))
+                    if avg_cost_entry > 0:
+                        _consider_price(avg_cost_entry, "summary_portfolio")
+                    notional_entry = self._decimal_from(entry.get("notional"))
+                    if notional_entry <= 0 and qty_entry > 0 and avg_cost_entry > 0:
+                        notional_entry = qty_entry * avg_cost_entry
+                    if notional_entry > 0:
+                        _consider_notional(notional_entry, "summary_portfolio")
+                    break
+
+        inventory = summary.get("inventory")
+        if isinstance(inventory, Mapping):
+            entry = inventory.get(symbol_upper)
+            if isinstance(entry, Mapping):
+                qty_inventory = self._decimal_from(
+                    entry.get("position_qty") or entry.get("qty")
+                )
+                if qty_inventory > 0:
+                    _consider_base(qty_inventory, "summary_inventory")
+                avg_cost_inventory = self._decimal_from(entry.get("avg_cost"))
+                if avg_cost_inventory > 0:
+                    _consider_price(avg_cost_inventory, "summary_inventory")
+                notional_inventory = self._decimal_from(entry.get("notional"))
+                if (
+                    notional_inventory <= 0
+                    and qty_inventory > 0
+                    and avg_cost_inventory > 0
+                ):
+                    notional_inventory = qty_inventory * avg_cost_inventory
+                if notional_inventory > 0:
+                    _consider_notional(notional_inventory, "summary_inventory")
+
+        snapshot = None
+        if api is not None:
+            try:
+                snapshot = prepare_spot_trade_snapshot(
+                    api,
+                    symbol_upper,
+                    include_balances=True,
+                    include_limits=True,
+                    include_price=True,
+                )
+            except Exception:
+                snapshot = None
+
+        if snapshot is not None:
+            balances = snapshot.balances if snapshot.balances is not None else {}
+            if isinstance(balances, Mapping):
+                balance_candidate = balances.get(base_asset) or balances.get(symbol_upper)
+            else:
+                balance_candidate = None
+            balance_decimal = self._decimal_from(balance_candidate)
+            if balance_decimal > 0:
+                _consider_base(balance_decimal, "snapshot_balances")
+
+            if snapshot.price is not None:
+                price_decimal = self._decimal_from(snapshot.price)
+                _consider_price(price_decimal, "snapshot_price", prefer=True)
+
+            limits = snapshot.limits if isinstance(snapshot.limits, Mapping) else None
+            if limits:
+                min_amt = self._decimal_from(limits.get("min_order_amt"))
+                if min_amt > 0:
+                    _consider_min_notional(min_amt)
+                quote_step_candidate = self._decimal_from(limits.get("quote_step"))
+                if quote_step_candidate > 0:
+                    quote_step = quote_step_candidate
+
+        candidate_notional = Decimal("0")
+        notional_source_final: Optional[str] = None
+        if available_base > 0 and price > 0:
+            candidate_notional = available_base * price
+            notional_source_final = "balances_price"
+        elif notional_hint > 0:
+            candidate_notional = notional_hint
+            notional_source_final = notional_source or "metadata_notional"
+
+        if quote_step > 0 and candidate_notional > 0:
+            candidate_notional = quantize_to_step(
+                candidate_notional, quote_step, rounding=ROUND_DOWN
+            )
+
+        if candidate_notional <= 0:
+            return None
+
+        payload: Dict[str, object] = {
+            "notional": float(candidate_notional),
+            "max_quote": float(candidate_notional),
+        }
+
+        if min_notional > 0:
+            payload["min_notional"] = float(min_notional)
+
+        context_payload: Dict[str, object] = {}
+        if available_base > 0:
+            context_payload["fallback_sell_available_base"] = float(available_base)
+        if price > 0:
+            context_payload["fallback_sell_price"] = float(price)
+        if min_notional > 0:
+            context_payload["fallback_sell_min_notional"] = float(min_notional)
+        if notional_source_final:
+            context_payload["fallback_sell_notional_source"] = notional_source_final
+        if base_source:
+            context_payload["fallback_sell_base_source"] = base_source
+        if price_source:
+            context_payload["fallback_sell_price_source"] = price_source
+
+        if context_payload:
+            payload["context"] = context_payload
+
+        return payload
 
     def _ensure_ws_activity(self, settings: Settings) -> None:
         if not getattr(settings, "ws_autostart", False):
