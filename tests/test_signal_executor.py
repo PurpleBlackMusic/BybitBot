@@ -241,6 +241,49 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_sell_ignores_max_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "ETHUSDT",
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=10.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=100.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict | None = None
+
+    def fake_place(api_obj, **kwargs):
+        nonlocal captured
+        captured = dict(kwargs)
+        return {"retCode": 0, "result": {"orderId": "sell-1"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured is not None
+    assert captured["side"] == "Sell"
+    assert captured.get("max_quote") is None
+    assert captured["qty"] > 0
+
+
 def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(
