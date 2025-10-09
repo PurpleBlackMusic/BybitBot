@@ -618,6 +618,57 @@ class SignalExecutor:
 
         return positions
 
+    @staticmethod
+    def _extract_force_exit_defaults(
+        stats: Mapping[str, object]
+    ) -> Dict[str, object]:
+        if not isinstance(stats, Mapping):
+            return {}
+
+        defaults_payload = stats.get("auto_exit_defaults")
+        if not isinstance(defaults_payload, Mapping):
+            return {}
+
+        hold_minutes = _safe_float(defaults_payload.get("hold_minutes"))
+        if hold_minutes is not None and hold_minutes <= 0:
+            hold_minutes = None
+        if hold_minutes is None:
+            hold_seconds = _safe_float(defaults_payload.get("hold_seconds"))
+            if hold_seconds is not None and hold_seconds > 0:
+                hold_minutes = hold_seconds / 60.0
+
+        exit_bps_candidate = defaults_payload.get("exit_bps")
+        if exit_bps_candidate is None:
+            exit_bps_candidate = defaults_payload.get("min_exit_bps")
+        exit_bps = _safe_float(exit_bps_candidate)
+
+        def _coerce_count(value: object) -> Optional[int]:
+            if isinstance(value, (int, float)):
+                count = int(value)
+                return count if count > 0 else None
+            return None
+
+        hold_samples = _coerce_count(
+            defaults_payload.get("hold_sample_count")
+            or defaults_payload.get("hold_samples")
+        )
+        bps_samples = _coerce_count(
+            defaults_payload.get("bps_sample_count")
+            or defaults_payload.get("bps_samples")
+        )
+
+        resolved: Dict[str, object] = {}
+        if hold_minutes is not None and hold_minutes > 0:
+            resolved["hold_minutes"] = float(hold_minutes)
+        if exit_bps is not None:
+            resolved["exit_bps"] = float(exit_bps)
+        if hold_samples is not None:
+            resolved["hold_samples"] = hold_samples
+        if bps_samples is not None:
+            resolved["bps_samples"] = bps_samples
+
+        return resolved
+
     def _maybe_force_exit(
         self, summary: Mapping[str, object], settings: Settings
     ) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
@@ -638,6 +689,44 @@ class SignalExecutor:
             pnl_limit = float(pnl_limit_raw) if pnl_limit_raw is not None else None
         except (TypeError, ValueError):
             pnl_limit = None
+
+        defaults_applied: Dict[str, object] = {}
+        defaults_meta: Dict[str, object] = {}
+
+        if hold_limit_minutes <= 0 or pnl_limit is None:
+            trade_stats: Optional[Mapping[str, object]]
+            try:
+                trade_stats = self.bot.trade_statistics()
+            except AttributeError:
+                trade_stats = None
+            except Exception as exc:
+                log("guardian.auto.force_exit.defaults_error", err=str(exc))
+                trade_stats = None
+
+            if trade_stats:
+                resolved_defaults = self._extract_force_exit_defaults(trade_stats)
+
+                hold_default = resolved_defaults.get("hold_minutes")
+                if hold_limit_minutes <= 0 and isinstance(hold_default, (int, float)):
+                    hold_limit_minutes = float(hold_default)
+                    defaults_applied["hold_minutes"] = hold_limit_minutes
+
+                exit_default = resolved_defaults.get("exit_bps")
+                if pnl_limit is None and isinstance(exit_default, (int, float)):
+                    pnl_limit = float(exit_default)
+                    defaults_applied["exit_bps"] = pnl_limit
+
+                for key in ("hold_samples", "bps_samples"):
+                    if key in resolved_defaults:
+                        defaults_meta[key] = resolved_defaults[key]
+
+        if defaults_applied:
+            log(
+                "guardian.auto.force_exit.defaults",
+                source="trade_stats",
+                **defaults_applied,
+                **defaults_meta,
+            )
 
         if hold_limit_minutes <= 0 and pnl_limit is None:
             return None, None
