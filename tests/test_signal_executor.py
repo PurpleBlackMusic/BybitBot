@@ -1270,6 +1270,76 @@ def test_signal_executor_does_not_notify_validation_when_disabled(
     assert called["value"] is False
 
 
+def test_signal_executor_rotates_symbol_after_repeated_price_deviation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "trade_candidates": [
+            {"symbol": "ADAUSDT", "actionable": True},
+            {"symbol": "XRPUSDT", "actionable": True},
+        ],
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    attempts: list[str] = []
+    error_counter = {"value": 0}
+
+    def fake_place(api, symbol, **kwargs):
+        attempts.append(symbol)
+        if symbol == "ADAUSDT" and error_counter["value"] < 2:
+            error_counter["value"] += 1
+            raise OrderValidationError(
+                "слишком сильное отклонение цены", code="price_deviation"
+            )
+        return {
+            "retCode": 0,
+            "result": {"orderId": f"ok-{len(attempts)}"},
+            "_local": {"order_audit": {}},
+        }
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: [])
+    monkeypatch.setattr(
+        signal_executor_module, "spot_inventory_and_pnl", lambda events: {}
+    )
+    monkeypatch.setattr(
+        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], None)
+    )
+
+    executor = SignalExecutor(bot)
+
+    first = executor.execute_once()
+    second = executor.execute_once()
+    third = executor.execute_once()
+
+    assert first.status == "skipped"
+    assert second.status == "skipped"
+    assert third.status == "filled"
+
+    assert attempts[0] == "ADAUSDT"
+    assert attempts[1] == "ADAUSDT"
+    assert attempts[2] == "XRPUSDT"
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
