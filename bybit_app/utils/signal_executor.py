@@ -252,6 +252,8 @@ class SignalExecutor:
                 context=order_context,
             )
 
+        max_quote = usable_after_reserve if side == "Buy" else None
+
         try:
             response = place_spot_market_with_tolerance(
                 api,
@@ -261,7 +263,7 @@ class SignalExecutor:
                 unit="quoteCoin",
                 tol_type="Percent",
                 tol_value=slippage_pct,
-                max_quote=usable_after_reserve,
+                max_quote=max_quote,
                 settings=settings,
             )
         except OrderValidationError as exc:
