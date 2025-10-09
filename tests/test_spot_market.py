@@ -768,6 +768,36 @@ def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     assert audit.get("limit_price") == "104"
 
 
+def test_prepare_spot_market_sorts_descending_asks_to_best_price():
+    orderbook = {
+        "result": {
+            "a": [["110", "5"], ["100", "5"]],
+            "b": [["99", "5"], ["98", "5"]],
+        }
+    }
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("100"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0,
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("500")},
+        limits=_basic_limits(),
+    )
+
+    audit = prepared.audit
+    assert prepared.payload["price"] == "100.0"
+    assert audit.get("limit_price") == "100"
+    assert audit.get("price_used") == "100"
+    consumed = audit.get("consumed_levels") or []
+    assert consumed and consumed[0]["price"] == "100"
+
+
 def test_prepare_spot_market_target_quote_min_notional_adjustment():
     orderbook = {"result": {"a": [["1.001", "20"]], "b": [["0.999", "20"]]}}
     limits = {

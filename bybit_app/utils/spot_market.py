@@ -434,7 +434,9 @@ def _format_step_decimal(value: Decimal, step: Decimal) -> str:
     return format_to_step(value, step, rounding=ROUND_DOWN)
 
 
-def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tuple[Decimal, Decimal]]:
+def _normalise_orderbook_levels(
+    levels: Sequence[Sequence[object]], *, descending: bool
+) -> list[tuple[Decimal, Decimal]]:
     normalised: list[tuple[Decimal, Decimal]] = []
     for entry in levels or []:
         if not isinstance(entry, Sequence) or len(entry) < 2:
@@ -444,6 +446,7 @@ def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tupl
         if price <= 0 or qty <= 0:
             continue
         normalised.append((price, qty))
+    normalised.sort(key=lambda level: level[0], reverse=descending)
     return normalised
 
 
@@ -472,8 +475,8 @@ def _orderbook_snapshot(api: BybitAPI, symbol: str) -> tuple[list[tuple[Decimal,
         asks_raw = result.get("a") or []
         bids_raw = result.get("b") or []
 
-    asks = _normalise_orderbook_levels(asks_raw)
-    bids = _normalise_orderbook_levels(bids_raw)
+    asks = _normalise_orderbook_levels(asks_raw, descending=False)
+    bids = _normalise_orderbook_levels(bids_raw, descending=True)
     return asks, bids
 
 
