@@ -330,7 +330,7 @@ class GuardianBot:
         if cached is not None:
             return cached
 
-        testnet = bool(getattr(self.settings, "testnet", True))
+        testnet = self.settings.testnet
         try:
             listed = get_listed_spot_symbols(testnet=testnet)
         except Exception as exc:  # pragma: no cover - defensive guard
@@ -1731,7 +1731,7 @@ class GuardianBot:
                 seen_symbols.add(upper_symbol)
 
         listed_symbols = set()
-        testnet_mode = bool(getattr(settings, "testnet", True))
+        testnet_mode = settings.testnet
         if filtered:
             listed_symbols = self._fetch_listed_spot_symbols()
             if listed_symbols:

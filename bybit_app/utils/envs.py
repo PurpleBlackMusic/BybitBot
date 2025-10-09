@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from typing import Any, Dict, Optional, Tuple
 
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
@@ -11,6 +11,53 @@ _CACHE: dict[str, Any] = {
     "settings": None,
     "key": None,
 }
+
+
+_TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
+_FALSE_STRINGS = {"0", "false", "no", "n", "off"}
+
+_SETTINGS_BOOL_FIELDS = {
+    "testnet",
+    "verify_ssl",
+    "dry_run",
+    "ai_enabled",
+    "ai_live_only",
+    "ai_market_scan_enabled",
+    "twap_enabled",
+    "spot_cash_only",
+    "allow_partial_fills",
+    "spot_server_tpsl",
+    "tg_trade_notifs",
+    "telegram_notify",
+    "heartbeat_enabled",
+    "ws_watchdog_enabled",
+    "ws_autostart",
+}
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Return a strict boolean for configuration style inputs."""
+
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return False
+
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return False
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+        return True
+
+    return bool(value)
 
 @dataclass
 class Settings:
@@ -95,6 +142,14 @@ class Settings:
     # WS
     ws_autostart: bool = True
 
+    def __post_init__(self) -> None:
+        for field in fields(self):
+            if field.name not in _SETTINGS_BOOL_FIELDS:
+                continue
+            current = getattr(self, field.name)
+            coerced = _coerce_bool(current)
+            setattr(self, field.name, coerced)
+
 def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(a)
     out.update({k: v for k, v in b.items() if v is not None})
@@ -178,7 +233,7 @@ def _env_signature(env: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
 def _cast_bool(x: Any) -> Optional[bool]:
     if x is None:
         return None
-    return str(x).lower() in ("1", "true", "yes", "y", "on")
+    return _coerce_bool(x)
 
 
 def _cast_int(x: Any) -> Optional[int]:
