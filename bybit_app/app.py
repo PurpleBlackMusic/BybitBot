@@ -23,7 +23,7 @@ from bybit_app.utils.ui import (
     auto_refresh,
 )
 from bybit_app.utils.background import ensure_background_services, get_ws_snapshot
-from bybit_app.utils.envs import get_settings
+from bybit_app.utils.envs import active_api_key, active_api_secret, active_dry_run, get_settings
 from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
 from bybit_app.utils.log import log
 
@@ -124,7 +124,9 @@ def render_header() -> None:
 
 
 def render_status(settings) -> None:
-    ok = bool(settings.api_key and settings.api_secret)
+    api_key_value = active_api_key(settings)
+    api_secret_value = active_api_secret(settings)
+    ok = bool(api_key_value and api_secret_value)
     status = build_status_card(
         "Ключи подключены" if ok else "Добавьте API ключи",
         "Готовы к размещению ордеров." if ok else "Введите ключ и секрет в разделе подключения.",
@@ -137,14 +139,14 @@ def render_status(settings) -> None:
             st.markdown(status, unsafe_allow_html=True)
         with metrics_col:
             st.metric("Сеть", "Testnet" if settings.testnet else "Mainnet")
-            st.metric("Режим", "DRY-RUN" if settings.dry_run else "Live")
+            st.metric("Режим", "DRY-RUN" if active_dry_run(settings) else "Live")
             reserve = getattr(settings, "spot_cash_reserve_pct", 10.0)
             st.metric("Резерв кэша", f"{reserve:.0f}%")
 
         updated_at = getattr(settings, "updated_at", None)
         last_update = updated_at.strftime("%d.%m.%Y %H:%M") if updated_at else "—"
         st.caption(
-            f"API key: {'✅' if settings.api_key else '❌'} · Secret: {'✅' if settings.api_secret else '❌'} · Настройки обновлены: {last_update}"
+            f"API key: {'✅' if api_key_value else '❌'} · Secret: {'✅' if api_secret_value else '❌'} · Настройки обновлены: {last_update}"
         )
 
         if not ok:
@@ -330,7 +332,7 @@ def render_signal_brief(bot: GuardianBot) -> GuardianBrief:
             f"{score['ev_bps']:.1f} б.п.",
             f"Мин. {score['min_ev_bps']:.1f} б.п.",
         )
-        trade_mode = "DRY-RUN" if settings.dry_run else "Live"
+        trade_mode = "DRY-RUN" if active_dry_run(settings) else "Live"
         metric_cols[2].metric("Тактика", mode_label, trade_mode)
         st.caption(f"Обновление: {score['last_update']}")
 
@@ -560,8 +562,8 @@ def collect_user_actions(
         seen[identity] = payload
         actions.append(payload)
 
-    has_keys = bool(getattr(settings, "api_key", None) and getattr(settings, "api_secret", None))
-    dry_run_enabled = bool(getattr(settings, "dry_run", False))
+    has_keys = bool(active_api_key(settings) and active_api_secret(settings))
+    dry_run_enabled = bool(active_dry_run(settings))
     reserve_pct = getattr(settings, "spot_cash_reserve_pct", None)
 
     if not has_keys:
@@ -941,13 +943,13 @@ def render_tips(settings, brief: GuardianBrief) -> None:
             - За уведомления отвечает Telegram-бот: включите его в блоке «Скрытые инструменты».
             """
         )
-        if settings.dry_run:
+        if active_dry_run(settings):
             st.info("DRY-RUN активен: безопасно тестируйте стратегии перед реальной торговлей.")
         else:
             st.warning("DRY-RUN выключен. Проверьте лимиты риска перед запуском торговых сценариев.")
         if brief.status_age and brief.status_age > 300:
             st.error("Данные сигнала устарели. Проверьте, что пайплайн сигналов работает корректно.")
-        if not (settings.api_key and settings.api_secret):
+        if not (active_api_key(settings) and active_api_secret(settings)):
             st.warning("API ключи не добавлены: без них торговля невозможна.")
 
 

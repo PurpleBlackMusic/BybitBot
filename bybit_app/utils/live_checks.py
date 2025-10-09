@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, Iterable, Optional, Tuple
 
 from .bybit_api import BybitAPI, creds_from_settings, get_api
-from .envs import Settings
+from .envs import Settings, active_api_key, active_api_secret, active_dry_run
 from .time_sync import extract_server_epoch
 
 
@@ -197,7 +197,7 @@ def api_key_status(
     api_key = getattr(settings, "api_key", "") or ""
     api_secret = getattr(settings, "api_secret", "") or ""
     network = "Testnet" if settings.testnet else "Mainnet"
-    mode = "DRY-RUN" if getattr(settings, "dry_run", True) else "Live"
+    mode = "DRY-RUN" if active_dry_run(settings) else "Live"
     base_details: Dict[str, object] = {"network": network, "mode": mode}
 
     if not api_key or not api_secret:
@@ -537,7 +537,7 @@ def bybit_realtime_status(
     """Check that Bybit responds with live balance and order data."""
 
     title = "Bybit реальное время"
-    if not (settings.api_key and settings.api_secret):
+    if not (active_api_key(settings) and active_api_secret(settings)):
         return {
             "title": title,
             "ok": False,
@@ -545,7 +545,7 @@ def bybit_realtime_status(
             "details": "Добавьте ключ и секрет Bybit, чтобы читать баланс и ордера.",
         }
 
-    if getattr(settings, "dry_run", True):
+    if active_dry_run(settings):
         return {
             "title": title,
             "ok": False,
