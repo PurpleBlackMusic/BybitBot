@@ -196,7 +196,7 @@ def api_key_status(
     title = "Подключение API"
     api_key = getattr(settings, "api_key", "") or ""
     api_secret = getattr(settings, "api_secret", "") or ""
-    network = "Testnet" if getattr(settings, "testnet", True) else "Mainnet"
+    network = "Testnet" if settings.testnet else "Mainnet"
     mode = "DRY-RUN" if getattr(settings, "dry_run", True) else "Live"
     base_details: Dict[str, object] = {"network": network, "mode": mode}
 
