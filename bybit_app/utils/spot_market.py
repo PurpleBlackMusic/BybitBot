@@ -11,7 +11,7 @@ from .bybit_api import BybitAPI
 from .log import log
 from . import validators
 from .envs import Settings
-from .precision import format_to_step
+from .precision import ceil_qty_to_min_notional, format_to_step
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -1616,6 +1616,26 @@ def prepare_spot_market_order(
     elif target_base is not None:
         qty_base_raw = target_base
 
+    def _apply_validation_result(result: validators.SpotValidationResult) -> None:
+        nonlocal validated, limit_price, qty_base, limit_notional
+
+        price_candidate = result.price
+        qty_candidate = result.qty
+        if price_candidate <= 0 or qty_candidate <= 0:
+            raise OrderValidationError(
+                "Валидация объёма вернула некорректные значения.",
+                code="validation_failed",
+                details={
+                    "price": str(price_candidate),
+                    "qty": str(qty_candidate),
+                },
+            )
+
+        validated = result
+        limit_price = price_candidate
+        qty_base = qty_candidate
+        limit_notional = result.notional
+
     validated = validators.validate_spot_rules(
         instrument=instrument_raw,
         price=price_used,
@@ -1623,21 +1643,29 @@ def prepare_spot_market_order(
         side=side_normalised,
     )
 
-    validated_price = validated.price
-    validated_qty = validated.qty
-    if validated_price <= 0 or validated_qty <= 0:
-        raise OrderValidationError(
-            "Валидация объёма вернула некорректные значения.",
-            code="validation_failed",
-            details={
-                "price": str(validated_price),
-                "qty": str(validated_qty),
-            },
-        )
+    _apply_validation_result(validated)
 
-    limit_price = validated_price
-    qty_base = validated_qty
-    limit_notional = validated.notional
+    if (
+        target_quote is not None
+        and limit_price > 0
+        and min_amount > 0
+        and any(reason.startswith("notional") for reason in validated.reasons)
+    ):
+        adjusted_qty_text = ceil_qty_to_min_notional(
+            qty_base,
+            limit_price,
+            min_amount,
+            qty_step,
+        )
+        adjusted_qty = _to_decimal(adjusted_qty_text)
+        if adjusted_qty > qty_base:
+            validated_adjusted = validators.validate_spot_rules(
+                instrument=instrument_raw,
+                price=limit_price,
+                qty=adjusted_qty,
+                side=side_normalised,
+            )
+            _apply_validation_result(validated_adjusted)
 
     if min_amount > 0 and limit_notional < min_amount and limit_price > 0:
         qty_needed = min_amount / limit_price
@@ -1649,8 +1677,7 @@ def prepare_spot_market_order(
             qty=qty_needed,
             side=side_normalised,
         )
-        qty_base = validated_min.qty
-        limit_notional = validated_min.notional
+        _apply_validation_result(validated_min)
 
     if unit_normalised == "quotecoin":
         market_unit = "quoteCoin"

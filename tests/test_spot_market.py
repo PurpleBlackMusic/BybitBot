@@ -768,6 +768,37 @@ def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     assert audit.get("limit_price") == "104"
 
 
+def test_prepare_spot_market_target_quote_min_notional_adjustment():
+    orderbook = {"result": {"a": [["1.001", "20"]], "b": [["0.999", "20"]]}}
+    limits = {
+        "min_order_amt": "10",
+        "quote_step": "0.01",
+        "min_order_qty": "0",
+        "qty_step": "0.00000001",
+        "quote_coin": "USDT",
+        "base_coin": "TEST",
+        "tick_size": "0.1",
+    }
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="TESTUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_value=10,
+        price_snapshot=Decimal("1.1"),
+        limits=limits,
+    )
+
+    audit = prepared.audit
+    assert audit.get("validator_ok") is True
+    assert not audit.get("validator_reasons")
+    assert Decimal(audit.get("limit_notional")) >= Decimal("10")
+    assert Decimal(audit.get("order_qty_base")) > Decimal("0")
+
+
 def test_buy_tick_and_validation_ceiling_respects_worst_ask():
     asks = [(Decimal("100.03"), Decimal("0.4"))]
     bids = [(Decimal("99.5"), Decimal("0.4"))]
