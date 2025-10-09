@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 
@@ -43,10 +45,13 @@ def _make_service(
     *,
     automation_stale_after: float = 0.5,
     ws_stub: SimpleNamespace | None = None,
+    loop_factory: Callable[[StubExecutor, Callable[..., None]], StubLoop] | None = None,
 ) -> BackgroundServices:
+    if loop_factory is None:
+        loop_factory = lambda executor, on_cycle: StubLoop(executor, on_cycle=on_cycle)
+
     bot_factory = lambda: SimpleNamespace(settings=SimpleNamespace())
     executor_factory = lambda bot: StubExecutor()
-    loop_factory = lambda executor, on_cycle: StubLoop(executor, on_cycle=on_cycle)
 
     if ws_stub is None:
         ws_stub = SimpleNamespace(
@@ -157,8 +162,18 @@ def test_automation_loop_restarts_on_stale(monkeypatch: pytest.MonkeyPatch) -> N
     if original_thread is not None and hasattr(original_thread, "join"):
         original_thread.join(timeout=1)
 
+    class FakeThread:
+        def __init__(self) -> None:
+            self._alive = True
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self._alive = False
+
     fake_event = background_module.threading.Event()
-    svc._automation_thread = SimpleNamespace(is_alive=lambda: True, join=lambda timeout=None: None)
+    svc._automation_thread = FakeThread()
     svc._automation_stop_event = fake_event
     svc._automation_last_cycle = time.time() - 1.0
 
@@ -166,6 +181,75 @@ def test_automation_loop_restarts_on_stale(monkeypatch: pytest.MonkeyPatch) -> N
     assert fake_event.is_set() is True
     assert svc._automation_restart_count == 2
 
+
+def test_automation_force_waits_for_previous_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    running_event = threading.Event()
+    waiting_event = threading.Event()
+    release_event = threading.Event()
+
+    class BlockingLoop:
+        def __init__(self, executor, *, on_cycle, **_: object) -> None:
+            self.executor = executor
+            self.on_cycle = on_cycle
+            self.run_calls = 0
+
+        def run(self, stop_event=None) -> None:
+            self.run_calls += 1
+            running_event.set()
+            if stop_event is not None and self.run_calls == 1:
+                while not stop_event.is_set():
+                    time.sleep(0.01)
+                waiting_event.set()
+                release_event.wait(timeout=1.0)
+            if self.on_cycle is not None:
+                self.on_cycle(ExecutionResult(status="skipped"), "sig", (True, True, True))
+            if stop_event is not None:
+                stop_event.set()
+
+    svc = _make_service(
+        monkeypatch,
+        loop_factory=lambda executor, on_cycle: BlockingLoop(executor, on_cycle=on_cycle),
+    )
+
+    svc.ensure_automation_loop()
+    initial_thread = svc._automation_thread
+    assert initial_thread is not None
+    assert running_event.wait(timeout=1.0)
+    initial_executor = svc._automation_executor
+    assert initial_executor is not None
+
+    restart_done = threading.Event()
+
+    def trigger_restart() -> None:
+        svc.ensure_automation_loop(force=True)
+        restart_done.set()
+
+    restart_thread = threading.Thread(target=trigger_restart)
+    restart_thread.start()
+
+    assert waiting_event.wait(timeout=1.0)
+    time.sleep(0.05)
+
+    assert svc._automation_restart_count == 1
+    assert svc._automation_thread is initial_thread
+
+    running_event.clear()
+    release_event.set()
+    restart_thread.join(timeout=1.0)
+    assert restart_done.is_set() is True
+
+    new_thread = svc._automation_thread
+    assert new_thread is not None and new_thread is not initial_thread
+    assert svc._automation_restart_count == 2
+    assert svc._automation_executor is initial_executor
+    assert running_event.wait(timeout=1.0)
+
+    stop_event = svc._automation_stop_event
+    if stop_event is not None:
+        stop_event.set()
+    new_thread.join(timeout=1.0)
 
 def test_automation_snapshot_marks_stale(monkeypatch: pytest.MonkeyPatch) -> None:
     svc = _make_service(monkeypatch, automation_stale_after=0.2)
