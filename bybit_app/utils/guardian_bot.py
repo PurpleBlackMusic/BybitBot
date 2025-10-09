@@ -18,6 +18,7 @@ WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 
 from .envs import Settings, get_settings, get_api_client
+from .pnl import ledger_path
 from .paths import DATA_DIR
 from .trade_analytics import (
     ExecutionRecord,
@@ -123,7 +124,8 @@ class GuardianBot:
         return Path(self.data_dir) / "ai" / "status.json"
 
     def _ledger_path(self) -> Path:
-        return Path(self.data_dir) / "pnl" / "executions.jsonl"
+        base = Path(self.data_dir) / "pnl" / "executions.jsonl"
+        return ledger_path(self.settings, base=base, prefer_existing=True)
 
     @staticmethod
     def _hash_bytes(payload: bytes) -> int:

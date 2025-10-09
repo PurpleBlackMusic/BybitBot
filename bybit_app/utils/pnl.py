@@ -7,7 +7,9 @@ import time
 import threading
 from collections import deque
 from collections.abc import Mapping
+from pathlib import Path
 
+from .envs import Settings, get_settings
 from .helpers import ensure_link_id
 from .log import log
 from .paths import DATA_DIR
@@ -16,9 +18,58 @@ LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
 _SUMMARY = DATA_DIR / "pnl" / "pnl_daily.json"
 _LOCK = threading.Lock()
 _RECENT_CACHE_SIZE = 2048
-_RECENT_KEYS = deque(maxlen=_RECENT_CACHE_SIZE)
-_RECENT_KEY_SET: set[str] = set()
-_RECENT_WARMED = False
+_RECENT_KEYS: dict[str, deque[str]] = {}
+_RECENT_KEY_SET: dict[str, set[str]] = {}
+_RECENT_WARMED: set[str] = set()
+
+
+def _coerce_settings(settings: Settings | None = None) -> Settings:
+    if isinstance(settings, Settings):
+        return settings
+    try:
+        resolved = get_settings()
+    except Exception:
+        return Settings()
+    if isinstance(resolved, Settings):
+        return resolved
+    return Settings()
+
+
+def _network_label(settings: Settings) -> str:
+    return "testnet" if settings.testnet else "mainnet"
+
+
+def _ledger_path_for(
+    settings: Settings | None = None,
+    *,
+    base: Path | None = None,
+    prefer_existing: bool = False,
+) -> Path:
+    resolved = _coerce_settings(settings)
+    network = _network_label(resolved)
+    suffix = f".{network}"
+    base_path = base if isinstance(base, Path) else LEDGER
+    candidate = base_path.with_name(f"{base_path.stem}{suffix}{base_path.suffix}")
+    if prefer_existing and not candidate.exists() and base_path.exists():
+        return base_path
+    return candidate
+
+
+def ledger_path(
+    settings: Settings | None = None,
+    *,
+    base: Path | None = None,
+    prefer_existing: bool = False,
+) -> Path:
+    """Return the execution ledger path for the requested network."""
+
+    return _ledger_path_for(settings, base=base, prefer_existing=prefer_existing)
+
+
+def _recent_cache(network: str) -> tuple[deque[str], set[str]]:
+    queue = _RECENT_KEYS.setdefault(network, deque(maxlen=_RECENT_CACHE_SIZE))
+    cache = _RECENT_KEY_SET.setdefault(network, set())
+    return queue, cache
 
 
 def _normalise_id(value) -> str | None:
@@ -81,35 +132,37 @@ def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
     return f"{order_id}:{fill_time}:{price}:{qty}:{digest}"
 
 
-def _remember_key(key: str) -> bool:
-    _seed_recent_keys()
+def _remember_key(key: str, *, settings: Settings) -> bool:
+    path = _ledger_path_for(settings)
+    network = _network_label(settings)
+    _seed_recent_keys(network, path)
 
-    if key in _RECENT_KEY_SET:
+    queue, cache = _recent_cache(network)
+
+    if key in cache:
         return False
 
-    if len(_RECENT_KEYS) == _RECENT_KEYS.maxlen:
-        expired = _RECENT_KEYS.popleft()
-        _RECENT_KEY_SET.discard(expired)
+    if len(queue) == queue.maxlen:
+        expired = queue.popleft()
+        cache.discard(expired)
 
-    _RECENT_KEYS.append(key)
-    _RECENT_KEY_SET.add(key)
+    queue.append(key)
+    cache.add(key)
     return True
 
 
-def _seed_recent_keys() -> None:
-    global _RECENT_WARMED
-
-    if _RECENT_WARMED:
+def _seed_recent_keys(network: str, path: Path) -> None:
+    if network in _RECENT_WARMED:
         return
 
-    _RECENT_WARMED = True
+    _RECENT_WARMED.add(network)
 
-    if not LEDGER.exists():
+    if not path.exists():
         return
 
     tail: deque[str] = deque(maxlen=_RECENT_CACHE_SIZE)
     try:
-        with LEDGER.open("r", encoding="utf-8") as fh:
+        with path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 if line.strip():
                     tail.append(line)
@@ -124,18 +177,20 @@ def _seed_recent_keys() -> None:
             continue
 
         key = _execution_key(payload)
-        if not key or key in _RECENT_KEY_SET:
+        queue, cache = _recent_cache(network)
+        if not key or key in cache:
             continue
 
-        if len(_RECENT_KEYS) == _RECENT_KEYS.maxlen:
-            expired = _RECENT_KEYS.popleft()
-            _RECENT_KEY_SET.discard(expired)
+        if len(queue) == queue.maxlen:
+            expired = queue.popleft()
+            cache.discard(expired)
 
-        _RECENT_KEYS.append(key)
-        _RECENT_KEY_SET.add(key)
+        queue.append(key)
+        cache.add(key)
 
-def add_execution(ev: dict):
+def add_execution(ev: dict, *, settings: Settings | None = None):
     """Сохраняем fill (частичный/полный) из топика execution. Ожидаем поля: symbol, side, orderLinkId, execPrice, execQty, execFee, execTime."""
+    resolved_settings = _coerce_settings(settings)
     rec = {
         "ts": int(time.time()*1000),
         "symbol": ev.get("symbol"),
@@ -149,8 +204,9 @@ def add_execution(ev: dict):
         "category": ev.get("category") or ev.get("orderCategory") or "spot"
     }
     key = _execution_key(ev)
+    path = _ledger_path_for(resolved_settings)
     with _LOCK:
-        if key and not _remember_key(key):
+        if key and not _remember_key(key, settings=resolved_settings):
             log(
                 "pnl.exec.duplicate",
                 symbol=rec["symbol"],
@@ -162,8 +218,8 @@ def add_execution(ev: dict):
         if key:
             rec["execKey"] = key
 
-        LEDGER.parent.mkdir(parents=True, exist_ok=True)
-        with LEDGER.open("a", encoding="utf-8") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     log("pnl.exec.add", symbol=rec["symbol"], qty=rec["execQty"], price=rec["execPrice"], fee=rec["execFee"], link=rec["orderLinkId"])
 
@@ -171,10 +227,11 @@ def _f(x):
     try: return float(x)
     except: return None
 
-def read_ledger(n: int = 5000):
-    if not LEDGER.exists():
+def read_ledger(n: int = 5000, *, settings: Settings | None = None):
+    path = _ledger_path_for(settings, prefer_existing=True)
+    if not path.exists():
         return []
-    with LEDGER.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8") as f:
         lines = [json.loads(l) for l in f if l.strip()]
     return lines[-n:]
 

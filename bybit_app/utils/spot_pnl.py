@@ -3,15 +3,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Union
 import json, time
-from .paths import DATA_DIR
 
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .envs import Settings, get_settings
+from .pnl import ledger_path
 
 
-def _resolve_ledger_path(ledger_path: Optional[Union[str, Path]]) -> Path:
+def _resolve_ledger_path(
+    ledger_path: Optional[Union[str, Path]],
+    *,
+    settings: Optional[Settings] = None,
+) -> Path:
     if ledger_path is None:
-        return LEDGER
+        return ledger_path_for_settings(settings)
     return Path(ledger_path)
+
+
+def ledger_path_for_settings(settings: Optional[Settings] = None) -> Path:
+    resolved = settings if isinstance(settings, Settings) else get_settings()
+    if not isinstance(resolved, Settings):
+        resolved = Settings()
+    return ledger_path(resolved, prefer_existing=True)
 
 
 def _iter_ledger_events(path: Path):
@@ -28,6 +39,7 @@ def _iter_ledger_events(path: Path):
 def spot_inventory_and_pnl(
     ledger_path: Optional[Union[str, Path]] = None,
     *,
+    settings: Optional[Settings] = None,
     events: Optional[Iterable[Mapping[str, object]]] = None,
 ):
     """Считает среднюю цену и реализованный PnL по споту на базе леджера исполнений.
@@ -36,7 +48,7 @@ def spot_inventory_and_pnl(
     """
     inv = {}
     if events is None:
-        path = _resolve_ledger_path(ledger_path)
+        path = _resolve_ledger_path(ledger_path, settings=settings)
         if not path.exists():
             return inv
         events_iter = _iter_ledger_events(path)

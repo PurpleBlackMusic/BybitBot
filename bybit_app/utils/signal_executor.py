@@ -966,7 +966,8 @@ class SignalExecutor:
 
         if rows is None:
             try:
-                rows = read_ledger(2000)
+                settings = self._resolve_settings()
+                rows = read_ledger(2000, settings=settings)
             except Exception:
                 return Decimal("0")
         if not rows:
@@ -1131,7 +1132,8 @@ class SignalExecutor:
         self, limit: int = 2000
     ) -> list[Mapping[str, object]]:
         try:
-            rows = read_ledger(limit)
+            settings = self._resolve_settings()
+            rows = read_ledger(limit, settings=settings)
         except Exception:
             return []
         return [row for row in rows if isinstance(row, Mapping)]

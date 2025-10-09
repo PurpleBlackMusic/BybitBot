@@ -6,9 +6,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .paths import DATA_DIR
-
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .envs import Settings, get_settings
+from .pnl import ledger_path
 
 
 def _load_events(ledger: Path) -> Iterable[dict[str, Any]]:
@@ -41,10 +40,21 @@ def _finalize_layers(book: dict[str, Any]) -> None:
         book["layers"] = [list(layer) for layer in layers]
 
 
-def spot_fifo_pnl(ledger_path: Path | None = None) -> dict[str, dict[str, Any]]:
+def _default_ledger(settings: Settings | None = None) -> Path:
+    resolved = settings if isinstance(settings, Settings) else get_settings()
+    if not isinstance(resolved, Settings):
+        resolved = Settings()
+    return ledger_path(resolved, prefer_existing=True)
+
+
+def spot_fifo_pnl(
+    ledger_path: Path | None = None,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, dict[str, Any]]:
     """FIFO учёт по каждой монете."""
 
-    ledger = ledger_path or LEDGER
+    ledger = ledger_path or _default_ledger(settings)
     if not ledger.exists():
         return {}
 

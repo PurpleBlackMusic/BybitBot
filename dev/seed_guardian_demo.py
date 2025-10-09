@@ -10,7 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from bybit_app.utils.envs import Settings
 from bybit_app.utils.paths import DATA_DIR
+from bybit_app.utils.pnl import ledger_path
 
 
 def _write(path: Path, payload: str) -> None:
@@ -38,7 +40,7 @@ def seed_status(now: datetime) -> None:
 
 
 def seed_executions(now: datetime) -> None:
-    ledger_path = Path(DATA_DIR) / "pnl" / "executions.jsonl"
+    ledger = ledger_path(Settings())
     random.seed(1337)
     events: list[dict[str, object]] = []
 
@@ -72,7 +74,7 @@ def seed_executions(now: datetime) -> None:
 
     events.sort(key=lambda payload: payload["execTime"])
     lines = "\n".join(json.dumps(event, ensure_ascii=False) for event in events)
-    _write(ledger_path, lines + "\n")
+    _write(ledger, lines + "\n")
 
 
 def main() -> None:

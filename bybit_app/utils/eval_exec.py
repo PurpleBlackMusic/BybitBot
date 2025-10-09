@@ -2,10 +2,19 @@
 from __future__ import annotations
 from pathlib import Path
 import json, time, statistics as stats
-from .paths import DATA_DIR
 
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .envs import Settings, get_settings
+from .paths import DATA_DIR
+from .pnl import ledger_path
+
 DEC_FILE = DATA_DIR / "pnl" / "decisions.jsonl"
+
+
+def _ledger_path(settings: Settings | None = None) -> Path:
+    resolved = settings if isinstance(settings, Settings) else get_settings()
+    if not isinstance(resolved, Settings):
+        resolved = Settings()
+    return ledger_path(resolved, prefer_existing=True)
 
 def _read_jsonl(p: Path):
     if not p.exists(): return []
@@ -14,7 +23,7 @@ def _read_jsonl(p: Path):
 
 def realized_impact_report(window_sec: int = 1800):
     decs = _read_jsonl(DEC_FILE)
-    exes = _read_jsonl(LEDGER)
+    exes = _read_jsonl(_ledger_path())
     out = {}
     now = time.time()*1000
     for d in decs:

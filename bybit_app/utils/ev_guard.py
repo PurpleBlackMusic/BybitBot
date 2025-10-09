@@ -2,11 +2,19 @@
 from __future__ import annotations
 import json, time
 from pathlib import Path
-from .paths import DATA_DIR
 
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .envs import Settings, get_settings
+from .paths import DATA_DIR
+from .pnl import ledger_path
 DECISIONS = DATA_DIR / "pnl" / "decisions.jsonl"
 GUARD = DATA_DIR / "ai" / "ev_guard.json"
+
+
+def _ledger_path(settings: Settings | None = None) -> Path:
+    resolved = settings if isinstance(settings, Settings) else get_settings()
+    if not isinstance(resolved, Settings):
+        resolved = Settings()
+    return ledger_path(resolved, prefer_existing=True)
 
 def _read_jsonl(p: Path):
     if not p.exists(): return []
@@ -14,7 +22,7 @@ def _read_jsonl(p: Path):
         return [json.loads(x) for x in f if x.strip()]
 
 def realized_bps_last_sells(window: int = 10):
-    rows = _read_jsonl(LEDGER)
+    rows = _read_jsonl(_ledger_path())
     sells = [r for r in rows if (r.get('category') or 'spot').lower()=='spot' and (r.get('side') or '').lower()=='sell']
     # группируем по символам и берём последние window исполнений sell на каждом символе
     out = {}

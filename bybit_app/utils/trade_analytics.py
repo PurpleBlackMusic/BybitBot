@@ -8,8 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
-from .paths import DATA_DIR
+from .envs import Settings, get_settings
 from .file_io import tail_lines
+from .pnl import ledger_path
 
 
 @dataclass(frozen=True)
@@ -102,15 +103,27 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
     )
 
 
-def load_executions(path: Optional[Path | str] = None, limit: Optional[int] = None) -> List[ExecutionRecord]:
+def load_executions(
+    path: Optional[Path | str] = None,
+    limit: Optional[int] = None,
+    *,
+    settings: Optional[Settings] = None,
+) -> List[ExecutionRecord]:
     """Load executions from a JSONL ledger file."""
 
-    ledger_path = Path(path) if path is not None else Path(DATA_DIR) / "pnl" / "executions.jsonl"
-    if not ledger_path.exists():
+    if path is not None:
+        ledger_path_obj = Path(path)
+    else:
+        resolved = settings if isinstance(settings, Settings) else get_settings()
+        if not isinstance(resolved, Settings):
+            resolved = Settings()
+        ledger_path_obj = ledger_path(resolved, prefer_existing=True)
+
+    if not ledger_path_obj.exists():
         return []
 
     records: List[ExecutionRecord] = []
-    lines = tail_lines(ledger_path, limit, drop_blank=True)
+    lines = tail_lines(ledger_path_obj, limit, drop_blank=True)
 
     for line in lines:
         if not line.strip():

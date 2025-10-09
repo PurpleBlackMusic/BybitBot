@@ -465,7 +465,11 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
         "_resolve_open_sell_reserved",
         lambda self, symbol, rows=None: Decimal("0"),
     )
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000: [])
+    monkeypatch.setattr(
+        signal_executor_module,
+        "read_ledger",
+        lambda n=2000, **_: [],
+    )
     monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events=None: {})
     monkeypatch.setattr(signal_executor_module, "send_telegram", lambda *args, **kwargs: None)
 
@@ -894,7 +898,11 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
         {"symbol": "BTCUSDT", "category": "spot", "side": "Buy", "execPrice": 100.0, "execQty": 0.2, "execFee": 0.0},
         {"symbol": "BTCUSDT", "category": "spot", "side": "Sell", "execPrice": 120.0, "execQty": 0.1, "execFee": 0.0},
     ]
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000: ledger_rows)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "read_ledger",
+        lambda n=2000, **_: ledger_rows,
+    )
 
     captured: dict[str, str] = {}
 
@@ -966,7 +974,11 @@ def test_signal_executor_uses_execution_stats_for_notifications(
     }
 
     monkeypatch.setattr(SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], exec_stats))
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000: [])
+    monkeypatch.setattr(
+        signal_executor_module,
+        "read_ledger",
+        lambda n=2000, **_: [],
+    )
     monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events: {})
 
     captured: dict[str, str] = {}

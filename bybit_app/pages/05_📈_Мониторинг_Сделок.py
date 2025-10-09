@@ -8,8 +8,10 @@ import pandas as pd
 import streamlit as st
 
 from utils.dataframe import arrow_safe
+from utils.envs import get_settings
 from utils.guardian_bot import GuardianBot
 from utils.paths import DATA_DIR
+from utils.pnl import ledger_path as resolve_ledger_path
 
 st.set_page_config(page_title="Мониторинг сделок", page_icon="📈", layout="wide")
 
@@ -235,12 +237,13 @@ with st.container(border=True):
 st.divider()
 
 st.subheader("Последние исполнения")
-ledger_path = Path(DATA_DIR) / "pnl" / "executions.jsonl"
-if not ledger_path.exists():
+current_settings = get_settings()
+ledger_file = resolve_ledger_path(current_settings, prefer_existing=True)
+if not ledger_file.exists():
     st.warning("Журнал исполнений пока пуст.")
 else:
     rows = []
-    for line in ledger_path.read_text(encoding="utf-8").splitlines()[-200:]:
+    for line in ledger_file.read_text(encoding="utf-8").splitlines()[-200:]:
         if not line.strip():
             continue
         try:
