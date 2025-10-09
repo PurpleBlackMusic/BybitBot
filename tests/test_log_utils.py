@@ -146,3 +146,23 @@ def test_log_serialises_exception_details(tmp_path, monkeypatch):
     assert exception["type"].endswith("RuntimeError")
     assert "kaboom" in exception["message"]
     assert "RuntimeError: kaboom" in exception["traceback"]
+
+
+def test_reset_logs_on_start_truncates_existing_file(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("legacy", encoding="utf-8")
+
+    log_module.reset_logs_on_start(force=True)
+
+    if log_file.exists():
+        assert log_file.read_text(encoding="utf-8") == ""
+    else:
+        assert not log_file.exists()
+
+    log_module.log("post-reset", value=1)
+    contents = log_file.read_text(encoding="utf-8")
+    assert "post-reset" in contents
+
+    log_module.reset_logs_on_start()
+    assert log_file.read_text(encoding="utf-8") == contents

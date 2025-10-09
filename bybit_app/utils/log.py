@@ -21,6 +21,8 @@ RETAIN_LOG_LINES = 5_000
 
 _LOCK = threading.RLock()
 
+_RESET_DONE = False
+
 _SEVERITY_KEYWORDS = {
     "critical": "critical",
     "fatal": "critical",
@@ -109,6 +111,34 @@ def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None)
 
     with _LOCK:
         _prune_log_file(max_bytes=maximum, retain_lines=keep)
+
+
+def reset_logs_on_start(*, force: bool = False) -> None:
+    """Ensure the log file starts empty for a fresh application launch."""
+
+    global _RESET_DONE
+
+    if _RESET_DONE and not force:
+        return
+
+    with _LOCK:
+        if _RESET_DONE and not force:
+            return
+
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            LOG_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Fall back to truncating in-place when unlinking fails, e.g. on
+            # locked filesystems during tests or restricted environments.
+            atomic_write_text(
+                LOG_FILE, "", encoding="utf-8", preserve_permissions=True
+            )
+
+        _RESET_DONE = True
 
 
 def _derive_severity(event: str, explicit: str | None) -> str:
@@ -221,3 +251,6 @@ def read_tail(
         if parsed is not None
     ]
     return parsed_records
+
+
+reset_logs_on_start()
