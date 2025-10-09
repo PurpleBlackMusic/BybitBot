@@ -97,6 +97,14 @@ def _symbol_cache_key(api: BybitAPI) -> str:
     return f"spot_usdt:{network}"
 
 
+def _price_cache_key(api: BybitAPI, symbol: str) -> str:
+    """Return a network-aware cache key for latest price lookups."""
+
+    network = _network_label(api)
+    normalised_symbol = (symbol or "").upper()
+    return f"{network}:{normalised_symbol}"
+
+
 def _instrument_cache_key(api: BybitAPI, symbol: str) -> str:
     """Return a cache key for instrument metadata scoped to the API network."""
 
@@ -761,8 +769,9 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
 
 
 def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
-    key = symbol.upper()
-    cached = _PRICE_CACHE.get(key)
+    key = (symbol or "").upper()
+    cache_key = _price_cache_key(api, key)
+    cached = _PRICE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -801,7 +810,7 @@ def _latest_price(api: BybitAPI, symbol: str) -> Decimal:
             details={"symbol": key},
         )
 
-    _PRICE_CACHE.set(key, price)
+    _PRICE_CACHE.set(cache_key, price)
     return price
 
 
@@ -1300,7 +1309,7 @@ def prepare_spot_trade_snapshot(
     price: Decimal | None = None
     if include_price:
         if force_refresh:
-            _PRICE_CACHE.invalidate(key)
+            _PRICE_CACHE.invalidate(_price_cache_key(api, key))
         price = _latest_price(api, key)
 
     balances: Dict[str, Decimal] | None = None
