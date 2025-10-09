@@ -84,3 +84,16 @@ def test_get_listed_spot_symbols_uses_cache(monkeypatch: pytest.MonkeyPatch) -> 
     assert first == {"BTCUSDT"}
     assert second == {"BTCUSDT"}
     assert calls.count == 1
+
+
+def test_get_listed_spot_symbols_testnet_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_get(url, params=None, timeout=None):
+        if "api-testnet" in url:
+            raise instruments.requests.exceptions.HTTPError("403 Client Error")
+        pytest.fail("mainnet catalogue should not be requested")
+
+    monkeypatch.setattr(instruments.requests, "get", fake_get)
+
+    result = instruments.get_listed_spot_symbols(testnet=True, force_refresh=True)
+
+    assert result == set()
