@@ -3,8 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json, time, statistics as stats
 from .paths import DATA_DIR
-
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .pnl import _ledger_path_for
 DEC_FILE = DATA_DIR / "pnl" / "decisions.jsonl"
 
 def _read_jsonl(p: Path):
@@ -14,7 +13,7 @@ def _read_jsonl(p: Path):
 
 def realized_impact_report(window_sec: int = 1800):
     decs = _read_jsonl(DEC_FILE)
-    exes = _read_jsonl(LEDGER)
+    exes = _read_jsonl(_ledger_path_for())
     out = {}
     now = time.time()*1000
     for d in decs:

@@ -6,9 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .paths import DATA_DIR
-
-LEDGER = DATA_DIR / "pnl" / "executions.jsonl"
+from .pnl import _ledger_path_for
 
 
 def _load_events(ledger: Path) -> Iterable[dict[str, Any]]:
@@ -44,7 +42,7 @@ def _finalize_layers(book: dict[str, Any]) -> None:
 def spot_fifo_pnl(ledger_path: Path | None = None) -> dict[str, dict[str, Any]]:
     """FIFO учёт по каждой монете."""
 
-    ledger = ledger_path or LEDGER
+    ledger = ledger_path or _ledger_path_for()
     if not ledger.exists():
         return {}
 

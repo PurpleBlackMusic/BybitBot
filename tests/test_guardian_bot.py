@@ -32,6 +32,18 @@ def _make_bot(
     return GuardianBot(data_dir=tmp_path, settings=settings)
 
 
+def _bot_with_ledger(
+    tmp_path: Path,
+    settings: Settings | None = None,
+    *,
+    live_only: bool = False,
+) -> tuple[GuardianBot, Path]:
+    bot = _make_bot(tmp_path, settings, live_only=live_only)
+    ledger_path = bot._ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    return bot, ledger_path
+
+
 STATUS_FILE_MAINNET = GuardianBot.status_filename(network=False)
 STATUS_FILE_TESTNET = GuardianBot.status_filename(network=True)
 
@@ -785,8 +797,7 @@ def test_guardian_answer_handles_non_string_questions(tmp_path: Path) -> None:
 
 
 def test_guardian_profit_answer_uses_ledger(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     events = [
         {
             "category": "spot",
@@ -809,7 +820,6 @@ def test_guardian_profit_answer_uses_ledger(tmp_path: Path) -> None:
         for ev in events:
             fh.write(json.dumps(ev) + "\n")
 
-    bot = _make_bot(tmp_path)
     reply = bot.answer("сколько прибыли сейчас?")
     assert "480.00" in reply or "800.00" in reply
     assert "USDT" in reply
@@ -823,8 +833,7 @@ def test_guardian_plan_answer_in_chat(tmp_path: Path) -> None:
 
 
 def test_guardian_answer_reports_portfolio_positions(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     events = [
         {
             "category": "spot",
@@ -845,7 +854,6 @@ def test_guardian_answer_reports_portfolio_positions(tmp_path: Path) -> None:
         for event in events:
             fh.write(json.dumps(event) + "\n")
 
-    bot = _make_bot(tmp_path)
     reply = bot.answer("что в портфеле?")
 
     assert "В портфеле" in reply
@@ -854,8 +862,7 @@ def test_guardian_answer_reports_portfolio_positions(tmp_path: Path) -> None:
 
 
 def test_guardian_answer_exposure_summary(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     events = [
         {
             "category": "spot",
@@ -933,8 +940,7 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     old_trade_ts = time.time() - 7200
     trade_event = {
         "category": "spot",
@@ -947,7 +953,6 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
     with ledger_path.open("w", encoding="utf-8") as fh:
         fh.write(json.dumps(trade_event) + "\n")
 
-    bot = _make_bot(tmp_path)
     reply = bot.answer("как здоровье данных?")
 
     assert "AI сигнал" in reply
@@ -966,8 +971,7 @@ def test_guardian_data_health_highlights_disabled_ai(tmp_path: Path) -> None:
 
 
 def test_guardian_answer_trade_history(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     now = time.time()
     events = [
         {
@@ -1012,8 +1016,7 @@ def test_guardian_answer_fees_without_history(tmp_path: Path) -> None:
 
 
 def test_guardian_answer_fee_activity_summary(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     now = datetime.now(timezone.utc)
     events = [
         {
@@ -1051,7 +1054,6 @@ def test_guardian_answer_fee_activity_summary(tmp_path: Path) -> None:
         for event in events:
             fh.write(json.dumps(event) + "\n")
 
-    bot = _make_bot(tmp_path)
     reply = bot.answer("дай сводку по комиссиям и maker/taker")
 
     assert "0.00024" in reply
@@ -1814,8 +1816,14 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = Settings(ai_live_only=False,
+        ai_symbols="SOLUSDT",
+        ai_max_concurrent=1,
+        ai_enabled=True,
+        ai_market_scan_enabled=False,
+    )
+
+    bot, ledger_path = _bot_with_ledger(tmp_path, settings)
     events = [
         {
             "category": "spot",
@@ -1837,15 +1845,6 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     with ledger_path.open("w", encoding="utf-8") as fh:
         for event in events:
             fh.write(json.dumps(event) + "\n")
-
-    settings = Settings(ai_live_only=False, 
-        ai_symbols="SOLUSDT",
-        ai_max_concurrent=1,
-        ai_enabled=True,
-        ai_market_scan_enabled=False,
-    )
-
-    bot = _make_bot(tmp_path, settings)
 
     summary = bot.status_summary()
     plan = summary["symbol_plan"]
@@ -1997,8 +1996,7 @@ def test_guardian_symbol_plan_cache_updates_on_portfolio_change(tmp_path: Path) 
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     initial_events = [
         {
             "category": "spot",
@@ -2012,8 +2010,6 @@ def test_guardian_symbol_plan_cache_updates_on_portfolio_change(tmp_path: Path) 
     with ledger_path.open("w", encoding="utf-8") as fh:
         for event in initial_events:
             fh.write(json.dumps(event) + "\n")
-
-    bot = _make_bot(tmp_path)
 
     summary_initial = bot.status_summary()
     plan_initial = summary_initial["symbol_plan"]
@@ -2118,8 +2114,7 @@ def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
     ]
 
 def test_guardian_recent_trades(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     events = [
         {"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "execPrice": "27000", "execQty": "0.01", "execTime": time.time()},
         {"category": "spot", "symbol": "ETHUSDT", "side": "Sell", "execPrice": "1900", "execQty": "0.5", "execFee": "0.2", "execTime": time.time()},
@@ -2129,7 +2124,6 @@ def test_guardian_recent_trades(tmp_path: Path) -> None:
         for ev in events:
             fh.write(json.dumps(ev) + "\n")
 
-    bot = _make_bot(tmp_path)
     trades = bot.recent_trades()
     assert len(trades) == 2
     assert all(trade["symbol"].endswith("USDT") for trade in trades)
@@ -2652,8 +2646,7 @@ def test_guardian_reports_live_fetch_error_when_available(tmp_path: Path, monkey
 
 
 def test_guardian_trade_statistics(tmp_path: Path) -> None:
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     now = time.time()
     events = [
         {"symbol": "BTCUSDT", "side": "Buy", "execPrice": 27000, "execQty": 0.01, "execTime": now - 120},
@@ -2664,7 +2657,6 @@ def test_guardian_trade_statistics(tmp_path: Path) -> None:
         for ev in events:
             fh.write(json.dumps(ev) + "\n")
 
-    bot = _make_bot(tmp_path)
     stats = bot.trade_statistics()
     assert stats["trades"] == 3
     assert "BTCUSDT" in stats["symbols"]
@@ -2684,15 +2676,13 @@ def test_guardian_unified_report_is_serialisable(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    bot, ledger_path = _bot_with_ledger(tmp_path)
     ledger_path.write_text(
         json.dumps({"category": "spot", "symbol": "BTCUSDT", "execPrice": 20000, "execQty": 0.1})
         + "\n",
         encoding="utf-8",
     )
 
-    bot = _make_bot(tmp_path)
     report = bot.unified_report()
 
     assert isinstance(report["brief"], dict)
@@ -2713,8 +2703,8 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = Settings(ai_live_only=False, api_key="k", api_secret="s")
+    bot, ledger_path = _bot_with_ledger(tmp_path, settings)
     ledger_path.write_text(
         json.dumps(
             {
@@ -2751,7 +2741,6 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
         },
     )
 
-    bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     bot.generate_brief()
     health = bot.data_health()
 
@@ -2780,8 +2769,8 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = Settings(ai_live_only=False, api_key="k", api_secret="s")
+    bot, ledger_path = _bot_with_ledger(tmp_path, settings)
     ledger_path.write_text(
         json.dumps(
             {
@@ -2819,7 +2808,6 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
         },
     )
 
-    bot = _make_bot(tmp_path, Settings(ai_live_only=False, api_key="k", api_secret="s"))
     report = bot.unified_report()
 
     monkeypatch.undo()
@@ -2865,7 +2853,8 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
     }
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
-    ledger_path = tmp_path / "pnl" / "executions.jsonl"
+    bot = CountingGuardianBot(data_dir=tmp_path, settings=Settings(ai_live_only=False, ai_market_scan_enabled=False))
+    ledger_path = bot._ledger_path()
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     ledger_path.write_text(
         json.dumps(
@@ -2882,7 +2871,6 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    bot = CountingGuardianBot(data_dir=tmp_path, settings=Settings(ai_live_only=False, ai_market_scan_enabled=False))
     first_report = bot.unified_report()
     assert first_report["statistics"]["trades"] == 1
     assert bot.load_calls == 1

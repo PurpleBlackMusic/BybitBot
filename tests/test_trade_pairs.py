@@ -14,7 +14,7 @@ def pnl_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     monkeypatch.setattr(trade_pairs, "DATA_DIR", base)
     trade_pairs.DEC = pnl / "decisions.jsonl"
-    trade_pairs.LED = pnl / "executions.jsonl"
+    trade_pairs.LED = pnl / "executions.testnet.jsonl"
     trade_pairs.TRD = pnl / "trades.jsonl"
     return pnl
 
@@ -51,7 +51,7 @@ def test_pair_trades_allocates_buy_fees_proportionally(pnl_dir: Path):
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -95,7 +95,7 @@ def test_pair_trades_preserves_fee_signs(pnl_dir: Path) -> None:
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -159,7 +159,7 @@ def test_pair_trades_prefers_matching_order_link_id(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -202,7 +202,7 @@ def test_pair_trades_discards_buys_outside_window(pnl_dir: Path):
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -247,7 +247,7 @@ def test_pair_trades_retains_recent_fill_when_pruning_stale_link(pnl_dir: Path):
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -290,7 +290,7 @@ def test_linked_sell_preserves_lot_outside_window(pnl_dir: Path) -> None:
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -345,7 +345,7 @@ def test_pair_trades_merges_context_when_extending_link_lot(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -390,7 +390,7 @@ def test_pair_trades_computes_r_mult_when_sl_or_rr_is_zero(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -441,7 +441,7 @@ def test_targeted_context_can_clear_sl_and_rr(pnl_dir: Path) -> None:
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -509,7 +509,7 @@ def test_symbol_context_persists_after_targeted_decision(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -562,7 +562,7 @@ def test_pair_trades_refreshes_context_before_sell(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -611,7 +611,7 @@ def test_pair_trades_skips_targeted_context_for_unlinked_entry(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -655,7 +655,7 @@ def test_pair_trades_applies_symbol_context_to_linked_exit(pnl_dir: Path):
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -726,7 +726,7 @@ def test_pair_trades_does_not_apply_targeted_context_to_unlinked_lot(pnl_dir: Pa
     (pnl_dir / "decisions.jsonl").write_text(
         "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
     )
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -787,7 +787,7 @@ def test_pair_trades_records_order_link_id_on_trades(pnl_dir: Path):
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -834,7 +834,7 @@ def test_pair_trades_skips_mismatched_link_sell_for_unlinked_lot(pnl_dir: Path):
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -885,7 +885,7 @@ def test_pair_trades_skips_targeted_sell_when_link_qty_is_insufficient(
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -943,7 +943,7 @@ def test_unlinked_sell_prefers_unlinked_lot_when_available(pnl_dir: Path) -> Non
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 
@@ -1015,7 +1015,7 @@ def test_unlinked_sell_skips_when_unlinked_qty_is_insufficient(pnl_dir: Path) ->
     ]
 
     (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
-    (pnl_dir / "executions.jsonl").write_text(
+    (pnl_dir / "executions.testnet.jsonl").write_text(
         "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
     )
 

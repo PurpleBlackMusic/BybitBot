@@ -308,7 +308,7 @@ class SignalExecutor:
         if audit:
             order["order_audit"] = audit
         private_snapshot = self._private_ws_snapshot()
-        ledger_rows = self._ledger_rows_snapshot()
+        ledger_rows = self._ledger_rows_snapshot(settings=settings)
 
         ladder_orders, execution_stats = self._place_tp_ladder(
             api,
@@ -835,10 +835,14 @@ class SignalExecutor:
         sold_total = Decimal("0")
         symbol_upper = symbol.upper()
 
-        rows = list(ledger_rows) if ledger_rows is not None else self._ledger_rows_snapshot()
+        rows = (
+            list(ledger_rows)
+            if ledger_rows is not None
+            else self._ledger_rows_snapshot(settings=settings)
+        )
 
         if rows:
-            pnl_snapshot = spot_inventory_and_pnl(events=rows)
+            pnl_snapshot = spot_inventory_and_pnl(events=rows, settings=settings)
             symbol_stats = pnl_snapshot.get(symbol_upper) or pnl_snapshot.get(symbol)
             if isinstance(symbol_stats, Mapping):
                 realized_pnl = self._decimal_from(symbol_stats.get("realized_pnl"))
@@ -1128,10 +1132,19 @@ class SignalExecutor:
         return rows
 
     def _ledger_rows_snapshot(
-        self, limit: int = 2000
+        self,
+        limit: int = 2000,
+        *,
+        settings: Optional[Settings] = None,
     ) -> list[Mapping[str, object]]:
+        resolved_settings: Optional[Settings] = settings
+        if resolved_settings is None:
+            try:
+                resolved_settings = self._resolve_settings()
+            except Exception:
+                resolved_settings = None
         try:
-            rows = read_ledger(limit)
+            rows = read_ledger(limit, settings=resolved_settings)
         except Exception:
             return []
         return [row for row in rows if isinstance(row, Mapping)]

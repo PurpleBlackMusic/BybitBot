@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
-from .paths import DATA_DIR
 from .file_io import tail_lines
+from .pnl import _ledger_path_for
 
 
 @dataclass(frozen=True)
@@ -102,10 +102,20 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
     )
 
 
-def load_executions(path: Optional[Path | str] = None, limit: Optional[int] = None) -> List[ExecutionRecord]:
+def load_executions(
+    path: Optional[Path | str] = None,
+    limit: Optional[int] = None,
+    *,
+    settings: object | None = None,
+    network: object | None = None,
+) -> List[ExecutionRecord]:
     """Load executions from a JSONL ledger file."""
 
-    ledger_path = Path(path) if path is not None else Path(DATA_DIR) / "pnl" / "executions.jsonl"
+    ledger_path = (
+        Path(path)
+        if path is not None
+        else _ledger_path_for(settings, network=network)
+    )
     if not ledger_path.exists():
         return []
 

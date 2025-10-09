@@ -20,7 +20,7 @@ streamlit run app.py
 python dev/seed_guardian_demo.py
 ```
 
-Скрипт создаст файлы `ai/status.testnet.json` и `ai/status.mainnet.json` с примером сигнала, а также журнал `pnl/executions.jsonl` с тремя десятками реалистичных исполнений. После этого главная страница, бот и мониторинг откроются уже с наполненными таблицами и метриками.
+Скрипт создаст файлы `ai/status.testnet.json` и `ai/status.mainnet.json` с примером сигнала, а также журналы `pnl/executions.testnet.jsonl` и `pnl/executions.mainnet.jsonl` с тремя десятками реалистичных исполнений. После этого главная страница, бот и мониторинг откроются уже с наполненными таблицами и метриками.
 
 После запуска попадёте на страницу «Bybit Spot Guardian»:
 

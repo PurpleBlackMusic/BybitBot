@@ -19,6 +19,7 @@ STALE_SIGNAL_SECONDS = 900.0
 
 from .envs import Settings, get_settings, get_api_client
 from .paths import DATA_DIR
+from .pnl import _ledger_path_for
 from .trade_analytics import (
     ExecutionRecord,
     aggregate_execution_metrics,
@@ -158,7 +159,8 @@ class GuardianBot:
         return f"ai/{filename}"
 
     def _ledger_path(self) -> Path:
-        return Path(self.data_dir) / "pnl" / "executions.jsonl"
+        filename = _ledger_path_for(self.settings).name
+        return Path(self.data_dir) / "pnl" / filename
 
     @staticmethod
     def _hash_bytes(payload: bytes) -> int:
@@ -3293,7 +3295,7 @@ class GuardianBot:
         if trades == 0 or not last_trade_ts:
             exec_ok = False
             exec_message = "Журнал исполнений пуст — бот ещё не записывал сделки."
-            exec_details = "Добавьте записи в pnl/executions.jsonl для проверки."
+            exec_details = "Добавьте записи в pnl/executions.<network>.jsonl для проверки."
         else:
             last_trade_dt = datetime.fromtimestamp(float(last_trade_ts), tz=timezone.utc)
             exec_age = (datetime.now(timezone.utc) - last_trade_dt).total_seconds()
