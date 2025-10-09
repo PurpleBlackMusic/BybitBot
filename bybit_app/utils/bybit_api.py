@@ -930,9 +930,21 @@ def clear_api_cache() -> None:
 def creds_from_settings(settings: "Settings") -> BybitCreds:
     """Build :class:`BybitCreds` from a ``Settings`` instance."""
 
+    if hasattr(settings, "get_api_key") and hasattr(settings, "get_api_secret"):
+        key = settings.get_api_key()
+        secret = settings.get_api_secret()
+    else:
+        key = getattr(settings, "api_key", "") or ""
+        secret = getattr(settings, "api_secret", "") or ""
+
+    if not key:
+        key = getattr(settings, "api_key", "") or ""
+    if not secret:
+        secret = getattr(settings, "api_secret", "") or ""
+
     return BybitCreds(
-        key=getattr(settings, "api_key", "") or "",
-        secret=getattr(settings, "api_secret", "") or "",
+        key=key or "",
+        secret=secret or "",
         testnet=settings.testnet,
     )
 

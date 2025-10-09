@@ -11,7 +11,13 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_
 import threading
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .envs import Settings, get_api_client, get_settings, creds_ok
+from .envs import (
+    Settings,
+    active_dry_run,
+    get_api_client,
+    get_settings,
+    creds_ok,
+)
 from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
@@ -176,11 +182,11 @@ class SignalExecutor:
 
         try:
             api, wallet_totals = self._resolve_wallet(
-                require_success=not settings.dry_run
+                require_success=not active_dry_run(settings)
             )
         except Exception as exc:
             reason_text = f"Не удалось получить баланс: {exc}"
-            if not creds_ok(settings) and not getattr(settings, "dry_run", True):
+            if not creds_ok(settings) and not active_dry_run(settings):
                 reason_text = (
                     "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
                 )
@@ -214,7 +220,7 @@ class SignalExecutor:
 
         if notional <= 0 or notional < min_notional:
             order_context["min_notional"] = min_notional
-            if getattr(settings, "dry_run", True):
+            if active_dry_run(settings):
                 order = copy.deepcopy(order_context)
                 order["slippage_percent"] = slippage_pct
                 order["note"] = "preview"
@@ -228,7 +234,7 @@ class SignalExecutor:
                 context=order_context,
             )
 
-        if getattr(settings, "dry_run", True):
+        if active_dry_run(settings):
             order = copy.deepcopy(order_context)
             order["slippage_percent"] = slippage_pct
             log("guardian.auto.preview", order=order)
@@ -1347,7 +1353,7 @@ class SignalExecutor:
         """Return a tuple describing current automation toggles."""
 
         settings = self._resolve_settings()
-        dry_run = bool(getattr(settings, "dry_run", True))
+        dry_run = bool(active_dry_run(settings))
         ai_enabled = bool(getattr(settings, "ai_enabled", False))
         return dry_run, creds_ok(settings), ai_enabled
 

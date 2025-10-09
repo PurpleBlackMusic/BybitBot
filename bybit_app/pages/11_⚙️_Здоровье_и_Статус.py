@@ -13,7 +13,7 @@ from utils.background import (
     restart_automation,
     restart_websockets,
 )
-from utils.envs import get_settings
+from utils.envs import active_dry_run, get_settings
 from utils.ui import auto_refresh
 
 
@@ -200,7 +200,7 @@ st.divider()
 
 with st.expander("Сырые данные"):
     st.markdown("### Настройки")
-    st.json({"testnet": settings.testnet, "dry_run": getattr(settings, "dry_run", True)})
+    st.json({"testnet": settings.testnet, "dry_run": active_dry_run(settings)})
     st.markdown("### WebSocket snapshot")
     st.json(ws_snapshot)
     st.markdown("### Automation snapshot")

@@ -16,10 +16,16 @@ _CACHE: dict[str, Any] = {
 _TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
 _FALSE_STRINGS = {"0", "false", "no", "n", "off"}
 
+
+def _network_field(base: str, testnet: bool) -> str:
+    return f"{base}_{'testnet' if testnet else 'mainnet'}"
+
 _SETTINGS_BOOL_FIELDS = {
     "testnet",
     "verify_ssl",
     "dry_run",
+    "dry_run_mainnet",
+    "dry_run_testnet",
     "ai_enabled",
     "ai_live_only",
     "ai_market_scan_enabled",
@@ -64,6 +70,10 @@ class Settings:
     # API / network
     api_key: str = ""
     api_secret: str = ""
+    api_key_mainnet: str = ""
+    api_secret_mainnet: str = ""
+    api_key_testnet: str = ""
+    api_secret_testnet: str = ""
     testnet: bool = True
     recv_window_ms: int = 15000
     http_timeout_ms: int = 10000
@@ -71,6 +81,8 @@ class Settings:
 
     # safety
     dry_run: bool = True
+    dry_run_mainnet: bool = True
+    dry_run_testnet: bool = True
     spot_cash_only: bool = True  # запрет заимствований на споте
     order_time_in_force: str = 'GTC'
     allow_partial_fills: bool = True
@@ -150,6 +162,92 @@ class Settings:
             coerced = _coerce_bool(current)
             setattr(self, field.name, coerced)
 
+        self._sync_credentials()
+
+    # --- helpers -----------------------------------------------------
+    def _active_suffix(self, testnet: Optional[bool] = None) -> str:
+        base_value = getattr(self, "testnet", True)
+        target = base_value if testnet is None else testnet
+        return "testnet" if _coerce_bool(target) else "mainnet"
+
+    def _sync_credentials(self) -> None:
+        suffix = self._active_suffix()
+        key_field = f"api_key_{suffix}"
+        secret_field = f"api_secret_{suffix}"
+        dry_field = f"dry_run_{suffix}"
+
+        # fill per-network credentials from legacy fields if needed
+        if self.api_key and not getattr(self, key_field):
+            object.__setattr__(self, key_field, self.api_key)
+        if self.api_secret and not getattr(self, secret_field):
+            object.__setattr__(self, secret_field, self.api_secret)
+        if self.dry_run is not None and getattr(self, dry_field) is True:
+            # allow explicit False legacy value to override defaults
+            object.__setattr__(self, dry_field, _coerce_bool(self.dry_run))
+
+        # keep legacy fields in sync with active network values
+        object.__setattr__(self, "api_key", getattr(self, key_field))
+        object.__setattr__(self, "api_secret", getattr(self, secret_field))
+        object.__setattr__(self, "dry_run", getattr(self, dry_field))
+
+    def get_api_key(self, *, testnet: Optional[bool] = None) -> str:
+        suffix = self._active_suffix(testnet)
+        return getattr(self, f"api_key_{suffix}")
+
+    def get_api_secret(self, *, testnet: Optional[bool] = None) -> str:
+        suffix = self._active_suffix(testnet)
+        return getattr(self, f"api_secret_{suffix}")
+
+    def get_dry_run(self, *, testnet: Optional[bool] = None) -> bool:
+        suffix = self._active_suffix(testnet)
+        return bool(getattr(self, f"dry_run_{suffix}"))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if name in {
+            "api_key",
+            "api_secret",
+            "dry_run",
+            "testnet",
+            "api_key_mainnet",
+            "api_secret_mainnet",
+            "api_key_testnet",
+            "api_secret_testnet",
+            "dry_run_mainnet",
+            "dry_run_testnet",
+        }:
+            self._sync_credentials()
+
+
+def _migrate_legacy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    migrated = dict(payload)
+    if not migrated:
+        return migrated
+
+    testnet_raw = migrated.get("testnet")
+    if testnet_raw is None:
+        testnet_flag = True
+    else:
+        testnet_flag = _coerce_bool(testnet_raw)
+
+    legacy_key = migrated.pop("api_key", None)
+    legacy_secret = migrated.pop("api_secret", None)
+    legacy_dry_run = migrated.pop("dry_run", None)
+
+    target_key_field = _network_field("api_key", testnet_flag)
+    target_secret_field = _network_field("api_secret", testnet_flag)
+    target_dry_field = _network_field("dry_run", testnet_flag)
+
+    if legacy_key is not None and not migrated.get(target_key_field):
+        migrated[target_key_field] = legacy_key
+    if legacy_secret is not None and not migrated.get(target_secret_field):
+        migrated[target_secret_field] = legacy_secret
+    if legacy_dry_run is not None and target_dry_field not in migrated:
+        migrated[target_dry_field] = legacy_dry_run
+
+    return migrated
+
+
 def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(a)
     out.update({k: v for k, v in b.items() if v is not None})
@@ -166,11 +264,17 @@ def _load_file() -> Dict[str, Any]:
 _ENV_MAP = {
     "api_key": "BYBIT_API_KEY",
     "api_secret": "BYBIT_API_SECRET",
+    "api_key_mainnet": "BYBIT_API_KEY_MAINNET",
+    "api_secret_mainnet": "BYBIT_API_SECRET_MAINNET",
+    "api_key_testnet": "BYBIT_API_KEY_TESTNET",
+    "api_secret_testnet": "BYBIT_API_SECRET_TESTNET",
     "testnet": "BYBIT_TESTNET",
     "recv_window_ms": "BYBIT_RECV_WINDOW_MS",
     "http_timeout_ms": "BYBIT_HTTP_TIMEOUT_MS",
     "verify_ssl": "BYBIT_VERIFY_SSL",
     "dry_run": "BYBIT_DRY_RUN",
+    "dry_run_mainnet": "BYBIT_DRY_RUN_MAINNET",
+    "dry_run_testnet": "BYBIT_DRY_RUN_TESTNET",
     "ai_enabled": "AI_ENABLED",
     "ai_category": "AI_CATEGORY",
     "ai_symbols": "AI_SYMBOLS",
@@ -261,6 +365,8 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["testnet"] = _cast_bool(m.get("testnet"))
     m["verify_ssl"] = _cast_bool(m.get("verify_ssl"))
     m["dry_run"] = _cast_bool(m.get("dry_run"))
+    m["dry_run_mainnet"] = _cast_bool(m.get("dry_run_mainnet"))
+    m["dry_run_testnet"] = _cast_bool(m.get("dry_run_testnet"))
 
     m["ai_enabled"] = _cast_bool(m.get("ai_enabled"))
     m["ai_horizon_bars"] = _cast_int(m.get("ai_horizon_bars"))
@@ -352,7 +458,9 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     if not m.get("heartbeat_minutes"):
         m["heartbeat_minutes"] = m.get("heartbeat_interval_min")
 
-    return m, _env_signature(raw_env)
+    migrated = _migrate_legacy_payload(m)
+
+    return migrated, _env_signature(raw_env)
 
 def _filter_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     from dataclasses import fields as _fields
@@ -400,47 +508,114 @@ def get_settings(force_reload: bool = False) -> Settings:
         return cached
 
     base = asdict(Settings())
-    file_payload = _load_file()
+    file_payload = _migrate_legacy_payload(_load_file())
     merged = _merge(base, _merge(file_payload, env_overrides))
 
-    dry_env_value = raw_env.get("dry_run")
-    dry_configured = "dry_run" in file_payload
+    active_testnet = _coerce_bool(merged.get("testnet"))
+    dry_field = _network_field("dry_run", active_testnet)
+    key_field = _network_field("api_key", active_testnet)
+    secret_field = _network_field("api_secret", active_testnet)
+
+    dry_configured = dry_field in file_payload or (
+        dry_field in env_overrides and env_overrides[dry_field] is not None
+    )
+    dry_env_value = raw_env.get(dry_field)
+    if dry_env_value is None:
+        dry_env_value = raw_env.get("dry_run")
+
     if not dry_configured and dry_env_value is not None:
         if isinstance(dry_env_value, str):
             dry_configured = bool(dry_env_value.strip())
         else:
             dry_configured = True
-    if not dry_configured:
-        if merged.get("dry_run") and merged.get("api_key") and merged.get("api_secret"):
-            merged["dry_run"] = False
+
+    if (
+        not dry_configured
+        and merged.get(dry_field)
+        and merged.get(key_field)
+        and merged.get(secret_field)
+    ):
+        merged[dry_field] = False
     filtered = _filter_fields(merged)
     settings = Settings(**filtered)
     return _set_cache(settings, key)
 
 def update_settings(**kwargs) -> Settings:
-    current = asdict(get_settings())
-    explicit_dry_run = "dry_run" in kwargs and kwargs["dry_run"] is not None
-    file_payload = _load_file()
+    current_settings = get_settings()
+    current = asdict(current_settings)
+    file_payload = _migrate_legacy_payload(_load_file())
     raw_env = _read_env()
-    current.update({k: v for k, v in kwargs.items() if v is not None})
+    env_overrides, _ = _env_overrides(raw_env)
 
-    dry_configured = "dry_run" in file_payload
-    if not dry_configured:
+    requested_testnet = kwargs.get("testnet")
+    if requested_testnet is None:
+        target_testnet = bool(current_settings.testnet)
+    else:
+        target_testnet = _coerce_bool(requested_testnet)
+
+    updates: Dict[str, Any] = {}
+    explicit_dry_run = False
+
+    for key, value in kwargs.items():
+        if value is None:
+            continue
+
+        if key == "api_key":
+            updates[_network_field("api_key", target_testnet)] = value
+        elif key == "api_secret":
+            updates[_network_field("api_secret", target_testnet)] = value
+        elif key == "dry_run":
+            field_name = _network_field("dry_run", target_testnet)
+            updates[field_name] = value
+            explicit_dry_run = True
+        elif key in {"dry_run_mainnet", "dry_run_testnet"}:
+            updates[key] = value
+            if key == _network_field("dry_run", target_testnet):
+                explicit_dry_run = True
+        else:
+            updates[key] = value
+
+    current.update(updates)
+
+    dry_field = _network_field("dry_run", target_testnet)
+    key_field = _network_field("api_key", target_testnet)
+    secret_field = _network_field("api_secret", target_testnet)
+
+    dry_configured = dry_field in file_payload or (
+        dry_field in env_overrides and env_overrides[dry_field] is not None
+    )
+    dry_env_value = raw_env.get(dry_field)
+    if dry_env_value is None:
         dry_env_value = raw_env.get("dry_run")
-        if dry_env_value is not None:
-            if isinstance(dry_env_value, str):
-                dry_configured = bool(dry_env_value.strip())
-            else:
-                dry_configured = True
+    if not dry_configured and dry_env_value is not None:
+        if isinstance(dry_env_value, str):
+            dry_configured = bool(dry_env_value.strip())
+        else:
+            dry_configured = True
 
     if (
         not explicit_dry_run
         and not dry_configured
-        and current.get("dry_run")
-        and current.get("api_key")
-        and current.get("api_secret")
+        and current.get(dry_field)
+        and current.get(key_field)
+        and current.get(secret_field)
     ):
-        current["dry_run"] = False
+        current[dry_field] = False
+
+    for network_flag in (True, False):
+        key_name = _network_field("api_key", network_flag)
+        secret_name = _network_field("api_secret", network_flag)
+        dry_name = _network_field("dry_run", network_flag)
+        if (
+            not current.get(key_name)
+            and not current.get(secret_name)
+            and current.get(dry_name) is True
+        ):
+            current.pop(dry_name, None)
+
+    for legacy in ("api_key", "api_secret", "dry_run"):
+        current.pop(legacy, None)
+
     SETTINGS_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
     _invalidate_cache()
     try:
@@ -456,7 +631,7 @@ def update_settings(**kwargs) -> Settings:
 def creds_ok(s: Optional[Settings] = None) -> bool:
     if s is None:
         s = get_settings()
-    return bool(s.api_key and s.api_secret)
+    return bool(active_api_key(s) and active_api_secret(s))
 
 
 def get_api_client(force_reload: bool = False):
@@ -465,3 +640,24 @@ def get_api_client(force_reload: bool = False):
     from .bybit_api import api_from_settings
 
     return api_from_settings(get_settings(force_reload=force_reload))
+
+
+def active_api_key(settings: Any) -> str:
+    getter = getattr(settings, "get_api_key", None)
+    if callable(getter):
+        return getter()
+    return getattr(settings, "api_key", "") or ""
+
+
+def active_api_secret(settings: Any) -> str:
+    getter = getattr(settings, "get_api_secret", None)
+    if callable(getter):
+        return getter()
+    return getattr(settings, "api_secret", "") or ""
+
+
+def active_dry_run(settings: Any) -> bool:
+    getter = getattr(settings, "get_dry_run", None)
+    if callable(getter):
+        return bool(getter())
+    return bool(getattr(settings, "dry_run", True))

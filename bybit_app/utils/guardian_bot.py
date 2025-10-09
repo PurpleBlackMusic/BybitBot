@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 
-from .envs import Settings, get_settings, get_api_client
+from .envs import Settings, active_dry_run, get_settings, get_api_client
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for
 from .trade_analytics import (
@@ -2981,7 +2981,7 @@ class GuardianBot:
             "Перед реальной торговлей протестируйте логику на учебном аккаунте или с маленькой суммой.",
             "Следите за обновлениями данных: если сигнал устарел, не спешите входить в рынок.",
         ]
-        if self.settings.dry_run:
+        if active_dry_run(self.settings):
             notes.insert(0, "Сейчас включен учебный режим: сделки не затрагивают реальные средства.")
         else:
             notes.insert(0, "Работаем с реальными средствами — подтверждайте только понятные сделки.")
@@ -3705,17 +3705,17 @@ class GuardianBot:
             )
         else:
             env_line = "Бот подключён к боевому счёту."
-            if settings.dry_run:
+            if active_dry_run(settings):
                 env_line += " Сделки подтверждаются в dry-run, исполнение нужно запускать вручную."
             else:
                 env_line += " Реальные сделки включены — контролируйте лимиты тщательно."
             lines.append(env_line)
 
-        if settings.testnet and not settings.dry_run:
+        if settings.testnet and not active_dry_run(settings):
             lines.append(
                 "Несмотря на тестнет, dry-run выключен — ордера будут отправляться в симулятор биржи."
             )
-        elif settings.dry_run and not settings.testnet:
+        elif active_dry_run(settings) and not settings.testnet:
             lines.append(
                 "Dry-run включён: заявки не отправляются на биржу, но журнал и сигналы записываются."
             )

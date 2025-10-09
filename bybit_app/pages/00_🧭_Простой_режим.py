@@ -17,7 +17,7 @@ from utils.background import (
     restart_websockets,
 )
 from utils.dataframe import arrow_safe
-from utils.envs import creds_ok
+from utils.envs import active_dry_run, creds_ok
 from utils.guardian_bot import GuardianBot
 from utils.ui import auto_refresh, rerun
 
@@ -566,7 +566,7 @@ with st.container():
 settings = bot.settings
 signal_fingerprint = bot.status_fingerprint()
 settings_marker = (
-    bool(getattr(settings, "dry_run", True)),
+    bool(active_dry_run(settings)),
     creds_ok(settings),
 )
 
