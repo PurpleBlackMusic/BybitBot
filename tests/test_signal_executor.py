@@ -11,7 +11,7 @@ from bybit_app.utils.signal_executor import (
     ExecutionResult,
     SignalExecutor,
 )
-from bybit_app.utils.spot_market import OrderValidationError
+from bybit_app.utils.spot_market import OrderValidationError, SpotTradeSnapshot
 
 
 @pytest.fixture(autouse=True)
@@ -239,6 +239,53 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert captured["side"] == "Buy"
     assert captured["unit"] == "quoteCoin"
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
+
+
+def test_signal_executor_sell_uses_balance_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=False)
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=0.0, available=0.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    snapshot = SpotTradeSnapshot(
+        symbol="ETHUSDT",
+        price=Decimal("2000"),
+        balances={"ETH": Decimal("0.05")},
+        limits={"min_order_amt": Decimal("5"), "quote_step": Decimal("0.01")},
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        lambda api_obj, symbol, **kwargs: snapshot,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs):
+        captured.update(kwargs)
+        return {"result": {"orderId": "sell-1"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured["side"] == "Sell"
+    assert captured["qty"] == pytest.approx(100.0)
+    assert result.context is not None
+    fallback = result.context.get("sell_balance_fallback")
+    assert isinstance(fallback, dict)
+    assert fallback.get("applied") is True
 
 
 def test_signal_executor_sell_ignores_max_quote(monkeypatch: pytest.MonkeyPatch) -> None:

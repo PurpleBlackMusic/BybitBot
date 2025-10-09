@@ -26,6 +26,7 @@ from .spot_market import (
     OrderValidationError,
     _instrument_limits,
     place_spot_market_with_tolerance,
+    prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
 from .pnl import read_ledger
@@ -202,6 +203,18 @@ class SignalExecutor:
         )
 
         min_notional = 5.0
+        fallback_meta: Optional[Dict[str, object]] = None
+        if side == "Sell" and notional <= 0:
+            fallback_notional, fallback_min, fallback_meta = self._sell_notional_from_balances(
+                summary=summary,
+                api=api,
+                symbol=symbol,
+                default_min_notional=min_notional,
+            )
+            if fallback_min > min_notional:
+                min_notional = fallback_min
+            if fallback_notional > 0:
+                notional = fallback_notional
 
         order_context = {
             "symbol": symbol,
@@ -213,6 +226,8 @@ class SignalExecutor:
         }
         if symbol_meta:
             order_context["symbol_meta"] = symbol_meta
+        if fallback_meta:
+            order_context["sell_balance_fallback"] = fallback_meta
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
@@ -1512,6 +1527,109 @@ class SignalExecutor:
         sizing = max(0.0, min(float(sizing_factor), 1.0))
         notional = round(base_notional * sizing, 2)
         return max(notional, 0.0), usable_after_reserve
+
+    def _sell_notional_from_balances(
+        self,
+        *,
+        summary: Mapping[str, object],
+        api: Optional[object],
+        symbol: str,
+        default_min_notional: float,
+    ) -> Tuple[float, float, Optional[Dict[str, object]]]:
+        base_symbol = (symbol or "").upper()
+        if base_symbol.endswith("USDT"):
+            base_asset = base_symbol[:-4] or base_symbol
+        else:
+            base_asset = base_symbol
+
+        min_requirement = Decimal(str(default_min_notional))
+        fallback_meta: Optional[Dict[str, object]] = None
+
+        if api is None:
+            return 0.0, float(min_requirement), None
+
+        try:
+            snapshot = prepare_spot_trade_snapshot(
+                api,
+                symbol,
+                include_balances=True,
+                include_price=True,
+                include_limits=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "guardian.auto.sell_fallback.snapshot_error",
+                symbol=symbol,
+                err=str(exc),
+            )
+            return 0.0, float(min_requirement), None
+
+        balances = snapshot.balances if isinstance(snapshot.balances, Mapping) else {}
+
+        def _format_decimal(value: Decimal) -> str:
+            try:
+                return format(value.normalize(), "f")
+            except (InvalidOperation, AttributeError):
+                if isinstance(value, Decimal):
+                    return format(value, "f")
+                return str(value)
+
+        available_base = self._decimal_from(balances.get(base_asset)) if balances else Decimal("0")
+        price_decimal = self._decimal_from(snapshot.price, Decimal("0"))
+
+        limits = snapshot.limits if isinstance(snapshot.limits, Mapping) else None
+        quote_step = Decimal("0.01")
+        if limits:
+            limit_min_amount = self._decimal_from(
+                limits.get("min_order_amt"), min_requirement
+            )
+            if limit_min_amount > min_requirement:
+                min_requirement = limit_min_amount
+            limit_quote_step = self._decimal_from(
+                limits.get("quote_step"), quote_step
+            )
+            if limit_quote_step > 0:
+                quote_step = limit_quote_step
+
+        fallback_meta = {
+            "base_asset": base_asset,
+            "available_base": _format_decimal(available_base),
+            "min_notional": _format_decimal(min_requirement),
+            "quote_step": _format_decimal(quote_step),
+        }
+        if price_decimal > 0:
+            fallback_meta["price"] = _format_decimal(price_decimal)
+        else:
+            fallback_meta["price"] = None
+
+        if available_base <= 0:
+            fallback_meta["applied"] = False
+            fallback_meta["reason"] = "no_balance"
+            return 0.0, float(min_requirement), fallback_meta
+
+        if price_decimal <= 0:
+            fallback_meta["applied"] = False
+            fallback_meta["reason"] = "no_price"
+            return 0.0, float(min_requirement), fallback_meta
+
+        quote_value = available_base * price_decimal
+        fallback_meta["quote_value"] = _format_decimal(quote_value)
+
+        notional_decimal = quantize_to_step(quote_value, quote_step, rounding=ROUND_DOWN)
+        fallback_meta["notional_quote"] = _format_decimal(notional_decimal)
+
+        if notional_decimal <= 0:
+            fallback_meta["applied"] = False
+            fallback_meta["reason"] = "rounding_to_zero"
+            return 0.0, float(min_requirement), fallback_meta
+
+        if notional_decimal < min_requirement:
+            fallback_meta["applied"] = False
+            fallback_meta["reason"] = "below_min_notional"
+            return 0.0, float(min_requirement), fallback_meta
+
+        fallback_meta["applied"] = True
+        return float(notional_decimal), float(min_requirement), fallback_meta
 
     def _ensure_ws_activity(self, settings: Settings) -> None:
         if not getattr(settings, "ws_autostart", False):
