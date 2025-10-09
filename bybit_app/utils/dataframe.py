@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from typing import Iterable
+
 import pandas as pd
 
 _TIME_HINTS: tuple[str, ...] = (
@@ -19,11 +22,69 @@ def _looks_like_time(name: str) -> bool:
     return any(hint in lowered for hint in _TIME_HINTS)
 
 
-def _coerce_datetime(series: pd.Series) -> pd.Series:
-    converted = pd.to_datetime(series, errors="coerce", utc=True)
+_EPOCH_LENGTH_TO_UNIT: dict[int, str] = {
+    10: "s",
+    13: "ms",
+    16: "us",
+    19: "ns",
+}
+
+
+def _valid_enough(original: pd.Series, converted: pd.Series) -> bool:
+    """Return ``True`` if *converted* contains enough non-null values."""
+
     valid = converted.notna().sum()
-    if valid >= max(1, int(0.3 * len(series))):
-        return converted
+    return valid >= max(1, int(0.3 * len(original)))
+
+
+def _numeric_like(values: pd.Series) -> bool:
+    if pd.api.types.is_numeric_dtype(values):
+        return True
+    try:
+        return values.astype(str).str.fullmatch(r"-?\d+").all()
+    except Exception:  # pragma: no cover - extremely defensive
+        return False
+
+
+def _infer_epoch_unit(values: Iterable[str]) -> str | None:
+    lengths = Counter(len(value) for value in values)
+    if not lengths:
+        return None
+    most_common_length, _ = lengths.most_common(1)[0]
+    return _EPOCH_LENGTH_TO_UNIT.get(most_common_length)
+
+
+def _coerce_datetime(series: pd.Series) -> pd.Series:
+    non_na = series.dropna()
+    if non_na.empty:
+        return series
+
+    candidates: list[dict[str, object]] = []
+
+    if _numeric_like(non_na):
+        unit = _infer_epoch_unit(non_na.astype(str))
+        if unit:
+            candidates.append({"unit": unit})
+
+    sample = non_na.astype(str)
+    if sample.str.contains(r"\d{4}-\d{2}-\d{2}", regex=True).any():
+        candidates.append({"format": "ISO8601"})
+
+    candidates.append({"format": "mixed"})
+
+    tried: set[tuple[tuple[str, object], ...]] = set()
+    for kwargs in candidates:
+        key = tuple(sorted(kwargs.items()))
+        if key in tried:
+            continue
+        tried.add(key)
+        try:
+            converted = pd.to_datetime(series, errors="coerce", utc=True, **kwargs)
+        except (TypeError, ValueError):
+            continue
+        if _valid_enough(series, converted):
+            return converted
+
     return series
 
 
