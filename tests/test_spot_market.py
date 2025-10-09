@@ -195,6 +195,38 @@ def test_tradable_universe_cache_scoped_by_network():
     assert meta_mainnet_cached["cache_state"] == "cached"
 
 
+def test_latest_price_cache_scoped_by_network():
+    payload = _universe_payload([
+        {"symbol": "BTCUSDT", "quoteCoin": "USDT", "status": "Trading"},
+    ])
+
+    testnet_creds = type("Creds", (), {"testnet": True})()
+    mainnet_creds = type("Creds", (), {"testnet": False})()
+
+    testnet_ticker = {"result": {"list": [{"symbol": "BTCUSDT", "lastPrice": "101"}]}}
+    mainnet_ticker = {"result": {"list": [{"symbol": "BTCUSDT", "lastPrice": "202"}]}}
+
+    testnet_api = DummyAPI(payload, ticker_payload=testnet_ticker, creds=testnet_creds)
+    mainnet_api = DummyAPI(payload, ticker_payload=mainnet_ticker, creds=mainnet_creds)
+
+    testnet_price = spot_market_module._latest_price(testnet_api, "BTCUSDT")
+    assert testnet_price == Decimal("101")
+    assert testnet_api.ticker_calls == 1
+
+    mainnet_price = spot_market_module._latest_price(mainnet_api, "BTCUSDT")
+    assert mainnet_price == Decimal("202")
+    assert mainnet_api.ticker_calls == 1
+
+    # Subsequent lookups should remain cached per network without extra API calls.
+    repeat_testnet_price = spot_market_module._latest_price(testnet_api, "BTCUSDT")
+    assert repeat_testnet_price == Decimal("101")
+    assert testnet_api.ticker_calls == 1
+
+    repeat_mainnet_price = spot_market_module._latest_price(mainnet_api, "BTCUSDT")
+    assert repeat_mainnet_price == Decimal("202")
+    assert mainnet_api.ticker_calls == 1
+
+
 def test_instrument_limits_cache_scoped_by_network():
     def build_payload(min_amount: str, qty_step: str) -> dict:
         return {
