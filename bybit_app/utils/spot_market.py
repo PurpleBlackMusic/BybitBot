@@ -69,18 +69,30 @@ _BALANCE_CACHE: TTLCache[Dict[str, Decimal]] = TTLCache(_BALANCE_CACHE_TTL)
 _SYMBOL_CACHE: TTLCache[Dict[str, object]] = TTLCache(_SYMBOL_CACHE_TTL)
 
 
-def _symbol_cache_key(api: BybitAPI) -> str:
-    """Return a cache key that incorporates the API's active network."""
+def _network_label(api: BybitAPI) -> str:
+    """Return the active network label for the supplied API instance."""
 
     creds = getattr(api, "creds", None)
     if creds is None:
-        network = "unknown"
-    else:
-        testnet_flag = getattr(creds, "testnet", None)
-        if testnet_flag is None:
-            network = "unknown"
-        else:
-            network = "testnet" if bool(testnet_flag) else "mainnet"
+        return "unknown"
+
+    testnet_flag = getattr(creds, "testnet", None)
+    if testnet_flag is None:
+        return "unknown"
+
+    return "testnet" if bool(testnet_flag) else "mainnet"
+
+
+def _balance_cache_key(api: BybitAPI, account_type: str) -> str:
+    network = _network_label(api)
+    account = (account_type or "UNIFIED").upper() or "UNIFIED"
+    return f"{network}:{account}"
+
+
+def _symbol_cache_key(api: BybitAPI) -> str:
+    """Return a cache key that incorporates the API's active network."""
+
+    network = _network_label(api)
 
     return f"spot_usdt:{network}"
 
@@ -1051,12 +1063,14 @@ def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal
 
 
 def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
-    key = account_type.upper() or "UNIFIED"
-    cached = _BALANCE_CACHE.get(key)
+    account_key = (account_type or "UNIFIED").upper() or "UNIFIED"
+    cache_key = _balance_cache_key(api, account_key)
+
+    cached = _BALANCE_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    primary_balances = _load_wallet_balances(api, account_type=key)
+    primary_balances = _load_wallet_balances(api, account_type=account_key)
 
     combined = dict(primary_balances)
     # Users often keep spot funds on a dedicated SPOT account while trading
@@ -1064,28 +1078,28 @@ def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> 
     # expose these assets we perform a transparent fallback to the SPOT
     # account and merge the balances so the guard sees the available funds.
     needs_fallback = False
-    if key in {"UNIFIED", "TRADE"}:
+    if account_key in {"UNIFIED", "TRADE"}:
         if not primary_balances:
             needs_fallback = True
         else:
             needs_fallback = all(amount <= 0 for amount in primary_balances.values())
     if needs_fallback:
-        spot_key = "SPOT"
-        spot_cached = _BALANCE_CACHE.get(spot_key)
+        spot_cache_key = _balance_cache_key(api, "SPOT")
+        spot_cached = _BALANCE_CACHE.get(spot_cache_key)
         if spot_cached is None:
-            spot_cached = _load_wallet_balances(api, account_type=spot_key)
+            spot_cached = _load_wallet_balances(api, account_type="SPOT")
             if not spot_cached:
                 spot_cached = _load_spot_exchange_balances(api)
-            _BALANCE_CACHE.set(spot_key, dict(spot_cached))
+            _BALANCE_CACHE.set(spot_cache_key, dict(spot_cached))
         elif not spot_cached:
             exchange_balances = _load_spot_exchange_balances(api)
             if exchange_balances:
                 spot_cached = exchange_balances
-                _BALANCE_CACHE.set(spot_key, dict(exchange_balances))
+                _BALANCE_CACHE.set(spot_cache_key, dict(exchange_balances))
         for asset, amount in (spot_cached or {}).items():
             combined[asset] = combined.get(asset, Decimal("0")) + amount
 
-    _BALANCE_CACHE.set(key, combined)
+    _BALANCE_CACHE.set(cache_key, combined)
     return combined
 
 
@@ -1282,9 +1296,9 @@ def prepare_spot_trade_snapshot(
 
     balances: Dict[str, Decimal] | None = None
     if include_balances:
-        account_key = account_type.upper() or "UNIFIED"
+        account_key = (account_type or "UNIFIED").upper() or "UNIFIED"
         if force_refresh:
-            _BALANCE_CACHE.invalidate(account_key)
+            _BALANCE_CACHE.invalidate(_balance_cache_key(api, account_key))
         balances = _wallet_available_balances(api, account_type=account_type)
 
     return SpotTradeSnapshot(symbol=key, price=price, balances=balances, limits=limits)
