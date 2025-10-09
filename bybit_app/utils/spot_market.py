@@ -2142,6 +2142,8 @@ def place_spot_market_with_tolerance(
 
     remaining_qty = original_qty
     remaining_cap = _to_decimal(max_quote) if max_quote is not None else None
+    min_order_amt: Decimal | None = None
+    min_order_qty: Decimal | None = None
     attempt_payloads: list[Dict[str, object]] = []
     attempt_audits: list[Dict[str, object]] = []
     attempt_logs: list[Dict[str, object]] = []
@@ -2162,6 +2164,31 @@ def place_spot_market_with_tolerance(
     while attempt < max_attempts:
         if remaining_qty <= 0:
             break
+
+        if min_order_amt is not None or min_order_qty is not None:
+            threshold: Decimal | None = None
+            skip_tail = False
+            if unit_normalised == "quotecoin" and min_order_amt is not None:
+                threshold = min_order_amt
+                if threshold - remaining_qty > _TOLERANCE_MARGIN:
+                    skip_tail = True
+            elif unit_normalised != "quotecoin" and min_order_qty is not None:
+                threshold = min_order_qty
+                if threshold - remaining_qty > _TOLERANCE_MARGIN:
+                    skip_tail = True
+
+            if skip_tail:
+                log(
+                    "spot.market.twap_tail_skipped",
+                    symbol=symbol,
+                    side=side,
+                    remaining_qty=_format_decimal(remaining_qty),
+                    min_threshold=_format_decimal(threshold) if threshold is not None else None,
+                    unit="quote" if unit_normalised == "quotecoin" else "base",
+                    attempts=attempt,
+                    twap_active=twap_active,
+                )
+                break
 
         if twap_active:
             slices_left = max(1, target_slices - twap_orders_sent)
@@ -2217,6 +2244,13 @@ def place_spot_market_with_tolerance(
                         twap_adjustments.append(adjustment)
                         continue
             raise
+
+        min_order_amt_candidate = _to_decimal(prepared.audit.get("min_order_amt"))
+        if min_order_amt_candidate > 0:
+            min_order_amt = min_order_amt_candidate
+        min_order_qty_candidate = _to_decimal(prepared.audit.get("min_order_qty"))
+        if min_order_qty_candidate > 0:
+            min_order_qty = min_order_qty_candidate
 
         attempt += 1
 

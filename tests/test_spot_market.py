@@ -1,5 +1,6 @@
 import time
 from decimal import Decimal
+from typing import Mapping
 
 import pytest
 
@@ -1103,6 +1104,82 @@ def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
     assert adjustments and adjustments[0].get("action") == "activate"
     assert adjustments[0].get("target_slices") == 10
     assert adjustments[0].get("ratio") == "10"
+
+
+def test_place_spot_market_twap_skips_tail_below_min_notional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=3)
+    api = DummyAPI(_universe_payload([]))
+
+    events: list[tuple[str, dict]] = []
+
+    def fake_log(event: str, **kwargs):
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(spot_market_module, "log", fake_log)
+
+    min_notional = Decimal("5")
+    prepared_requests: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        prepared_requests.append(qty_decimal)
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "1",
+            "timeInForce": "GTC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+        }
+        audit = {
+            "quote_step": "0.01",
+            "qty_step": "0.00000001",
+            "min_order_amt": format(min_notional, "f"),
+            "min_order_qty": "0.00000001",
+        }
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    place_payloads: list[dict] = []
+
+    def fake_place_order(**payload):
+        place_payloads.append(payload)
+        return {
+            "result": {
+                "orderQty": payload.get("qty"),
+                "cumExecQty": "9",
+                "cumExecValue": "9",
+                "avgPrice": "1",
+                "leavesQty": "1",
+            }
+        }
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        settings=settings,
+    )
+
+    assert isinstance(response, Mapping)
+    assert place_payloads and len(place_payloads) == 1
+    assert prepared_requests == [Decimal("10")]
+
+    tail_logs = [entry for entry in events if entry[0] == "spot.market.twap_tail_skipped"]
+    assert tail_logs, "tail skip event should be logged"
+    tail_event = tail_logs[-1][1]
+    assert tail_event["remaining_qty"] == "1"
+    assert tail_event["min_threshold"] == "5"
+    assert tail_event["unit"] == "quote"
 
 
 def test_place_spot_market_accepts_bps_suffix():
