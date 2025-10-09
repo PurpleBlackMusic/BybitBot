@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
+from bybit_app.utils import pnl as pnl_module
+from bybit_app.utils.pnl import add_execution
 from bybit_app.utils.spot_pnl import spot_inventory_and_pnl
 
 
@@ -59,3 +62,50 @@ def test_spot_pnl_caps_sell_volume(tmp_path: Path) -> None:
     assert eth["position_qty"] == 0.0
     assert eth["avg_cost"] == 0.0
     assert abs(eth["realized_pnl"] - 200.0) < 1e-9
+
+
+def test_spot_pnl_network_isolation(tmp_path: Path, monkeypatch) -> None:
+    base_dir = tmp_path / "data" / "pnl"
+    monkeypatch.setattr(pnl_module, "_LEDGER_DIR", base_dir)
+    pnl_module._RECENT_KEYS.clear()
+    pnl_module._RECENT_KEY_SET.clear()
+    pnl_module._RECENT_WARMED.clear()
+
+    testnet_settings = SimpleNamespace(testnet=True)
+    mainnet_settings = SimpleNamespace(testnet=False)
+
+    add_execution(
+        {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "orderLinkId": "tn-1",
+            "execPrice": "10000",
+            "execQty": "0.5",
+            "execFee": "0.1",
+            "execTime": 1,
+            "category": "spot",
+        },
+        settings=testnet_settings,
+    )
+
+    add_execution(
+        {
+            "symbol": "ETHUSDT",
+            "side": "Buy",
+            "orderLinkId": "mn-1",
+            "execPrice": "2000",
+            "execQty": "1",
+            "execFee": "0.2",
+            "execTime": 2,
+            "category": "spot",
+        },
+        settings=mainnet_settings,
+    )
+
+    testnet_inventory = spot_inventory_and_pnl(settings=testnet_settings)
+    mainnet_inventory = spot_inventory_and_pnl(settings=mainnet_settings)
+
+    assert set(testnet_inventory) == {"BTCUSDT"}
+    assert testnet_inventory["BTCUSDT"]["position_qty"] == 0.5
+    assert set(mainnet_inventory) == {"ETHUSDT"}
+    assert mainnet_inventory["ETHUSDT"]["position_qty"] == 1.0

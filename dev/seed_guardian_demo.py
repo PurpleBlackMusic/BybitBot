@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from bybit_app.utils.guardian_bot import GuardianBot
 from bybit_app.utils.paths import DATA_DIR
+from bybit_app.utils.pnl import _ledger_path_for
 
 
 def _write(path: Path, payload: str) -> None:
@@ -41,7 +42,6 @@ def seed_status(now: datetime) -> None:
 
 
 def seed_executions(now: datetime) -> None:
-    ledger_path = Path(DATA_DIR) / "pnl" / "executions.jsonl"
     random.seed(1337)
     events: list[dict[str, object]] = []
 
@@ -75,7 +75,10 @@ def seed_executions(now: datetime) -> None:
 
     events.sort(key=lambda payload: payload["execTime"])
     lines = "\n".join(json.dumps(event, ensure_ascii=False) for event in events)
-    _write(ledger_path, lines + "\n")
+
+    for network in (True, False):
+        ledger_path = _ledger_path_for(network=network)
+        _write(ledger_path, lines + "\n")
 
 
 def main() -> None:

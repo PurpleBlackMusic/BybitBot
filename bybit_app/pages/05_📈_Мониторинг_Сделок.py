@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
-
 import pandas as pd
 import streamlit as st
 
 from utils.dataframe import arrow_safe
 from utils.guardian_bot import GuardianBot
-from utils.paths import DATA_DIR
+from utils.pnl import _ledger_path_for
 
 st.set_page_config(page_title="Мониторинг сделок", page_icon="📈", layout="wide")
 
@@ -235,7 +233,7 @@ with st.container(border=True):
 st.divider()
 
 st.subheader("Последние исполнения")
-ledger_path = Path(DATA_DIR) / "pnl" / "executions.jsonl"
+ledger_path = _ledger_path_for()
 if not ledger_path.exists():
     st.warning("Журнал исполнений пока пуст.")
 else:

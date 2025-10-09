@@ -625,7 +625,7 @@ class WSManager:
         with self._fill_lock:
             inventory: dict[str, dict[str, object]] = {}
             try:
-                inventory = spot_inventory_and_pnl()
+                inventory = spot_inventory_and_pnl(settings=self.s)
             except Exception as exc:
                 log("ws.private.inventory.error", err=str(exc))
             else:

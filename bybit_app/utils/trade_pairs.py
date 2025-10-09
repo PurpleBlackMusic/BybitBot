@@ -4,9 +4,10 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from .paths import DATA_DIR
+from .pnl import _ledger_path_for
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
-LED = DATA_DIR / "pnl" / "executions.jsonl"
+LED: Path | None = None
 TRD = DATA_DIR / "pnl" / "trades.jsonl"
 
 def _read_jsonl(p: Path) -> list[dict]:
@@ -19,13 +20,28 @@ def _write_jsonl(p: Path, rows: List[Dict[str, Any]]):
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-def pair_trades(window_ms: int = 7*24*3600*1000) -> list[dict]:
+def _resolve_ledger_path(
+    *,
+    settings: object | None = None,
+    network: object | None = None,
+) -> Path:
+    if LED is not None:
+        return Path(LED)
+    return _ledger_path_for(settings, network=network)
+
+
+def pair_trades(
+    window_ms: int = 7*24*3600*1000,
+    *,
+    settings: object | None = None,
+    network: object | None = None,
+) -> list[dict]:
     """Пары сделок (spot): entry=покупка (Buy), exit=продажа (Sell).
     Линкуем через orderLinkId при наличии, иначе по времени и символу.
     Выход: список трейдов с метриками: r_mult, bps_realized, hold_sec, fees.
     """
     decs = _read_jsonl(DEC)
-    exes = _read_jsonl(LED)
+    exes = _read_jsonl(_resolve_ledger_path(settings=settings, network=network))
     # Сортируем по времени
     decs.sort(key=lambda d: d.get("ts", 0))
     exes.sort(key=lambda e: e.get("execTime") or e.get("ts") or 0)
