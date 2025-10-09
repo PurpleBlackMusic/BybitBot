@@ -1683,7 +1683,7 @@ class SignalExecutor:
 
         cleaned = normalised
 
-        if not getattr(settings, "testnet", True):
+        if not settings.testnet:
             meta_payload: Dict[str, object] = {}
             if quote_meta:
                 meta_payload["quote_conversion"] = quote_meta

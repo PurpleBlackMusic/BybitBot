@@ -912,7 +912,7 @@ def get_api(
     return _build_api(
         creds.key or "",
         creds.secret or "",
-        bool(creds.testnet),
+        creds.testnet,
         int(recv_window),
         int(timeout),
         bool(verify_ssl),
@@ -933,7 +933,7 @@ def creds_from_settings(settings: "Settings") -> BybitCreds:
     return BybitCreds(
         key=getattr(settings, "api_key", "") or "",
         secret=getattr(settings, "api_secret", "") or "",
-        testnet=bool(getattr(settings, "testnet", True)),
+        testnet=settings.testnet,
     )
 
 
@@ -944,7 +944,7 @@ def api_from_settings(settings: "Settings") -> BybitAPI:
         creds_from_settings(settings),
         recv_window=int(getattr(settings, "recv_window_ms", 15000)),
         timeout=int(getattr(settings, "http_timeout_ms", 10000)),
-        verify_ssl=bool(getattr(settings, "verify_ssl", True)),
+        verify_ssl=settings.verify_ssl,
     )
 
 # --- metadata used by KillSwitch & API Nanny ---
