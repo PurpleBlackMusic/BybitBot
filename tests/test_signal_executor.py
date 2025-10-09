@@ -1255,6 +1255,12 @@ def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.Monkey
         return StubAPI(total=1000.0, available=900.0)
 
     monkeypatch.setattr(signal_executor_module, "get_api_client", fake_api)
+    logged_events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **payload: object) -> None:
+        logged_events.append((event, dict(payload)))
+
+    monkeypatch.setattr(signal_executor_module, "log", fake_log)
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -1262,6 +1268,7 @@ def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.Monkey
     assert result.status == "disabled"
     assert result.reason is not None and "WebSocket" in result.reason
     assert api_called["value"] is False
+    assert all(event != "guardian.auto.ws.autostart.error" for event, _ in logged_events)
 
 
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:

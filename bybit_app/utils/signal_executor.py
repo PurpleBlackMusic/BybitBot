@@ -1643,8 +1643,11 @@ class SignalExecutor:
     def _ensure_ws_activity(self, settings: Settings) -> None:
         if not getattr(settings, "ws_autostart", False):
             return
+        autostart = getattr(ws_manager, "autostart", None)
+        if not callable(autostart):
+            return
         try:
-            ws_manager.autostart(include_private=True)
+            autostart(include_private=True)
         except Exception as exc:  # pragma: no cover - defensive guard
             log("guardian.auto.ws.autostart.error", err=str(exc))
 
