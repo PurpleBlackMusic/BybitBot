@@ -21,14 +21,16 @@ def _looks_like_time(name: str) -> bool:
 
 def _coerce_datetime(series: pd.Series) -> pd.Series:
     converted = pd.to_datetime(series, errors="coerce", utc=True)
-    if converted.notna().sum() >= max(1, int(0.6 * len(series))):
+    valid = converted.notna().sum()
+    if valid >= max(1, int(0.3 * len(series))):
         return converted
     return series
 
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
     converted = pd.to_numeric(series, errors="coerce")
-    if converted.notna().sum() >= max(1, int(0.6 * len(series))):
+    valid = converted.notna().sum()
+    if valid >= max(1, int(0.3 * len(series))):
         return converted
     return series
 

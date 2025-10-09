@@ -210,9 +210,12 @@ def api_key_status(
 
     client: BybitAPI
     if api is None:
+        recv_window = int(getattr(settings, "recv_window_ms", 15000) or 15000)
+        if recv_window < 10000:
+            recv_window = 10000
         client = get_api(
             creds_from_settings(settings),
-            recv_window=int(getattr(settings, "recv_window_ms", 5000) or 5000),
+            recv_window=recv_window,
             timeout=int(getattr(settings, "http_timeout_ms", 10000) or 10000),
             verify_ssl=bool(getattr(settings, "verify_ssl", True)),
         )
@@ -552,9 +555,16 @@ def bybit_realtime_status(
 
     client: BybitAPI
     if api is None:
+        recv_window = getattr(settings, "recv_window_ms", 15000) or 15000
+        try:
+            recv_window = int(recv_window)
+        except (TypeError, ValueError):
+            recv_window = 15000
+        if recv_window < 10000:
+            recv_window = 10000
         client = get_api(
             creds_from_settings(settings),
-            recv_window=getattr(settings, "recv_window_ms", 5000) or 5000,
+            recv_window=recv_window,
             timeout=getattr(settings, "http_timeout_ms", 10000) or 10000,
             verify_ssl=getattr(settings, "verify_ssl", True),
         )

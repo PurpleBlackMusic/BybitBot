@@ -17,6 +17,7 @@ _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
 _BALANCE_CACHE_TTL = 5.0
 _INSTRUMENT_CACHE_TTL = 600.0
+_INSTRUMENT_DYNAMIC_TTL = 30.0
 _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
@@ -608,8 +609,15 @@ def _execution_stats(
 def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     key = symbol.upper()
     cached = _INSTRUMENT_CACHE.get(key)
+    now = time.time()
     if cached is not None:
-        return cached
+        dynamic_ts = cached.get("_dynamic_ts") if isinstance(cached, dict) else None
+        try:
+            ts_value = float(dynamic_ts) if dynamic_ts is not None else None
+        except (TypeError, ValueError):
+            ts_value = None
+        if ts_value is not None and now - ts_value < _INSTRUMENT_DYNAMIC_TTL:
+            return cached
 
     try:
         response = api.instruments_info(category="spot", symbol=key)
@@ -711,6 +719,7 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
         "status": status,
     }
     limits["_instrument"] = instrument
+    limits["_dynamic_ts"] = now
     _INSTRUMENT_CACHE.set(key, limits)
     return limits
 

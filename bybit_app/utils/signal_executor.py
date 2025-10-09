@@ -18,6 +18,7 @@ from .live_checks import extract_wallet_totals
 from .log import log
 from .spot_market import (
     OrderValidationError,
+    _instrument_limits,
     place_spot_market_with_tolerance,
     resolve_trade_symbol,
 )
@@ -306,12 +307,17 @@ class SignalExecutor:
                 audit = local.get("order_audit")
         if audit:
             order["order_audit"] = audit
+        private_snapshot = self._private_ws_snapshot()
+        ledger_rows = self._ledger_rows_snapshot()
+
         ladder_orders, execution_stats = self._place_tp_ladder(
             api,
             settings,
             symbol,
             side,
             response,
+            ledger_rows=ledger_rows,
+            private_snapshot=private_snapshot,
         )
         if execution_stats:
             order_context["execution"] = execution_stats
@@ -327,6 +333,7 @@ class SignalExecutor:
             ladder_orders=ladder_orders,
             execution_stats=execution_stats,
             audit=audit,
+            ledger_rows=ledger_rows,
         )
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
 
@@ -339,6 +346,9 @@ class SignalExecutor:
         symbol: str,
         side: str,
         response: Mapping[str, object] | None,
+        *,
+        ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
+        private_snapshot: Mapping[str, object] | None = None,
     ) -> tuple[list[Dict[str, object]], Dict[str, str]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
@@ -356,11 +366,18 @@ class SignalExecutor:
             return [], {}
 
         order_id, order_link_id = self._extract_order_identifiers(response)
+        execution_rows = self._realtime_private_rows(
+            "execution", snapshot=private_snapshot
+        )
+        order_rows = self._realtime_private_rows("order", snapshot=private_snapshot)
+
         filled_base_total = self._collect_filled_base_total(
             symbol,
             order_id=order_id,
             order_link_id=order_link_id,
             executed_base=executed_base_raw,
+            ws_rows=execution_rows,
+            ledger_rows=ledger_rows,
         )
         if filled_base_total <= 0:
             return [], {}
@@ -378,16 +395,63 @@ class SignalExecutor:
                 if isinstance(candidate, Mapping):
                     audit = candidate
 
+        limits: Mapping[str, object] | None = None
+        try:
+            limits = _instrument_limits(api, symbol)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log("guardian.auto.tp_ladder.limits.error", symbol=symbol, err=str(exc))
+            limits = None
+
         qty_step = self._decimal_from(audit.get("qty_step") if audit else None, Decimal("0.00000001"))
         if qty_step <= 0:
             qty_step = Decimal("0.00000001")
+        if limits:
+            limit_qty_step = self._decimal_from(limits.get("qty_step"), qty_step)
+            if limit_qty_step > qty_step:
+                qty_step = limit_qty_step
+
         min_qty = self._decimal_from(audit.get("min_order_qty") if audit else None, Decimal("0"))
+        if limits:
+            limit_min_qty = self._decimal_from(limits.get("min_order_qty"))
+            if limit_min_qty > min_qty:
+                min_qty = limit_min_qty
+
         quote_step = self._decimal_from(audit.get("quote_step") if audit else None, Decimal("0.01"))
+        if limits:
+            limit_quote_step = self._decimal_from(limits.get("quote_step"), quote_step)
+            if limit_quote_step > quote_step:
+                quote_step = limit_quote_step
+
         price_step = self._infer_price_step(audit)
+        if limits:
+            limit_price_step = self._decimal_from(limits.get("tick_size"))
+            if limit_price_step > price_step:
+                price_step = limit_price_step
         if price_step <= 0:
             price_step = Decimal("0.00000001")
 
-        open_sell_reserved = self._resolve_open_sell_reserved(symbol)
+        min_notional = self._decimal_from(audit.get("min_order_amt") if audit else None, Decimal("0"))
+        price_band_min = self._decimal_from(audit.get("min_price") if audit else None, Decimal("0"))
+        price_band_max = self._decimal_from(audit.get("max_price") if audit else None, Decimal("0"))
+        if limits:
+            limit_min_notional = self._decimal_from(limits.get("min_order_amt"))
+            if limit_min_notional > min_notional:
+                min_notional = limit_min_notional
+            limit_min_price = self._decimal_from(limits.get("min_price"))
+            limit_max_price = self._decimal_from(limits.get("max_price"))
+            if limit_min_price > 0:
+                price_band_min = limit_min_price
+            if limit_max_price > 0:
+                price_band_max = limit_max_price
+
+        if min_notional > 0 and avg_price > 0:
+            min_qty_from_notional = self._round_to_step(
+                min_notional / avg_price, qty_step, rounding=ROUND_UP
+            )
+            if min_qty_from_notional > min_qty:
+                min_qty = min_qty_from_notional
+
+        open_sell_reserved = self._resolve_open_sell_reserved(symbol, rows=order_rows)
         available_base = filled_base_total - open_sell_reserved
         if available_base < 0:
             available_base = Decimal("0")
@@ -471,6 +535,12 @@ class SignalExecutor:
         for step_cfg, qty in allocations:
             price = avg_price * (Decimal("1") + step_cfg.profit_fraction)
             price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+            price = self._clamp_price_to_band(
+                price,
+                price_step=price_step,
+                band_min=price_band_min,
+                band_max=price_band_max,
+            )
             if aggregated and aggregated[-1]["price"] == price:
                 aggregated[-1]["qty"] += qty
                 aggregated[-1]["steps"].append(step_cfg)
@@ -489,7 +559,15 @@ class SignalExecutor:
                 continue
             rung_index += 1
             price = self._round_to_step(entry["price"], price_step, rounding=ROUND_UP)
+            price = self._clamp_price_to_band(
+                price,
+                price_step=price_step,
+                band_min=price_band_min,
+                band_max=price_band_max,
+            )
             if price <= 0:
+                continue
+            if min_notional > 0 and price * qty < min_notional:
                 continue
             qty_text = self._format_decimal_step(qty, qty_step)
             price_text = self._format_price_step(price, price_step)
@@ -621,6 +699,10 @@ class SignalExecutor:
                 if isinstance(candidate_payload, Mapping):
                     _assign(candidate_payload)
 
+        if order_link_id:
+            order_link_id = ensure_link_id(order_link_id)
+        if order_id:
+            order_id = order_id.strip()
         return order_id, order_link_id
 
     def _collect_filled_base_total(
@@ -630,17 +712,25 @@ class SignalExecutor:
         order_id: Optional[str],
         order_link_id: Optional[str],
         executed_base: Decimal,
+        ws_rows: Optional[Sequence[Mapping[str, object]]] = None,
+        ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         best_total = executed_base if executed_base > 0 else Decimal("0")
 
         ws_total = self._filled_base_from_private_ws(
-            symbol, order_id=order_id, order_link_id=order_link_id
+            symbol,
+            order_id=order_id,
+            order_link_id=order_link_id,
+            rows=ws_rows,
         )
         if ws_total > best_total:
             best_total = ws_total
 
         ledger_total = self._filled_base_from_ledger(
-            symbol, order_id=order_id, order_link_id=order_link_id
+            symbol,
+            order_id=order_id,
+            order_link_id=order_link_id,
+            rows=ledger_rows,
         )
         if ledger_total > best_total:
             best_total = ledger_total
@@ -657,6 +747,7 @@ class SignalExecutor:
         ladder_orders: Sequence[Mapping[str, object]] | None,
         execution_stats: Mapping[str, object] | None,
         audit: Mapping[str, object] | None,
+        ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> None:
         notify_enabled = bool(
             getattr(settings, "telegram_notify", False) or getattr(settings, "tg_trade_notifs", False)
@@ -723,18 +814,15 @@ class SignalExecutor:
         sold_total = Decimal("0")
         symbol_upper = symbol.upper()
 
-        try:
-            ledger_rows = read_ledger(2000)
-        except Exception:
-            ledger_rows = []
+        rows = list(ledger_rows) if ledger_rows is not None else self._ledger_rows_snapshot()
 
-        if ledger_rows:
-            pnl_snapshot = spot_inventory_and_pnl(events=ledger_rows)
+        if rows:
+            pnl_snapshot = spot_inventory_and_pnl(events=rows)
             symbol_stats = pnl_snapshot.get(symbol_upper) or pnl_snapshot.get(symbol)
             if isinstance(symbol_stats, Mapping):
                 realized_pnl = self._decimal_from(symbol_stats.get("realized_pnl"))
 
-            for entry in ledger_rows:
+            for entry in rows:
                 if not isinstance(entry, Mapping):
                     continue
                 if str(entry.get("symbol") or "").upper() != symbol_upper:
@@ -792,16 +880,19 @@ class SignalExecutor:
         *,
         order_id: Optional[str],
         order_link_id: Optional[str],
+        rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         if not order_id and not order_link_id:
             return Decimal("0")
 
-        rows = self._realtime_private_rows("execution")
+        if rows is None:
+            rows = self._realtime_private_rows("execution")
         if not rows:
             return Decimal("0")
 
         symbol_upper = symbol.upper()
         total = Decimal("0")
+        seen_exec_ids: set[str] = set()
 
         for row in rows:
             if not isinstance(row, Mapping):
@@ -817,8 +908,16 @@ class SignalExecutor:
             cum_qty = self._decimal_from(row.get("cumExecQty"))
             if cum_qty > 0:
                 total = max(total, cum_qty)
+                exec_id = self._normalise_exec_id(row)
+                if exec_id:
+                    seen_exec_ids.add(exec_id)
                 continue
 
+            exec_id = self._normalise_exec_id(row)
+            if exec_id and exec_id in seen_exec_ids:
+                continue
+            if exec_id:
+                seen_exec_ids.add(exec_id)
             qty = self._decimal_from(row.get("execQty"))
             if qty > 0:
                 total += qty
@@ -831,13 +930,17 @@ class SignalExecutor:
         *,
         order_id: Optional[str],
         order_link_id: Optional[str],
+        rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         if not order_id and not order_link_id:
             return Decimal("0")
 
-        try:
-            rows = read_ledger(2000)
-        except Exception:
+        if rows is None:
+            try:
+                rows = read_ledger(2000)
+            except Exception:
+                return Decimal("0")
+        if not rows:
             return Decimal("0")
 
         symbol_upper = symbol.upper()
@@ -861,8 +964,13 @@ class SignalExecutor:
 
         return total
 
-    def _resolve_open_sell_reserved(self, symbol: str) -> Decimal:
-        rows = self._realtime_private_rows("order")
+    def _resolve_open_sell_reserved(
+        self,
+        symbol: str,
+        rows: Optional[Sequence[Mapping[str, object]]] = None,
+    ) -> Decimal:
+        if rows is None:
+            rows = self._realtime_private_rows("order")
         if not rows:
             return Decimal("0")
 
@@ -915,11 +1023,12 @@ class SignalExecutor:
         order_id: Optional[str],
         order_link_id: Optional[str],
     ) -> bool:
-        if order_link_id:
+        normalised_link = ensure_link_id(order_link_id) if order_link_id else None
+        if normalised_link:
             for key in ("orderLinkId", "orderLinkID"):
                 candidate = row.get(key)
                 if isinstance(candidate, str) and candidate.strip():
-                    if candidate.strip() == order_link_id:
+                    if ensure_link_id(candidate.strip()) == normalised_link:
                         return True
         if order_id:
             for key in ("orderId", "orderID"):
@@ -929,14 +1038,37 @@ class SignalExecutor:
                         return True
         return not order_id and not order_link_id
 
-    def _realtime_private_rows(self, topic_keyword: str) -> list[Mapping[str, object]]:
+    @staticmethod
+    def _normalise_exec_id(row: Mapping[str, object]) -> Optional[str]:
+        for key in ("execId", "execID", "executionId", "executionID", "fillId", "tradeId", "matchId"):
+            candidate = row.get(key)
+            if isinstance(candidate, str):
+                text = candidate.strip()
+                if text:
+                    return text
+        return None
+
+    def _private_ws_snapshot(self) -> Mapping[str, object] | None:
         cache = getattr(ws_manager, "_realtime_cache", None)
         if cache is None or not hasattr(cache, "snapshot"):
-            return []
-
+            return None
         try:
             snapshot = cache.snapshot(private_ttl=None)
         except Exception:
+            return None
+        if isinstance(snapshot, Mapping):
+            return snapshot
+        return None
+
+    def _realtime_private_rows(
+        self,
+        topic_keyword: str,
+        *,
+        snapshot: Mapping[str, object] | None = None,
+    ) -> list[Mapping[str, object]]:
+        if snapshot is None:
+            snapshot = self._private_ws_snapshot()
+        if not isinstance(snapshot, Mapping):
             return []
 
         private = snapshot.get("private") if isinstance(snapshot, Mapping) else None
@@ -965,6 +1097,15 @@ class SignalExecutor:
                 if isinstance(entry, Mapping):
                     rows.append(entry)
         return rows
+
+    def _ledger_rows_snapshot(
+        self, limit: int = 2000
+    ) -> list[Mapping[str, object]]:
+        try:
+            rows = read_ledger(limit)
+        except Exception:
+            return []
+        return [row for row in rows if isinstance(row, Mapping)]
 
     @staticmethod
     def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
@@ -1071,6 +1212,26 @@ class SignalExecutor:
     @staticmethod
     def _format_price_step(value: Decimal, step: Decimal) -> str:
         return format_to_step(value, step, rounding=ROUND_UP)
+
+    def _clamp_price_to_band(
+        self,
+        price: Decimal,
+        *,
+        price_step: Decimal,
+        band_min: Decimal,
+        band_max: Decimal,
+    ) -> Decimal:
+        adjusted = price
+        if band_min > 0 and adjusted < band_min:
+            adjusted = band_min
+        if band_max > 0 and adjusted > band_max:
+            adjusted = band_max
+        adjusted = self._round_to_step(adjusted, price_step, rounding=ROUND_UP)
+        if band_min > 0 and adjusted < band_min:
+            adjusted = self._round_to_step(band_min, price_step, rounding=ROUND_UP)
+        if band_max > 0 and adjusted > band_max:
+            adjusted = self._round_to_step(band_max, price_step, rounding=ROUND_DOWN)
+        return adjusted
 
     @staticmethod
     def _extract_execution_totals(response: Mapping[str, object] | None) -> tuple[Decimal, Decimal]:

@@ -358,3 +358,4 @@
 {"symbol": "ETHUSDT", "side": "Buy", "execQty": 0.107894, "execPrice": 2700.2858, "execFee": 0.174807, "execTime": 1760004057.102783, "isMaker": false, "category": "spot"}
 {"symbol": "SOLUSDT", "side": "Buy", "execQty": 0.449952, "execPrice": 183.1653, "execFee": 0.049449, "execTime": 1760009000.159649, "isMaker": true, "category": "spot"}
 {"symbol": "SOLUSDT", "side": "Buy", "execQty": 0.585144, "execPrice": 184.7735, "execFee": 0.064871, "execTime": 1760013145.305823, "isMaker": false, "category": "spot"}
+{"ts": 1760017267314, "symbol": "ETHUSDT", "side": null, "orderId": null, "orderLinkId": "abc", "execPrice": 2000.0, "execQty": 0.5, "execFee": null, "execTime": "1690000000000", "category": "spot", "execKey": "None:1690000000000:2000.0:0.5:e2c207cd"}

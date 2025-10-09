@@ -212,6 +212,10 @@ def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(manager.priv_store, "append", lambda payload: calls.append(payload))
     monkeypatch.setattr(pnl_module, "add_execution", lambda payload: exec_calls.append(payload))
 
+    manager.s.api_key = "key"
+    manager.s.api_secret = "secret"
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
+
     assert manager.start_private() is True
     assert captured["started"] is True
     callback = captured["callback"]
@@ -300,6 +304,10 @@ def test_start_private_does_not_restart_running_client(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(ws_manager_module, "WSPrivateV5", DummyPrivate)
 
+    manager.s.api_key = "key"
+    manager.s.api_secret = "secret"
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
+
     assert manager.start_private() is True
     priv = manager._priv
     assert isinstance(priv, DummyPrivate)
@@ -324,6 +332,10 @@ def test_start_private_handles_start_failure(monkeypatch: pytest.MonkeyPatch) ->
             pass
 
     monkeypatch.setattr(ws_manager_module, "WSPrivateV5", FailingPrivate)
+
+    manager.s.api_key = "key"
+    manager.s.api_secret = "secret"
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     assert manager.start_private() is False
     assert manager._priv is None
