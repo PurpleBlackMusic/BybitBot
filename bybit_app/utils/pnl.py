@@ -133,9 +133,9 @@ def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
 
 
 def _remember_key(key: str, *, settings: Settings) -> bool:
-    path = _ledger_path_for(settings)
+    warm_path = _ledger_path_for(settings, prefer_existing=True)
     network = _network_label(settings)
-    _seed_recent_keys(network, path)
+    _seed_recent_keys(network, warm_path)
 
     queue, cache = _recent_cache(network)
 
