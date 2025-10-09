@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings, update_settings
 from utils.universe import (
     apply_universe_to_settings,
@@ -20,7 +21,7 @@ min_turn = st.number_input("Мин. оборот 24h (USD)", 0.0, 1e12, float(ge
 if st.button("🔎 Собрать топ USDT‑пар по 24h обороту"):
     syms = build_universe(api, size=int(size), min_turnover=float(min_turn))
     st.success(f"Юниверс обновлён: {', '.join(syms)}")
-    st.dataframe(pd.DataFrame({"symbol": syms}), use_container_width=True)
+    st.dataframe(arrow_safe(pd.DataFrame({"symbol": syms})), use_container_width=True)
 
 if st.button("💾 Применить в настройки (ai_symbols)"):
     syms = load_universe()

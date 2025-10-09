@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 
+import pandas as pd
 import streamlit as st
 from utils.envs import get_api_client, get_settings
 from utils.paths import DATA_DIR
+from utils.dataframe import arrow_safe
 
 st.set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
 st.title("💰 PnL Дашборд")
@@ -113,7 +115,11 @@ try:
             if obj.get("event") == "ai.signal":
                 rows.append(obj.get("payload", {}))
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(
+            arrow_safe(pd.DataFrame(rows)),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.info("Пока нет сигналов.")
 except Exception as e:

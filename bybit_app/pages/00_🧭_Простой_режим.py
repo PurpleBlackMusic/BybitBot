@@ -16,6 +16,7 @@ from utils.background import (
     restart_automation,
     restart_websockets,
 )
+from utils.dataframe import arrow_safe
 from utils.envs import creds_ok
 from utils.guardian_bot import GuardianBot
 from utils.ui import auto_refresh, rerun
@@ -673,16 +674,15 @@ else:
     if reasons:
         warning_lines = ["Причины паузы:"] + [f"• {reason}" for reason in reasons]
         st.warning("\n".join(warning_lines))
+        reason_rows = [
+            {
+                "Причина": reason,
+                "Что делать": _recommendation(reason),
+            }
+            for reason in reasons
+        ]
         st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Причина": reason,
-                        "Что делать": _recommendation(reason),
-                    }
-                    for reason in reasons
-                ]
-            ),
+            arrow_safe(pd.DataFrame(reason_rows)),
             use_container_width=True,
             hide_index=True,
         )
@@ -954,7 +954,7 @@ for title, is_ok, detail in readiness_checks:
 
 if readiness_rows:
     st.dataframe(
-        pd.DataFrame(readiness_rows),
+        arrow_safe(pd.DataFrame(readiness_rows)),
         use_container_width=True,
         hide_index=True,
     )
@@ -1005,7 +1005,7 @@ recovery_plan = _recovery_steps(reasons, readiness_checks, summary)
 if recovery_plan:
     st.markdown("#### Как разблокировать бота")
     st.dataframe(
-        pd.DataFrame(recovery_plan),
+        arrow_safe(pd.DataFrame(recovery_plan)),
         use_container_width=True,
         hide_index=True,
     )
@@ -1057,7 +1057,7 @@ if history:
             "Готовность",
         ]
     ]
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(arrow_safe(display_df), use_container_width=True, hide_index=True)
 
 st.session_state["previous_summary"] = copy.deepcopy(summary)
 st.session_state["previous_readiness"] = readiness_score
@@ -1139,7 +1139,11 @@ cols[2].metric("Активных сделок", portfolio_totals.get("open_posit
 
 positions = portfolio.get("positions", [])
 if positions:
-    st.dataframe(pd.DataFrame(positions), use_container_width=True, hide_index=True)
+    st.dataframe(
+        arrow_safe(pd.DataFrame(positions)),
+        use_container_width=True,
+        hide_index=True,
+    )
 else:
     st.caption("Позиции отсутствуют — капитал в резерве.")
 
@@ -1164,11 +1168,19 @@ if health_cards:
 
 if watchlist:
     st.markdown("#### Наблюдаемые пары")
-    st.dataframe(pd.DataFrame(watchlist), use_container_width=True, hide_index=True)
+    st.dataframe(
+        arrow_safe(pd.DataFrame(watchlist)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 if recent_trades:
     st.markdown("#### Последние сделки")
-    st.dataframe(pd.DataFrame(recent_trades), use_container_width=True, hide_index=True)
+    st.dataframe(
+        arrow_safe(pd.DataFrame(recent_trades)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 if trade_stats.get("trades"):
     st.markdown("#### Статистика исполнения")

@@ -11,6 +11,15 @@ from bybit_app.utils import ws_private_v5
 from bybit_app.utils.ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
 
 
+@pytest.fixture(autouse=True)
+def _patch_time_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        ws_private_v5,
+        "synced_timestamp_ms",
+        lambda *args, **kwargs: 1_700_000_000_000,
+    )
+
+
 class _ImmediateThread:
     """Thread stub that runs the target synchronously for deterministic tests."""
 
@@ -154,7 +163,7 @@ def test_ws_private_v5_validates_credentials(monkeypatch: pytest.MonkeyPatch) ->
         lambda force_reload=False: SimpleNamespace(
             api_key="",
             api_secret="",
-            recv_window_ms=5000,
+            recv_window_ms=15000,
         ),
     )
 
@@ -170,7 +179,7 @@ def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.Mo
         lambda force_reload=False: SimpleNamespace(
             api_key="abc",
             api_secret="def",
-            recv_window_ms=5000,
+            recv_window_ms=15000,
         ),
     )
     events: list[tuple[str, dict[str, Any]]] = []
@@ -209,7 +218,7 @@ def test_ws_private_v5_subscribes_to_default_topics(monkeypatch: pytest.MonkeyPa
         lambda force_reload=False: SimpleNamespace(
             api_key="abc",
             api_secret="def",
-            recv_window_ms=5000,
+            recv_window_ms=15000,
         ),
     )
     events: list[tuple[str, dict[str, Any]]] = []
@@ -235,7 +244,7 @@ def test_ws_private_v5_merges_custom_topics(monkeypatch: pytest.MonkeyPatch) -> 
         lambda force_reload=False: SimpleNamespace(
             api_key="abc",
             api_secret="def",
-            recv_window_ms=5000,
+            recv_window_ms=15000,
         ),
     )
     _install_thread_stub(monkeypatch)
@@ -285,7 +294,7 @@ def test_ws_private_v5_emits_heartbeat_on_pong(monkeypatch: pytest.MonkeyPatch) 
         lambda force_reload=False: SimpleNamespace(
             api_key="abc",
             api_secret="def",
-            recv_window_ms=5000,
+            recv_window_ms=15000,
         ),
     )
     _install_thread_stub(monkeypatch)

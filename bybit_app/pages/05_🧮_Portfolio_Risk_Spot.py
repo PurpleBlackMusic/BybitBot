@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 from utils.portfolio import corr_matrix, save_corr, load_corr, estimate_portfolio_allocation
 
@@ -15,11 +16,11 @@ if st.button("🔄 Пересчитать корреляции (30д, 1h)"):
     if not C.empty:
         save_corr(C)
         st.success("Обновлено.")
-        st.dataframe(C, use_container_width=True)
+        st.dataframe(arrow_safe(C), use_container_width=True)
 else:
     C = load_corr()
     if not C.empty:
-        st.dataframe(C, use_container_width=True)
+        st.dataframe(arrow_safe(C), use_container_width=True)
     else:
         st.info("Пока нет сохранённой матрицы. Нажмите «Пересчитать».")
 

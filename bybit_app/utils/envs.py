@@ -18,7 +18,7 @@ class Settings:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = True
-    recv_window_ms: int = 5000
+    recv_window_ms: int = 15000
     http_timeout_ms: int = 10000
     verify_ssl: bool = True
 
@@ -27,7 +27,7 @@ class Settings:
     spot_cash_only: bool = True  # запрет заимствований на споте
     order_time_in_force: str = 'GTC'
     allow_partial_fills: bool = True
-    reprice_unfilled_after_sec: int = 15
+    reprice_unfilled_after_sec: int = 45
     max_amendments: int = 3
     spot_tpsl_sl_order_type: str = 'Market'
     spot_tpsl_tp_order_type: str = 'Market'
@@ -40,7 +40,7 @@ class Settings:
     spot_tp_ladder_split_pct: str = '50,30,20'
 
     # AI — общие
-    ai_enabled: bool = False
+    ai_enabled: bool = True
     ai_category: str = "spot"
     ai_symbols: str = ""
     ai_whitelist: str = ""
@@ -70,8 +70,8 @@ class Settings:
 
     # Universe presets / filters
     ai_universe_preset: str = "Стандарт"
-    ai_max_spread_bps: float = 45.0
-    ai_min_turnover_usd: float = 1_000_000.0
+    ai_max_spread_bps: float = 75.0
+    ai_min_turnover_usd: float = 250_000.0
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
@@ -79,7 +79,7 @@ class Settings:
 
     # WS Watchdog
     ws_watchdog_enabled: bool = True
-    ws_watchdog_max_age_sec: int = 90
+    ws_watchdog_max_age_sec: int = 60
     execution_watchdog_max_age_sec: int = 600
 
     # Telegram

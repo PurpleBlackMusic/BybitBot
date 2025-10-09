@@ -1,11 +1,12 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
+from utils.dataframe import arrow_safe
 from utils.symbol_overrides import load_overrides, set_override
 st.title("🧰 Пер‑символьные настройки (Spot)")
 ovr = load_overrides()
 if ovr:
-    st.dataframe(pd.DataFrame(ovr).T, use_container_width=True)
+    st.dataframe(arrow_safe(pd.DataFrame(ovr).T), use_container_width=True)
 sym = st.text_input("Символ", value="BTCUSDT").upper().strip()
 imp = st.number_input("Лимит импакта (bps) — пусто чтобы не менять", 0.0, 500.0, 0.0)
 th  = st.number_input("Buy threshold — пусто чтобы не менять", 0.0, 1.0, 0.0, step=0.01)

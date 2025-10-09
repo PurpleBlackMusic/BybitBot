@@ -1,5 +1,5 @@
 from __future__ import annotations
-import time, hmac, hashlib, json
+import hmac, hashlib, json, time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
@@ -16,6 +16,7 @@ API_TEST = "https://api-testnet.bybit.com"
 
 from .helpers import ensure_link_id
 from .log import log
+from .time_sync import invalidate_synced_clock, synced_timestamp_ms
 
 @dataclass
 class BybitCreds:
@@ -24,7 +25,7 @@ class BybitCreds:
     testnet: bool = True
 
 class BybitAPI:
-    def __init__(self, creds: BybitCreds, recv_window: int = 5000, timeout: int = 10000, verify_ssl: bool = True):
+    def __init__(self, creds: BybitCreds, recv_window: int = 15000, timeout: int = 10000, verify_ssl: bool = True):
         self.creds = creds
         self.recv_window = int(recv_window)
         self.timeout = int(timeout)
@@ -50,6 +51,16 @@ class BybitAPI:
         payload = f"{ts}{self.creds.key}{self.recv_window}{query_or_body}"
         return hmac.new(self.creds.secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
+    def _timestamp_ms(self, *, force_refresh: bool = False) -> int:
+        timeout_seconds = max(self.timeout / 1000.0, 1.0)
+        return synced_timestamp_ms(
+            self.base,
+            session=self.session,
+            timeout=timeout_seconds,
+            verify=self.verify_ssl,
+            force_refresh=force_refresh,
+        )
+
     def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None, signed: bool = False):
         url = self.base + path
         if not signed:
@@ -74,7 +85,7 @@ class BybitAPI:
             return r.json()
 
         # signed
-        ts = str(int(time.time() * 1000))
+        ts = str(self._timestamp_ms())
         if method.upper() == "GET":
             ordered_params = sorted((params or {}).items())
             q = urlencode(ordered_params)
@@ -97,19 +108,39 @@ class BybitAPI:
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
-        resp = self._req(method, path, params=params, body=body, signed=signed)
-        # bybit v5 формат: {retCode, retMsg, result, ...}
-        if isinstance(resp, dict):
+        attempts = 2 if signed else 1
+        last_error: RuntimeError | None = None
+
+        for attempt in range(attempts):
+            resp = self._req(method, path, params=params, body=body, signed=signed)
+            if not isinstance(resp, dict):
+                return resp
+
             ret_code = resp.get("retCode", 0)
-            if isinstance(ret_code, str):
+            numeric_code = ret_code
+            if isinstance(numeric_code, str):
                 try:
-                    ret_code = int(ret_code)
+                    numeric_code = int(numeric_code)
                 except ValueError:
-                    pass
-            if ret_code != 0:
-                raise RuntimeError(
-                    f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})"
-                )
+                    numeric_code = ret_code
+
+            if numeric_code in (0, "0"):
+                return resp
+
+            error = RuntimeError(
+                f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})"
+            )
+            last_error = error
+
+            if signed and attempt == 0 and numeric_code == 10002:
+                invalidate_synced_clock(self.base)
+                self._timestamp_ms(force_refresh=True)
+                continue
+
+            raise error
+
+        if last_error:
+            raise last_error
         return resp
 
     @staticmethod
@@ -868,7 +899,7 @@ def _build_api(key: str, secret: str, testnet: bool, recv_window: int, timeout: 
 
 def get_api(
     creds: BybitCreds,
-    recv_window: int = 5000,
+    recv_window: int = 15000,
     timeout: int = 10000,
     verify_ssl: bool = True,
 ) -> BybitAPI:
@@ -892,6 +923,8 @@ def clear_api_cache() -> None:
     """Reset the cached API clients (useful in tests)."""
 
     _build_api.cache_clear()
+    invalidate_synced_clock(API_MAIN)
+    invalidate_synced_clock(API_TEST)
 
 
 def creds_from_settings(settings: "Settings") -> BybitCreds:
@@ -909,7 +942,7 @@ def api_from_settings(settings: "Settings") -> BybitAPI:
 
     return get_api(
         creds_from_settings(settings),
-        recv_window=int(getattr(settings, "recv_window_ms", 5000)),
+        recv_window=int(getattr(settings, "recv_window_ms", 15000)),
         timeout=int(getattr(settings, "http_timeout_ms", 10000)),
         verify_ssl=bool(getattr(settings, "verify_ssl", True)),
     )

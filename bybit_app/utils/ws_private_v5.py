@@ -9,8 +9,10 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
+from .bybit_api import API_MAIN, API_TEST
 from .envs import get_settings
 from .log import log
+from .time_sync import invalidate_synced_clock, synced_timestamp_ms
 
 
 DEFAULT_TOPICS: tuple[str, ...] = (
@@ -50,6 +52,12 @@ class WSPrivateV5:
         payload = f"GET/realtime{expires_ms}"
         return hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
+    def _rest_base(self) -> str:
+        url = (self.url or "").lower()
+        if "testnet" in url:
+            return API_TEST
+        return API_MAIN
+
     def _auth_args(self, key: str, secret: str, *, leeway: float = 10.0) -> tuple[str, str, str]:
         """Prepare authentication arguments for the `auth` request.
 
@@ -58,7 +66,27 @@ class WSPrivateV5:
         clock skew or scheduling delays causing an immediate "Params Error".
         """
 
-        expires_ms = int((time.time() + max(leeway, 1.0)) * 1000)
+        settings = None
+        try:
+            settings = get_settings()
+        except Exception:
+            settings = None
+
+        verify_ssl = True
+        if settings is not None:
+            verify_ssl = bool(getattr(settings, "verify_ssl", True))
+
+        base_url = self._rest_base()
+        try:
+            now_ms = synced_timestamp_ms(
+                base_url,
+                timeout=5.0,
+                verify=verify_ssl,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            now_ms = int(time.time() * 1000)
+
+        expires_ms = now_ms + int(max(leeway, 1.0) * 1000)
         signature = self._sign(expires_ms, key, secret)
         return key, str(expires_ms), signature
 
@@ -201,6 +229,7 @@ class WSPrivateV5:
             log("ws.private.disabled", reason="no websocket-client", err=str(e))
             return False
 
+        base_url = self._rest_base()
         auth_args = self._auth_args(api_key, api_secret)
         auth = {"op": "auth", "args": list(auth_args)}
         self._set_topics(topics)
@@ -282,7 +311,24 @@ class WSPrivateV5:
                             self._subscribe_missing(ws)
                             log("ws.private.auth.ok")
                         else:
-                            log("ws.private.auth.error", msg=payload.get("ret_msg"))
+                            ret_code = (
+                                payload.get("ret_code")
+                                or payload.get("code")
+                                or payload.get("retCode")
+                            )
+                            log(
+                                "ws.private.auth.error",
+                                msg=payload.get("ret_msg"),
+                                code=ret_code,
+                            )
+                            if ret_code in (10002, "10002"):
+                                invalidate_synced_clock(base_url)
+                                retry_args = self._auth_args(api_key, api_secret)
+                                auth.update({"args": list(retry_args)})
+                                try:
+                                    ws.send(json.dumps(auth))
+                                except Exception as exc:
+                                    log("ws.private.auth.retry.error", err=str(exc))
                     elif payload.get("op") == "subscribe":
                         success = payload.get("success", True)
                         args = payload.get("args")

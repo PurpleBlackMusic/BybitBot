@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from utils.dataframe import arrow_safe
 from utils.guardian_bot import GuardianBot
 from utils.paths import DATA_DIR
 
@@ -211,7 +212,7 @@ with st.container(border=True):
                 "realized_pnl": "Реализованный PnL",
             }
         )
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(arrow_safe(df), use_container_width=True, hide_index=True)
     else:
         st.info("Позиции не обнаружены — бот ждёт подходящего момента.")
 
@@ -227,7 +228,7 @@ with st.container(border=True):
             }
         )
         df_activity["Доля покупок"] = (df_activity["Доля покупок"] * 100).round(1).astype(str) + "%"
-        st.dataframe(df_activity, use_container_width=True, hide_index=True)
+        st.dataframe(arrow_safe(df_activity), use_container_width=True, hide_index=True)
     else:
         st.caption("Как только появятся сделки, здесь появится разбивка по парам.")
 
@@ -274,7 +275,7 @@ else:
         )
         df["Время"] = df["ts"].dt.strftime("%Y-%m-%d %H:%M:%S").fillna("—")
         df = df.drop(columns=["ts"])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(arrow_safe(df), use_container_width=True, hide_index=True)
     else:
         st.info("Ещё не было сделок, которые бот записал в журнал.")
 

@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd, numpy as np, time
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 from utils.impact import estimate_vwap_from_orderbook
 
@@ -24,5 +25,5 @@ if st.button("▶️ Замерить"):
             rows.append({"sample": i, "qty": q, "impact_bps": est.get("impact_bps"), "vwap": est.get("vwap"), "mid": est.get("mid")})
         time.sleep(pause)
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(arrow_safe(df), use_container_width=True)
     st.caption("Совет: используйте p75 impact для порога импакта на паре.")
