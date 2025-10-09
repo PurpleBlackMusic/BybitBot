@@ -450,7 +450,9 @@ def _normalise_orderbook_levels(levels: Sequence[Sequence[object]]) -> list[tupl
 def _apply_tick(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
     if tick_size <= 0:
         return price
-    multiplier = (price / tick_size).to_integral_value(rounding=ROUND_DOWN)
+    side_normalised = (side or "").lower()
+    rounding = ROUND_UP if side_normalised == "buy" else ROUND_DOWN
+    multiplier = (price / tick_size).to_integral_value(rounding=rounding)
     adjusted = multiplier * tick_size
     if adjusted <= 0:
         adjusted = tick_size
@@ -1618,6 +1620,7 @@ def prepare_spot_market_order(
         instrument=instrument_raw,
         price=price_used,
         qty=qty_base_raw,
+        side=side_normalised,
     )
 
     validated_price = validated.price
@@ -1644,6 +1647,7 @@ def prepare_spot_market_order(
             instrument=instrument_raw,
             price=limit_price,
             qty=qty_needed,
+            side=side_normalised,
         )
         qty_base = validated_min.qty
         limit_notional = validated_min.notional
@@ -1713,6 +1717,7 @@ def prepare_spot_market_order(
                 instrument=instrument_raw,
                 price=limit_price,
                 qty=qty_candidate,
+                side=side_normalised,
             )
             candidate_qty = validated_loop.qty
             candidate_notional = validated_loop.notional
