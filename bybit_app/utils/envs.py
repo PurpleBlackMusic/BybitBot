@@ -38,6 +38,8 @@ class Settings:
     spot_cash_reserve_pct: float = 10.0
     spot_tp_ladder_bps: str = '35,70,110'
     spot_tp_ladder_split_pct: str = '50,30,20'
+    spot_tp_reprice_threshold_bps: float = 5.0
+    spot_tp_reprice_qty_buffer: float = 0.0
 
     # AI — общие
     ai_enabled: bool = True
@@ -152,6 +154,8 @@ _ENV_MAP = {
     "allow_partial_fills": "ALLOW_PARTIAL_FILLS",
     "reprice_unfilled_after_sec": "REPRICE_UNFILLED_AFTER_SEC",
     "max_amendments": "MAX_AMENDMENTS",
+    "spot_tp_reprice_threshold_bps": "SPOT_TP_REPRICE_THRESHOLD_BPS",
+    "spot_tp_reprice_qty_buffer": "SPOT_TP_REPRICE_QTY_BUFFER",
     "telegram_token": "TG_BOT_TOKEN",
     "telegram_chat_id": "TG_CHAT_ID",
     "telegram_notify": "TG_NOTIFY",
@@ -244,6 +248,14 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"
     m["spot_cash_only"] = _cast_bool(m.get("spot_cash_only", True))
+    m["spot_tp_reprice_threshold_bps"] = _cast_float(
+        m.get("spot_tp_reprice_threshold_bps", 5.0)
+    )
+    buffer_val = _cast_float(m.get("spot_tp_reprice_qty_buffer"))
+    if buffer_val is not None:
+        m["spot_tp_reprice_qty_buffer"] = buffer_val
+    else:
+        m.pop("spot_tp_reprice_qty_buffer", None)
 
     tif_raw = m.get("order_time_in_force")
     if isinstance(tif_raw, str):

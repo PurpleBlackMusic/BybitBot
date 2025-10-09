@@ -70,6 +70,34 @@ class StubAPI:
             },
         }
 
+    def instruments_info(self, category: str = "spot", symbol: str | None = None, **_: object) -> dict:
+        symbol_text = symbol or "BTCUSDT"
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "symbol": symbol_text,
+                        "status": "Trading",
+                        "baseCoin": symbol_text[:-4] if symbol_text.endswith("USDT") else "BTC",
+                        "quoteCoin": "USDT",
+                        "lotSizeFilter": {
+                            "minOrderAmt": "5",
+                            "minOrderQty": "0.0001",
+                            "qtyStep": "0.0001",
+                            "minOrderQtyIncrement": "0.0001",
+                            "minOrderAmtIncrement": "0.01",
+                        },
+                        "priceFilter": {
+                            "tickSize": "0.0001",
+                            "minPrice": "0",
+                            "maxPrice": "0",
+                        },
+                    }
+                ]
+            },
+        }
+
 
 def patch_tp_sources(
     monkeypatch: pytest.MonkeyPatch,
@@ -92,7 +120,7 @@ def patch_tp_sources(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_open_sell_reserved",
-        lambda self, symbol: reserved,
+        lambda self, symbol, rows=None: reserved,
     )
 
 
@@ -269,14 +297,15 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert second["side"] == "Sell"
     assert first["orderType"] == "Limit"
     assert second["orderType"] == "Limit"
-    assert first["qty"] == "0.45"
-    assert second["qty"] == "0.30"
-    assert first["price"] == "100.50000000"
-    assert second["price"] == "101.00000000"
+    assert Decimal(first["qty"]) == Decimal("0.45")
+    assert Decimal(second["qty"]) == Decimal("0.30")
+    assert Decimal(first["price"]) == Decimal("100.5")
+    assert Decimal(second["price"]) == Decimal("101")
     assert result.order is not None
     assert result.order.get("take_profit_orders")
     assert result.context is not None
-    assert result.context.get("execution", {}).get("avg_price") == "100.00000000"
+    execution_payload = result.context.get("execution", {})
+    assert Decimal(execution_payload.get("avg_price")) == Decimal("100")
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -395,9 +424,9 @@ def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyP
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
-    assert execution.get("sell_budget_base") == "0.00"
-    assert execution.get("open_sell_reserved") == "0.50"
-    assert execution.get("filled_base_total") == "0.50"
+    assert Decimal(execution.get("sell_budget_base")) == Decimal("0")
+    assert Decimal(execution.get("open_sell_reserved")) == Decimal("0.5")
+    assert Decimal(execution.get("filled_base_total")) == Decimal("0.5")
 
 
 def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
@@ -434,7 +463,7 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_open_sell_reserved",
-        lambda self, symbol: Decimal("0"),
+        lambda self, symbol, rows=None: Decimal("0"),
     )
     monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000: [])
     monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events=None: {})
@@ -471,8 +500,80 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     assert result.status == "filled"
     assert len(api.orders) == 2
     first, second = api.orders
-    assert first["qty"] == "0.45"
-    assert second["qty"] == "0.30"
+    assert Decimal(first["qty"]) == Decimal("0.45")
+    assert Decimal(second["qty"]) == Decimal("0.30")
+
+
+def test_signal_executor_tp_ladder_respects_price_band(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50",
+        spot_tp_ladder_split_pct="100",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=2000.0, available=1500.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.2"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.2",
+            "cumExecValue": "20",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.1",
+                "min_order_qty": "0.1",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda _api, _symbol: {
+            "qty_step": Decimal("0.1"),
+            "min_order_qty": Decimal("0.1"),
+            "quote_step": Decimal("0.01"),
+            "tick_size": Decimal("0.5"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("105"),
+            "max_price": Decimal("0"),
+            "base_coin": "BTC",
+            "quote_coin": "USDT",
+        },
+    )
+
+    def fake_place(api_obj, **kwargs):
+        return response_payload
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(api.orders) == 1
+    order = api.orders[0]
+    assert Decimal(order["price"]) == Decimal("105")
+    assert Decimal(order["qty"]) == Decimal("0.2")
 
 
 def test_signal_executor_open_sell_reserved_prefers_latest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -583,15 +684,15 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
 
     assert result.status == "filled"
     assert len(api.orders) == 3
-    qtys = [order["qty"] for order in api.orders]
-    prices = [order["price"] for order in api.orders]
-    assert qtys == ["0.37", "0.22", "0.16"]
-    assert prices == ["100.35000000", "100.70000000", "101.10000000"]
+    qtys = [Decimal(order["qty"]) for order in api.orders]
+    prices = [Decimal(order["price"]) for order in api.orders]
+    assert qtys == [Decimal("0.37"), Decimal("0.22"), Decimal("0.16")]
+    assert prices == [Decimal("100.35"), Decimal("100.7"), Decimal("101.1")]
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
     assert execution.get("executed_base") == "0.75"
-    assert execution.get("avg_price") == "100.00000000"
+    assert Decimal(execution.get("avg_price")) == Decimal("100")
     assert execution.get("sell_budget_base") == "0.75"
     assert execution.get("filled_base_total") == "0.75"
 
@@ -776,7 +877,7 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
         lambda *args, **kwargs: response_payload,
     )
 
-    def fake_tp(self, api_obj, settings_obj, symbol, side, response):
+    def fake_tp(self, api_obj, settings_obj, symbol, side, response, **kwargs):
         return (
             [{"price": "105.0", "qty": "0.3", "profit_bps": "35"}],
             {

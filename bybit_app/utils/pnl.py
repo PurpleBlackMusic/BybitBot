@@ -8,6 +8,7 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 
+from .helpers import ensure_link_id
 from .log import log
 from .paths import DATA_DIR
 
@@ -37,8 +38,9 @@ def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
     if normalised_existing:
         return normalised_existing
 
-    order_id = _normalise_id(ev.get("orderId"))
-    link_id = _normalise_id(ev.get("orderLinkId"))
+    order_id = _normalise_id(ev.get("orderId") or ev.get("orderID"))
+    link_candidate = _normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID"))
+    link_id = ensure_link_id(link_candidate) if link_candidate else None
     trade_id = _normalise_id(ev.get("tradeId") or ev.get("matchId"))
     exec_id = _normalise_id(
         ev.get("execId")
@@ -139,7 +141,7 @@ def add_execution(ev: dict):
         "symbol": ev.get("symbol"),
         "side": ev.get("side"),
         "orderId": ev.get("orderId"),
-        "orderLinkId": ev.get("orderLinkId"),
+        "orderLinkId": ensure_link_id(_normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID"))),
         "execPrice": _f(ev.get("execPrice")),
         "execQty": _f(ev.get("execQty")),
         "execFee": _f(ev.get("execFee")),

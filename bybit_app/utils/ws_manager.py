@@ -7,7 +7,7 @@ import time
 import ssl
 import random
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
-from typing import Iterable, Optional
+from typing import Iterable, Mapping, Optional
 
 import websocket  # websocket-client
 
@@ -75,7 +75,7 @@ class WSManager:
         self._last_execution: Optional[dict] = None
         self._realtime_cache = get_realtime_cache()
         self._fill_lock = threading.Lock()
-        self._tp_ladder_plan: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._tp_ladder_plan: dict[str, dict[str, object]] = {}
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -211,6 +211,15 @@ class WSManager:
         )
 
     def start_private(self) -> bool:
+        try:
+            settings = get_settings()
+        except Exception:
+            settings = None
+        if settings is not None and not creds_ok(settings):
+            log("ws.private.disabled", reason="missing credentials")
+            self._priv = None
+            self._priv_url = None
+            return False
         try:
             url = self._private_url()
 
@@ -636,6 +645,7 @@ class WSManager:
                         config=config,
                         api=api,
                         limits_cache=limits_cache,
+                        settings=settings,
                     )
                 except Exception as exc:
                     log(
@@ -669,6 +679,7 @@ class WSManager:
         config: list[tuple[Decimal, Decimal]] | None = None,
         api=None,
         limits_cache: dict[str, dict[str, object]] | None = None,
+        settings=None,
     ) -> None:
         if not isinstance(row, dict):
             return
@@ -693,9 +704,14 @@ class WSManager:
         if qty <= 0 or avg_cost <= 0:
             return
 
+        settings_obj = settings
         if config is None:
-            settings = get_settings()
-            config = self._resolve_tp_config(settings)
+            if settings_obj is None:
+                try:
+                    settings_obj = get_settings()
+                except Exception:
+                    settings_obj = None
+            config = self._resolve_tp_config(settings_obj) if settings_obj else []
         if not config:
             return
 
@@ -730,6 +746,9 @@ class WSManager:
         min_qty = self._decimal_from(limits.get("min_order_qty"))
         if min_qty < 0:
             min_qty = Decimal("0")
+        min_notional = self._decimal_from(limits.get("min_order_amt"))
+        price_band_min = self._decimal_from(limits.get("min_price"))
+        price_band_max = self._decimal_from(limits.get("max_price"))
 
         reserved = self._reserved_sell_qty(symbol)
         available_qty = qty - reserved
@@ -745,19 +764,73 @@ class WSManager:
             qty_step=qty_step,
             price_step=price_step,
             min_qty=min_qty,
+            min_notional=min_notional,
+            min_price=price_band_min,
+            max_price=price_band_max,
         )
         if not plan:
             return
 
         signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
-        previous = self._tp_ladder_plan.get(symbol)
-        if previous == signature:
+        previous_meta = self._tp_ladder_plan.get(symbol) or {}
+        previous_signature = None
+        previous_avg_cost = Decimal("0")
+        previous_qty = Decimal("0")
+        if isinstance(previous_meta, Mapping):
+            existing_sig = previous_meta.get("signature")
+            if isinstance(existing_sig, tuple):
+                previous_signature = existing_sig
+            previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
+            previous_qty = self._decimal_from(previous_meta.get("qty"))
+        if previous_signature == signature:
             log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
+            return
+
+        threshold_bps = Decimal("0")
+        qty_threshold = qty_step
+        if settings_obj is None:
+            try:
+                settings_obj = get_settings()
+            except Exception:
+                settings_obj = None
+        if settings_obj is not None:
+            threshold_raw = getattr(settings_obj, "spot_tp_reprice_threshold_bps", 0) or 0
+            threshold_bps = self._decimal_from(threshold_raw)
+            qty_threshold_raw = getattr(settings_obj, "spot_tp_reprice_qty_buffer", None)
+            if qty_threshold_raw is not None:
+                candidate = self._decimal_from(qty_threshold_raw)
+                if candidate > qty_threshold:
+                    qty_threshold = candidate
+
+        price_change = abs(avg_cost - previous_avg_cost)
+        allowed_delta = Decimal("0")
+        if threshold_bps > 0 and avg_cost > 0:
+            allowed_delta = (avg_cost * threshold_bps) / Decimal("10000")
+        qty_change = abs(available_qty - previous_qty)
+        if (
+            previous_signature is not None
+            and allowed_delta > 0
+            and price_change < allowed_delta
+            and qty_threshold > 0
+            and qty_change <= qty_threshold
+        ):
+            log(
+                "ws.private.tp_ladder.skip",
+                symbol=symbol,
+                reason="below_threshold",
+                price_change=str(price_change.normalize()),
+                qty_change=str(qty_change.normalize()),
+            )
             return
 
         self._cancel_existing_tp_orders(api, symbol)
         self._execute_tp_plan(api, symbol, plan)
-        self._tp_ladder_plan[symbol] = signature
+        self._tp_ladder_plan[symbol] = {
+            "signature": signature,
+            "avg_cost": avg_cost,
+            "qty": available_qty,
+            "updated_ts": time.time(),
+        }
 
     def _reserved_sell_qty(self, symbol: str) -> Decimal:
         rows = self._realtime_private_rows("order")
@@ -860,6 +933,26 @@ class WSManager:
                     count=len(chunk),
                 )
 
+    def _apply_price_band(
+        self,
+        price: Decimal,
+        *,
+        price_step: Decimal,
+        min_price: Decimal,
+        max_price: Decimal,
+    ) -> Decimal:
+        adjusted = price
+        if min_price > 0 and adjusted < min_price:
+            adjusted = min_price
+        if max_price > 0 and adjusted > max_price:
+            adjusted = max_price
+        adjusted = quantize_to_step(adjusted, price_step, rounding=ROUND_UP)
+        if min_price > 0 and adjusted < min_price:
+            adjusted = quantize_to_step(min_price, price_step, rounding=ROUND_UP)
+        if max_price > 0 and adjusted > max_price:
+            adjusted = quantize_to_step(max_price, price_step, rounding=ROUND_DOWN)
+        return adjusted
+
     def _build_tp_plan(
         self,
         *,
@@ -869,10 +962,20 @@ class WSManager:
         qty_step: Decimal,
         price_step: Decimal,
         min_qty: Decimal,
+        min_notional: Decimal,
+        min_price: Decimal,
+        max_price: Decimal,
     ) -> list[dict[str, object]]:
         total_qty = max(total_qty, Decimal("0"))
         if total_qty <= 0 or not config:
             return []
+
+        if min_notional > 0 and avg_cost > 0:
+            min_qty_from_notional = quantize_to_step(
+                min_notional / avg_cost, qty_step, rounding=ROUND_UP
+            )
+            if min_qty_from_notional > min_qty:
+                min_qty = min_qty_from_notional
 
         allocations: list[tuple[Decimal, Decimal]] = []
         remaining = total_qty
@@ -906,6 +1009,12 @@ class WSManager:
         for profit_bps, qty in allocations:
             price_raw = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
             price = quantize_to_step(price_raw, price_step, rounding=ROUND_UP)
+            price = self._apply_price_band(
+                price,
+                price_step=price_step,
+                min_price=min_price,
+                max_price=max_price,
+            )
             if price <= 0:
                 continue
             qty_payload = quantize_to_step(qty, qty_step, rounding=ROUND_DOWN)
@@ -932,7 +1041,17 @@ class WSManager:
             if min_qty > 0 and qty_payload < min_qty:
                 continue
             qty_text = format_to_step(qty_payload, qty_step, rounding=ROUND_DOWN)
-            price_text = format_to_step(entry["price"], price_step, rounding=ROUND_UP)
+            price = self._apply_price_band(
+                entry["price"],
+                price_step=price_step,
+                min_price=min_price,
+                max_price=max_price,
+            )
+            if price <= 0:
+                continue
+            if min_notional > 0 and price * qty_payload < min_notional:
+                continue
+            price_text = format_to_step(price, price_step, rounding=ROUND_UP)
             if not qty_text or qty_text == "0":
                 continue
             if not price_text or price_text == "0":
