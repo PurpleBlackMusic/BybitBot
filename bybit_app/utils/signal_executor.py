@@ -27,6 +27,7 @@ from .spot_market import (
     _instrument_limits,
     _resolve_slippage_tolerance,
     place_spot_market_with_tolerance,
+    prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
 from .pnl import read_ledger
@@ -202,7 +203,20 @@ class SignalExecutor:
             settings, total_equity, available_equity, sizing_factor
         )
 
+        fallback_context: Optional[Dict[str, object]] = None
         min_notional = 5.0
+        if side == "Sell" and notional <= 0:
+            fallback_notional, fallback_context, fallback_min_notional = (
+                self._sell_notional_from_holdings(
+                    api,
+                    symbol,
+                    summary=summary,
+                )
+            )
+            if fallback_min_notional is not None and fallback_min_notional > min_notional:
+                min_notional = fallback_min_notional
+            if fallback_notional is not None and fallback_notional > 0:
+                notional = fallback_notional
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
@@ -233,6 +247,8 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if fallback_context:
+            order_context["sell_fallback"] = fallback_context
         if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
             order_context["requested_notional_quote"] = notional
         if symbol_meta:
@@ -1532,6 +1548,97 @@ class SignalExecutor:
         sizing = max(0.0, min(float(sizing_factor), 1.0))
         notional = round(base_notional * sizing, 2)
         return max(notional, 0.0), usable_after_reserve
+
+    def _sell_notional_from_holdings(
+        self,
+        api: Optional[object],
+        symbol: str,
+        *,
+        summary: Optional[Mapping[str, object]] = None,
+    ) -> Tuple[Optional[float], Optional[Dict[str, object]], Optional[float]]:
+        context: Dict[str, object] = {"source": "balances"}
+        if symbol:
+            context["symbol"] = symbol
+
+        if api is None:
+            context["error"] = "api_unavailable"
+            return None, context, None
+
+        try:
+            snapshot = prepare_spot_trade_snapshot(
+                api,
+                symbol,
+                include_limits=True,
+                include_price=True,
+                include_balances=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "guardian.auto.sell_notional.snapshot_error",
+                symbol=symbol,
+                err=str(exc),
+            )
+            context["error"] = str(exc)
+            return None, context, None
+
+        limits = snapshot.limits or {}
+        balances = snapshot.balances or {}
+        price = snapshot.price
+
+        base_asset = str(limits.get("base_coin") or "").upper()
+        if not base_asset and symbol:
+            cleaned_symbol = str(symbol).strip().upper()
+            if cleaned_symbol.endswith("USDT") and len(cleaned_symbol) > 4:
+                base_asset = cleaned_symbol[:-4]
+        if not base_asset and summary:
+            candidate = summary.get("base_asset") if isinstance(summary, Mapping) else None
+            if isinstance(candidate, str) and candidate.strip():
+                base_asset = candidate.strip().upper()
+
+        context["base_asset"] = base_asset or None
+
+        min_order_amt = self._decimal_from(limits.get("min_order_amt"), Decimal(str(5.0)))
+        if min_order_amt <= 0:
+            min_order_amt = Decimal("0")
+
+        context["min_order_amt"] = float(min_order_amt) if min_order_amt > 0 else 0.0
+
+        if not base_asset:
+            context["error"] = "base_asset_unknown"
+            return None, context, float(min_order_amt) if min_order_amt > 0 else None
+
+        available_base = balances.get(base_asset)
+        if not isinstance(available_base, Decimal):
+            available_base = self._decimal_from(available_base)
+
+        if available_base is None or available_base <= 0:
+            context["available_base"] = 0.0
+            context["error"] = "no_balance"
+            return None, context, float(min_order_amt) if min_order_amt > 0 else None
+
+        context["available_base"] = float(available_base)
+
+        if not isinstance(price, Decimal):
+            price = self._decimal_from(price)
+
+        if price is None or price <= 0:
+            context["error"] = "price_unavailable"
+            return None, context, float(min_order_amt) if min_order_amt > 0 else None
+
+        context["price_snapshot"] = float(price)
+
+        quote_notional = available_base * price
+        if quote_notional <= 0:
+            context["error"] = "notional_unavailable"
+            return None, context, float(min_order_amt) if min_order_amt > 0 else None
+
+        context["quote_notional"] = float(quote_notional)
+
+        return (
+            float(quote_notional),
+            context,
+            float(min_order_amt) if min_order_amt > 0 else None,
+        )
 
     def _ensure_ws_activity(self, settings: Settings) -> None:
         if not getattr(settings, "ws_autostart", False):
