@@ -46,6 +46,7 @@ class BackgroundServices:
         self._automation_thread: Optional[threading.Thread] = None
         self._automation_stop_event: Optional[threading.Event] = None
         self._automation_state: Dict[str, Any] = {}
+        self._automation_executor: Optional[SignalExecutor] = None
         self._automation_error: Optional[str] = None
         self._automation_started_at: float = 0.0
         self._automation_last_cycle: float = 0.0
@@ -242,6 +243,9 @@ class BackgroundServices:
 
     def ensure_automation_loop(self, *, force: bool = False) -> bool:
         join_thread: Optional[threading.Thread] = None
+        should_start = False
+        executor: Optional[SignalExecutor] = None
+
         with self._automation_lock:
             thread = self._automation_thread
             alive = bool(thread and thread.is_alive())
@@ -262,35 +266,59 @@ class BackgroundServices:
                 stale = True
 
             if force or not alive or stale:
+                executor = self._automation_executor
+                should_start = True
                 if thread and alive:
                     stop_event = self._automation_stop_event
                     if stop_event is not None:
                         stop_event.set()
                     if hasattr(thread, "join"):
                         join_thread = thread
-                self._automation_thread = None
-                self._automation_state = {}
-                self._automation_error = None
-
-                stop_event = threading.Event()
-                self._automation_stop_event = stop_event
-                self._automation_started_at = time.time()
-                self._automation_last_cycle = self._automation_started_at
-
-                thread = threading.Thread(
-                    target=self._run_automation_loop,
-                    args=(stop_event,),
-                    daemon=True,
-                )
-                self._automation_thread = thread
-                self._automation_restart_count += 1
-                thread.start()
 
         if join_thread is not None:
             try:
                 join_thread.join(timeout=5)
             except Exception:  # pragma: no cover - defensive guard
                 pass
+            if join_thread.is_alive():
+                log(
+                    "background.automation.restart_blocked",
+                    reason="join_timeout",
+                )
+                should_start = False
+
+        if not should_start:
+            return True
+
+        with self._automation_lock:
+            thread = self._automation_thread
+            if thread and thread.is_alive():
+                log(
+                    "background.automation.restart_blocked",
+                    reason="thread_still_alive",
+                )
+                return True
+
+            stop_event = threading.Event()
+            self._automation_stop_event = stop_event
+            self._automation_started_at = time.time()
+            self._automation_last_cycle = self._automation_started_at
+            self._automation_error = None
+
+            state: Dict[str, Any] = {}
+            state["executor"] = executor
+            self._automation_state = state
+            self._automation_executor = executor
+
+            thread = threading.Thread(
+                target=self._run_automation_loop,
+                args=(stop_event, executor),
+                daemon=True,
+            )
+            self._automation_thread = thread
+            self._automation_restart_count += 1
+
+        thread.start()
         return True
 
     def restart_automation_loop(self) -> bool:
@@ -313,9 +341,14 @@ class BackgroundServices:
             on_cycle=on_cycle,
         )
 
-    def _run_automation_loop(self, stop_event: threading.Event) -> None:
-        bot = self._bot_factory()
-        executor = self._executor_factory(bot)
+    def _run_automation_loop(
+        self, stop_event: threading.Event, executor: Optional[SignalExecutor] = None
+    ) -> None:
+        if executor is None:
+            bot = self._bot_factory()
+            executor = self._executor_factory(bot)
+
+        self._automation_executor = executor
 
         def handle_cycle(
             result: ExecutionResult,
@@ -340,6 +373,7 @@ class BackgroundServices:
                 "ts": ts,
             }
             with self._automation_lock:
+                state["executor"] = self._automation_executor
                 self._automation_state = state
                 self._automation_last_cycle = ts
 
