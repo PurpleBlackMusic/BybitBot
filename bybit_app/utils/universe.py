@@ -91,7 +91,7 @@ def _resolve_liquidity_filters(
     max_spread_bps: float | None,
 ):
     settings = get_settings()
-    is_testnet = bool(getattr(settings, "testnet", True))
+    is_testnet = settings.testnet
 
     if is_testnet:
         default_turnover = TESTNET_DEFAULT_MIN_TURNOVER
