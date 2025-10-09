@@ -69,8 +69,8 @@ def test_resolve_liquidity_filters_reads_settings(monkeypatch: pytest.MonkeyPatc
 
     min_turnover, max_spread = universe_module._resolve_liquidity_filters(None, None)
 
-    assert min_turnover == 2_000_000.0
-    assert max_spread == 25.0
+    assert min_turnover == 1_000_000.0
+    assert max_spread == 40.0
 
 
 def test_resolve_liquidity_filters_respects_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

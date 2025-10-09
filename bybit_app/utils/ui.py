@@ -54,6 +54,40 @@ else:
         pass
 
 
+_pyarrow_spec = util.find_spec("pyarrow")
+if _pyarrow_spec is not None:
+    pyarrow = import_module("pyarrow")
+else:
+    pyarrow = None
+
+
+def _coerce_arrow_table(value: Any) -> Any:
+    if value is None or pyarrow is None:
+        return value
+
+    module_name = getattr(value.__class__, "__module__", "")
+    is_arrow = module_name.startswith("pyarrow")
+    if not is_arrow:
+        table_cls = getattr(pyarrow, "Table", None)
+        record_batch_cls = getattr(pyarrow, "RecordBatch", None)
+        if table_cls is not None and isinstance(value, table_cls):
+            is_arrow = True
+        elif record_batch_cls is not None and isinstance(value, record_batch_cls):
+            is_arrow = True
+
+    if not is_arrow:
+        return value
+
+    to_pandas = getattr(value, "to_pandas", None)
+    if callable(to_pandas):
+        try:
+            return to_pandas()
+        except Exception:  # pragma: no cover - fallback to original
+            return value
+
+    return value
+
+
 def _patch_responsive_dataframe() -> None:
     """Remap deprecated ``use_container_width`` to the new API once."""
 
@@ -80,6 +114,13 @@ def _patch_responsive_dataframe() -> None:
     fallback_errors = tuple(fallback_error_types)
 
     def patched(*args: Any, **kwargs: Any):  # type: ignore[override]
+        if args:
+            coerced = _coerce_arrow_table(args[0])
+            if coerced is not args[0]:
+                args = (coerced,) + args[1:]
+        if "data" in kwargs:
+            kwargs["data"] = _coerce_arrow_table(kwargs["data"])
+
         use_container = kwargs.pop("use_container_width", None)
         if use_container and "width" not in kwargs:
             if supports_use_container_width:

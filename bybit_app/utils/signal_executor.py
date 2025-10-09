@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 import threading
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .envs import Settings, get_api_client, get_settings, creds_ok
 from .helpers import ensure_link_id
@@ -74,6 +74,7 @@ class _LadderStep:
         return self.profit_bps / Decimal("10000")
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
+_TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
 def _format_bybit_error(exc: Exception) -> str:
@@ -84,6 +85,13 @@ def _format_bybit_error(exc: Exception) -> str:
         message = match.group("message").strip()
         return f"Bybit отказал ({code}): {message}"
     return f"Не удалось отправить ордер: {text}"
+
+
+def _extract_bybit_error_code(exc: Exception) -> Optional[str]:
+    match = _BYBIT_ERROR.search(str(exc))
+    if match:
+        return match.group("code")
+    return None
 
 
 class SignalExecutor:
@@ -127,6 +135,7 @@ class SignalExecutor:
             )
 
         settings = self._resolve_settings()
+        self._ensure_ws_activity(settings)
         if not getattr(settings, "ai_enabled", False):
             return self._decision(
                 "disabled",
@@ -498,6 +507,18 @@ class SignalExecutor:
             try:
                 response_payload = api.place_order(**payload)  # type: ignore[call-arg]
             except Exception as exc:  # pragma: no cover - network/runtime errors
+                error_code = _extract_bybit_error_code(exc)
+                if error_code in _TP_LADDER_SKIP_CODES:
+                    log(
+                        "guardian.auto.tp_ladder.skip",
+                        symbol=symbol,
+                        rung=rung_index,
+                        qty=qty_text,
+                        price=price_text,
+                        profit_bps=profit_text,
+                        code=error_code,
+                    )
+                    continue
                 log(
                     "guardian.auto.tp_ladder.error",
                     symbol=symbol,
@@ -1273,48 +1294,185 @@ class SignalExecutor:
         notional = round(base_notional * sizing, 2)
         return max(notional, 0.0), usable_after_reserve
 
+    def _ensure_ws_activity(self, settings: Settings) -> None:
+        if not getattr(settings, "ws_autostart", False):
+            return
+        try:
+            ws_manager.autostart(include_private=True)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("guardian.auto.ws.autostart.error", err=str(exc))
+
+    def _candidate_symbol_stream(
+        self, summary: Mapping[str, object]
+    ) -> List[Tuple[str, Optional[Dict[str, object]]]]:
+        ordered: List[Tuple[str, Optional[Dict[str, object]]]] = []
+        seen: Set[str] = set()
+
+        def _append(symbol: object, meta: Optional[Dict[str, object]] = None) -> None:
+            cleaned = _safe_symbol(symbol)
+            if not cleaned or cleaned in seen:
+                return
+            seen.add(cleaned)
+            ordered.append((cleaned, dict(meta) if meta else None))
+
+        trade_candidates = summary.get("trade_candidates")
+        if isinstance(trade_candidates, Sequence):
+            actionable_new: List[Tuple[str, Dict[str, object]]] = []
+            ready_new: List[Tuple[str, Dict[str, object]]] = []
+            actionable_existing: List[Tuple[str, Dict[str, object]]] = []
+            backlog: List[Tuple[str, Dict[str, object]]] = []
+            for idx, entry in enumerate(trade_candidates):
+                if not isinstance(entry, Mapping):
+                    continue
+                symbol = _safe_symbol(entry.get("symbol"))
+                if not symbol:
+                    continue
+                meta: Dict[str, object] = {
+                    "source": "trade_candidates",
+                    "rank": idx + 1,
+                    "symbol": symbol,
+                }
+                priority = entry.get("priority")
+                if priority is not None:
+                    meta["priority"] = priority
+                actionable = bool(entry.get("actionable"))
+                ready = bool(entry.get("ready"))
+                holding = bool(entry.get("holding"))
+                meta["actionable"] = actionable
+                meta["ready"] = ready
+                meta["holding"] = holding
+                for key in (
+                    "probability",
+                    "probability_pct",
+                    "ev_bps",
+                    "edge_score",
+                    "score",
+                    "watchlist_rank",
+                    "note",
+                    "trend",
+                    "exposure_pct",
+                    "position_qty",
+                    "position_notional",
+                    "position_avg_cost",
+                ):
+                    value = entry.get(key)
+                    if value is not None:
+                        meta[key] = value
+                sources = entry.get("sources")
+                if isinstance(sources, Iterable) and not isinstance(sources, (str, bytes)):
+                    meta["sources"] = [
+                        str(item)
+                        for item in sources
+                        if isinstance(item, str) and item.strip()
+                    ]
+                reasons = entry.get("reasons")
+                if isinstance(reasons, Iterable) and not isinstance(reasons, (str, bytes)):
+                    meta["reasons"] = [
+                        str(item)
+                        for item in reasons
+                        if isinstance(item, str) and item.strip()
+                    ]
+                target: List[Tuple[str, Dict[str, object]]]
+                if actionable and not holding:
+                    target = actionable_new
+                elif ready and not holding:
+                    target = ready_new
+                elif actionable:
+                    target = actionable_existing
+                else:
+                    target = backlog
+                target.append((symbol, meta))
+            for bucket in (actionable_new, ready_new, actionable_existing, backlog):
+                for symbol, meta in bucket:
+                    _append(symbol, meta)
+
+        plan = summary.get("symbol_plan")
+        if isinstance(plan, Mapping):
+            for key in ("actionable_combined", "combined"):
+                pool = plan.get(key)
+                if not isinstance(pool, Sequence):
+                    continue
+                for idx, item in enumerate(pool):
+                    if isinstance(item, Mapping):
+                        symbol_value = item.get("symbol")
+                    else:
+                        symbol_value = item
+                    meta = {"source": f"symbol_plan.{key}", "rank": idx + 1}
+                    _append(symbol_value, meta)
+
+        extra_candidates = summary.get("candidate_symbols")
+        if isinstance(extra_candidates, Sequence):
+            for idx, candidate in enumerate(extra_candidates):
+                meta = {"source": "candidate_symbols", "rank": idx + 1}
+                _append(candidate, meta)
+
+        primary = summary.get("primary_watch")
+        if isinstance(primary, Mapping):
+            primary_meta: Dict[str, object] = {"source": "primary_watch"}
+            edge_score = primary.get("edge_score")
+            if edge_score is not None:
+                primary_meta["edge_score"] = edge_score
+            probability = primary.get("probability")
+            if probability is not None:
+                primary_meta["probability"] = probability
+            _append(primary.get("symbol"), primary_meta)
+
+        _append(summary.get("symbol"), {"source": "summary.symbol"})
+
+        return ordered
+
+    @staticmethod
+    def _merge_symbol_meta(
+        candidate_meta: Optional[Mapping[str, object]],
+        resolved_meta: Optional[Mapping[str, object]],
+    ) -> Optional[Dict[str, object]]:
+        combined: Dict[str, object] = {}
+        if isinstance(resolved_meta, Mapping):
+            combined.update(resolved_meta)
+        if candidate_meta:
+            combined["candidate"] = dict(candidate_meta)
+        return combined or None
+
     def _select_symbol(
         self, summary: Dict[str, object], settings: Settings
     ) -> tuple[Optional[str], Optional[Dict[str, object]]]:
-        candidates: list[str] = []
+        fallback_meta: Optional[Dict[str, object]] = None
+        api: Optional[object] = None
+        api_error: Optional[str] = None
 
-        symbol = _safe_symbol(summary.get("symbol"))
-        if symbol:
-            candidates.append(symbol)
-
-        primary = summary.get("primary_watch")
-        if isinstance(primary, dict):
-            primary_symbol = _safe_symbol(primary.get("symbol"))
-            if primary_symbol and primary_symbol not in candidates:
-                candidates.append(primary_symbol)
-
-        extra = summary.get("candidate_symbols")
-        if isinstance(extra, (list, tuple)):
-            for candidate in extra:
-                cleaned = _safe_symbol(candidate)
-                if cleaned and cleaned not in candidates:
-                    candidates.append(cleaned)
-
-        for candidate in candidates:
-            resolved, meta = self._map_symbol(candidate, settings=settings)
+        for candidate, candidate_meta in self._candidate_symbol_stream(summary):
+            resolved, meta, api, api_error = self._map_symbol(
+                candidate,
+                settings=settings,
+                api=api,
+                api_error=api_error,
+            )
+            combined_meta = self._merge_symbol_meta(candidate_meta, meta)
             if resolved:
-                return resolved, meta
+                return resolved, combined_meta
+            if combined_meta:
+                fallback_meta = combined_meta
 
-        return None, None
+        return None, fallback_meta
 
     def _map_symbol(
-        self, symbol: str, *, settings: Settings
-    ) -> tuple[Optional[str], Optional[Dict[str, object]]]:
+        self,
+        symbol: str,
+        *,
+        settings: Settings,
+        api: Optional[object],
+        api_error: Optional[str],
+    ) -> tuple[Optional[str], Optional[Dict[str, object]], Optional[object], Optional[str]]:
         cleaned = _safe_symbol(symbol)
         if not cleaned:
-            return None, None
+            return None, None, api, api_error
 
         normalised, quote_source = ensure_usdt_symbol(cleaned)
         if not normalised:
             meta: Dict[str, object] = {"reason": "unsupported_quote", "requested": cleaned}
             if quote_source:
                 meta["quote"] = quote_source
-            return None, meta
+            return None, meta, api, api_error
 
         quote_meta: Optional[Dict[str, object]] = None
         if quote_source:
@@ -1331,12 +1489,31 @@ class SignalExecutor:
             meta_payload: Dict[str, object] = {}
             if quote_meta:
                 meta_payload["quote_conversion"] = quote_meta
-            return cleaned, meta_payload or None
+            return cleaned, meta_payload or None, api, api_error
 
-        try:
-            api = get_api_client()
-        except Exception as exc:  # pragma: no cover - defensive
-            return None, {"reason": "api_unavailable", "error": str(exc), "requested": cleaned}
+        if api_error is not None:
+            failure_meta: Dict[str, object] = {
+                "reason": "api_unavailable",
+                "error": api_error,
+                "requested": cleaned,
+            }
+            if quote_meta:
+                failure_meta["quote_conversion"] = quote_meta
+            return None, failure_meta, api, api_error
+
+        if api is None:
+            try:
+                api = get_api_client()
+            except Exception as exc:  # pragma: no cover - defensive
+                error_text = str(exc)
+                failure_meta = {
+                    "reason": "api_unavailable",
+                    "error": error_text,
+                    "requested": cleaned,
+                }
+                if quote_meta:
+                    failure_meta["quote_conversion"] = quote_meta
+                return None, failure_meta, None, error_text
 
         resolved, meta = resolve_trade_symbol(cleaned, api=api, allow_nearest=True)
         if resolved is None:
@@ -1345,15 +1522,15 @@ class SignalExecutor:
                 if isinstance(meta, Mapping):
                     extra.update(meta)
                 extra["quote_conversion"] = quote_meta
-                return None, extra
-            return None, meta
+                return None, extra, api, api_error
+            return None, meta, api, api_error
 
         final_meta: Dict[str, object] = {}
         if isinstance(meta, Mapping):
             final_meta.update(meta)
         if quote_meta:
             final_meta.setdefault("quote_conversion", quote_meta)
-        return resolved, final_meta or None
+        return resolved, final_meta or None, api, api_error
 
     def _signal_sizing_factor(
         self, summary: Dict[str, object], settings: Settings

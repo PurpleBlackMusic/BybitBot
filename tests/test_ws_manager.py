@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Iterable
 
 import pytest
 
@@ -93,6 +94,57 @@ def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) ->
     status = manager.status()
     assert status["public"]["running"] is True
     assert status["private"]["running"] is True
+
+
+def test_ws_manager_autostart_respects_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(
+        ws_autostart=True,
+        ws_watchdog_max_age_sec=90,
+        testnet=True,
+        api_key="key",
+        api_secret="secret",
+    )
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: settings)
+    manager.s = settings
+
+    monkeypatch.setattr(
+        manager,
+        "status",
+        lambda: {"public": {"running": False}, "private": {"running": False}},
+    )
+
+    calls: dict[str, object] = {}
+
+    def fake_start_public(subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
+        calls["public"] = tuple(subs)
+        return True
+
+    def fake_start_private() -> bool:
+        calls["private"] = True
+        return True
+
+    monkeypatch.setattr(manager, "start_public", fake_start_public)
+    monkeypatch.setattr(manager, "start_private", fake_start_private)
+
+    started_public, started_private = manager.autostart()
+
+    assert started_public is True
+    assert started_private is True
+    assert calls["public"] == ("tickers.BTCUSDT",)
+    assert calls["private"] is True
+
+
+def test_ws_manager_autostart_returns_false_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    settings = SimpleNamespace(ws_autostart=False)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: settings)
+    manager.s = settings
+
+    result = manager.autostart()
+    assert result == (False, False)
 
 
 def test_ws_manager_status_detects_connected_socket() -> None:

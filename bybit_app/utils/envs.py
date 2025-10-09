@@ -70,8 +70,8 @@ class Settings:
 
     # Universe presets / filters
     ai_universe_preset: str = "Стандарт"
-    ai_max_spread_bps: float = 25.0
-    ai_min_turnover_usd: float = 2_000_000.0
+    ai_max_spread_bps: float = 45.0
+    ai_min_turnover_usd: float = 1_000_000.0
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
@@ -91,7 +91,7 @@ class Settings:
     heartbeat_interval_min: int = 30
 
     # WS
-    ws_autostart: bool = False
+    ws_autostart: bool = True
 
 def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(a)
