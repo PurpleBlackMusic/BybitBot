@@ -124,9 +124,15 @@ def filter_available_spot_pairs(symbols: Iterable[str]) -> list[str]:
     if not usdt_only:
         return []
 
+    settings = get_settings()
+    is_testnet = getattr(settings, "testnet", True)
+
     listed = [
         sym
-        for sym in (_normalize_symbol(symbol) for symbol in filter_listed_spot_symbols(usdt_only))
+        for sym in (
+            _normalize_symbol(symbol)
+            for symbol in filter_listed_spot_symbols(usdt_only, testnet=is_testnet)
+        )
         if sym
     ]
 

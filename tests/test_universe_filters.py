@@ -7,7 +7,7 @@ def test_filter_available_spot_pairs_uses_listed_symbols(monkeypatch: pytest.Mon
     monkeypatch.setattr(
         universe_module,
         "filter_listed_spot_symbols",
-        lambda symbols: [symbol for symbol in symbols if symbol == "ETHUSDT"],
+        lambda symbols, **kwargs: [symbol for symbol in symbols if symbol == "ETHUSDT"],
     )
 
     result = universe_module.filter_available_spot_pairs([
@@ -19,10 +19,41 @@ def test_filter_available_spot_pairs_uses_listed_symbols(monkeypatch: pytest.Mon
     assert result == ["ETHUSDT"]
 
 
+def test_filter_available_spot_pairs_respects_mainnet(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummySettings:
+        testnet = False
+
+    captured = {}
+
+    def _fake_filter(symbols, *, testnet, **kwargs):
+        captured["testnet"] = testnet
+        return [
+            symbol
+            for symbol in symbols
+            if symbol in {"BTCUSDT", "MAINNETONLYUSDT"}
+        ]
+
+    monkeypatch.setattr(universe_module, "get_settings", lambda: DummySettings())
+    monkeypatch.setattr(universe_module, "filter_listed_spot_symbols", _fake_filter)
+
+    result = universe_module.filter_available_spot_pairs([
+        "BTCUSDT",
+        "MAINNETONLYUSDT",
+        "TESTNETONLYUSDT",
+    ])
+
+    assert captured["testnet"] is False
+    assert result == ["BTCUSDT", "MAINNETONLYUSDT"]
+
+
 def test_filter_available_spot_pairs_falls_back_when_listing_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(universe_module, "filter_listed_spot_symbols", lambda symbols: [])
+    monkeypatch.setattr(
+        universe_module,
+        "filter_listed_spot_symbols",
+        lambda symbols, **kwargs: [],
+    )
 
     result = universe_module.filter_available_spot_pairs(["ETHUSDT", "ADAUSDT"])
 
@@ -35,7 +66,7 @@ def test_filter_available_spot_pairs_excludes_blacklisted_tokens(
     monkeypatch.setattr(
         universe_module,
         "filter_listed_spot_symbols",
-        lambda symbols: list(symbols),
+        lambda symbols, **kwargs: list(symbols),
     )
 
     result = universe_module.filter_available_spot_pairs(
@@ -116,7 +147,7 @@ def test_build_universe_skips_blacklisted_pairs(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         universe_module,
         "filter_listed_spot_symbols",
-        lambda symbols: list(symbols),
+        lambda symbols, **kwargs: list(symbols),
     )
 
     result = universe_module.build_universe(DummyAPI(), size=5)
@@ -160,7 +191,7 @@ def test_build_universe_retains_size_after_listing_filter(monkeypatch: pytest.Mo
     monkeypatch.setattr(
         universe_module,
         "filter_listed_spot_symbols",
-        lambda symbols: [symbol for symbol in symbols if symbol != "FAKEUSDT"],
+        lambda symbols, **kwargs: [symbol for symbol in symbols if symbol != "FAKEUSDT"],
     )
 
     result = universe_module.build_universe(DummyAPI(), size=2)
