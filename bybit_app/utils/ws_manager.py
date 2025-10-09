@@ -7,7 +7,7 @@ import time
 import ssl
 import random
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 import websocket  # websocket-client
 
@@ -866,8 +866,68 @@ class WSManager:
             "updated_ts": time.time(),
         }
 
+    def private_snapshot(self) -> Mapping[str, object] | None:
+        cache = self._realtime_cache
+        if cache is None or not hasattr(cache, "snapshot"):
+            return None
+        try:
+            snapshot = cache.snapshot(private_ttl=None)
+        except Exception:
+            return None
+        if isinstance(snapshot, Mapping):
+            return snapshot
+        return None
+
+    def realtime_private_rows(
+        self,
+        topic_keyword: str,
+        *,
+        snapshot: Mapping[str, object] | None = None,
+    ) -> list[Mapping[str, object]]:
+        if snapshot is None:
+            snapshot = self.private_snapshot()
+        if not isinstance(snapshot, Mapping):
+            return []
+
+        private = snapshot.get("private") if isinstance(snapshot, Mapping) else None
+        if not isinstance(private, Mapping):
+            return []
+
+        rows: list[Mapping[str, object]] = []
+        keyword = topic_keyword.lower()
+        for topic, record in private.items():
+            topic_key = str(topic).lower()
+            if keyword not in topic_key:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            payload = record.get("payload")
+            candidates: Sequence[object] | None = None
+            if isinstance(payload, Mapping):
+                maybe_rows = payload.get("rows")
+                if isinstance(maybe_rows, Sequence):
+                    candidates = maybe_rows
+            elif isinstance(payload, Sequence):
+                candidates = payload
+            if not candidates:
+                continue
+            for entry in candidates:
+                if isinstance(entry, Mapping):
+                    rows.append(entry)
+        return rows
+
+    # Backwards compatibility for legacy callers that still reference the
+    # private helper name.
+    def _realtime_private_rows(
+        self,
+        topic_keyword: str,
+        *,
+        snapshot: Mapping[str, object] | None = None,
+    ) -> list[Mapping[str, object]]:
+        return self.realtime_private_rows(topic_keyword, snapshot=snapshot)
+
     def _reserved_sell_qty(self, symbol: str) -> Decimal:
-        rows = self._realtime_private_rows("order")
+        rows = self.realtime_private_rows("order")
         if not rows:
             return Decimal("0")
 

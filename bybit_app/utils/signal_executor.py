@@ -1182,7 +1182,7 @@ class SignalExecutor:
                 audit = local.get("order_audit")
         if audit:
             order["order_audit"] = audit
-        private_snapshot = self._private_ws_snapshot()
+        private_snapshot = ws_manager.private_snapshot()
         ledger_rows = self._ledger_rows_snapshot(settings=settings)
 
         ladder_orders, execution_stats = self._place_tp_ladder(
@@ -1242,10 +1242,10 @@ class SignalExecutor:
             return [], {}
 
         order_id, order_link_id = self._extract_order_identifiers(response)
-        execution_rows = self._realtime_private_rows(
+        execution_rows = ws_manager.realtime_private_rows(
             "execution", snapshot=private_snapshot
         )
-        order_rows = self._realtime_private_rows("order", snapshot=private_snapshot)
+        order_rows = ws_manager.realtime_private_rows("order", snapshot=private_snapshot)
 
         filled_base_total = self._collect_filled_base_total(
             symbol,
@@ -1837,7 +1837,7 @@ class SignalExecutor:
             return Decimal("0")
 
         if rows is None:
-            rows = self._realtime_private_rows("execution")
+            rows = ws_manager.realtime_private_rows("execution")
         if not rows:
             return Decimal("0")
 
@@ -1921,7 +1921,7 @@ class SignalExecutor:
         rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         if rows is None:
-            rows = self._realtime_private_rows("order")
+            rows = ws_manager.realtime_private_rows("order")
         if not rows:
             return Decimal("0")
 
@@ -1998,56 +1998,6 @@ class SignalExecutor:
                 if text:
                     return text
         return None
-
-    def _private_ws_snapshot(self) -> Mapping[str, object] | None:
-        cache = getattr(ws_manager, "_realtime_cache", None)
-        if cache is None or not hasattr(cache, "snapshot"):
-            return None
-        try:
-            snapshot = cache.snapshot(private_ttl=None)
-        except Exception:
-            return None
-        if isinstance(snapshot, Mapping):
-            return snapshot
-        return None
-
-    def _realtime_private_rows(
-        self,
-        topic_keyword: str,
-        *,
-        snapshot: Mapping[str, object] | None = None,
-    ) -> list[Mapping[str, object]]:
-        if snapshot is None:
-            snapshot = self._private_ws_snapshot()
-        if not isinstance(snapshot, Mapping):
-            return []
-
-        private = snapshot.get("private") if isinstance(snapshot, Mapping) else None
-        if not isinstance(private, Mapping):
-            return []
-
-        rows: list[Mapping[str, object]] = []
-        keyword = topic_keyword.lower()
-        for topic, record in private.items():
-            topic_key = str(topic).lower()
-            if keyword not in topic_key:
-                continue
-            if not isinstance(record, Mapping):
-                continue
-            payload = record.get("payload")
-            candidates: Sequence[object] | None = None
-            if isinstance(payload, Mapping):
-                maybe_rows = payload.get("rows")
-                if isinstance(maybe_rows, Sequence):
-                    candidates = maybe_rows
-            elif isinstance(payload, Sequence):
-                candidates = payload
-            if not candidates:
-                continue
-            for entry in candidates:
-                if isinstance(entry, Mapping):
-                    rows.append(entry)
-        return rows
 
     def _ledger_rows_snapshot(
         self,

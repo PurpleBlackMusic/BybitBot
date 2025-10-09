@@ -189,6 +189,37 @@ def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest
     assert manager.s is refreshed_private
 
 
+def test_ws_manager_realtime_private_rows_filters_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    snapshot = {
+        "private": {
+            "order.BTCUSDT": {
+                "payload": {
+                    "rows": [
+                        {"orderId": "1", "symbol": "BTCUSDT"},
+                        "not-a-dict",
+                    ]
+                }
+            },
+            "execution.ETHUSDT": {
+                "payload": [
+                    {"execId": "2", "symbol": "ETHUSDT"},
+                    42,
+                ]
+            },
+            "position": {"payload": {"rows": "ignored"}},
+            "order-linear": "invalid",
+        }
+    }
+
+    rows = manager.realtime_private_rows("order", snapshot=snapshot)
+    assert rows == [{"orderId": "1", "symbol": "BTCUSDT"}]
+
+    monkeypatch.setattr(manager, "private_snapshot", lambda: snapshot)
+    auto_rows = manager.realtime_private_rows("execution")
+    assert auto_rows == [{"execId": "2", "symbol": "ETHUSDT"}]
+
 def test_refresh_settings_handles_typeerror(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
 
