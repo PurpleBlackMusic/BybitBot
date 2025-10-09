@@ -195,6 +195,52 @@ def test_tradable_universe_cache_scoped_by_network():
     assert meta_mainnet_cached["cache_state"] == "cached"
 
 
+def test_instrument_limits_cache_scoped_by_network():
+    def build_payload(min_amount: str, qty_step: str) -> dict:
+        return {
+            "result": {
+                "list": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "status": "Trading",
+                        "baseCoin": "BTC",
+                        "quoteCoin": "USDT",
+                        "lotSizeFilter": {
+                            "minOrderAmt": min_amount,
+                            "minOrderQty": "0.0001",
+                            "qtyStep": qty_step,
+                        },
+                    }
+                ]
+            }
+        }
+
+    testnet_payload = build_payload("6", "0.0001")
+    mainnet_payload = build_payload("11", "0.001")
+
+    testnet_creds = type("Creds", (), {"testnet": True})()
+    mainnet_creds = type("Creds", (), {"testnet": False})()
+
+    testnet_api = DummyAPI(testnet_payload, creds=testnet_creds)
+    mainnet_api = DummyAPI(mainnet_payload, creds=mainnet_creds)
+
+    limits_testnet = spot_market_module._instrument_limits(testnet_api, "BTCUSDT")
+    limits_mainnet = spot_market_module._instrument_limits(mainnet_api, "BTCUSDT")
+
+    assert limits_testnet["min_order_amt"] == Decimal("6")
+    assert limits_mainnet["min_order_amt"] == Decimal("11")
+
+    # alternating requests should continue to return environment-specific limits
+    limits_testnet_again = spot_market_module._instrument_limits(testnet_api, "BTCUSDT")
+    limits_mainnet_again = spot_market_module._instrument_limits(mainnet_api, "BTCUSDT")
+
+    assert limits_testnet_again["min_order_amt"] == Decimal("6")
+    assert limits_mainnet_again["min_order_amt"] == Decimal("11")
+
+    assert testnet_api.info_calls == 1
+    assert mainnet_api.info_calls == 1
+
+
 def test_resolve_trade_symbol_prefers_canonical_symbol_for_alias():
     payload = _universe_payload([
         {

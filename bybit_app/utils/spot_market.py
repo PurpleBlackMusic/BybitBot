@@ -97,6 +97,13 @@ def _symbol_cache_key(api: BybitAPI) -> str:
     return f"spot_usdt:{network}"
 
 
+def _instrument_cache_key(api: BybitAPI, symbol: str) -> str:
+    """Return a cache key for instrument metadata scoped to the API network."""
+
+    network = _network_label(api)
+    return f"{network}:{(symbol or '').upper()}"
+
+
 class OrderValidationError(RuntimeError):
     """Raised when a trade request violates exchange constraints."""
 
@@ -636,7 +643,8 @@ def _execution_stats(
 
 def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     key = symbol.upper()
-    cached = _INSTRUMENT_CACHE.get(key)
+    cache_key = _instrument_cache_key(api, key)
+    cached = _INSTRUMENT_CACHE.get(cache_key)
     now = time.time()
     if cached is not None:
         dynamic_ts = cached.get("_dynamic_ts") if isinstance(cached, dict) else None
@@ -748,7 +756,7 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     }
     limits["_instrument"] = instrument
     limits["_dynamic_ts"] = now
-    _INSTRUMENT_CACHE.set(key, limits)
+    _INSTRUMENT_CACHE.set(cache_key, limits)
     return limits
 
 
@@ -1281,11 +1289,12 @@ def prepare_spot_trade_snapshot(
     """Fetch reusable inputs for a subsequent spot market order."""
 
     key = symbol.upper()
+    instrument_cache_key = _instrument_cache_key(api, key)
 
     limits: Mapping[str, object] | None = None
     if include_limits:
         if force_refresh:
-            _INSTRUMENT_CACHE.invalidate(key)
+            _INSTRUMENT_CACHE.invalidate(instrument_cache_key)
         limits = _instrument_limits(api, key)
 
     price: Decimal | None = None
