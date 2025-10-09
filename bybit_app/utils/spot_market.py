@@ -489,6 +489,8 @@ def _plan_limit_ioc_order(
     target_base: Decimal | None,
     qty_step: Decimal,
     min_qty: Decimal,
+    max_price: Decimal | None = None,
+    min_price: Decimal | None = None,
 ) -> tuple[Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
     side_normalised = side
     levels = asks if side_normalised == "buy" else bids
@@ -516,7 +518,18 @@ def _plan_limit_ioc_order(
             code="qty_invalid",
         )
 
+    price_limit_hit = False
+
     for price, qty in levels:
+        if side_normalised == "buy" and max_price is not None:
+            if price - max_price > _TOLERANCE_MARGIN:
+                price_limit_hit = True
+                break
+        if side_normalised == "sell" and min_price is not None:
+            if min_price - price > _TOLERANCE_MARGIN:
+                price_limit_hit = True
+                break
+
         worst_price = price
         if target_base is not None:
             remaining_base = target_base - accumulated_base
@@ -551,6 +564,22 @@ def _plan_limit_ioc_order(
                 "requested_base": _format_decimal(target_base),
                 "available_base": _format_decimal(accumulated_base),
                 "side": side_normalised,
+                **(
+                    {
+                        "price_cap": _format_decimal(max_price),
+                        "price_limit_hit": True,
+                    }
+                    if price_limit_hit and side_normalised == "buy" and max_price is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "price_floor": _format_decimal(min_price),
+                        "price_limit_hit": True,
+                    }
+                    if price_limit_hit and side_normalised == "sell" and min_price is not None
+                    else {}
+                ),
             },
         )
 
@@ -562,6 +591,22 @@ def _plan_limit_ioc_order(
                 "requested_quote": _format_decimal(target_quote),
                 "available_quote": _format_decimal(accumulated_quote),
                 "side": side_normalised,
+                **(
+                    {
+                        "price_cap": _format_decimal(max_price),
+                        "price_limit_hit": True,
+                    }
+                    if price_limit_hit and side_normalised == "buy" and max_price is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "price_floor": _format_decimal(min_price),
+                        "price_limit_hit": True,
+                    }
+                    if price_limit_hit and side_normalised == "sell" and min_price is not None
+                    else {}
+                ),
             },
         )
 
@@ -1595,6 +1640,14 @@ def prepare_spot_market_order(
     if price_hint is None:
         price_hint = _latest_price(api, symbol)
 
+    max_price_allowed: Decimal | None
+    min_price_allowed: Decimal | None
+    max_price_allowed, min_price_allowed = _max_mark_price(
+        price_hint,
+        side=side_normalised,
+        deviation=price_deviation,
+    )
+
     asks, bids = _orderbook_snapshot(api, symbol)
     worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
         asks=asks,
@@ -1604,6 +1657,8 @@ def prepare_spot_market_order(
         target_base=target_base,
         qty_step=qty_step,
         min_qty=min_qty,
+        max_price=max_price_allowed,
+        min_price=min_price_allowed,
     )
 
 
@@ -1901,26 +1956,31 @@ def prepare_spot_market_order(
                 },
             )
 
-    max_price, min_price = _max_mark_price(price_hint, side=side_normalised, deviation=price_deviation)
-    if max_price is not None and limit_price > max_price:
+    if (
+        max_price_allowed is not None
+        and limit_price - max_price_allowed > _TOLERANCE_MARGIN
+    ):
         raise OrderValidationError(
             "Ожидаемая цена превышает допустимое отклонение от mark.",
             code="price_deviation",
             details={
                 "limit_price": _format_decimal(limit_price),
                 "mark_price": _format_decimal(price_hint),
-                "max_allowed": _format_decimal(max_price),
+                "max_allowed": _format_decimal(max_price_allowed),
                 "side": side_normalised,
             },
         )
-    if min_price is not None and limit_price < min_price:
+    if (
+        min_price_allowed is not None
+        and min_price_allowed - limit_price > _TOLERANCE_MARGIN
+    ):
         raise OrderValidationError(
             "Ожидаемая цена ниже допустимого отклонения от mark.",
             code="price_deviation",
             details={
                 "limit_price": _format_decimal(limit_price),
                 "mark_price": _format_decimal(price_hint),
-                "min_allowed": _format_decimal(min_price),
+                "min_allowed": _format_decimal(min_price_allowed),
                 "side": side_normalised,
             },
         )
@@ -2024,6 +2084,10 @@ def prepare_spot_market_order(
         audit["max_available"] = _format_decimal(max_available)
     if price_hint is not None:
         audit["price_used"] = _format_decimal(price_hint)
+    if max_price_allowed is not None:
+        audit["price_ceiling"] = _format_decimal(max_price_allowed)
+    if min_price_allowed is not None:
+        audit["price_floor"] = _format_decimal(min_price_allowed)
     if balances_checked:
         audit["balances_checked"] = [
             {"asset": asset, "required": _format_decimal(amount)} for asset, amount in balances_checked

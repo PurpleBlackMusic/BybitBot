@@ -916,6 +916,31 @@ def test_sell_tick_and_validation_floor_retained():
     assert validated.qty <= total_consumed
 
 
+def test_prepare_spot_market_limits_depth_by_mark_tolerance():
+    orderbook = {"result": {"a": [["100.5", "5"], ["100.6", "5"]], "b": [["99.5", "5"]]}}
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("100"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("0.1"),
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("500")},
+            limits=_basic_limits(),
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "insufficient_liquidity"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("price_cap") == "100.1"
+    assert details.get("price_limit_hit") is True
+
+
 def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
     orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)
@@ -935,10 +960,10 @@ def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
         )
 
     err = excinfo.value
-    assert getattr(err, "code", None) == "price_deviation"
+    assert getattr(err, "code", None) == "insufficient_liquidity"
     details = getattr(err, "details", {}) or {}
-    assert details.get("max_allowed") == "101"
-    assert details.get("mark_price") == "100"
+    assert details.get("price_cap") == "101"
+    assert details.get("price_limit_hit") is True
 
 
 def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
