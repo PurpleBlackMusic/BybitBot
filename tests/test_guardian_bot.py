@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import os
+import copy
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1933,6 +1934,104 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
     assert diversification["concentration_level"] == "high"
 
 
+def test_guardian_symbol_plan_trade_performance_adjusts_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "XRPUSDT",
+                "probability": 0.62,
+                "ev_bps": 14.0,
+                "trend": "buy",
+                "actionable": True,
+            },
+            {
+                "symbol": "SOLUSDT",
+                "probability": 0.68,
+                "ev_bps": 22.0,
+                "trend": "buy",
+                "actionable": True,
+            },
+        ]
+    }
+
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    settings = Settings(
+        ai_live_only=False,
+        ai_max_concurrent=3,
+        ai_enabled=True,
+        ai_buy_threshold=0.55,
+        ai_min_ev_bps=10.0,
+    )
+
+    bot = _make_bot(tmp_path, settings)
+
+    trades_payload = [
+        {"symbol": "SOLUSDT", "bps_realized": 12.0, "hold_sec": 3600},
+        {"symbol": "SOLUSDT", "bps_realized": 8.0, "hold_sec": 7200},
+        {"symbol": "SOLUSDT", "bps_realized": 5.0, "hold_sec": 1800},
+        {"symbol": "XRPUSDT", "bps_realized": -6.0, "hold_sec": 4800},
+        {"symbol": "XRPUSDT", "bps_realized": -4.0, "hold_sec": 5400},
+        {"symbol": "XRPUSDT", "bps_realized": -7.0, "hold_sec": 6000},
+    ]
+
+    def fake_pair_trades(*_: object, **__: object) -> list[dict]:
+        return copy.deepcopy(trades_payload)
+
+    monkeypatch.setattr(guardian_bot_module, "pair_trades", fake_pair_trades)
+
+    summary = bot.status_summary()
+    plan = summary["symbol_plan"]
+
+    details = plan["details"]
+    sol = details["SOLUSDT"]
+    xrp = details["XRPUSDT"]
+
+    assert sol["realized_bps_avg"] == pytest.approx(8.333, rel=1e-3)
+    assert sol["win_rate_pct"] == pytest.approx(100.0, rel=1e-3)
+    assert sol["median_hold_sec"] == pytest.approx(3600.0, rel=1e-3)
+    assert sol["trade_sample_count"] == 3
+    assert sol["performance_bias"] == "positive"
+
+    assert xrp["realized_bps_avg"] == pytest.approx(-5.667, rel=1e-3)
+    assert xrp["win_rate_pct"] == pytest.approx(0.0, rel=1e-3)
+    assert xrp["median_hold_sec"] == pytest.approx(5400.0, rel=1e-3)
+    assert xrp["trade_sample_count"] == 3
+    assert xrp["performance_bias"] == "negative"
+
+    priority_symbols = [item["symbol"] for item in plan["priority_table"][:2]]
+    assert priority_symbols == ["SOLUSDT", "XRPUSDT"]
+    sol_entry = plan["priority_table"][0]
+    xrp_entry = plan["priority_table"][1]
+    assert sol_entry["priority_adjustment"] < 0
+    assert xrp_entry["priority_adjustment"] > 0
+
+    performance_overview = summary["performance_overview"]
+    assert performance_overview["positive_count"] == 1
+    assert performance_overview["negative_count"] == 1
+    assert performance_overview["top_positive"][0]["symbol"] == "SOLUSDT"
+
+    breakdown = summary["watchlist_breakdown"]
+    assert breakdown["counts"]["positive_bias"] == 1
+    assert breakdown["counts"]["negative_bias"] == 1
+    actionable_metrics = breakdown["metrics"]["actionable"]
+    assert actionable_metrics["realized_bps_avg"] == pytest.approx(1.33, rel=1e-2)
+
+    highlights = {item["symbol"]: item for item in summary["watchlist_highlights"]}
+    assert highlights["SOLUSDT"]["performance_bias"] == "positive"
+    assert highlights["XRPUSDT"]["performance_bias"] == "negative"
+
+    candidates = summary["trade_candidates"][:2]
+    assert candidates[0]["symbol"] == "SOLUSDT"
+    assert candidates[0]["realized_bps_avg"] == pytest.approx(8.333, rel=1e-3)
+    assert candidates[1]["symbol"] == "XRPUSDT"
+    assert candidates[1]["win_rate_pct"] == pytest.approx(0.0, rel=1e-3)
+
+    assert bot.dynamic_symbols(limit=0)[:2] == ["SOLUSDT", "XRPUSDT"]
 def test_guardian_symbol_plan_cache_updates_on_watchlist_change(tmp_path: Path) -> None:
     status = {
         "symbol": "ETHUSDT",

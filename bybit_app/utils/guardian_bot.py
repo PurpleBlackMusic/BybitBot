@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from statistics import StatisticsError, median
 
 
 WARNING_SIGNAL_SECONDS = 300.0
@@ -25,6 +26,7 @@ from .trade_analytics import (
     aggregate_execution_metrics,
     normalise_execution_payload,
 )
+from .trade_pairs import pair_trades
 from .spot_pnl import spot_inventory_and_pnl
 from .symbols import ensure_usdt_symbol
 from .live_checks import api_key_status, bybit_realtime_status
@@ -1447,6 +1449,92 @@ class GuardianBot:
         for symbol in positions_only:
             _record(symbol, source="positions_only")
 
+        performance_metrics: Dict[str, Dict[str, object]] = {}
+        try:
+            paired_trades = pair_trades(settings=settings)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "guardian.symbol_plan.trade_pairs_error",
+                error=str(exc),
+            )
+            paired_trades = []
+
+        if paired_trades:
+            buckets: Dict[str, Dict[str, object]] = {}
+            for trade in paired_trades:
+                symbol_value = trade.get("symbol")
+                if not isinstance(symbol_value, str):
+                    continue
+                symbol = symbol_value.strip().upper()
+                if not symbol:
+                    continue
+
+                bucket = buckets.setdefault(
+                    symbol,
+                    {
+                        "bps": [],
+                        "hold": [],
+                        "wins": 0,
+                        "count": 0,
+                    },
+                )
+
+                bps_value = self._coerce_float(trade.get("bps_realized"))
+                if bps_value is not None:
+                    bucket["bps"].append(bps_value)
+                    bucket["count"] = int(bucket.get("count", 0)) + 1
+                    if bps_value > 0:
+                        bucket["wins"] = int(bucket.get("wins", 0)) + 1
+
+                hold_value = self._coerce_float(trade.get("hold_sec"))
+                if hold_value is not None:
+                    bucket.setdefault("hold", []).append(hold_value)
+
+            for symbol, bucket in buckets.items():
+                trade_count = int(bucket.get("count", 0))
+                if trade_count <= 0:
+                    continue
+
+                bps_values = [float(val) for val in bucket.get("bps", []) if isinstance(val, (int, float))]
+                if not bps_values:
+                    continue
+
+                realised_avg = round(sum(bps_values) / len(bps_values), 3)
+                wins = int(bucket.get("wins", 0))
+                win_rate_pct: Optional[float]
+                if trade_count > 0:
+                    win_rate_pct = round((wins / trade_count) * 100.0, 2)
+                else:
+                    win_rate_pct = None
+
+                hold_samples = [
+                    float(val)
+                    for val in bucket.get("hold", [])
+                    if isinstance(val, (int, float))
+                ]
+                median_hold: Optional[float]
+                if hold_samples:
+                    try:
+                        median_hold = float(median(hold_samples))
+                    except StatisticsError:
+                        median_hold = None
+                else:
+                    median_hold = None
+
+                metrics_payload: Dict[str, object] = {
+                    "realized_bps_avg": realised_avg,
+                    "win_rate_pct": win_rate_pct,
+                    "median_hold_sec": round(median_hold, 2)
+                    if isinstance(median_hold, float)
+                    else None,
+                    "trade_sample_count": trade_count,
+                }
+                performance_metrics[symbol] = metrics_payload
+
+        for symbol, metrics_payload in performance_metrics.items():
+            if symbol in symbol_details:
+                _record(symbol, **metrics_payload)
+
         dynamic_sequence: List[str] = []
         for bucket in (position_symbols, actionable, ready, watchlist_symbols):
             for symbol in bucket:
@@ -1456,6 +1544,70 @@ class GuardianBot:
         limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0)
         if len(position_symbols) > limit_hint:
             limit_hint = len(position_symbols)
+
+        base_order = {symbol: idx for idx, symbol in enumerate(dynamic_sequence)}
+        priority_adjustments: Dict[str, float] = {}
+        for symbol in dynamic_sequence:
+            info = symbol_details.get(symbol, {})
+            sample_raw = info.get("trade_sample_count")
+            sample_size = int(sample_raw) if isinstance(sample_raw, (int, float)) else 0
+            if sample_size < 3:
+                continue
+
+            realised = self._coerce_float(info.get("realized_bps_avg"))
+            win_rate_pct = self._coerce_float(info.get("win_rate_pct"))
+            win_rate = None
+            if win_rate_pct is not None:
+                win_rate = win_rate_pct / 100.0
+
+            adjustment = 0.0
+            if realised is not None:
+                if realised >= 10.0:
+                    adjustment -= 2.0
+                elif realised >= 3.0:
+                    adjustment -= 1.0
+                elif realised <= -10.0:
+                    adjustment += 2.0
+                elif realised <= -3.0:
+                    adjustment += 1.0
+
+            if win_rate is not None:
+                if win_rate >= 0.65:
+                    adjustment -= 1.0
+                elif win_rate >= 0.55:
+                    adjustment -= 0.5
+                elif win_rate <= 0.35:
+                    adjustment += 1.0
+                elif win_rate <= 0.45:
+                    adjustment += 0.5
+
+            if abs(adjustment) < 1e-6:
+                continue
+
+            priority_adjustments[symbol] = adjustment
+
+        if priority_adjustments:
+            dynamic_sequence = sorted(
+                dynamic_sequence,
+                key=lambda sym: (
+                    base_order[sym] + priority_adjustments.get(sym, 0.0),
+                    base_order[sym],
+                    sym,
+                ),
+            )
+
+            for symbol, adjustment in priority_adjustments.items():
+                if adjustment < 0:
+                    bias = "positive"
+                elif adjustment > 0:
+                    bias = "negative"
+                else:
+                    bias = "neutral"
+                _record(
+                    symbol,
+                    priority_adjustment=round(adjustment, 3),
+                    performance_bias=bias,
+                )
 
         for idx, symbol in enumerate(dynamic_sequence):
             _record(symbol, priority_rank=idx, priority_order=idx + 1)
@@ -1508,6 +1660,8 @@ class GuardianBot:
             "top_probability": _best_of(actionable, "probability_pct"),
             "top_ev": _best_of(actionable, "ev_bps"),
             "top_edge_score": _best_of(actionable, "edge_score"),
+            "top_realized_bps": _best_of(actionable, "realized_bps_avg"),
+            "top_win_rate": _best_of(actionable, "win_rate_pct"),
         }
 
         ready_summary = {
@@ -1515,6 +1669,8 @@ class GuardianBot:
             "top_probability": _best_of(ready, "probability_pct"),
             "top_ev": _best_of(ready, "ev_bps"),
             "top_edge_score": _best_of(ready, "edge_score"),
+            "top_realized_bps": _best_of(ready, "realized_bps_avg"),
+            "top_win_rate": _best_of(ready, "win_rate_pct"),
         }
 
         total_notional = float(total_notional)
@@ -1683,6 +1839,12 @@ class GuardianBot:
                     "position_notional": info.get("position_notional"),
                     "position_avg_cost": info.get("position_avg_cost"),
                     "exposure_pct": info.get("exposure_pct"),
+                    "realized_bps_avg": info.get("realized_bps_avg"),
+                    "win_rate_pct": info.get("win_rate_pct"),
+                    "median_hold_sec": info.get("median_hold_sec"),
+                    "trade_sample_count": info.get("trade_sample_count"),
+                    "priority_adjustment": info.get("priority_adjustment"),
+                    "performance_bias": info.get("performance_bias"),
                 }
             )
 
@@ -1959,6 +2121,10 @@ class GuardianBot:
             exposure_pct = self._coerce_float(raw_entry.get("exposure_pct"))
             position_qty = self._coerce_float(raw_entry.get("position_qty"))
             position_notional = self._coerce_float(raw_entry.get("position_notional"))
+            realized_bps_avg = self._coerce_float(raw_entry.get("realized_bps_avg"))
+            win_rate_pct = self._coerce_float(raw_entry.get("win_rate_pct"))
+            median_hold_sec = self._coerce_float(raw_entry.get("median_hold_sec"))
+            priority_adjustment = self._coerce_float(raw_entry.get("priority_adjustment"))
 
             entry = {
                 "symbol": symbol,
@@ -1979,6 +2145,18 @@ class GuardianBot:
                 "exposure_pct": round(exposure_pct, 3) if exposure_pct is not None else None,
                 "position_qty": position_qty,
                 "position_notional": position_notional,
+                "realized_bps_avg": round(realized_bps_avg, 3)
+                if realized_bps_avg is not None
+                else None,
+                "win_rate_pct": round(win_rate_pct, 2) if win_rate_pct is not None else None,
+                "median_hold_sec": round(median_hold_sec, 2)
+                if median_hold_sec is not None
+                else None,
+                "trade_sample_count": raw_entry.get("trade_sample_count"),
+                "priority_adjustment": round(priority_adjustment, 3)
+                if priority_adjustment is not None
+                else None,
+                "performance_bias": raw_entry.get("performance_bias"),
             }
 
             summary.append(entry)
@@ -1987,6 +2165,56 @@ class GuardianBot:
                 break
 
         return summary
+
+    @staticmethod
+    def _compose_performance_overview(
+        plan: Mapping[str, object]
+    ) -> Optional[Dict[str, object]]:
+        priority_table = plan.get("priority_table") if isinstance(plan, Mapping) else None
+        if not isinstance(priority_table, Sequence):
+            return None
+
+        buckets: Dict[str, List[Dict[str, object]]] = {
+            "positive": [],
+            "negative": [],
+            "neutral": [],
+        }
+
+        for raw_entry in priority_table:
+            if not isinstance(raw_entry, Mapping):
+                continue
+
+            symbol_value = raw_entry.get("symbol")
+            if not isinstance(symbol_value, str):
+                continue
+            symbol = symbol_value.strip().upper()
+            if not symbol:
+                continue
+
+            bias_value = str(raw_entry.get("performance_bias") or "neutral").lower()
+            bucket_key = bias_value if bias_value in buckets else "neutral"
+
+            payload = {
+                "symbol": symbol,
+                "realized_bps_avg": raw_entry.get("realized_bps_avg"),
+                "win_rate_pct": raw_entry.get("win_rate_pct"),
+                "median_hold_sec": raw_entry.get("median_hold_sec"),
+                "trade_sample_count": raw_entry.get("trade_sample_count"),
+                "priority_adjustment": raw_entry.get("priority_adjustment"),
+            }
+            buckets[bucket_key].append(payload)
+
+        if not any(buckets.values()):
+            return None
+
+        overview: Dict[str, object] = {}
+        for key, items in buckets.items():
+            overview[f"{key}_count"] = len(items)
+            overview[key] = tuple(items)
+            if items:
+                overview[f"top_{key}"] = tuple(items[:3])
+
+        return overview
 
     @staticmethod
     def _condense_watchlist_entry(entry: Dict[str, object]) -> Dict[str, object]:
@@ -2005,6 +2233,12 @@ class GuardianBot:
             "edge_score": entry.get("edge_score"),
             "score": entry.get("score"),
             "note": entry.get("note"),
+            "realized_bps_avg": entry.get("realized_bps_avg"),
+            "win_rate_pct": entry.get("win_rate_pct"),
+            "median_hold_sec": entry.get("median_hold_sec"),
+            "trade_sample_count": entry.get("trade_sample_count"),
+            "priority_adjustment": entry.get("priority_adjustment"),
+            "performance_bias": entry.get("performance_bias"),
         }
 
         return compact
@@ -2040,6 +2274,14 @@ class GuardianBot:
         overall_expectancies: List[float] = []
         actionable_probabilities: List[float] = []
         actionable_expectancies: List[float] = []
+        overall_realised: List[float] = []
+        actionable_realised: List[float] = []
+        overall_win_rates: List[float] = []
+        actionable_win_rates: List[float] = []
+        overall_holds: List[float] = []
+        actionable_holds: List[float] = []
+        positive_bias = 0
+        negative_bias = 0
 
         for compact in condensed_entries:
             trend = str(compact.get("trend") or "wait").lower()
@@ -2072,6 +2314,33 @@ class GuardianBot:
                 if compact["actionable"]:
                     actionable_expectancies.append(expectancy_number)
 
+            realised_value = compact.get("realized_bps_avg")
+            if isinstance(realised_value, (int, float)):
+                realised_number = float(realised_value)
+                overall_realised.append(realised_number)
+                if compact["actionable"]:
+                    actionable_realised.append(realised_number)
+
+            win_rate_value = compact.get("win_rate_pct")
+            if isinstance(win_rate_value, (int, float)):
+                win_rate_number = float(win_rate_value)
+                overall_win_rates.append(win_rate_number)
+                if compact["actionable"]:
+                    actionable_win_rates.append(win_rate_number)
+
+            hold_value = compact.get("median_hold_sec")
+            if isinstance(hold_value, (int, float)):
+                hold_number = float(hold_value)
+                overall_holds.append(hold_number)
+                if compact["actionable"]:
+                    actionable_holds.append(hold_number)
+
+            bias = compact.get("performance_bias")
+            if bias == "positive":
+                positive_bias += 1
+            elif bias == "negative":
+                negative_bias += 1
+
         counts = {
             "total": total,
             "actionable": len(actionable),
@@ -2081,6 +2350,10 @@ class GuardianBot:
             "sells": len(sells),
             "neutral": len(neutral),
         }
+        if positive_bias:
+            counts["positive_bias"] = positive_bias
+        if negative_bias:
+            counts["negative_bias"] = negative_bias
 
         dominant_trend: Optional[str]
         if actionable_buys or actionable_sells:
@@ -2102,6 +2375,14 @@ class GuardianBot:
                 return None
             return round(sum(values) / len(values), 2)
 
+        def _median(values: Sequence[float]) -> Optional[float]:
+            if not values:
+                return None
+            try:
+                return float(median(values))
+            except StatisticsError:
+                return None
+
         overall_metrics: Dict[str, float] = {}
         overall_probability_avg = _average(overall_probabilities)
         if overall_probability_avg is not None:
@@ -2109,6 +2390,15 @@ class GuardianBot:
         overall_expectancy_avg = _average(overall_expectancies)
         if overall_expectancy_avg is not None:
             overall_metrics["ev_avg_bps"] = overall_expectancy_avg
+        overall_realised_avg = _average(overall_realised)
+        if overall_realised_avg is not None:
+            overall_metrics["realized_bps_avg"] = overall_realised_avg
+        overall_win_rate_avg = _average(overall_win_rates)
+        if overall_win_rate_avg is not None:
+            overall_metrics["win_rate_avg_pct"] = overall_win_rate_avg
+        overall_hold_median = _median(overall_holds)
+        if overall_hold_median is not None:
+            overall_metrics["median_hold_sec"] = round(overall_hold_median, 2)
 
         actionable_metrics: Dict[str, float] = {}
         actionable_probability_avg = _average(actionable_probabilities)
@@ -2117,6 +2407,15 @@ class GuardianBot:
         actionable_expectancy_avg = _average(actionable_expectancies)
         if actionable_expectancy_avg is not None:
             actionable_metrics["ev_avg_bps"] = actionable_expectancy_avg
+        actionable_realised_avg = _average(actionable_realised)
+        if actionable_realised_avg is not None:
+            actionable_metrics["realized_bps_avg"] = actionable_realised_avg
+        actionable_win_rate_avg = _average(actionable_win_rates)
+        if actionable_win_rate_avg is not None:
+            actionable_metrics["win_rate_avg_pct"] = actionable_win_rate_avg
+        actionable_hold_median = _median(actionable_holds)
+        if actionable_hold_median is not None:
+            actionable_metrics["median_hold_sec"] = round(actionable_hold_median, 2)
 
         metrics: Dict[str, Dict[str, float]] = {}
         if overall_metrics:
@@ -2161,6 +2460,14 @@ class GuardianBot:
         ev_bps = entry.get("ev_bps")
         if isinstance(ev_bps, (int, float)):
             parts.append(f"EV {float(ev_bps):.1f} б.п.")
+
+        realized = entry.get("realized_bps_avg")
+        if isinstance(realized, (int, float)):
+            parts.append(f"реал {float(realized):.1f} б.п.")
+
+        win_rate = entry.get("win_rate_pct")
+        if isinstance(win_rate, (int, float)):
+            parts.append(f"win {float(win_rate):.1f}%")
 
         note = entry.get("note")
         if isinstance(note, str):
@@ -2299,6 +2606,63 @@ class GuardianBot:
         portfolio = ledger_view.portfolio
         settings = self.settings
         context = self._derive_signal_context(status, settings, portfolio=portfolio)
+        raw_watchlist = context.get("watchlist", [])
+        plan_from_context = context.get("symbol_plan") if isinstance(context, Mapping) else None
+        if isinstance(plan_from_context, Mapping):
+            symbol_plan = dict(plan_from_context)
+        else:
+            symbol_plan = self._build_symbol_plan(
+                raw_watchlist,
+                settings,
+                portfolio=portfolio,
+                ledger_signature=signature[1],
+            )
+
+        plan_copy = copy.deepcopy(symbol_plan)
+        context["symbol_plan"] = plan_copy
+
+        plan_details = plan_copy.get("details") if isinstance(plan_copy, Mapping) else None
+        if isinstance(plan_details, Mapping) and isinstance(raw_watchlist, Sequence):
+            enriched_watchlist: List[Dict[str, object]] = []
+            for entry in raw_watchlist:
+                if isinstance(entry, Mapping):
+                    updated_entry = dict(entry)
+                else:
+                    updated_entry = {"symbol": entry}
+                symbol_value = updated_entry.get("symbol")
+                symbol_key = (
+                    str(symbol_value).strip().upper()
+                    if isinstance(symbol_value, str)
+                    else None
+                )
+                if symbol_key and symbol_key in plan_details:
+                    detail = plan_details[symbol_key]
+                    if isinstance(detail, Mapping):
+                        for key in (
+                            "realized_bps_avg",
+                            "win_rate_pct",
+                            "median_hold_sec",
+                            "trade_sample_count",
+                            "priority_adjustment",
+                            "performance_bias",
+                        ):
+                            value = detail.get(key)
+                            if value is not None:
+                                updated_entry[key] = value
+                enriched_watchlist.append(updated_entry)
+
+            context["watchlist"] = enriched_watchlist
+            try:
+                enriched_breakdown = self._watchlist_breakdown(enriched_watchlist)
+            except Exception:
+                enriched_breakdown = None
+            else:
+                context["watchlist_breakdown"] = copy.deepcopy(enriched_breakdown)
+                context["watchlist_digest"] = self._watchlist_digest(enriched_breakdown)
+            watchlist = enriched_watchlist
+        else:
+            watchlist = raw_watchlist
+
         brief = self._brief_from_status(status, settings, context)
         status_summary = self._build_status_summary(
             status,
@@ -2308,26 +2672,16 @@ class GuardianBot:
             context,
         )
 
-        watchlist = context.get("watchlist", [])
-        symbol_plan: Dict[str, object]
-        plan_from_context = context.get("symbol_plan") if isinstance(context, Mapping) else None
-        if isinstance(plan_from_context, Mapping):
-            symbol_plan = dict(plan_from_context)
-        else:
-            symbol_plan = self._build_symbol_plan(
-                watchlist,
-                settings,
-                portfolio=portfolio,
-                ledger_signature=signature[1],
-            )
-        plan_copy = copy.deepcopy(symbol_plan)
-        context["symbol_plan"] = plan_copy
         recent_trades = list(ledger_view.recent_trades)
         execution_records = ledger_view.executions
         trade_stats = ledger_view.trade_stats
 
         summary_plan = copy.deepcopy(plan_copy)
         status_summary["symbol_plan"] = summary_plan
+
+        performance_overview = self._compose_performance_overview(summary_plan)
+        if performance_overview:
+            status_summary["performance_overview"] = performance_overview
 
         limit_hint = int(symbol_plan.get("limit") or 0)
         candidate_pool = list(symbol_plan.get("combined") or [])
@@ -2519,6 +2873,12 @@ class GuardianBot:
                     "note": entry.get("note"),
                     "actionable": entry.get("actionable"),
                     "edge_score": entry.get("edge_score"),
+                    "realized_bps_avg": entry.get("realized_bps_avg"),
+                    "win_rate_pct": entry.get("win_rate_pct"),
+                    "median_hold_sec": entry.get("median_hold_sec"),
+                    "trade_sample_count": entry.get("trade_sample_count"),
+                    "priority_adjustment": entry.get("priority_adjustment"),
+                    "performance_bias": entry.get("performance_bias"),
                 }
                 if idx == 0:
                     highlight["primary"] = True
