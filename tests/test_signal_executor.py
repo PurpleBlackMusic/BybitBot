@@ -1183,6 +1183,93 @@ def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) 
     assert result.reason is not None and "min_notional" in result.reason
 
 
+def test_signal_executor_notifies_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        telegram_notify=True,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_place(*_args, **_kwargs):
+        raise OrderValidationError("слишком сильное отклонение цены", code="price_deviation")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    captured: list[str] = []
+
+    def fake_send(text: str) -> None:
+        captured.append(text)
+
+    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert captured, "telegram notification should be sent"
+    assert "price_deviation" in captured[0]
+    assert "ETHUSDT" in captured[0]
+
+
+def test_signal_executor_does_not_notify_validation_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        telegram_notify=False,
+        tg_trade_notifs=False,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_place(*_args, **_kwargs):
+        raise OrderValidationError("слишком сильное отклонение цены", code="price_deviation")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    called = {"value": False}
+
+    def fake_send(_text: str) -> None:
+        called["value"] = True
+
+    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert called["value"] is False
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

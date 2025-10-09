@@ -315,6 +315,13 @@ class SignalExecutor:
 
             skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
             if exc.code in skip_codes:
+                self._maybe_notify_validation_skip(
+                    settings=settings,
+                    symbol=symbol,
+                    side=side,
+                    code=exc.code,
+                    message=str(exc),
+                )
                 return self._decision(
                     "skipped",
                     reason=f"Ордер пропущен ({exc.code}): {exc}",
@@ -780,6 +787,48 @@ class SignalExecutor:
             best_total = ledger_total
 
         return best_total
+
+    def _maybe_notify_validation_skip(
+        self,
+        *,
+        settings: Settings,
+        symbol: str,
+        side: str,
+        code: Optional[str],
+        message: str,
+    ) -> None:
+        notify_enabled = bool(
+            getattr(settings, "telegram_notify", False)
+            or getattr(settings, "tg_trade_notifs", False)
+        )
+        if not notify_enabled:
+            return
+
+        side_lower = str(side or "").lower()
+        action_text = "покупка" if side_lower == "buy" else "продажа"
+        symbol_text = (symbol or "").upper() or "UNKNOWN"
+        code_text = code or "unknown"
+        message_text = message or ""
+
+        notify_text = (
+            f"⚠️ {symbol_text}: {action_text} пропущена ({code_text}) — {message_text}"
+        )
+        log(
+            "telegram.validation.notify",
+            symbol=symbol_text,
+            side=side_lower,
+            code=code_text,
+        )
+        try:
+            send_telegram(notify_text)
+        except Exception as exc:  # pragma: no cover - network/HTTP errors
+            log(
+                "telegram.validation.error",
+                symbol=symbol_text,
+                side=side_lower,
+                code=code_text,
+                error=str(exc),
+            )
 
     def _maybe_notify_trade(
         self,
