@@ -189,6 +189,21 @@ def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest
     assert manager.s is refreshed_private
 
 
+def test_refresh_settings_handles_typeerror(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    refreshed = SimpleNamespace(testnet=False)
+    events: list[str] = []
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: refreshed)
+    monkeypatch.setattr(ws_manager_module, "log", lambda event, **kw: events.append(event))
+
+    manager._refresh_settings()
+
+    assert manager.s is refreshed
+    assert events == []
+
+
 def test_public_network_error_on_testnet_keeps_testnet_url(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
     settings = SimpleNamespace(testnet=True)

@@ -84,6 +84,9 @@ class WSManager:
         """Reload settings so WS endpoints respect latest configuration."""
         try:
             self.s = get_settings(force_reload=True)
+        except TypeError:
+            # Older call signatures may not accept the keyword argument.
+            self.s = get_settings()
         except Exception as e:  # pragma: no cover - defensive, rare
             log("ws.settings.refresh.error", err=str(e))
 
