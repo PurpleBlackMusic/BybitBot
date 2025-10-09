@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from bybit_app.utils import spot_market as spot_market_module
+from bybit_app.utils import validators
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.spot_market import (
     OrderValidationError,
@@ -765,6 +766,93 @@ def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     audit = prepared.audit
     assert audit.get("price_used") == "100"
     assert audit.get("limit_price") == "104"
+
+
+def test_buy_tick_and_validation_ceiling_respects_worst_ask():
+    asks = [(Decimal("100.03"), Decimal("0.4"))]
+    bids = [(Decimal("99.5"), Decimal("0.4"))]
+    target_quote = Decimal("10")
+    qty_step = Decimal("0.05")
+    min_qty = Decimal("0.01")
+    tick_size = Decimal("0.1")
+
+    worst_price, qty_base, _, consumed = spot_market_module._plan_limit_ioc_order(
+        asks=asks,
+        bids=bids,
+        side="buy",
+        target_quote=target_quote,
+        target_base=None,
+        qty_step=qty_step,
+        min_qty=min_qty,
+    )
+
+    limit_price = spot_market_module._apply_tick(worst_price, tick_size, "buy")
+
+    instrument = {
+        "priceFilter": {"tickSize": str(tick_size)},
+        "lotSizeFilter": {
+            "qtyStep": str(qty_step),
+            "minOrderQty": str(min_qty),
+            "minNotional": "0",
+            "minOrderAmt": "0",
+        },
+    }
+
+    qty_base_raw = target_quote / limit_price
+    validated = validators.validate_spot_rules(
+        instrument=instrument,
+        price=limit_price,
+        qty=qty_base_raw,
+        side="buy",
+    )
+
+    total_consumed = sum(qty for _, qty in consumed)
+
+    assert limit_price >= worst_price
+    assert validated.qty >= total_consumed
+
+
+def test_sell_tick_and_validation_floor_retained():
+    asks = [(Decimal("101.2"), Decimal("0.4"))]
+    bids = [(Decimal("99.97"), Decimal("0.4"))]
+    target_base = Decimal("0.11")
+    qty_step = Decimal("0.05")
+    min_qty = Decimal("0.01")
+    tick_size = Decimal("0.1")
+
+    worst_price, qty_base, _, consumed = spot_market_module._plan_limit_ioc_order(
+        asks=asks,
+        bids=bids,
+        side="sell",
+        target_quote=None,
+        target_base=target_base,
+        qty_step=qty_step,
+        min_qty=min_qty,
+    )
+
+    limit_price = spot_market_module._apply_tick(worst_price, tick_size, "sell")
+
+    instrument = {
+        "priceFilter": {"tickSize": str(tick_size)},
+        "lotSizeFilter": {
+            "qtyStep": str(qty_step),
+            "minOrderQty": str(min_qty),
+            "minNotional": "0",
+            "minOrderAmt": "0",
+        },
+    }
+
+    validated = validators.validate_spot_rules(
+        instrument=instrument,
+        price=limit_price,
+        qty=target_base,
+        side="sell",
+    )
+
+    total_consumed = sum(qty for _, qty in consumed)
+
+    assert limit_price <= worst_price
+    assert validated.qty <= total_consumed
 
 
 def test_prepare_spot_market_blocks_price_outside_mark_tolerance():

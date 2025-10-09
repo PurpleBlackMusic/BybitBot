@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Mapping, Sequence
 
 
@@ -77,15 +77,15 @@ def _instrument_decimal(
     return Decimal(default)
 
 
-def _quantize(value: Decimal, step: Decimal) -> Decimal:
+def _quantize(value: Decimal, step: Decimal, *, rounding=ROUND_DOWN) -> Decimal:
     if step <= 0:
         return value
     try:
-        return value.quantize(step, rounding=ROUND_DOWN)
+        return value.quantize(step, rounding=rounding)
     except InvalidOperation:
         exponent = step.normalize().as_tuple().exponent
         quantum = Decimal("1").scaleb(exponent)
-        return value.quantize(quantum, rounding=ROUND_DOWN)
+        return value.quantize(quantum, rounding=rounding)
 
 
 def _format_decimal(value: Decimal, step: Decimal) -> str:
@@ -123,6 +123,8 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
     price = kwargs.get("price")
     qty = kwargs.get("qty")
 
+    side = kwargs.get("side")
+
     if len(args) == 1 and isinstance(args[0], Mapping):
         instrument = args[0]
     elif len(args) >= 6:
@@ -131,10 +133,14 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
         candidate = args[5]
         if isinstance(candidate, Mapping):
             instrument = candidate
+        if len(args) >= 7 and side is None:
+            side = args[6]
     else:
         candidate = kwargs.get("instrument")
         if isinstance(candidate, Mapping):
             instrument = candidate
+    if side is None and len(args) > 6:
+        side = args[6]
 
     if instrument is None:
         raise ValueError("instrument is required for validation")
@@ -144,6 +150,9 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
 
     price_decimal = _to_decimal(price, field="price")
     qty_decimal = _to_decimal(qty, field="qty")
+
+    side_normalised = (side or "").lower()
+    rounding_mode = ROUND_UP if side_normalised == "buy" else ROUND_DOWN
 
     tick_size = _instrument_decimal(
         instrument,
@@ -176,8 +185,8 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
         default="0",
     )
 
-    price_q = _quantize(price_decimal, tick_size)
-    qty_q = _quantize(qty_decimal, qty_step)
+    price_q = _quantize(price_decimal, tick_size, rounding=rounding_mode)
+    qty_q = _quantize(qty_decimal, qty_step, rounding=rounding_mode)
 
     reasons: list[str] = []
     notional = price_q * qty_q
