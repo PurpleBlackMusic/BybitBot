@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+from utils.dataframe import arrow_safe
 
 from utils.envs import get_api_client, get_settings
 
@@ -33,6 +34,6 @@ try:
     if table.empty:
         st.info("Баланс не содержит монет для отображения.")
     else:
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.dataframe(arrow_safe(table), use_container_width=True, hide_index=True)
 except Exception as e:
     st.error(f"Ошибка чтения баланса: {e}")

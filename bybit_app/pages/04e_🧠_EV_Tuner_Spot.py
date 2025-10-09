@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
+from utils.dataframe import arrow_safe
 from utils.eval_exec import realized_impact_report
 from utils.envs import get_settings, update_settings
 
@@ -11,7 +12,7 @@ if not rep:
     st.info("Недостаточно данных (нужны недавние исполнения и решения).")
 else:
     df = pd.DataFrame(rep).T
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(arrow_safe(df), use_container_width=True)
     st.caption("Порог = 1.1 × p75 реализованного импакта, но не ниже 5 bps.")
     s = get_settings()
     sym = st.text_input("Символ для применения (точно как в отчёте)", value=(list(rep.keys())[0] if rep else "BTCUSDT")).upper().strip()

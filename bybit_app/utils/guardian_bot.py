@@ -1731,23 +1731,40 @@ class GuardianBot:
                 seen_symbols.add(upper_symbol)
 
         listed_symbols = set()
+        testnet_mode = bool(getattr(settings, "testnet", True))
         if filtered:
             listed_symbols = self._fetch_listed_spot_symbols()
             if listed_symbols:
                 before = len(filtered)
-                filtered = [
+                filtered_candidates = [
                     entry
                     for entry in filtered
                     if isinstance(entry.get("symbol"), str)
                     and entry["symbol"].strip().upper() in listed_symbols
                 ]
-                removed = before - len(filtered)
-                if removed > 0:
+                removed = before - len(filtered_candidates)
+                if removed > 0 and testnet_mode and len(filtered_candidates) <= max(5, before // 2):
                     log(
-                        "guardian.watchlist.filtered_unlisted",
+                        "guardian.watchlist.listing_filter.skipped",
                         removed=removed,
-                        remaining=len(filtered),
+                        remaining=len(filtered_candidates),
+                        reason="testnet",
                     )
+                else:
+                    filtered = filtered_candidates
+                    if removed > 0:
+                        log(
+                            "guardian.watchlist.filtered_unlisted",
+                            removed=removed,
+                            remaining=len(filtered),
+                        )
+            elif testnet_mode:
+                log(
+                    "guardian.watchlist.listing_filter.skipped",
+                    removed=0,
+                    remaining=len(filtered),
+                    reason="empty_catalog",
+                )
 
         if not filtered:
             return filtered

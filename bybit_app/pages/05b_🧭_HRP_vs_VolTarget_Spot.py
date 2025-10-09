@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 from utils.portfolio import corr_matrix, estimate_portfolio_allocation, load_corr
 from utils.hrp import hrp_weights
@@ -13,11 +14,11 @@ symbols = [x.strip().upper() for x in (s.ai_symbols or "BTCUSDT,ETHUSDT,SOLUSDT"
 
 if st.button("🔄 Посчитать матрицу (30д, 1h)"):
     C = corr_matrix(api, symbols, interval="60", lookback_hours=24*30)
-    st.dataframe(C, use_container_width=True)
+    st.dataframe(arrow_safe(C), use_container_width=True)
 else:
     C = load_corr()
     if not C.empty:
-        st.dataframe(C, use_container_width=True)
+        st.dataframe(arrow_safe(C), use_container_width=True)
     else:
         st.info("Нет сохранённой матрицы. Пересчитайте на странице Portfolio Risk.")
 
@@ -30,7 +31,10 @@ if not C.empty:
     # подадим фиктивную матрицу R, чтобы hrp_weights принял DataFrame
     R = pd.DataFrame(np.random.randn(100, len(C.columns)), columns=C.columns)
     w_hrp = hrp_weights(R)
-    st.dataframe(w_hrp.rename("weight").to_frame(), use_container_width=True)
+    st.dataframe(
+        arrow_safe(w_hrp.rename("weight").to_frame()),
+        use_container_width=True,
+    )
 else:
     st.info("Нет матрицы для HRP.")
 

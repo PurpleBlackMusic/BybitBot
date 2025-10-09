@@ -51,10 +51,16 @@ def _long_link(label: str = "LINK") -> str:
     return f"{label}-" + "X" * 40 + "-PRIMARY"
 
 
-def test_signed_get_params_are_sorted_and_signed() -> None:
+def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _RecordingSession()
     api = BybitAPI(BybitCreds(key="key123", secret="secret456", testnet=True))
     api.session = session
+
+    monkeypatch.setattr(
+        bybit_api_module,
+        "synced_timestamp_ms",
+        lambda *args, **kwargs: 1_700_000_000_000,
+    )
 
     api.fee_rate(category="spot", symbol="BTCUSDT", baseCoin="USDT")
 
@@ -73,7 +79,7 @@ def test_signed_get_params_are_sorted_and_signed() -> None:
     headers = payload["headers"]
     ts = headers["X-BAPI-TIMESTAMP"]
     expected_query = "baseCoin=USDT&category=spot&symbol=BTCUSDT"
-    expected_payload = f"{ts}key1235000{expected_query}".encode()
+    expected_payload = f"{ts}key12315000{expected_query}".encode()
     expected_sign = hmac.new(b"secret456", expected_payload, hashlib.sha256).hexdigest()
     assert headers["X-BAPI-SIGN"] == expected_sign
 

@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, json, pandas as pd, textwrap
+from utils.dataframe import arrow_safe
 from utils.log import read_tail
 from utils.ui import safe_set_page_config, inject_css
 
@@ -27,7 +28,7 @@ for ln in lines:
 
 if rows:
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(arrow_safe(df), use_container_width=True, hide_index=True)
     with st.expander("Показать полный лог (в развернутом виде)"):
         for rec in reversed(full[-200:]):  # последние 200 строк разворачиваем
             st.caption(f"{rec['ts']} • {rec['event']}")

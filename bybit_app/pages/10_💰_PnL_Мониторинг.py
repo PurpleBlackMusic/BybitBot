@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import streamlit as st, pandas as pd, json
+from utils.dataframe import arrow_safe
 from utils.pnl import daily_pnl, read_ledger
 from utils.paths import DATA_DIR
 
@@ -16,7 +17,7 @@ st.caption("Последние исполнения (сырые):")
 rows = read_ledger(200)
 if rows:
     df = pd.DataFrame(rows)
-    st.dataframe(df.tail(200), use_container_width=True, hide_index=True)
+    st.dataframe(arrow_safe(df.tail(200)), use_container_width=True, hide_index=True)
 else:
     st.info("Исполнений пока нет.")
 
@@ -36,7 +37,7 @@ inv = spot_inventory_and_pnl()
 if inv:
     import pandas as pd
     df = pd.DataFrame.from_dict(inv, orient="index")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(arrow_safe(df), use_container_width=True)
 else:
     st.info("Инвентарь спота ещё пуст.")
 
@@ -48,6 +49,6 @@ fifo = spot_fifo_pnl()
 if fifo:
     import pandas as pd
     df_fifo = pd.DataFrame({k: {"realized_pnl": v["realized_pnl"], "position_qty": v["position_qty"], "layers": len(v["layers"])} for k, v in fifo.items()}).T
-    st.dataframe(df_fifo, use_container_width=True)
+    st.dataframe(arrow_safe(df_fifo), use_container_width=True)
 else:
     st.info("Пока нечего считать по FIFO.")

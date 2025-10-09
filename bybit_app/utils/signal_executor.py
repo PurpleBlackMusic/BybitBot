@@ -7,7 +7,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import threading
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -392,6 +392,10 @@ class SignalExecutor:
         if available_base < 0:
             available_base = Decimal("0")
 
+        if open_sell_reserved > 0 and qty_step > 0 and available_base > qty_step:
+            # leave a small buffer to avoid "insufficient balance" from rounding noise
+            available_base -= qty_step
+
         sell_budget_base = self._round_to_step(available_base, qty_step, rounding=ROUND_DOWN)
         total_qty = sell_budget_base if sell_budget_base > 0 else Decimal("0")
         if total_qty <= 0:
@@ -466,7 +470,7 @@ class SignalExecutor:
         aggregated: list[Dict[str, object]] = []
         for step_cfg, qty in allocations:
             price = avg_price * (Decimal("1") + step_cfg.profit_fraction)
-            price = self._round_to_step(price, price_step, rounding=ROUND_DOWN)
+            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
             if aggregated and aggregated[-1]["price"] == price:
                 aggregated[-1]["qty"] += qty
                 aggregated[-1]["steps"].append(step_cfg)
@@ -484,11 +488,11 @@ class SignalExecutor:
             if min_qty > 0 and qty < min_qty:
                 continue
             rung_index += 1
-            price = self._round_to_step(entry["price"], price_step, rounding=ROUND_DOWN)
+            price = self._round_to_step(entry["price"], price_step, rounding=ROUND_UP)
             if price <= 0:
                 continue
             qty_text = self._format_decimal_step(qty, qty_step)
-            price_text = self._format_decimal_step(price, price_step)
+            price_text = self._format_price_step(price, price_step)
             profit_labels = [str(step.profit_bps.normalize()) for step in entry["steps"]]
             profit_text = ",".join(profit_labels)
             link_seed = f"AI-TP-{symbol}-{base_timestamp}-{rung_index}"
@@ -1063,6 +1067,10 @@ class SignalExecutor:
     @staticmethod
     def _format_decimal_step(value: Decimal, step: Decimal) -> str:
         return format_to_step(value, step, rounding=ROUND_DOWN)
+
+    @staticmethod
+    def _format_price_step(value: Decimal, step: Decimal) -> str:
+        return format_to_step(value, step, rounding=ROUND_UP)
 
     @staticmethod
     def _extract_execution_totals(response: Mapping[str, object] | None) -> tuple[Decimal, Decimal]:

@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 import streamlit as st
+import pandas as pd
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 
 st.title("📈 Скринер — объём и волатильность (spot)")
@@ -23,7 +25,11 @@ try:
     rows = [r for r in rows if q.upper() in str(r.get("symbol","")).upper()]
     rows.sort(key=lambda r: as_float(r.get("turnover24h",0)), reverse=True)
     if rows:
-        st.dataframe(rows[:top_n], use_container_width=True)
+        st.dataframe(
+            arrow_safe(pd.DataFrame(rows[:top_n])),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.info("Нет данных под текущий фильтр.")
 except Exception as e:

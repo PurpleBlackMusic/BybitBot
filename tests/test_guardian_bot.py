@@ -33,7 +33,9 @@ def _make_bot(
 
 
 def test_guardian_brief_waits_when_status_missing(tmp_path: Path) -> None:
-    bot = _make_bot(tmp_path)
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
     brief = bot.generate_brief()
     assert brief.mode == "wait"
     assert "спокойный режим" in brief.headline.lower()
@@ -99,7 +101,9 @@ def test_guardian_brief_respects_explicit_mode_hint(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    bot = _make_bot(tmp_path)
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
     brief = bot.generate_brief()
 
     assert brief.mode == "wait"
@@ -124,7 +128,9 @@ def test_guardian_brief_handles_sell_mode_hint(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    bot = _make_bot(tmp_path)
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
     brief = bot.generate_brief()
 
     assert brief.mode == "sell"
@@ -157,7 +163,9 @@ def test_guardian_watchlist_drops_unlisted_symbols(
         lambda **kwargs: {"BTCUSDT"},
     )
 
-    bot = _make_bot(tmp_path)
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
     watchlist = bot.market_watchlist()
 
     assert [item["symbol"] for item in watchlist] == ["BTCUSDT"]

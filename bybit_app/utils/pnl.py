@@ -38,13 +38,22 @@ def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
         return normalised_existing
 
     order_id = _normalise_id(ev.get("orderId"))
-    exec_id = _normalise_id(ev.get("execId") or ev.get("executionId"))
+    link_id = _normalise_id(ev.get("orderLinkId"))
+    trade_id = _normalise_id(ev.get("tradeId") or ev.get("matchId"))
+    exec_id = _normalise_id(
+        ev.get("execId")
+        or ev.get("executionId")
+        or ev.get("fillId")
+        or ev.get("tradeId")
+    )
 
-    if not order_id:
-        return None
+    owner = order_id or link_id or trade_id
+
+    if exec_id and owner:
+        return f"{owner}:{exec_id}"
 
     if exec_id:
-        return f"{order_id}:{exec_id}"
+        return exec_id
 
     fill_time = (
         _normalise_id(ev.get("execTime"))
@@ -57,7 +66,8 @@ def _execution_key(ev: Mapping[str, object] | dict) -> str | None:
 
     fingerprint_source = json.dumps(
         {
-            "orderId": order_id,
+            "owner": owner,
+            "symbol": _normalise_id(ev.get("symbol")),
             "fillTime": fill_time,
             "execPrice": price,
             "execQty": qty,

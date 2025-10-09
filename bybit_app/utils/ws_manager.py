@@ -6,7 +6,7 @@ import threading
 import time
 import ssl
 import random
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Iterable, Optional
 
 import websocket  # websocket-client
@@ -22,6 +22,7 @@ from .ws_private_v5 import WSPrivateV5
 from .realtime_cache import get_realtime_cache
 from .spot_pnl import spot_inventory_and_pnl
 from .spot_market import _instrument_limits
+from .precision import format_to_step, quantize_to_step
 
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
@@ -74,6 +75,7 @@ class WSManager:
         self._last_execution: Optional[dict] = None
         self._realtime_cache = get_realtime_cache()
         self._fill_lock = threading.Lock()
+        self._tp_ladder_plan: dict[str, tuple[tuple[str, str], ...]] = {}
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -729,17 +731,92 @@ class WSManager:
         if min_qty < 0:
             min_qty = Decimal("0")
 
-        self._cancel_existing_tp_orders(api, symbol)
-        self._place_tp_orders(
-            api,
-            symbol,
-            qty,
-            avg_cost,
-            config,
-            qty_step,
-            price_step,
-            min_qty,
+        reserved = self._reserved_sell_qty(symbol)
+        available_qty = qty - reserved
+        if reserved > 0 and qty_step > 0 and available_qty > qty_step:
+            available_qty -= qty_step
+        if available_qty <= 0:
+            return
+
+        plan = self._build_tp_plan(
+            total_qty=available_qty,
+            avg_cost=avg_cost,
+            config=config,
+            qty_step=qty_step,
+            price_step=price_step,
+            min_qty=min_qty,
         )
+        if not plan:
+            return
+
+        signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
+        previous = self._tp_ladder_plan.get(symbol)
+        if previous == signature:
+            log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
+            return
+
+        self._cancel_existing_tp_orders(api, symbol)
+        self._execute_tp_plan(api, symbol, plan)
+        self._tp_ladder_plan[symbol] = signature
+
+    def _reserved_sell_qty(self, symbol: str) -> Decimal:
+        rows = self._realtime_private_rows("order")
+        if not rows:
+            return Decimal("0")
+
+        symbol_upper = symbol.upper()
+        reserved: dict[str, Decimal] = {}
+        total = Decimal("0")
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol") or "").strip().upper() != symbol_upper:
+                continue
+            side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
+            if side != "sell":
+                continue
+            order_type = str(row.get("orderType") or row.get("orderTypeV2") or "").strip().lower()
+            if order_type and order_type != "limit":
+                continue
+            status = str(row.get("orderStatus") or row.get("status") or "").strip().lower()
+            if status:
+                closed_prefixes = (
+                    "cancel",
+                    "reject",
+                    "filled",
+                    "trigger",
+                    "inactive",
+                    "deactivate",
+                    "expire",
+                )
+                if any(status.startswith(prefix) for prefix in closed_prefixes):
+                    continue
+
+            qty = self._decimal_from(row.get("leavesQty"))
+            if qty <= 0:
+                qty = self._decimal_from(row.get("qty"))
+            if qty <= 0:
+                qty = self._decimal_from(row.get("orderQty"))
+            if qty <= 0:
+                continue
+
+            key: Optional[str] = None
+            for candidate_key in ("orderId", "orderID", "orderLinkId", "orderLinkID"):
+                candidate = row.get(candidate_key)
+                if isinstance(candidate, str) and candidate.strip():
+                    key = candidate.strip()
+                    break
+            if key is None:
+                key = f"anon-{id(row)}"
+
+            previous = reserved.get(key)
+            if previous is not None:
+                total -= previous
+            reserved[key] = qty
+            total += qty
+
+        return total
 
     def _cancel_existing_tp_orders(self, api, symbol: str) -> None:
         try:
@@ -783,34 +860,30 @@ class WSManager:
                     count=len(chunk),
                 )
 
-    def _place_tp_orders(
+    def _build_tp_plan(
         self,
-        api,
-        symbol: str,
+        *,
         total_qty: Decimal,
         avg_cost: Decimal,
         config: list[tuple[Decimal, Decimal]],
         qty_step: Decimal,
         price_step: Decimal,
         min_qty: Decimal,
-    ) -> None:
+    ) -> list[dict[str, object]]:
         total_qty = max(total_qty, Decimal("0"))
-        if total_qty <= 0:
-            return
+        if total_qty <= 0 or not config:
+            return []
 
         allocations: list[tuple[Decimal, Decimal]] = []
         remaining = total_qty
 
         for idx, (profit_bps, fraction) in enumerate(config):
-            if idx == len(config) - 1:
-                target = remaining
-            else:
-                target = total_qty * fraction
-            qty = self._round_to_step(target, qty_step, rounding=ROUND_DOWN)
+            target = remaining if idx == len(config) - 1 else total_qty * fraction
+            qty = quantize_to_step(target, qty_step, rounding=ROUND_DOWN)
             if qty <= 0:
                 continue
             if qty > remaining:
-                qty = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+                qty = quantize_to_step(remaining, qty_step, rounding=ROUND_DOWN)
             if qty <= 0:
                 continue
             if min_qty > 0 and qty < min_qty:
@@ -819,28 +892,81 @@ class WSManager:
             allocations.append((profit_bps, qty))
 
         if remaining > Decimal("0") and allocations:
-            extra = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
+            extra = quantize_to_step(remaining, qty_step, rounding=ROUND_DOWN)
             if extra > 0:
                 profit_bps, qty = allocations[-1]
                 new_qty = qty + extra
                 if min_qty <= 0 or new_qty >= min_qty:
                     allocations[-1] = (profit_bps, new_qty)
-                    remaining -= extra
 
         if not allocations:
+            return []
+
+        aggregated: list[dict[str, object]] = []
+        for profit_bps, qty in allocations:
+            price_raw = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
+            price = quantize_to_step(price_raw, price_step, rounding=ROUND_UP)
+            if price <= 0:
+                continue
+            qty_payload = quantize_to_step(qty, qty_step, rounding=ROUND_DOWN)
+            if qty_payload <= 0:
+                continue
+            if min_qty > 0 and qty_payload < min_qty:
+                continue
+            merged = None
+            for entry in aggregated:
+                if entry["price"] == price:
+                    merged = entry
+                    break
+            if merged:
+                merged["qty"] += qty_payload
+                merged["steps"].append(profit_bps)
+            else:
+                aggregated.append({"price": price, "qty": qty_payload, "steps": [profit_bps]})
+
+        plan: list[dict[str, object]] = []
+        for entry in aggregated:
+            qty_payload = quantize_to_step(entry["qty"], qty_step, rounding=ROUND_DOWN)
+            if qty_payload <= 0:
+                continue
+            if min_qty > 0 and qty_payload < min_qty:
+                continue
+            qty_text = format_to_step(qty_payload, qty_step, rounding=ROUND_DOWN)
+            price_text = format_to_step(entry["price"], price_step, rounding=ROUND_UP)
+            if not qty_text or qty_text == "0":
+                continue
+            if not price_text or price_text == "0":
+                continue
+            profit_labels = [str(step.normalize()) for step in entry["steps"]]
+            plan.append(
+                {
+                    "qty": qty_payload,
+                    "qty_text": qty_text,
+                    "price": entry["price"],
+                    "price_text": price_text,
+                    "profit_labels": profit_labels,
+                }
+            )
+
+        return plan
+
+    def _execute_tp_plan(
+        self,
+        api,
+        symbol: str,
+        plan: list[dict[str, object]],
+    ) -> None:
+        if not plan:
             return
 
         timestamp = int(time.time() * 1000)
-        rung_index = 0
-
-        for profit_bps, qty in allocations:
-            rung_index += 1
-            price = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
-            price = self._round_to_step(price, price_step, rounding=ROUND_DOWN)
-            if price <= 0:
+        for rung_index, entry in enumerate(plan, start=1):
+            qty_text = str(entry.get("qty_text") or "0")
+            price_text = str(entry.get("price_text") or "0")
+            if qty_text == "0" or price_text == "0":
                 continue
-            qty_text = self._format_decimal_step(qty, qty_step)
-            price_text = self._format_decimal_step(price, price_step)
+            profit_labels = entry.get("profit_labels") or []
+            profit_text = ",".join(profit_labels) if profit_labels else "-"
             link_seed = f"AI-TP-{symbol}-{timestamp}-{rung_index}"
             link_id = ensure_link_id(link_seed) or link_seed
             payload = {
@@ -881,7 +1007,7 @@ class WSManager:
                 rung=rung_index,
                 qty=qty_text,
                 price=price_text,
-                profit_bps=str(profit_bps),
+                profit_bps=profit_text,
             )
 
     def _resolve_tp_config(self, settings) -> list[tuple[Decimal, Decimal]]:
