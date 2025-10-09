@@ -4,14 +4,21 @@ from pathlib import Path
 
 import pytest
 
-from bybit_app.utils.market_scanner import MarketScanner, MarketScannerError, scan_market_opportunities
+from bybit_app.utils.market_scanner import (
+    MarketScanner,
+    MarketScannerError,
+    scan_market_opportunities,
+)
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
 
 
-def _write_snapshot(tmp_path: Path, rows: list[dict[str, object]]) -> None:
+def _write_snapshot(
+    tmp_path: Path, rows: list[dict[str, object]], *, testnet: bool = False
+) -> None:
     snapshot = {"ts": time.time(), "rows": rows}
-    path = tmp_path / "ai" / "market_snapshot.json"
+    filename = "market_snapshot_testnet.json" if testnet else "market_snapshot.json"
+    path = tmp_path / "ai" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot), encoding="utf-8")
 
@@ -174,6 +181,55 @@ def test_market_scanner_converts_usdc_symbols(tmp_path: Path) -> None:
     assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
     conversion = opportunities[0].get("quote_conversion")
     assert conversion == {"from": "USDC", "to": "USDT", "original": "SOLUSDC"}
+
+
+def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
+    mainnet_rows = [
+        {
+            "symbol": "MAINUSDT",
+            "turnover24h": "3000000",
+            "price24hPcnt": "1.5",
+            "bestBidPrice": "1.0",
+            "bestAskPrice": "1.01",
+            "volume24h": "1200000",
+        }
+    ]
+    testnet_rows = [
+        {
+            "symbol": "TESTUSDT",
+            "turnover24h": "4000000",
+            "price24hPcnt": "2.5",
+            "bestBidPrice": "2.0",
+            "bestAskPrice": "2.01",
+            "volume24h": "2200000",
+        }
+    ]
+
+    _write_snapshot(tmp_path, mainnet_rows)
+    _write_snapshot(tmp_path, testnet_rows, testnet=True)
+
+    mainnet_opps = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=1_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=100.0,
+        limit=5,
+        testnet=False,
+    )
+
+    testnet_opps = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=1_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=100.0,
+        limit=5,
+        testnet=True,
+    )
+
+    assert [entry["symbol"] for entry in mainnet_opps] == ["MAINUSDT"]
+    assert [entry["symbol"] for entry in testnet_opps] == ["TESTUSDT"]
 
 
 class _DummyAPI:

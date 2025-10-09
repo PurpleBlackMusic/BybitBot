@@ -165,6 +165,8 @@ class LiveSignalFetcher:
         else:
             limit_hint = min(max(limit_hint * 2, 5), 50)
 
+        testnet = bool(getattr(settings, "testnet", False))
+
         try:
             opportunities = scan_market_opportunities(
                 api,
@@ -176,6 +178,8 @@ class LiveSignalFetcher:
                 whitelist=whitelist or (),
                 blacklist=blacklist or (),
                 cache_ttl=0.0 if self.live_only else None,
+                settings=settings,
+                testnet=testnet,
             )
         except Exception as exc:
             raise LiveSignalError(str(exc)) from exc

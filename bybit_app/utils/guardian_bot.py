@@ -1105,6 +1105,8 @@ class GuardianBot:
         except Exception:
             api = None
 
+        testnet = bool(getattr(settings, "testnet", False))
+
         try:
             return scan_market_opportunities(
                 api,
@@ -1115,6 +1117,8 @@ class GuardianBot:
                 max_spread_bps=max_spread,
                 whitelist=whitelist,
                 blacklist=blacklist or None,
+                settings=settings,
+                testnet=testnet,
             )
         except Exception:
             return []

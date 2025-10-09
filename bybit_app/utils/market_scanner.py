@@ -28,6 +28,7 @@ from .telegram_notify import send_telegram
 if TYPE_CHECKING:  # pragma: no cover - for type checking only
     from .portfolio_manager import PortfolioManager
     from .symbol_resolver import InstrumentMetadata, SymbolResolver
+    from .envs import Settings
 
 SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
@@ -37,8 +38,31 @@ class MarketScannerError(RuntimeError):
     """Raised when the market snapshot cannot be loaded."""
 
 
-def _snapshot_path(data_dir: Path) -> Path:
-    return Path(data_dir) / "ai" / SNAPSHOT_FILENAME
+def _network_snapshot_filename(
+    *, testnet: Optional[bool] = None, settings: Optional["Settings"] = None
+) -> str:
+    """Return the snapshot filename matching the active network."""
+
+    resolved = testnet
+    if resolved is None and settings is not None:
+        try:
+            resolved = bool(getattr(settings, "testnet"))
+        except Exception:
+            resolved = None
+
+    if resolved:
+        if "." in SNAPSHOT_FILENAME:
+            stem, ext = SNAPSHOT_FILENAME.rsplit(".", 1)
+            return f"{stem}_testnet.{ext}"
+        return f"{SNAPSHOT_FILENAME}_testnet"
+    return SNAPSHOT_FILENAME
+
+
+def _snapshot_path(
+    data_dir: Path, *, testnet: Optional[bool] = None, settings: Optional["Settings"] = None
+) -> Path:
+    filename = _network_snapshot_filename(testnet=testnet, settings=settings)
+    return Path(data_dir) / "ai" / filename
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -120,8 +144,13 @@ def _edge_score(
     return score
 
 
-def load_market_snapshot(data_dir: Path = DATA_DIR) -> Optional[Dict[str, object]]:
-    path = _snapshot_path(data_dir)
+def load_market_snapshot(
+    data_dir: Path = DATA_DIR,
+    *,
+    testnet: Optional[bool] = None,
+    settings: Optional["Settings"] = None,
+) -> Optional[Dict[str, object]]:
+    path = _snapshot_path(data_dir, testnet=testnet, settings=settings)
     if not path.exists():
         return None
     try:
@@ -130,8 +159,14 @@ def load_market_snapshot(data_dir: Path = DATA_DIR) -> Optional[Dict[str, object
         return None
 
 
-def save_market_snapshot(snapshot: Dict[str, object], data_dir: Path = DATA_DIR) -> None:
-    path = _snapshot_path(data_dir)
+def save_market_snapshot(
+    snapshot: Dict[str, object],
+    data_dir: Path = DATA_DIR,
+    *,
+    testnet: Optional[bool] = None,
+    settings: Optional["Settings"] = None,
+) -> None:
+    path = _snapshot_path(data_dir, testnet=testnet, settings=settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -164,6 +199,8 @@ def scan_market_opportunities(
     whitelist: Iterable[str] | None = None,
     blacklist: Iterable[str] | None = None,
     cache_ttl: float = DEFAULT_CACHE_TTL,
+    settings: Optional["Settings"] = None,
+    testnet: Optional[bool] = None,
 ) -> List[Dict[str, object]]:
     """Rank spot symbols by liquidity and momentum to surface opportunities."""
 
@@ -173,7 +210,7 @@ def scan_market_opportunities(
         effective_change = 0.05
     max_spread_bps = float(max_spread_bps)
 
-    snapshot = load_market_snapshot(data_dir)
+    snapshot = load_market_snapshot(data_dir, settings=settings, testnet=testnet)
     now = time.time()
     if snapshot is not None and cache_ttl is not None and cache_ttl >= 0:
         ts = _safe_float(snapshot.get("ts"))
@@ -186,7 +223,12 @@ def scan_market_opportunities(
         except Exception:
             snapshot = None
         else:
-            save_market_snapshot(snapshot, data_dir=data_dir)
+            save_market_snapshot(
+                snapshot,
+                data_dir=data_dir,
+                settings=settings,
+                testnet=testnet,
+            )
 
     if snapshot is None:
         raise MarketScannerError(
