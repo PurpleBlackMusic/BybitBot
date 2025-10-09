@@ -121,8 +121,8 @@ class Settings:
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True
-    ai_max_hold_minutes: float = 0.0
-    ai_min_exit_bps: Optional[float] = None
+    ai_max_hold_minutes: float = 0.0  # 0 → использовать авто-порог по статистике
+    ai_min_exit_bps: Optional[float] = None  # None → авто-порог из статистики
 
     # TWAP
     twap_slices: int = 8

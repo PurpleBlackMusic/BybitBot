@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
-from statistics import StatisticsError, median
+from statistics import StatisticsError, median, quantiles
 
 
 WARNING_SIGNAL_SECONDS = 300.0
@@ -3606,10 +3606,59 @@ class GuardianBot:
 
         snapshot = self._get_snapshot()
         if limit is None or limit <= 0:
-            return copy.deepcopy(snapshot.trade_stats)
+            stats = copy.deepcopy(snapshot.trade_stats)
+            defaults = self._auto_exit_defaults()
+            if defaults:
+                stats = dict(stats)
+                stats["auto_exit_defaults"] = defaults
+            return stats
 
         records: Tuple[ExecutionRecord, ...] = snapshot.executions[-limit:]
         return aggregate_execution_metrics(records)
+
+    def _auto_exit_defaults(self) -> Dict[str, object]:
+        """Derive adaptive exit thresholds from paired trade statistics."""
+
+        try:
+            trades = pair_trades(settings=self.settings)
+        except Exception:
+            return {}
+
+        hold_samples: List[float] = []
+        pnl_samples: List[float] = []
+
+        for trade in trades:
+            hold_value = self._coerce_float(trade.get("hold_sec"))
+            if hold_value is not None and math.isfinite(hold_value) and hold_value > 0:
+                hold_samples.append(float(hold_value))
+
+            pnl_value = self._coerce_float(trade.get("bps_realized"))
+            if pnl_value is not None and math.isfinite(pnl_value):
+                pnl_samples.append(float(pnl_value))
+
+        defaults: Dict[str, object] = {}
+
+        if hold_samples:
+            try:
+                hold_median = float(median(hold_samples))
+            except StatisticsError:
+                hold_median = None
+            if hold_median is not None and math.isfinite(hold_median) and hold_median > 0:
+                defaults["hold_seconds"] = round(hold_median, 2)
+                defaults["hold_minutes"] = round(hold_median / 60.0, 4)
+                defaults["hold_sample_count"] = len(hold_samples)
+
+        if len(pnl_samples) >= 1:
+            try:
+                quartiles = quantiles(pnl_samples, n=4, method="inclusive")
+            except (StatisticsError, ValueError):
+                quartiles = []
+            exit_threshold = quartiles[0] if quartiles else None
+            if exit_threshold is not None and math.isfinite(exit_threshold):
+                defaults["exit_bps"] = round(float(exit_threshold), 4)
+                defaults["bps_sample_count"] = len(pnl_samples)
+
+        return defaults
 
     def data_health(self) -> Dict[str, Dict[str, object]]:
         """High level diagnostics for the UI to highlight stale inputs."""

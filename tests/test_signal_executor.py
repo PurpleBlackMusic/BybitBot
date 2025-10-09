@@ -45,6 +45,9 @@ class StubBot:
     def portfolio_overview(self) -> dict:
         return {}
 
+    def trade_statistics(self, limit: Optional[int] = None) -> dict:
+        return {}
+
 
 class StubAPI:
     def __init__(self, total: float = 0.0, available: float = 0.0) -> None:
@@ -199,6 +202,69 @@ def test_signal_executor_maps_usdc_symbol(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.status == "dry_run"
     assert result.order is not None
     assert result.order["symbol"] == "ADAUSDT"
+
+
+def test_signal_executor_force_exit_uses_trade_stats_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": False, "mode": "buy", "symbol": "ADAUSDT"}
+    settings = Settings(ai_enabled=True, ai_max_hold_minutes=0.0, ai_min_exit_bps=None)
+    bot = StubBot(summary, settings)
+
+    stats_calls: dict[str, int] = {}
+
+    def fake_trade_statistics(limit: Optional[int] = None) -> dict:
+        stats_calls["count"] = stats_calls.get("count", 0) + 1
+        return {
+            "auto_exit_defaults": {
+                "hold_minutes": 15.0,
+                "hold_sample_count": 12,
+                "exit_bps": -20.0,
+                "bps_sample_count": 12,
+            }
+        }
+
+    monkeypatch.setattr(bot, "trade_statistics", fake_trade_statistics)
+
+    positions = {
+        "ADAUSDT": {
+            "qty": 10.0,
+            "avg_cost": 1.0,
+            "realized_pnl": 0.0,
+            "hold_seconds": 1200.0,
+            "price": 0.95,
+            "pnl_value": -0.5,
+            "pnl_bps": -5.0,
+            "quote_notional": 9.5,
+        }
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_open_positions",
+        lambda self, settings, summary: positions,
+    )
+
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **payload: object) -> None:
+        events.append((event, dict(payload)))
+
+    monkeypatch.setattr(signal_executor_module, "log", fake_log)
+
+    executor = SignalExecutor(bot)
+    forced_summary, metadata = executor._maybe_force_exit(summary, settings)
+
+    assert stats_calls.get("count", 0) >= 1
+    assert forced_summary is not None
+    assert forced_summary["mode"] == "sell"
+    assert forced_summary["actionable"] is True
+    assert forced_summary["symbol"] == "ADAUSDT"
+    assert metadata is not None
+    assert metadata.get("hold_threshold_minutes") == pytest.approx(15.0)
+    triggers = metadata.get("triggers") or []
+    assert any(trigger.get("type") == "hold_time" for trigger in triggers)
+    assert any(event == "guardian.auto.force_exit.defaults" for event, _ in events)
 
 
 def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) -> None:
