@@ -25,6 +25,7 @@ from bybit_app.utils.ui import (
 from bybit_app.utils.background import ensure_background_services, get_ws_snapshot
 from bybit_app.utils.envs import get_settings
 from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
+from bybit_app.utils.log import log
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
 ensure_background_services()
@@ -81,7 +82,12 @@ def _load_guardian_bot() -> GuardianBot:
 def get_bot() -> GuardianBot:
     """Return a cached GuardianBot instance."""
 
-    return _load_guardian_bot()
+    bot = _load_guardian_bot()
+    try:
+        bot.refresh()
+    except Exception as exc:  # pragma: no cover - defensive guard for UI runtime
+        log("guardian.refresh.error", err=str(exc))
+    return bot
 
 
 def render_navigation_grid(shortcuts: list[tuple[str, str, str]], *, columns: int = 2) -> None:

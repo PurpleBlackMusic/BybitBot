@@ -181,12 +181,28 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
 
     reasons: list[str] = []
     notional = price_q * qty_q
-    if min_notional > 0 and notional < min_notional:
-        reasons.append(
-            f"notional {notional:.12f} < minNotional {min_notional:.12f}"
-        )
-    if min_qty > 0 and qty_q < min_qty:
-        reasons.append(f"qty {qty_q:.12f} < minQty {min_qty:.12f}")
+
+    tolerance_components = [Decimal("0.00000001")]
+    if tick_size > 0 and qty_q > 0:
+        tolerance_components.append((tick_size * qty_q).copy_abs())
+    if price_q > 0 and qty_step > 0:
+        tolerance_components.append((price_q * qty_step).copy_abs())
+    if min_notional > 0:
+        tolerance_components.append((min_notional * Decimal("0.000001")).copy_abs())
+    notional_tolerance = max(tolerance_components)
+
+    if min_notional > 0:
+        gap = min_notional - notional
+        if gap > notional_tolerance:
+            reasons.append(
+                f"notional {notional:.12f} < minNotional {min_notional:.12f}"
+            )
+
+    if min_qty > 0:
+        qty_tolerance = qty_step if qty_step > 0 else Decimal("0.00000001")
+        qty_gap = min_qty - qty_q
+        if qty_gap > qty_tolerance:
+            reasons.append(f"qty {qty_q:.12f} < minQty {min_qty:.12f}")
 
     return SpotValidationResult(
         price=price_q,

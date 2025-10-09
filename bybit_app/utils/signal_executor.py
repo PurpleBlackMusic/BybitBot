@@ -753,6 +753,7 @@ class SignalExecutor:
             getattr(settings, "telegram_notify", False) or getattr(settings, "tg_trade_notifs", False)
         )
         if not notify_enabled:
+            log("telegram.trade.skip", reason="notifications_disabled")
             return
 
         executed_base, executed_quote = self._extract_execution_totals(response)
@@ -773,15 +774,35 @@ class SignalExecutor:
                 executed_quote = executed_base * stats_avg
 
         if executed_base <= 0 or executed_quote <= 0:
+            log(
+                "telegram.trade.skip",
+                reason="no_fills",
+                symbol=symbol,
+                executed_base=str(executed_base),
+                executed_quote=str(executed_quote),
+            )
             return
 
         min_notional_raw = getattr(settings, "tg_trade_notifs_min_notional", 0.0) or 0.0
         min_notional = self._decimal_from(min_notional_raw, Decimal("0"))
         if min_notional > 0 and executed_quote < min_notional:
+            log(
+                "telegram.trade.skip",
+                reason="below_notional",
+                symbol=symbol,
+                executed_quote=str(executed_quote),
+                threshold=str(min_notional),
+            )
             return
 
         avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
         if avg_price <= 0:
+            log(
+                "telegram.trade.skip",
+                reason="invalid_avg_price",
+                symbol=symbol,
+                avg_price=str(avg_price),
+            )
             return
 
         qty_step = self._decimal_from(audit.get("qty_step")) if isinstance(audit, Mapping) else Decimal("0.00000001")
@@ -844,6 +865,14 @@ class SignalExecutor:
         message = (
             f"{direction} {qty_text} {base_asset} по {price_text}, "
             f"цель {target_text}, продано {sold_text}, PnL {pnl_text}"
+        )
+        log(
+            "telegram.trade.notify",
+            symbol=symbol,
+            side=side,
+            qty=str(executed_base),
+            price=str(avg_price),
+            notional=str(executed_quote),
         )
         send_telegram(message)
 

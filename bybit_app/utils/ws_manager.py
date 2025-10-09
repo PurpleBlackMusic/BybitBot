@@ -55,6 +55,8 @@ class WSManager:
         self._pub_ws: Optional[websocket.WebSocketApp] = None
         self._pub_subs: tuple[str, ...] = tuple()
         self._pub_ping_thread: Optional[threading.Thread] = None
+        self._pub_url_override: Optional[str] = None
+        self._pub_current_url: Optional[str] = None
 
         # private
         self._priv: Optional[WSPrivateV5] = None
@@ -92,11 +94,37 @@ class WSManager:
 
     def _public_url(self) -> str:
         self._refresh_settings()
-        return (
+        base_url = (
             "wss://stream-testnet.bybit.com/v5/public/spot"
             if self.s.testnet
             else "wss://stream.bybit.com/v5/public/spot"
         )
+        if not self.s.testnet and self._pub_url_override is not None:
+            self._pub_url_override = None
+        return self._pub_url_override or base_url
+
+    def _fallback_public_to_mainnet(self, reason: str) -> None:
+        if not self.s.testnet:
+            return
+        if self._pub_url_override == "wss://stream.bybit.com/v5/public/spot":
+            return
+        self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
+        log("ws.public.fallback.mainnet", reason=reason)
+
+    @staticmethod
+    def _is_network_error(error: object) -> bool:
+        if isinstance(error, OSError):
+            return True
+        text = str(error or "").lower()
+        network_signals = (
+            "name or service not known",
+            "temporary failure in name resolution",
+            "getaddrinfo failed",
+            "timed out",
+            "connection refused",
+            "cannot assign requested address",
+        )
+        return any(token in text for token in network_signals)
 
     def start_public(self, subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
         subs = tuple(subs)
@@ -112,11 +140,10 @@ class WSManager:
                     log("ws.public.resub.error", err=str(e))
             return True
 
-        url = self._public_url()
         self._pub_running = True
 
         def on_open(ws):
-            log("ws.public.open", url=url)
+            log("ws.public.open", url=self._pub_current_url)
             # стартуем лёгкий пинг‑луп (каждые ~20с)
             def _ping_loop():
                 try:
@@ -161,16 +188,20 @@ class WSManager:
                 log("ws.public.pong")
 
         def on_error(ws, error):
-            log("ws.public.error", err=str(error))
+            log("ws.public.error", err=str(error), url=self._pub_current_url)
+            if self.s.testnet and self._is_network_error(error):
+                self._fallback_public_to_mainnet(str(error))
 
         def on_close(ws, code, msg):
-            log("ws.public.close", code=code, msg=msg)
+            log("ws.public.close", code=code, msg=msg, url=self._pub_current_url)
 
         def run():
             backoff = 1.0
             while self._pub_running:
+                current_url = self._public_url()
+                self._pub_current_url = current_url
                 ws = websocket.WebSocketApp(
-                    url,
+                    current_url,
                     on_open=on_open,
                     on_message=on_message,
                     on_error=on_error,
@@ -199,6 +230,8 @@ class WSManager:
                 self._pub_ws.close()
         except Exception:
             pass
+        finally:
+            self._pub_current_url = None
         self._pub_ws = None
 
     # ----------------------- Private ----------------------
