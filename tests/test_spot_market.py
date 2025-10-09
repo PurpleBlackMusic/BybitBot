@@ -20,6 +20,7 @@ class DummyAPI:
         ticker_payload=None,
         wallet_payload=None,
         orderbook_payload=None,
+        creds=None,
     ):
         self.instrument_payload = instrument_payload
         self.ticker_payload = ticker_payload
@@ -36,6 +37,8 @@ class DummyAPI:
         self.info_calls = 0
         self.ticker_calls = 0
         self.wallet_calls = 0
+        if creds is not None:
+            self.creds = creds
 
     def instruments_info(self, category="spot", symbol: str | None = None, **kwargs):
         self.info_calls += 1
@@ -140,7 +143,7 @@ def test_resolve_trade_symbol_refreshes_when_cache_stale():
     api = DummyAPI(payload)
 
     spot_market_module._SYMBOL_CACHE.set(
-        "spot_usdt",
+        spot_market_module._symbol_cache_key(api),
         {"symbols": {}, "by_base": {}, "aliases": {}, "ts": time.time()},
     )
 
@@ -149,6 +152,38 @@ def test_resolve_trade_symbol_refreshes_when_cache_stale():
     assert resolved == "NEWUSDT"
     assert meta["reason"] == "exact"
     assert meta["cache_state"] == "refreshed"
+
+
+def test_tradable_universe_cache_scoped_by_network():
+    payload_testnet = _universe_payload([
+        {"symbol": "TNTUSDT", "quoteCoin": "USDT", "status": "Trading"},
+    ])
+    payload_mainnet = _universe_payload([
+        {"symbol": "MAINUSDT", "quoteCoin": "USDT", "status": "Trading"},
+    ])
+
+    testnet_creds = type("Creds", (), {"testnet": True})()
+    mainnet_creds = type("Creds", (), {"testnet": False})()
+
+    testnet_api = DummyAPI(payload_testnet, creds=testnet_creds)
+    mainnet_api = DummyAPI(payload_mainnet, creds=mainnet_creds)
+
+    resolved_testnet, meta_testnet = resolve_trade_symbol("TNTUSDT", api=testnet_api)
+    assert resolved_testnet == "TNTUSDT"
+    assert meta_testnet["cache_state"] == "cached"
+
+    resolved_mainnet, meta_mainnet = resolve_trade_symbol("MAINUSDT", api=mainnet_api)
+    assert resolved_mainnet == "MAINUSDT"
+    assert meta_mainnet["cache_state"] == "cached"
+
+    # cached lookup should return without refetching but remain scoped per network
+    cached_testnet, meta_testnet_cached = resolve_trade_symbol("TNTUSDT", api=testnet_api)
+    assert cached_testnet == "TNTUSDT"
+    assert meta_testnet_cached["cache_state"] == "cached"
+
+    cached_mainnet, meta_mainnet_cached = resolve_trade_symbol("MAINUSDT", api=mainnet_api)
+    assert cached_mainnet == "MAINUSDT"
+    assert meta_mainnet_cached["cache_state"] == "cached"
 
 
 def test_resolve_trade_symbol_prefers_canonical_symbol_for_alias():
