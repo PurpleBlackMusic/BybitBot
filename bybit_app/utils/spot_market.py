@@ -69,6 +69,22 @@ _BALANCE_CACHE: TTLCache[Dict[str, Decimal]] = TTLCache(_BALANCE_CACHE_TTL)
 _SYMBOL_CACHE: TTLCache[Dict[str, object]] = TTLCache(_SYMBOL_CACHE_TTL)
 
 
+def _symbol_cache_key(api: BybitAPI) -> str:
+    """Return a cache key that incorporates the API's active network."""
+
+    creds = getattr(api, "creds", None)
+    if creds is None:
+        network = "unknown"
+    else:
+        testnet_flag = getattr(creds, "testnet", None)
+        if testnet_flag is None:
+            network = "unknown"
+        else:
+            network = "testnet" if bool(testnet_flag) else "mainnet"
+
+    return f"spot_usdt:{network}"
+
+
 class OrderValidationError(RuntimeError):
     """Raised when a trade request violates exchange constraints."""
 
@@ -211,7 +227,7 @@ def _fetch_spot_instruments(api: BybitAPI, *, limit: int = 500) -> List[Dict[str
 def _tradable_spot_usdt_universe(
     api: BybitAPI, *, force_refresh: bool = False
 ) -> Dict[str, object]:
-    cache_key = "spot_usdt"
+    cache_key = _symbol_cache_key(api)
     cached = None if force_refresh else _SYMBOL_CACHE.get(cache_key)
     if cached is not None:
         return cached
