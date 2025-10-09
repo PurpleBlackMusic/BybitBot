@@ -1,31 +1,139 @@
 
 from __future__ import annotations
-import json
-import time
 
+import json
+import threading
+import time
+from typing import Any, Iterable, Iterator
+
+from .file_io import atomic_write_text, tail_lines
 from .paths import LOG_DIR
-from .file_io import tail_lines
 
 LOG_FILE = LOG_DIR / "app.log"
 
+# Default retention parameters keep the log at a manageable size while still
+# preserving enough history for troubleshooting. The values are deliberately
+# conservative and can be adjusted in tests through monkeypatching.
+MAX_LOG_BYTES = 5_000_000
+RETAIN_LOG_LINES = 5_000
 
-def log(event: str, **payload):
-    rec = {"ts": int(time.time() * 1000), "event": event, "payload": payload}
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+_LOCK = threading.RLock()
 
 
-def read_tail(n: int | str = 1000):
+def _normalise_limit(value: int | str | None, fallback: int) -> int:
+    """Return a safe integer limit used by :func:`read_tail`."""
+
     try:
-        limit = int(n)
+        limit = int(value) if value is not None else fallback
     except (TypeError, ValueError):
-        limit = 1000
+        limit = fallback
+    return max(limit, 0)
 
+
+def _iter_json_lines(
+    lines: Iterable[str], *, drop_invalid: bool
+) -> Iterator[tuple[str, Any | None]]:
+    """Yield ``(raw, parsed)`` pairs for JSON lines, tolerating blanks."""
+
+    for raw in lines:
+        text = raw.strip()
+        if not text:
+            if drop_invalid:
+                continue
+            yield raw, None
+            continue
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            if drop_invalid:
+                continue
+            raise ValueError(f"invalid JSON log line: {raw!r}") from None
+
+        yield raw, parsed
+
+
+def _prune_log_file(
+    *, max_bytes: int, retain_lines: int, size_hint: int | None = None
+) -> None:
+    """Truncate ``LOG_FILE`` when it exceeds ``max_bytes``."""
+
+    if max_bytes <= 0 or retain_lines <= 0:
+        return
+    if not LOG_FILE.exists():
+        return
+
+    try:
+        size = size_hint if size_hint is not None else LOG_FILE.stat().st_size
+    except OSError:
+        return
+
+    if size <= max_bytes:
+        return
+
+    tail = tail_lines(
+        LOG_FILE,
+        retain_lines,
+        encoding="utf-8",
+        errors="replace",
+        keep_newlines=False,
+        drop_blank=True,
+    )
+
+    cleaned = [raw for raw, _ in _iter_json_lines(tail, drop_invalid=True)]
+    if cleaned:
+        text = "\n".join(cleaned) + "\n"
+    else:
+        text = ""
+
+    atomic_write_text(LOG_FILE, text, encoding="utf-8", preserve_permissions=True)
+
+
+def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None) -> None:
+    """Manually trigger log pruning using optional retention overrides."""
+
+    maximum = max_bytes if max_bytes is not None else MAX_LOG_BYTES
+    keep = retain_lines if retain_lines is not None else RETAIN_LOG_LINES
+
+    with _LOCK:
+        _prune_log_file(max_bytes=maximum, retain_lines=keep)
+
+
+def log(event: str, **payload: Any) -> None:
+    """Append a JSON record with ``event`` and ``payload`` to the log file."""
+
+    record = {"ts": int(time.time() * 1000), "event": event, "payload": payload}
+    text = json.dumps(record, ensure_ascii=False)
+
+    with _LOCK:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+            handle.flush()
+            try:
+                size_hint = handle.buffer.tell()
+            except AttributeError:
+                size_hint = None
+        _prune_log_file(
+            max_bytes=MAX_LOG_BYTES,
+            retain_lines=RETAIN_LOG_LINES,
+            size_hint=size_hint,
+        )
+
+
+def read_tail(
+    n: int | str = 1000,
+    *,
+    parse: bool = False,
+    drop_invalid: bool = True,
+) -> list[Any]:
+    """Return the tail of the log file, optionally parsed as JSON objects."""
+
+    limit = _normalise_limit(n, 1000)
     if limit <= 0:
         return []
 
-    return tail_lines(
+    lines = tail_lines(
         LOG_FILE,
         limit,
         encoding="utf-8",
@@ -33,3 +141,13 @@ def read_tail(n: int | str = 1000):
         keep_newlines=False,
         drop_blank=False,
     )
+
+    if not parse:
+        return lines
+
+    parsed_records = [
+        parsed
+        for _, parsed in _iter_json_lines(lines, drop_invalid=drop_invalid)
+        if parsed is not None
+    ]
+    return parsed_records
