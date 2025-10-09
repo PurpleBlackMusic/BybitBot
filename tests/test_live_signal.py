@@ -59,6 +59,43 @@ def test_live_signal_fetcher_reuses_cache_within_ttl(
     assert second["status_source"] == "live"
 
 
+def test_live_signal_fetcher_threads_network_flag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    clock = Clock(start=1_500.0)
+    monkeypatch.setattr(live_signal_module, "time", clock)
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    captured: list[bool] = []
+
+    def fake_scan(api, **kwargs):
+        captured.append(bool(kwargs.get("testnet")))
+        symbol = "TESTCOINUSDT" if kwargs.get("testnet") else "MAINCOINUSDT"
+        return [_make_opportunity(symbol)]
+
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", fake_scan)
+
+    base_kwargs = dict(ai_live_only=False, ai_min_ev_bps=5.0)
+
+    main_fetcher = LiveSignalFetcher(
+        settings=Settings(testnet=False, **base_kwargs),
+        data_dir=tmp_path,
+        cache_ttl=0.0,
+    )
+    main_status = main_fetcher.fetch()
+
+    test_fetcher = LiveSignalFetcher(
+        settings=Settings(testnet=True, **base_kwargs),
+        data_dir=tmp_path,
+        cache_ttl=0.0,
+    )
+    test_status = test_fetcher.fetch()
+
+    assert captured == [False, True]
+    assert main_status["symbol"] == "MAINCOINUSDT"
+    assert test_status["symbol"] == "TESTCOINUSDT"
+
+
 def test_live_signal_fetcher_reports_failure_when_scan_empty(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

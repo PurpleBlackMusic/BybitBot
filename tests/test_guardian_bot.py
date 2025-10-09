@@ -1447,7 +1447,7 @@ def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
     }
     snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
+    settings = Settings(testnet=False, ai_live_only=False,
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
@@ -1467,6 +1467,67 @@ def test_guardian_market_scan_extends_watchlist(tmp_path: Path) -> None:
     summary = bot.status_summary()
     assert summary["watchlist_total"] >= 2
     assert summary["watchlist_highlights"][0]["symbol"] == "SOLUSDT"
+
+
+def test_guardian_market_scan_respects_network_snapshots(tmp_path: Path) -> None:
+    ai_dir = tmp_path / "ai"
+    ai_dir.mkdir(parents=True, exist_ok=True)
+
+    main_snapshot = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "SOLUSDT",
+                "turnover24h": "7200000",
+                "price24hPcnt": "3.1",
+                "bestBidPrice": "20.0",
+                "bestAskPrice": "20.02",
+                "volume24h": "1500000",
+            }
+        ],
+    }
+    test_snapshot = {
+        "ts": time.time(),
+        "rows": [
+            {
+                "symbol": "APTUSDT",
+                "turnover24h": "6400000",
+                "price24hPcnt": "4.5",
+                "bestBidPrice": "9.0",
+                "bestAskPrice": "9.01",
+                "volume24h": "980000",
+            }
+        ],
+    }
+
+    (ai_dir / "market_snapshot.json").write_text(json.dumps(main_snapshot), encoding="utf-8")
+    (ai_dir / "market_snapshot_testnet.json").write_text(
+        json.dumps(test_snapshot),
+        encoding="utf-8",
+    )
+
+    shared_settings = dict(
+        ai_live_only=False,
+        ai_market_scan_enabled=True,
+        ai_enabled=True,
+        ai_min_turnover_usd=1_000_000.0,
+        ai_min_ev_bps=40.0,
+        ai_max_spread_bps=40.0,
+        ai_symbols="",
+        ai_max_concurrent=2,
+    )
+
+    main_settings = Settings(testnet=False, **shared_settings)
+    test_settings = Settings(testnet=True, **shared_settings)
+
+    main_bot = GuardianBot(data_dir=tmp_path, settings=main_settings)
+    test_bot = GuardianBot(data_dir=tmp_path, settings=test_settings)
+
+    main_symbols = [entry["symbol"] for entry in main_bot.market_watchlist()[:1]]
+    test_symbols = [entry["symbol"] for entry in test_bot.market_watchlist()[:1]]
+
+    assert main_symbols == ["SOLUSDT"]
+    assert test_symbols == ["APTUSDT"]
 
 
 def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None:
@@ -1505,7 +1566,7 @@ def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None
     }
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
+    settings = Settings(testnet=False, ai_live_only=False,
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
@@ -1557,7 +1618,7 @@ def test_guardian_market_scan_respects_lists(tmp_path: Path) -> None:
     }
     snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
+    settings = Settings(testnet=False, ai_live_only=False,
         ai_market_scan_enabled=True,
         ai_enabled=True,
         ai_min_turnover_usd=1_000_000.0,
