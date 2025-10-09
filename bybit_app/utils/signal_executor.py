@@ -25,6 +25,7 @@ from .log import log
 from .spot_market import (
     OrderValidationError,
     _instrument_limits,
+    _resolve_slippage_tolerance,
     place_spot_market_with_tolerance,
     resolve_trade_symbol,
 )
@@ -203,22 +204,41 @@ class SignalExecutor:
 
         min_notional = 5.0
 
-        order_context = {
-            "symbol": symbol,
-            "side": side,
-            "notional_quote": notional,
-            "available_equity": available_equity,
-            "usable_after_reserve": usable_after_reserve,
-            "total_equity": total_equity,
-        }
-        if symbol_meta:
-            order_context["symbol_meta"] = symbol_meta
-
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
         slippage_pct = _normalise_slippage_percent(slippage_pct)
 
-        if notional <= 0 or notional < min_notional:
+        tolerance_multiplier, _, _, _ = _resolve_slippage_tolerance("Percent", slippage_pct)
+
+        adjusted_notional = notional
+        if (
+            side == "Buy"
+            and usable_after_reserve > 0
+            and tolerance_multiplier > 0
+        ):
+            usable_decimal = Decimal(str(usable_after_reserve))
+            tolerance_decimal = Decimal(str(tolerance_multiplier))
+            planned_decimal = Decimal(str(notional))
+            affordable = usable_decimal / tolerance_decimal
+            if affordable < planned_decimal:
+                adjusted_notional = float(affordable)
+
+        adjusted_notional = max(adjusted_notional, 0.0)
+
+        order_context = {
+            "symbol": symbol,
+            "side": side,
+            "notional_quote": adjusted_notional,
+            "available_equity": available_equity,
+            "usable_after_reserve": usable_after_reserve,
+            "total_equity": total_equity,
+        }
+        if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
+            order_context["requested_notional_quote"] = notional
+        if symbol_meta:
+            order_context["symbol_meta"] = symbol_meta
+
+        if adjusted_notional <= 0 or adjusted_notional < min_notional:
             order_context["min_notional"] = min_notional
             if active_dry_run(settings):
                 order = copy.deepcopy(order_context)
@@ -259,7 +279,7 @@ class SignalExecutor:
                 api,
                 symbol=symbol,
                 side=side,
-                qty=float(notional),
+                qty=adjusted_notional,
                 unit="quoteCoin",
                 tol_type="Percent",
                 tol_value=slippage_pct,

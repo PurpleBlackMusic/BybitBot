@@ -241,6 +241,64 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_scales_buy_notional_for_slippage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=25.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+        ai_max_slippage_bps=500,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=120.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs):
+        multiplier, _, _, _ = signal_executor_module._resolve_slippage_tolerance(
+            "Percent", kwargs["tol_value"]
+        )
+        guard = kwargs.get("max_quote")
+        qty = Decimal(str(kwargs["qty"]))
+        multiplier_decimal = Decimal(str(multiplier))
+        if guard is not None:
+            guard_decimal = Decimal(str(guard))
+            if qty * multiplier_decimal > guard_decimal + Decimal("1e-9"):
+                raise OrderValidationError("max quote exceeded", code="max_quote")
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "scaled"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured
+
+    usable_after_reserve = 120.0 - 500.0 * 0.02
+    multiplier, _, _, _ = signal_executor_module._resolve_slippage_tolerance(
+        "Percent", settings.ai_max_slippage_bps / 100.0
+    )
+    expected_qty = Decimal(str(usable_after_reserve)) / Decimal(str(multiplier))
+
+    assert float(captured["qty"]) == pytest.approx(float(expected_qty), rel=1e-6)
+    assert captured["max_quote"] == pytest.approx(usable_after_reserve)
+
+
 def test_signal_executor_sell_ignores_max_quote(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,
