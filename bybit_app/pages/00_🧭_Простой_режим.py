@@ -153,7 +153,7 @@ def _progress_to_threshold(value: float, target: float) -> tuple[float | None, f
 def _recommendation(reason: str) -> str:
     text = reason.lower()
     if "устар" in text:
-        return "Обновите status.json или дождитесь нового статуса от GuardianBot."
+        return "Обновите status.<сеть>.json или дождитесь нового статуса от GuardianBot."
     if "уверенность" in text:
         return "Дождитесь, пока вероятность превысит заданный порог или скорректируйте настройки."
     if "выгода" in text:
@@ -168,7 +168,7 @@ def _recommendation(reason: str) -> str:
 def _priority_for(reason: str) -> tuple[int, str, str]:
     text = reason.lower()
     if "устар" in text:
-        return 0, "Освежить данные", "Перезагрузите status.json или запустите обновление GuardianBot."
+        return 0, "Освежить данные", "Перезагрузите status.<сеть>.json или запустите обновление GuardianBot."
     if "уверенность" in text:
         return 1, "Дождаться уверенности", "Проверьте силу сигнала или отрегулируйте пороги уверенности."
     if "выгода" in text:
@@ -191,7 +191,7 @@ def _priority_label(rank: int) -> str:
 def _readiness_guidance(title: str) -> str:
     title = title.lower()
     if "обновление данных" in title:
-        return "Нажмите «Обновить данные» или проверьте, что status.json обновился у GuardianBot."
+        return "Нажмите «Обновить данные» или проверьте, что status.<сеть>.json обновился у GuardianBot."
     if "источник данных" in title:
         return "Включите живой источник или дождитесь, пока бот перестанет использовать кэш."
     if "уверенность" in title:
@@ -530,7 +530,7 @@ staleness_message = (
 
 source_labels = {
     "live": "Живые данные",
-    "file": "Локальный status.json",
+    "file": "Локальный status.<сеть>.json",
     "cached": "Кэшированный снимок",
     "missing": "Источник не определён",
     "seed": "Демо-данные",
@@ -654,7 +654,7 @@ source_label = str(summary.get("status_source") or "").lower()
 if source_label == "live":
     source_text = "Живой статус"
 elif source_label == "file":
-    source_text = "Файл status.json"
+    source_text = "Файл status.<сеть>.json"
 elif source_label == "cached":
     source_text = "Кэш"
 else:
@@ -822,7 +822,7 @@ if staleness_state == "stale":
         (
             "Обновление данных",
             False,
-            staleness_message or "Сигнал устарел — обновите status.json перед сделкой.",
+            staleness_message or "Сигнал устарел — обновите status.<сеть>.json перед сделкой.",
         )
     )
 else:

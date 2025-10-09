@@ -119,8 +119,43 @@ class GuardianBot:
         for sub in ("ai", "pnl"):
             (Path(self.data_dir) / sub).mkdir(parents=True, exist_ok=True)
 
-    def _status_path(self) -> Path:
-        return Path(self.data_dir) / "ai" / "status.json"
+    @staticmethod
+    def _normalise_network_marker(value: object) -> Optional[str]:
+        if isinstance(value, bool):
+            return "testnet" if value else "mainnet"
+
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in {"testnet", "mainnet"}:
+                return cleaned
+            if cleaned in {"true", "1", "yes", "on"}:
+                return "testnet"
+            if cleaned in {"false", "0", "no", "off"}:
+                return "mainnet"
+
+        return None
+
+    @classmethod
+    def status_filename(cls, *, network: object | None = None) -> str:
+        marker = cls._normalise_network_marker(network)
+        if marker:
+            return f"status.{marker}.json"
+        return "status.json"
+
+    def _status_path(self, *, network: object | None = None) -> Path:
+        marker: object | None = network
+        if marker is None:
+            try:
+                marker = getattr(self.settings, "testnet", None)
+            except Exception:
+                marker = None
+
+        filename = self.status_filename(network=marker)
+        return Path(self.data_dir) / "ai" / filename
+
+    def _status_file_hint(self) -> str:
+        filename = self.status_filename(network=getattr(self.settings, "testnet", None))
+        return f"ai/{filename}"
 
     def _ledger_path(self) -> Path:
         return Path(self.data_dir) / "pnl" / "executions.jsonl"
@@ -848,7 +883,7 @@ class GuardianBot:
         suffix = (
             "проверьте подключение к прямому каналу Bybit."
             if live_only
-            else "убедитесь, что сервис записи status.json активен."
+            else f"убедитесь, что сервис записи {self._status_file_hint()} активен."
         )
 
         if age is None:
@@ -2532,7 +2567,7 @@ class GuardianBot:
 
         if staleness_state == "stale":
             reasons.append(
-                "Сигнал устарел — обновите status.json перед тем, как открывать сделки."
+                f"Сигнал устарел — обновите {self._status_file_hint()} перед тем, как открывать сделки."
             )
 
         if mode == "buy":
@@ -3217,17 +3252,18 @@ class GuardianBot:
         status = snapshot.status
         summary = snapshot.status_summary
         age = snapshot.brief.status_age
+        status_hint = self._status_file_hint()
 
         staleness_state, staleness_message = self._status_staleness(age)
 
         if snapshot.status_from_cache:
             ai_ok = False
             ai_message = (
-                "Используем сохранённый сигнал — не удалось прочитать актуальный status.json."
+                f"Используем сохранённый сигнал — не удалось прочитать актуальный {status_hint}."
             )
             ai_details = (
                 f"Последнее обновление: {summary.get('last_update', '—')}. "
-                "Проверьте сервис, который пишет файл ai/status.json."
+                f"Проверьте сервис, который пишет файл {status_hint}."
             )
             if self._status_read_error:
                 error_text = str(self._status_read_error).strip()
@@ -3245,7 +3281,7 @@ class GuardianBot:
         else:
             ai_ok = False
             ai_message = "AI сигнал ещё не поступал — запустите Guardian Bot или загрузите демо-данные."
-            ai_details = "Файл ai/status.json не найден."
+            ai_details = f"Файл {status_hint} не найден."
 
         stats = snapshot.trade_stats
         trades = int(stats.get("trades", 0) or 0)
@@ -3442,9 +3478,10 @@ class GuardianBot:
         )
 
     def _format_signal_quality_answer(self, summary: Dict[str, object]) -> str:
+        status_hint = self._status_file_hint()
         if not summary.get("has_status"):
             return (
-                "Живой сигнал пока не загружен — обновите ai/status.json, "
+                f"Живой сигнал пока не загружен — обновите {status_hint}, "
                 "чтобы бот смог рассказать про вероятность и выгоду."
             )
 
@@ -3517,7 +3554,7 @@ class GuardianBot:
 
         if status_source == "file":
             lines.append(
-                "Данные прочитаны из локального status.json — убедитесь, что файл обновляется автоматически."
+                f"Данные прочитаны из локального {status_hint} — убедитесь, что файл обновляется автоматически."
             )
         elif status_source == "cached" or summary.get("fallback_used"):
             lines.append(
@@ -3531,9 +3568,10 @@ class GuardianBot:
         return "\n".join(lines)
 
     def _format_update_answer(self, summary: Dict[str, object]) -> str:
+        status_hint = self._status_file_hint()
         if not summary.get("has_status"):
             return (
-                "Свежие данные ещё не поступали — файл ai/status.json отсутствует или пуст. "
+                f"Свежие данные ещё не поступали — файл {status_hint} отсутствует или пуст. "
                 "Запустите сервис генерации сигнала или загрузите демо-статус, чтобы бот видел обновления."
             )
 

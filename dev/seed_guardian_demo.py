@@ -10,6 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from bybit_app.utils.guardian_bot import GuardianBot
 from bybit_app.utils.paths import DATA_DIR
 
 
@@ -19,7 +20,6 @@ def _write(path: Path, payload: str) -> None:
 
 
 def seed_status(now: datetime) -> None:
-    status_path = Path(DATA_DIR) / "ai" / "status.json"
     status = {
         "symbol": "BTCUSDT",
         "side": "buy",
@@ -34,7 +34,10 @@ def seed_status(now: datetime) -> None:
             "SOLUSDT": {"score": 0.58, "trend": "wait", "note": "Импульс выдыхается"},
         },
     }
-    _write(status_path, json.dumps(status, ensure_ascii=False, indent=2))
+    for network in (False, True):
+        filename = GuardianBot.status_filename(network=network)
+        status_path = Path(DATA_DIR) / "ai" / filename
+        _write(status_path, json.dumps(status, ensure_ascii=False, indent=2))
 
 
 def seed_executions(now: datetime) -> None:

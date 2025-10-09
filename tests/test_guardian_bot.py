@@ -32,6 +32,17 @@ def _make_bot(
     return GuardianBot(data_dir=tmp_path, settings=settings)
 
 
+STATUS_FILE_MAINNET = GuardianBot.status_filename(network=False)
+STATUS_FILE_TESTNET = GuardianBot.status_filename(network=True)
+
+
+def _write_status(bot: GuardianBot, payload: Dict[str, object]) -> Path:
+    path = bot._status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def test_guardian_brief_waits_when_status_missing(tmp_path: Path) -> None:
     settings = Settings(ai_live_only=False)
     settings.testnet = False
@@ -52,14 +63,11 @@ def test_guardian_brief_buy_signal(tmp_path: Path) -> None:
         "last_tick_ts": time.time(),
         "explanation": "Растёт интерес покупателей",
     }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
-    bot = _make_bot(
-        tmp_path,
-        Settings(ai_live_only=False, ai_symbols="ETHUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=10.0),
+    settings = Settings(
+        ai_live_only=False, ai_symbols="ETHUSDT", ai_buy_threshold=0.6, ai_min_ev_bps=10.0
     )
+    bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
     brief = bot.generate_brief()
     assert brief.mode == "buy"
     assert "ETHUSDT" in brief.headline
@@ -76,11 +84,9 @@ def test_guardian_brief_prefers_status_symbol(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
-    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_symbols=""))
+    settings = Settings(ai_live_only=False, ai_symbols="")
+    bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
     brief = bot.generate_brief()
 
     assert brief.symbol == "SOLUSDT"
@@ -97,13 +103,10 @@ def test_guardian_brief_respects_explicit_mode_hint(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
     settings = Settings(ai_live_only=False)
     settings.testnet = False
     bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
     brief = bot.generate_brief()
 
     assert brief.mode == "wait"
@@ -124,13 +127,10 @@ def test_guardian_brief_handles_sell_mode_hint(tmp_path: Path) -> None:
         "mode": "sell",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
     settings = Settings(ai_live_only=False)
     settings.testnet = False
     bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
     brief = bot.generate_brief()
 
     assert brief.mode == "sell"
@@ -143,6 +143,56 @@ def test_guardian_brief_handles_sell_mode_hint(tmp_path: Path) -> None:
     assert any("уверенность" in reason.lower() for reason in summary["actionable_reasons"])
 
 
+def test_guardian_status_files_are_network_specific(tmp_path: Path) -> None:
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
+
+    mainnet_status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.61,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    mainnet_path = _write_status(bot, mainnet_status)
+    summary_main = bot.status_summary()
+
+    assert mainnet_path.name == STATUS_FILE_MAINNET
+    assert summary_main["symbol"] == "BTCUSDT"
+
+    settings.testnet = True
+    testnet_status = {
+        "symbol": "ETHUSDT",
+        "probability": 0.74,
+        "ev_bps": 26.0,
+        "side": "buy",
+        "last_tick_ts": time.time(),
+    }
+    testnet_path = _write_status(bot, testnet_status)
+    bot.refresh()
+    summary_test = bot.status_summary()
+
+    assert testnet_path.name == STATUS_FILE_TESTNET
+    assert summary_test["symbol"] == "ETHUSDT"
+
+    settings.testnet = False
+    bot.refresh()
+    summary_main_again = bot.status_summary()
+
+    assert summary_main_again["symbol"] == "BTCUSDT"
+
+
+def test_status_path_falls_back_to_legacy_name_when_unknown(tmp_path: Path) -> None:
+    settings = Settings(ai_live_only=False)
+    bot = _make_bot(tmp_path, settings)
+
+    settings.testnet = "mystery"  # type: ignore[assignment]
+    path = bot._status_path()
+
+    assert path.name == "status.json"
+
+
 def test_guardian_watchlist_drops_unlisted_symbols(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -153,10 +203,6 @@ def test_guardian_watchlist_drops_unlisted_symbols(
             {"symbol": "", "score": 0.2},
         ]
     }
-    status_path = tmp_path / "ai" / "status.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(status), encoding="utf-8")
-
     monkeypatch.setattr(
         guardian_bot_module,
         "get_listed_spot_symbols",
@@ -166,6 +212,7 @@ def test_guardian_watchlist_drops_unlisted_symbols(
     settings = Settings(ai_live_only=False)
     settings.testnet = False
     bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
     watchlist = bot.market_watchlist()
 
     assert [item["symbol"] for item in watchlist] == ["BTCUSDT"]
@@ -179,7 +226,7 @@ def test_guardian_brief_understands_russian_buy_hint(tmp_path: Path) -> None:
         "mode": "Покупаем аккуратно",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -198,7 +245,7 @@ def test_guardian_respects_custom_buy_threshold(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -226,7 +273,7 @@ def test_guardian_summary_flags_low_confidence_under_defaults(tmp_path: Path) ->
         "mode": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -260,7 +307,7 @@ def test_guardian_summary_reports_effective_thresholds(tmp_path: Path) -> None:
         "side": "sell",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -297,7 +344,7 @@ def test_guardian_brief_wait_hint_from_russian_phrase(tmp_path: Path) -> None:
         "mode": "ничего не делаем, ждём",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -316,7 +363,7 @@ def test_guardian_summary_highlights_ev_shortfall(tmp_path: Path) -> None:
         "mode": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -344,7 +391,7 @@ def test_guardian_summary_highlights_sell_threshold(tmp_path: Path) -> None:
         "mode": "sell",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -373,7 +420,7 @@ def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
         "mode": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -396,7 +443,7 @@ def test_guardian_summary_mentions_disabled_ai(tmp_path: Path) -> None:
 
 
 def test_guardian_operation_mode_auto(tmp_path: Path) -> None:
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(
         json.dumps(
@@ -862,7 +909,7 @@ def test_guardian_answer_watchlist_summary(tmp_path: Path) -> None:
             "DOGEUSDT": {"trend": "wait"},
         },
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -882,7 +929,7 @@ def test_guardian_answer_health_summary(tmp_path: Path) -> None:
         "side": "wait",
         "last_tick_ts": time.time() - 4000,
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1023,7 +1070,7 @@ def test_guardian_signal_quality_answer(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1058,7 +1105,7 @@ def test_guardian_update_answer_reports_freshness(tmp_path: Path) -> None:
         "ev_bps": 18.0,
         "last_tick_ts": time.time() - 120,
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1078,7 +1125,7 @@ def test_guardian_update_answer_without_status(tmp_path: Path) -> None:
     reply = bot.answer("почему статус давно не обновлялся?")
 
     assert "Свежие данные ещё не поступали" in reply
-    assert "ai/status.json" in reply
+    assert f"ai/{STATUS_FILE_TESTNET}" in reply
 
 
 def test_guardian_market_story_returns_explanation(tmp_path: Path) -> None:
@@ -1090,7 +1137,7 @@ def test_guardian_market_story_returns_explanation(tmp_path: Path) -> None:
         "last_tick_ts": time.time(),
         "explanation": "Модель увидела повышенный объём покупок",
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1108,7 +1155,7 @@ def test_guardian_staleness_alert_when_old(tmp_path: Path) -> None:
         "side": "wait",
         "last_tick_ts": time.time() - 3600,
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1130,7 +1177,7 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
             "DOGEUSDT": {"score": "n/a", "trend": "wait"},
         },
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1175,7 +1222,7 @@ def test_guardian_brief_selects_best_watchlist_symbol(tmp_path: Path) -> None:
             "SOLUSDT": {"probability": 0.4, "ev_bps": 4.0, "trend": "wait"},
         },
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1209,7 +1256,7 @@ def test_guardian_watchlist_skips_neutral_leaders(tmp_path: Path) -> None:
             {"symbol": "XRPUSDT", "probability": 0.68, "ev_bps": 11.0, "trend": "buy"},
         ]
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1260,7 +1307,7 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
         ]
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1495,7 +1542,7 @@ def test_guardian_market_scan_can_override_status_symbol(tmp_path: Path) -> None
     }
     snapshot_path.write_text(json.dumps(snapshot_payload), encoding="utf-8")
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_payload = {
         "symbol": "BTCUSDT",
         "probability": 0.82,
@@ -1604,7 +1651,7 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
         ]
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1702,7 +1749,7 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
         ]
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1845,7 +1892,7 @@ def test_guardian_symbol_plan_cache_updates_on_watchlist_change(tmp_path: Path) 
         ],
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1885,7 +1932,7 @@ def test_guardian_symbol_plan_cache_updates_on_portfolio_change(tmp_path: Path) 
         ],
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1941,7 +1988,7 @@ def test_guardian_dynamic_symbols_fallbacks_to_status_symbol(tmp_path: Path) -> 
         "last_tick_ts": time.time(),
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -1980,7 +2027,7 @@ def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
         ]
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2037,7 +2084,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
         "last_tick_ts": time.time(),
         "extra": "ignored",
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2076,7 +2123,7 @@ def test_guardian_status_summary_and_report(tmp_path: Path) -> None:
 
 
 def test_guardian_status_fingerprint_tracks_changes(tmp_path: Path) -> None:
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
 
     first_status = {
@@ -2118,7 +2165,7 @@ def test_guardian_status_recovers_from_partial_write(tmp_path: Path, monkeypatch
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
@@ -2151,7 +2198,7 @@ def test_guardian_status_fallback_when_file_missing(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
@@ -2179,7 +2226,7 @@ def test_guardian_status_fallback_forces_retry(tmp_path: Path, monkeypatch) -> N
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status_payload), encoding="utf-8")
 
@@ -2217,7 +2264,7 @@ def test_guardian_status_fallback_forces_retry(tmp_path: Path, monkeypatch) -> N
 
 
 def test_guardian_status_refreshes_when_mtime_static(tmp_path: Path) -> None:
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
 
     first_status = {
@@ -2261,7 +2308,7 @@ def test_guardian_status_refreshes_when_mtime_static(tmp_path: Path) -> None:
 
 
 def test_guardian_status_refreshes_when_content_size_static(tmp_path: Path) -> None:
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
 
     first_payload = (
@@ -2331,7 +2378,7 @@ def test_guardian_replaces_demo_with_live_signal(tmp_path: Path, monkeypatch) ->
         "watchlist": [],
     }
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(demo_status), encoding="utf-8")
 
@@ -2379,7 +2426,7 @@ def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time() - 3600,
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2405,7 +2452,7 @@ def test_guardian_status_refreshes_stale_signal_with_live_fetch(
         "side": "buy",
         "last_tick_ts": time.time() - (guardian_bot_module.STALE_SIGNAL_SECONDS * 2),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(old_status), encoding="utf-8")
 
@@ -2454,7 +2501,7 @@ def test_guardian_live_only_prefers_live_feed(monkeypatch: pytest.MonkeyPatch, t
         "side": "buy",
         "last_tick_ts": time.time() - 60.0,
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(stale_status), encoding="utf-8")
 
@@ -2487,7 +2534,7 @@ def test_guardian_live_only_prefers_live_feed(monkeypatch: pytest.MonkeyPatch, t
 def test_guardian_live_only_returns_empty_when_feed_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     demo_payload = {
         "symbol": "ETHUSDT",
@@ -2522,7 +2569,7 @@ def test_guardian_reports_live_fetch_error_when_available(tmp_path: Path, monkey
         "side": "buy",
         "last_tick_ts": time.time() - (guardian_bot_module.STALE_SIGNAL_SECONDS + 5),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -2572,7 +2619,7 @@ def test_guardian_unified_report_is_serialisable(tmp_path: Path) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2601,7 +2648,7 @@ def test_guardian_data_health(tmp_path: Path, monkeypatch) -> None:
         "side": "buy",
         "last_tick_ts": time.time(),
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2668,7 +2715,7 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
         "last_tick_ts": time.time(),
         "watchlist": {"ETHUSDT": {"score": 0.6, "trend": "buy"}},
     }
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
@@ -2746,7 +2793,7 @@ def test_guardian_reuses_ledger_cache(tmp_path: Path) -> None:
             self.recent_calls += 1
             return super()._build_recent_trades(spot_events, limit)
 
-    status_path = tmp_path / "ai" / "status.json"
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_payload = {
         "symbol": "BTCUSDT",
