@@ -189,6 +189,29 @@ def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest
     assert manager.s is refreshed_private
 
 
+def test_public_network_error_on_testnet_keeps_testnet_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    settings = SimpleNamespace(testnet=True)
+    manager.s = settings
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "get_settings",
+        lambda *, force_reload=False: settings,
+    )
+
+    manager._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
+    monkeypatch.setattr(manager, "_is_network_error", lambda error: True)
+
+    error = OSError("temporary failure")
+    if manager._is_network_error(error):
+        manager._fallback_public_to_mainnet(str(error))
+
+    resolved_url = manager._public_url()
+    assert resolved_url.endswith("stream-testnet.bybit.com/v5/public/spot")
+    assert manager._pub_url_override is None
+
+
 def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
 

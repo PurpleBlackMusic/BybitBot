@@ -106,10 +106,8 @@ class WSManager:
     def _fallback_public_to_mainnet(self, reason: str) -> None:
         if not self.s.testnet:
             return
-        if self._pub_url_override == "wss://stream.bybit.com/v5/public/spot":
-            return
-        self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
-        log("ws.public.fallback.mainnet", reason=reason)
+        self._pub_url_override = None
+        log("ws.public.testnet.network_error", reason=reason)
 
     @staticmethod
     def _is_network_error(error: object) -> bool:
@@ -189,7 +187,7 @@ class WSManager:
 
         def on_error(ws, error):
             log("ws.public.error", err=str(error), url=self._pub_current_url)
-            if self.s.testnet and self._is_network_error(error):
+            if self._is_network_error(error):
                 self._fallback_public_to_mainnet(str(error))
 
         def on_close(ws, code, msg):
