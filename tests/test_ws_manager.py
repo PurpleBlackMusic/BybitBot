@@ -818,3 +818,98 @@ def test_ws_private_v5_resubscribe_requires_connected_socket() -> None:
     assert ws_client._ws.sent == [
         {"op": "subscribe", "args": list(DEFAULT_TOPICS)}
     ]
+
+
+def test_handle_execution_fill_uses_cached_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=True)
+
+    ledger_rows = [
+        {
+            "execId": "fill-1",
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "execQty": "1",
+            "execPrice": "100",
+            "execTime": "1",
+        }
+    ]
+    ledger_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_read_ledger(*args, **kwargs):
+        ledger_calls.append((args, kwargs))
+        return list(ledger_rows)
+
+    inventory_snapshots = [
+        {
+            "BTCUSDT": {
+                "position_qty": Decimal("0"),
+                "avg_cost": Decimal("0"),
+                "realized_pnl": Decimal("15"),
+            }
+        },
+        {
+            "BTCUSDT": {
+                "position_qty": Decimal("0"),
+                "avg_cost": Decimal("0"),
+                "realized_pnl": Decimal("20"),
+            }
+        },
+    ]
+    recovery_snapshot = {
+        "BTCUSDT": {
+            "position_qty": Decimal("1"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("10"),
+        }
+    }
+    inventory_call_index = 0
+
+    def fake_spot_inventory_and_pnl(*, events=None, settings=None):
+        nonlocal inventory_call_index
+        if events is not None:
+            return recovery_snapshot
+        result = inventory_snapshots[inventory_call_index]
+        inventory_call_index += 1
+        return result
+
+    notifications: list[str] = []
+
+    monkeypatch.setattr(ws_manager_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+    monkeypatch.setattr(ws_manager_module, "enqueue_telegram_message", notifications.append)
+
+    fill_row = {
+        "execId": "fill-1",
+        "symbol": "BTCUSDT",
+        "side": "Sell",
+        "execQty": "1",
+        "execPrice": "100",
+        "execTime": "1",
+        "orderStatus": "Filled",
+    }
+
+    manager._handle_execution_fill([fill_row])
+
+    assert len(ledger_calls) == 1
+    assert manager._inventory_baseline["BTCUSDT"]["realized_pnl"] == Decimal("15")
+    assert notifications
+
+    manager._inventory_snapshot = {}
+    notifications.clear()
+
+    fill_row_restart = {
+        "execId": "fill-2",
+        "symbol": "BTCUSDT",
+        "side": "Sell",
+        "execQty": "1",
+        "execPrice": "105",
+        "execTime": "2",
+        "orderStatus": "Filled",
+    }
+
+    manager._handle_execution_fill([fill_row_restart])
+
+    assert len(ledger_calls) == 1
+    assert notifications
+    assert manager._inventory_baseline["BTCUSDT"]["realized_pnl"] == Decimal("20")

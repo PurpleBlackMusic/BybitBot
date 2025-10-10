@@ -690,6 +690,11 @@ class WSManager:
                     normalized_inventory,
                     previous_inventory,
                 )
+                self._inventory_baseline = {
+                    symbol: dict(stats)
+                    for symbol, stats in normalized_inventory.items()
+                    if isinstance(stats, Mapping)
+                }
 
             last_exec_id = self._inventory_last_exec_id
             for row in rows:
@@ -890,12 +895,13 @@ class WSManager:
         symbol: str,
         rows: Sequence[Mapping[str, object]],
     ) -> Mapping[str, Decimal] | None:
-        recovered = self._previous_stats_from_ledger(symbol, rows)
-        if isinstance(recovered, Mapping):
-            return recovered
         baseline = self._inventory_baseline.get(symbol)
         if isinstance(baseline, Mapping):
             return dict(baseline)
+        recovered = self._previous_stats_from_ledger(symbol, rows)
+        if isinstance(recovered, Mapping):
+            self._inventory_baseline[symbol] = dict(recovered)
+            return recovered
         return None
 
     def _previous_stats_from_ledger(
