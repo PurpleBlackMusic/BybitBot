@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable
 
 from .bybit_api import API_MAIN, API_TEST
 from .envs import get_settings
+from .settings_loader import call_get_settings
 from .log import log
 from .time_sync import invalidate_synced_clock, synced_timestamp_ms
 
@@ -216,7 +217,7 @@ class WSPrivateV5:
                         log("ws.private.resub.error", err=str(exc))
             return True
 
-        settings = get_settings(force_reload=True)
+        settings = call_get_settings(get_settings, force_reload=True)
         api_key = getattr(settings, "api_key", "") or ""
         api_secret = getattr(settings, "api_secret", "") or ""
         if not api_key or not api_secret:

@@ -460,6 +460,7 @@ def test_ws_manager_send_sell_fill_notification(monkeypatch: pytest.MonkeyPatch)
     manager = WSManager()
     manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
     manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     manager._inventory_snapshot = {
         "ETHUSDT": {
@@ -517,6 +518,7 @@ def test_ws_manager_sell_notification_after_restart(monkeypatch: pytest.MonkeyPa
     manager = WSManager()
     manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
     manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     manager._inventory_snapshot = {}
     manager._inventory_baseline = {}
@@ -587,6 +589,7 @@ def test_ws_manager_replays_inventory_when_snapshot_fails(
     manager = WSManager()
     manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
     manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     manager._inventory_snapshot = {
         "ETHUSDT": {
@@ -667,6 +670,7 @@ def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest
 def test_sell_fill_recovery_uses_limited_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
     manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     symbol = "BTCUSDT"
     buy_row = {
@@ -825,7 +829,9 @@ def test_ws_manager_realtime_private_rows_filters_payload(monkeypatch: pytest.Mo
     auto_rows = manager.realtime_private_rows("execution")
     assert auto_rows == [{"execId": "2", "symbol": "ETHUSDT"}]
 
-def test_refresh_settings_handles_typeerror(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_refresh_settings_supports_keywordless_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = WSManager()
 
     refreshed = SimpleNamespace(testnet=False)
@@ -1199,6 +1205,7 @@ def test_ws_private_v5_resubscribe_requires_connected_socket() -> None:
 def test_handle_execution_fill_uses_cached_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
     manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=True)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
 
     ledger_rows = [
         {

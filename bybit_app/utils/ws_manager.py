@@ -16,6 +16,7 @@ from copy import deepcopy
 
 from .envs import get_settings, get_api_client, creds_ok
 from .helpers import ensure_link_id
+from .settings_loader import call_get_settings
 from .paths import DATA_DIR
 from .pnl import read_ledger
 from .store import JLStore
@@ -94,10 +95,7 @@ class WSManager:
         """Reload settings so WS endpoints respect latest configuration."""
         previous_testnet = self._last_settings_testnet
         try:
-            self.s = get_settings(force_reload=True)
-        except TypeError:
-            # Older call signatures may not accept the keyword argument.
-            self.s = get_settings()
+            self.s = call_get_settings(get_settings, force_reload=True)
         except Exception as e:  # pragma: no cover - defensive, rare
             log("ws.settings.refresh.error", err=str(e))
         current_testnet = getattr(self.s, "testnet", None)
