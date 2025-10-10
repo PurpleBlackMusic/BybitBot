@@ -59,27 +59,33 @@ def _coerce_datetime(series: pd.Series) -> pd.Series:
     if non_na.empty:
         return series
 
-    candidates: list[dict[str, object]] = []
+    candidates: list[tuple[pd.Series, dict[str, object]]] = []
 
     if _numeric_like(non_na):
         unit = _infer_epoch_unit(non_na.astype(str))
         if unit:
-            candidates.append({"unit": unit})
+            numeric_series = pd.to_numeric(series, errors="coerce")
+            if _valid_enough(series, numeric_series):
+                candidates.append((numeric_series, {"unit": unit}))
+            else:
+                candidates.append((series, {"unit": unit}))
 
     sample = non_na.astype(str)
     if sample.str.contains(r"\d{4}-\d{2}-\d{2}", regex=True).any():
-        candidates.append({"format": "ISO8601"})
+        candidates.append((series, {"format": "ISO8601"}))
 
-    candidates.append({"format": "mixed"})
+    candidates.append((series, {"format": "mixed"}))
 
     tried: set[tuple[tuple[str, object], ...]] = set()
-    for kwargs in candidates:
+    for candidate_series, kwargs in candidates:
         key = tuple(sorted(kwargs.items()))
         if key in tried:
             continue
         tried.add(key)
         try:
-            converted = pd.to_datetime(series, errors="coerce", utc=True, **kwargs)
+            converted = pd.to_datetime(
+                candidate_series, errors="coerce", utc=True, **kwargs
+            )
         except (TypeError, ValueError):
             continue
         if _valid_enough(series, converted):
