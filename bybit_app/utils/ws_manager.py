@@ -791,13 +791,22 @@ class WSManager:
                 continue
             symbol_upper = str(symbol or "").upper()
             current_stats = inventory_snapshot.get(symbol_upper) or inventory_snapshot.get(symbol)
-            if not isinstance(current_stats, Mapping):
-                log(
-                    "telegram.trade.skip",
-                    symbol=symbol_upper,
-                    reason="inventory_missing",
+            recovered_previous: Mapping[str, Decimal] | None = None
+            current_missing = not isinstance(current_stats, Mapping)
+            if current_missing:
+                recovered_previous = self._recover_previous_stats(
+                    symbol_upper,
+                    rows,
                 )
-                continue
+                if isinstance(recovered_previous, Mapping):
+                    current_stats = recovered_previous
+                else:
+                    current_stats = None
+                if not isinstance(current_stats, Mapping):
+                    log(
+                        "telegram.trade.inventory.recover.failed",
+                        symbol=symbol_upper,
+                    )
             total_qty = Decimal("0")
             total_quote = Decimal("0")
             for row in rows:
@@ -839,8 +848,6 @@ class WSManager:
                 )
                 continue
 
-            remaining_qty = self._decimal_from(current_stats.get("position_qty"))
-
             base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else symbol_upper
             qty_step = self._infer_step_from_rows(rows, "execQty")
             price_step = self._infer_step_from_rows(rows, "execPrice")
@@ -848,31 +855,49 @@ class WSManager:
             price_text = self._format_decimal_step(avg_price, price_step)
 
             remainder_text = None
-            position_closed = remaining_qty <= Decimal("0")
-            if not position_closed:
-                remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
-                remainder_text = f"{remainder_qty_text} {base_asset}"
+            position_closed = False
+            if isinstance(current_stats, Mapping) and not current_missing:
+                remaining_qty = self._decimal_from(current_stats.get("position_qty"))
+                position_closed = remaining_qty <= Decimal("0")
+                if not position_closed:
+                    remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
+                    remainder_text = f"{remainder_qty_text} {base_asset}"
+            else:
+                remainder_text = "unknown"
 
             previous_stats = previous_snapshot.get(symbol_upper) or previous_snapshot.get(symbol)
             if not isinstance(previous_stats, Mapping):
-                previous_stats = self._recover_previous_stats(
-                    symbol_upper,
-                    rows,
-                )
+                if recovered_previous is not None:
+                    previous_stats = recovered_previous
+                else:
+                    previous_stats = self._recover_previous_stats(
+                        symbol_upper,
+                        rows,
+                    )
 
             fallback_notification = False
             trade_realized: Decimal | None = None
-            if isinstance(previous_stats, Mapping):
+            if (
+                isinstance(previous_stats, Mapping)
+                and isinstance(current_stats, Mapping)
+                and not current_missing
+            ):
                 current_realized = self._decimal_from(current_stats.get("realized_pnl"))
                 previous_realized = self._decimal_from(previous_stats.get("realized_pnl"))
                 trade_realized = current_realized - previous_realized
                 pnl_display = trade_realized.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 pnl_text = f"{pnl_display:+.2f} USDT"
             else:
+                if not isinstance(previous_stats, Mapping):
+                    reason = "missing_previous_inventory"
+                elif not isinstance(current_stats, Mapping) or current_missing:
+                    reason = "missing_current_inventory"
+                else:  # pragma: no cover - defensive guard
+                    reason = "missing_inventory"
                 log(
                     "telegram.trade.previous_stats.missing",
                     symbol=symbol_upper,
-                    reason="missing_previous_inventory",
+                    reason=reason,
                 )
                 fallback_notification = True
                 pnl_text = "PnL n/a"

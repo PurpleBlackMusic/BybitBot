@@ -881,6 +881,107 @@ def test_sell_fill_recovery_uses_limited_ledger(monkeypatch: pytest.MonkeyPatch)
     assert captured["message"] == "ok"
 
 
+def test_notify_sell_fills_recovers_missing_current_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
+
+    captured: dict[str, object] = {}
+    messages: list[str] = []
+
+    def fake_format_sell_close_message(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "message"
+
+    def fake_enqueue(message: str) -> None:
+        messages.append(message)
+
+    recover_calls: list[tuple[str, object]] = []
+
+    def fake_recover(symbol: str, rows):  # type: ignore[no-untyped-def]
+        recover_calls.append((symbol, rows))
+        baseline = {
+            "position_qty": Decimal("0.4000"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("1"),
+        }
+        manager._inventory_baseline[symbol] = dict(baseline)
+        return baseline
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "format_sell_close_message",
+        fake_format_sell_close_message,
+    )
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        fake_enqueue,
+    )
+    monkeypatch.setattr(manager, "_recover_previous_stats", fake_recover)
+
+    fills = {
+        "ETHUSDT": [
+            {
+                "execQty": "0.1000",
+                "execPrice": "120",
+                "symbol": "ETHUSDT",
+            }
+        ]
+    }
+
+    manager._notify_sell_fills(fills, inventory_snapshot={}, previous_snapshot={})
+
+    assert recover_calls and recover_calls[0][0] == "ETHUSDT"
+    assert messages == ["message"]
+    assert captured["pnl_text"] == "PnL n/a"
+    assert captured["remainder_text"] == "unknown"
+    assert captured["position_closed"] is False
+    assert "ETHUSDT" in manager._inventory_baseline
+
+
+def test_notify_sell_fills_recovery_failure_still_notifies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: manager.s)
+
+    messages: list[str] = []
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "format_sell_close_message",
+        lambda **kwargs: captured.update(kwargs) or "message",
+    )
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        lambda message: messages.append(message),
+    )
+    monkeypatch.setattr(manager, "_recover_previous_stats", lambda *_, **__: None)
+
+    fills = {
+        "BTCUSDT": [
+            {
+                "execQty": "0.5000",
+                "execPrice": "30000",
+                "symbol": "BTCUSDT",
+            }
+        ]
+    }
+
+    manager._notify_sell_fills(fills, inventory_snapshot={}, previous_snapshot={})
+
+    assert messages == ["message"]
+    assert captured["pnl_text"] == "PnL n/a"
+    assert captured["remainder_text"] == "unknown"
+    assert captured["position_closed"] is False
+
+
 def test_notify_sell_fills_reload_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     initial_settings = SimpleNamespace(telegram_notify=False, tg_trade_notifs=False)
     updated_settings = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
