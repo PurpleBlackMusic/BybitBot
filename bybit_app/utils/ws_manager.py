@@ -1509,6 +1509,7 @@ class WSManager:
                 "orderLinkId": link_id,
                 "orderFilter": "Order",
             }
+            final_payload = payload
             try:
                 api.place_order(**payload)
             except Exception as exc:
@@ -1523,13 +1524,26 @@ class WSManager:
                         code=error_code,
                     )
                     continue
-                log(
-                    "ws.private.tp_ladder.place.error",
-                    err=str(exc),
-                    symbol=symbol,
-                    rung=rung_index,
-                )
-                continue
+                if error_code == "170372":
+                    retry_payload = self._reprice_tp_rung_to_ceiling(
+                        api,
+                        symbol,
+                        final_payload,
+                        qty_text=qty_text,
+                        rung_index=rung_index,
+                    )
+                    if retry_payload is None:
+                        continue
+                    final_payload = retry_payload
+                    price_text = str(final_payload.get("price") or price_text)
+                else:
+                    log(
+                        "ws.private.tp_ladder.place.error",
+                        err=str(exc),
+                        symbol=symbol,
+                        rung=rung_index,
+                    )
+                    continue
             log(
                 "ws.private.tp_ladder.place",
                 symbol=symbol,
@@ -1538,6 +1552,109 @@ class WSManager:
                 price=price_text,
                 profit_bps=profit_text,
             )
+
+    def _reprice_tp_rung_to_ceiling(
+        self,
+        api,
+        symbol: str,
+        payload: Mapping[str, object],
+        *,
+        qty_text: str,
+        rung_index: int,
+    ) -> Optional[dict[str, object]]:
+        try:
+            limits = _instrument_limits(api, symbol)
+        except Exception as exc:
+            log(
+                "ws.private.tp_ladder.reprice.limits_error",
+                symbol=symbol,
+                rung=rung_index,
+                err=str(exc),
+            )
+            enqueue_telegram_message(
+                f"⚠️ Не удалось обновить TP-рог {symbol} #{rung_index}: ошибка получения лимитов ({exc})."
+            )
+            return None
+
+        max_price = self._decimal_from(limits.get("max_price"))
+        tick_size = self._decimal_from(limits.get("tick_size"))
+        min_notional = self._decimal_from(limits.get("min_order_amt"))
+        qty_decimal = self._decimal_from(qty_text)
+        price_decimal = self._decimal_from(payload.get("price"))
+
+        if qty_decimal <= 0 or max_price <= 0:
+            log(
+                "ws.private.tp_ladder.reprice.skip",
+                symbol=symbol,
+                rung=rung_index,
+                reason="invalid_limits",
+                qty=str(qty_decimal),
+                max_price=str(max_price),
+            )
+            enqueue_telegram_message(
+                f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: некорректные лимиты (qty={qty_decimal}, max={max_price})."
+            )
+            return None
+
+        capped_price = min(price_decimal, max_price)
+        capped_price = quantize_to_step(capped_price, tick_size, rounding=ROUND_DOWN)
+        if capped_price <= 0:
+            log(
+                "ws.private.tp_ladder.reprice.skip",
+                symbol=symbol,
+                rung=rung_index,
+                reason="non_positive_price",
+                price=str(capped_price),
+            )
+            enqueue_telegram_message(
+                f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: цена после округления неположительна ({capped_price})."
+            )
+            return None
+
+        notional = capped_price * qty_decimal
+        if min_notional > 0 and notional < min_notional:
+            log(
+                "ws.private.tp_ladder.reprice.skip",
+                symbol=symbol,
+                rung=rung_index,
+                reason="min_notional",
+                notional=str(notional),
+                min_notional=str(min_notional),
+            )
+            enqueue_telegram_message(
+                f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: объём {notional.normalize()} "
+                f"ниже минимального {min_notional.normalize()}"
+            )
+            return None
+
+        adjusted_price_text = format_to_step(capped_price, tick_size, rounding=ROUND_DOWN)
+        updated_payload = dict(payload)
+        updated_payload["price"] = adjusted_price_text
+
+        try:
+            api.place_order(**updated_payload)
+        except Exception as exc:
+            log(
+                "ws.private.tp_ladder.reprice.error",
+                symbol=symbol,
+                rung=rung_index,
+                err=str(exc),
+                price=adjusted_price_text,
+            )
+            enqueue_telegram_message(
+                f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: повторная отправка не удалась ({exc})."
+            )
+            return None
+
+        log(
+            "ws.private.tp_ladder.reprice.applied",
+            symbol=symbol,
+            rung=rung_index,
+            original_price=str(price_decimal),
+            adjusted_price=adjusted_price_text,
+            max_price=str(max_price),
+        )
+        return updated_payload
 
     def _resolve_tp_config(self, settings) -> list[tuple[Decimal, Decimal]]:
         levels_raw = getattr(settings, "spot_tp_ladder_bps", "") or ""
