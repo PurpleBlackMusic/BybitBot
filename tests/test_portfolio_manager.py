@@ -83,3 +83,14 @@ def test_portfolio_manager_blocks_when_capital_below_minimum() -> None:
     # Remaining capital is below the required minimum allocation
     assert manager.request_allocation("ETHUSDT", now=10.0) is None
 
+
+def test_release_ignored_for_unallocated_symbol() -> None:
+    manager = PortfolioManager(total_capital=500, max_positions=1, cooldown=300.0, min_allocation=50.0)
+    base_time = 1_000.0
+
+    # Release a symbol that was never allocated; this should not trigger cooldown tracking.
+    manager.release("XRPUSDT", now=base_time)
+
+    allocation = manager.request_allocation("XRPUSDT", now=base_time + 1)
+    assert allocation is not None
+
