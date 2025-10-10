@@ -1,7 +1,7 @@
 import copy
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Mapping, Optional, Tuple, Union
 
 import time
 
@@ -9,6 +9,7 @@ import pytest
 
 import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
+import bybit_app.utils.spot_pnl as spot_pnl_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.signal_executor import (
     AutomationLoop,
@@ -363,14 +364,35 @@ def test_signal_executor_force_exit_ignores_stale_summary_price(
         }
     ]
 
-    monkeypatch.setattr(
-        signal_executor_module,
-        "read_ledger",
-        lambda limit, settings=None: list(events),
-    )
+    def fake_read_ledger(
+        limit: int | None = None,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows = list(events)
+        if return_meta:
+            return rows, "evt-0", True
+        return rows
 
-    def fake_inventory(*, events=None, settings=None, **_):
-        return {"BTCUSDT": {"position_qty": 2.0, "avg_cost": 100.0, "realized_pnl": 0.0}}
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+
+    def fake_inventory(
+        *,
+        events=None,
+        settings=None,
+        return_layers: bool = False,
+        **_,
+    ):
+        inventory = {
+            "BTCUSDT": {"position_qty": 2.0, "avg_cost": 100.0, "realized_pnl": 0.0}
+        }
+        if return_layers:
+            return inventory, {}
+        return inventory
 
     monkeypatch.setattr(
         signal_executor_module,
@@ -626,9 +648,18 @@ def test_signal_executor_guard_forces_sell_on_time_and_loss(
     ]
 
     def fake_read_ledger(
-        n: int = 5000, *, settings: object | None = None, network: object | None = None
-    ) -> list[dict[str, object]]:
-        return list(events)
+        n: int | None = 5000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows = list(events)
+        if return_meta:
+            return rows, "evt-guard", True
+        return rows
 
     monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
 
@@ -929,8 +960,33 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
         "_resolve_open_sell_reserved",
         lambda self, symbol, rows=None: Decimal("0"),
     )
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: [])
-    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events=None: {})
+    def empty_read_ledger(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows: list[Mapping[str, object]] = []
+        if return_meta:
+            return rows, None, True
+        return rows
+
+    def empty_inventory(
+        *,
+        events=None,
+        settings=None,
+        return_layers: bool = False,
+        **_,
+    ):
+        if return_layers:
+            return {}, {}
+        return {}
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", empty_read_ledger)
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", empty_inventory)
     monkeypatch.setattr(
         signal_executor_module,
         "enqueue_telegram_message",
@@ -1363,7 +1419,21 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
         {"symbol": "BTCUSDT", "category": "spot", "side": "Buy", "execPrice": 100.0, "execQty": 0.2, "execFee": 0.0},
         {"symbol": "BTCUSDT", "category": "spot", "side": "Sell", "execPrice": 120.0, "execQty": 0.1, "execFee": 0.0},
     ]
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: ledger_rows)
+    def ledger_snapshot(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows = list(ledger_rows)
+        if return_meta:
+            return rows, "ledger-last", True
+        return rows
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", ledger_snapshot)
 
     captured: dict[str, str] = {}
 
@@ -1438,8 +1508,28 @@ def test_signal_executor_uses_execution_stats_for_notifications(
     }
 
     monkeypatch.setattr(SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], exec_stats))
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: [])
-    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events: {})
+
+    def empty_snapshot(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows: list[Mapping[str, object]] = []
+        if return_meta:
+            return rows, None, True
+        return rows
+
+    def empty_inventory(*, events=None, settings=None, return_layers: bool = False, **_):
+        if return_layers:
+            return {}, {}
+        return {}
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", empty_snapshot)
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", empty_inventory)
 
     captured: dict[str, str] = {}
 
@@ -1517,7 +1607,7 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
             "marker": "before",
         }
     ]
-    after_rows = before_rows + [
+    incremental_rows = [
         {
             "symbol": "ETHUSDT",
             "category": "spot",
@@ -1529,12 +1619,22 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
         }
     ]
 
-    snapshots = [before_rows, after_rows]
+    snapshots: list[tuple[list[Mapping[str, object]], str]] = [
+        (before_rows, "before"),
+        (incremental_rows, "after"),
+    ]
 
-    def fake_snapshot(self, limit: int = 2000, *, settings: Settings | None = None):
+    def fake_snapshot(
+        self,
+        limit: int = 2000,
+        *,
+        settings: Settings | None = None,
+        last_exec_id: str | None = None,
+    ) -> tuple[list[Mapping[str, object]], str]:
         if snapshots:
-            return [dict(entry) for entry in snapshots.pop(0)]
-        return [dict(entry) for entry in after_rows]
+            rows, last_id = snapshots.pop(0)
+            return [dict(entry) for entry in rows], last_id
+        return [dict(entry) for entry in incremental_rows], "after"
 
     monkeypatch.setattr(SignalExecutor, "_ledger_rows_snapshot", fake_snapshot)
 
@@ -1547,6 +1647,7 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
         symbol,
         *,
         new_rows=None,
+        **_kwargs,
     ):
         helper_calls.append(
             (
@@ -1579,6 +1680,147 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
     assert message.startswith("🔴 ETHUSDT: закрытие 0.4000 ETH по 120.00000000")
     assert "PnL сделки +4.00 USDT" in message
     assert helper_calls == [(len(before_rows), 1)]
+
+
+def test_signal_executor_long_ledger_realized_pnl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        telegram_notify=True,
+        tg_trade_notifs=True,
+        tg_trade_notifs_min_notional=5.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "ok": True,
+        "result": {
+            "orderId": "long-ledger-sell",
+            "cumExecQty": "50",
+            "cumExecValue": "1500",
+            "avgPrice": "30",
+        },
+        "_local": {
+            "order_audit": {"qty_step": "0.0001", "limit_price": "30"},
+            "order_payload": {"qty": "50", "price": "30"},
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: response_payload,
+    )
+
+    total_events = 2100
+    before_full: list[dict[str, object]] = []
+    for idx in range(total_events):
+        price = 10.0 if idx < 100 else 20.0
+        before_full.append(
+            {
+                "symbol": "BTCUSDT",
+                "category": "spot",
+                "side": "Buy",
+                "execPrice": price,
+                "execQty": 1.0,
+                "execFee": 0.0,
+                "execId": f"buy-{idx}",
+            }
+        )
+
+    truncated_before = before_full[-2000:]
+    before_last_id = truncated_before[-1]["execId"]
+
+    sell_row = {
+        "symbol": "BTCUSDT",
+        "category": "spot",
+        "side": "Sell",
+        "execPrice": "30",
+        "execQty": "50",
+        "execFee": "0",
+        "execId": "sell-2100",
+    }
+
+    def fake_read_ledger(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        if last_exec_id == before_last_id:
+            rows = [sell_row]
+            marker_found = True
+            last_seen = sell_row["execId"]
+        elif last_exec_id is not None:
+            rows = truncated_before[-(n or len(truncated_before)) :] + [sell_row]
+            marker_found = False
+            last_seen = sell_row["execId"]
+        else:
+            rows = truncated_before[-(n or len(truncated_before)) :]
+            marker_found = True
+            last_seen = before_last_id
+
+        snapshot = [dict(entry) for entry in rows]
+        if return_meta:
+            return snapshot, last_seen, marker_found
+        return snapshot
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+
+    inventory_state, layer_state = spot_pnl_module.spot_inventory_and_pnl(
+        events=before_full, return_layers=True
+    )
+
+    def fake_inventory(
+        *,
+        events=None,
+        settings=None,
+        return_layers: bool = False,
+        **_,
+    ):
+        inventory_copy = copy.deepcopy(inventory_state)
+        layers_copy = copy.deepcopy(layer_state)
+        if return_layers:
+            return inventory_copy, layers_copy
+        return inventory_copy
+
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", fake_inventory)
+
+    captured: dict[str, str] = {}
+
+    def fake_send(text: str):
+        captured["text"] = text
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert "text" in captured
+    message = captured["text"]
+    assert "+523.81 USDT" in message
 
 def test_signal_executor_incremental_pnl_helper(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(
@@ -1654,6 +1896,25 @@ def test_signal_executor_incremental_pnl_helper(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(signal_executor_module, "enqueue_telegram_message", fake_send)
 
+    inventory_state, layer_state = spot_pnl_module.spot_inventory_and_pnl(
+        events=ledger_rows_before, return_layers=True
+    )
+
+    def fake_inventory(
+        *,
+        events=None,
+        settings=None,
+        return_layers: bool = False,
+        **_,
+    ):
+        inventory_copy = copy.deepcopy(inventory_state)
+        layers_copy = copy.deepcopy(layer_state)
+        if return_layers:
+            return inventory_copy, layers_copy
+        return inventory_copy
+
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", fake_inventory)
+
     original_realized = SignalExecutor._realized_delta
     helper_calls: list[Decimal] = []
     helper_new_rows: list[int] = []
@@ -1665,6 +1926,7 @@ def test_signal_executor_incremental_pnl_helper(monkeypatch: pytest.MonkeyPatch)
         symbol,
         *,
         new_rows=None,
+        **_kwargs,
     ):
         helper_new_rows.append(0 if new_rows is None else len(new_rows))
         result = original_realized(
@@ -1873,10 +2135,27 @@ def test_signal_executor_rotates_symbol_after_repeated_price_deviation(
     monkeypatch.setattr(
         signal_executor_module, "place_spot_market_with_tolerance", fake_place
     )
-    monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: [])
-    monkeypatch.setattr(
-        signal_executor_module, "spot_inventory_and_pnl", lambda events: {}
-    )
+    def empty_read(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows: list[Mapping[str, object]] = []
+        if return_meta:
+            return rows, None, True
+        return rows
+
+    def empty_inventory(*, events=None, settings=None, return_layers: bool = False, **_):
+        if return_layers:
+            return {}, {}
+        return {}
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", empty_read)
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", empty_inventory)
     monkeypatch.setattr(
         SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], None)
     )

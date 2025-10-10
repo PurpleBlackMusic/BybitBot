@@ -33,7 +33,7 @@ from .spot_market import (
     resolve_trade_symbol,
 )
 from .pnl import daily_pnl, read_ledger, invalidate_daily_pnl_cache
-from .spot_pnl import spot_inventory_and_pnl, _inventory_from_events, _replay_events
+from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
@@ -1532,7 +1532,7 @@ class SignalExecutor:
 
         max_quote = usable_after_reserve if side == "Buy" else None
 
-        ledger_before = self._ledger_rows_snapshot(settings=settings)
+        ledger_before, last_exec_id = self._ledger_rows_snapshot(settings=settings)
 
         try:
             response = place_spot_market_with_tolerance(
@@ -1670,7 +1670,9 @@ class SignalExecutor:
         if audit:
             order["order_audit"] = audit
         private_snapshot = ws_manager.private_snapshot()
-        ledger_rows_after = self._ledger_rows_snapshot(settings=settings)
+        ledger_rows_after, _ = self._ledger_rows_snapshot(
+            settings=settings, last_exec_id=last_exec_id
+        )
 
         ladder_orders, execution_stats = self._place_tp_ladder(
             api,
@@ -2248,7 +2250,7 @@ class SignalExecutor:
         rows_after = (
             list(ledger_rows_after)
             if ledger_rows_after is not None
-            else self._ledger_rows_snapshot(settings=settings)
+            else self._ledger_rows_snapshot(settings=settings)[0]
         )
 
         symbol_upper = symbol.upper()
@@ -2256,17 +2258,41 @@ class SignalExecutor:
         new_symbol_rows = self._extract_new_symbol_rows(
             rows_before, rows_after, symbol_upper
         )
+
+        sold_total = Decimal("0")
+        has_sell = False
+        for entry in new_symbol_rows:
+            if str(entry.get("side") or "").lower() == "sell":
+                has_sell = True
+                sold_total += self._decimal_from(entry.get("execQty"))
+
+        before_state: Mapping[str, object] | None = None
+        before_layers: Mapping[str, object] | None = None
+        if has_sell:
+            try:
+                inventory_snapshot, layer_snapshot = spot_inventory_and_pnl(
+                    settings=settings, return_layers=True
+                )
+            except Exception:
+                inventory_snapshot, layer_snapshot = {}, {}
+            if isinstance(inventory_snapshot, Mapping):
+                candidate_state = inventory_snapshot.get(symbol_upper)
+                if isinstance(candidate_state, Mapping):
+                    before_state = candidate_state
+            if isinstance(layer_snapshot, Mapping):
+                candidate_layer = layer_snapshot.get(symbol_upper)
+                if isinstance(candidate_layer, Mapping):
+                    before_layers = candidate_layer
+
         trade_realized_pnl = self._realized_delta(
             rows_before,
             rows_after,
             symbol_upper,
             new_rows=new_symbol_rows,
+            before_state=before_state,
+            before_layers=before_layers,
+            settings=settings,
         )
-
-        sold_total = Decimal("0")
-        for entry in new_symbol_rows:
-            if str(entry.get("side") or "").lower() == "sell":
-                sold_total += self._decimal_from(entry.get("execQty"))
 
         sell_budget = Decimal("0")
         if isinstance(execution_stats, Mapping):
@@ -2390,24 +2416,84 @@ class SignalExecutor:
         symbol: str,
         *,
         new_rows: Optional[Sequence[Mapping[str, object]]] = None,
+        before_state: Optional[Mapping[str, object]] = None,
+        before_layers: Optional[Mapping[str, object]] = None,
+        settings: Optional[Settings] = None,
     ) -> Decimal:
         symbol_upper = symbol.upper()
-        before_filtered = self._filter_symbol_ledger_rows(rows_before, symbol_upper)
-        candidate_rows = (
+        candidate_rows_source = (
             list(new_rows)
             if new_rows is not None
             else self._extract_new_symbol_rows(rows_before, rows_after, symbol_upper)
         )
+        if not candidate_rows_source:
+            return Decimal("0")
+
+        candidate_rows = self._filter_symbol_ledger_rows(
+            candidate_rows_source, symbol_upper
+        )
         if not candidate_rows:
             return Decimal("0")
 
-        inventory, layers = _inventory_from_events(before_filtered)
-        before_state = inventory.get(symbol_upper)
-        realized_before = (
-            self._decimal_from(before_state.get("realized_pnl"))
-            if isinstance(before_state, Mapping)
-            else Decimal("0")
+        has_sell_events = any(
+            str(row.get("side") or "").strip().lower() == "sell"
+            for row in candidate_rows
         )
+        if not has_sell_events:
+            return Decimal("0")
+
+        inventory: dict[str, dict[str, float]] = {}
+        layers: dict[str, dict[str, object]] = {}
+
+        resolved_state: Optional[Mapping[str, object]] = (
+            before_state if isinstance(before_state, Mapping) else None
+        )
+        resolved_layers: Optional[Mapping[str, object]] = (
+            before_layers if isinstance(before_layers, Mapping) else None
+        )
+
+        if resolved_state is None:
+            try:
+                inventory_snapshot, layer_snapshot = spot_inventory_and_pnl(
+                    settings=settings, return_layers=True
+                )
+            except Exception:
+                inventory_snapshot, layer_snapshot = {}, {}
+            if isinstance(inventory_snapshot, Mapping):
+                candidate_state = inventory_snapshot.get(symbol_upper)
+                if isinstance(candidate_state, Mapping):
+                    resolved_state = candidate_state
+            if resolved_layers is None and isinstance(layer_snapshot, Mapping):
+                candidate_layers = layer_snapshot.get(symbol_upper)
+                if isinstance(candidate_layers, Mapping):
+                    resolved_layers = candidate_layers
+
+        realized_before = Decimal("0")
+        if isinstance(resolved_state, Mapping):
+            realized_before = self._decimal_from(resolved_state.get("realized_pnl"))
+            inventory[symbol_upper] = {
+                "position_qty": float(
+                    self._decimal_from(resolved_state.get("position_qty"))
+                ),
+                "avg_cost": float(
+                    self._decimal_from(resolved_state.get("avg_cost"))
+                ),
+                "realized_pnl": float(realized_before),
+            }
+        else:
+            inventory[symbol_upper] = {
+                "position_qty": 0.0,
+                "avg_cost": 0.0,
+                "realized_pnl": 0.0,
+            }
+
+        if isinstance(resolved_layers, Mapping):
+            layers[symbol_upper] = copy.deepcopy(resolved_layers)
+        else:
+            layers[symbol_upper] = {
+                "position_qty": inventory[symbol_upper]["position_qty"],
+                "layers": [],
+            }
 
         _replay_events(candidate_rows, inventory, layers)
 
@@ -2599,7 +2685,8 @@ class SignalExecutor:
         limit: int = 2000,
         *,
         settings: Optional[Settings] = None,
-    ) -> list[Mapping[str, object]]:
+        last_exec_id: Optional[str] = None,
+    ) -> tuple[list[Mapping[str, object]], Optional[str]]:
         resolved_settings: Optional[Settings] = settings
         if resolved_settings is None:
             try:
@@ -2607,10 +2694,21 @@ class SignalExecutor:
             except Exception:
                 resolved_settings = None
         try:
-            rows = read_ledger(limit, settings=resolved_settings)
+            rows, newest_exec_id, _ = read_ledger(
+                limit,
+                settings=resolved_settings,
+                last_exec_id=last_exec_id,
+                return_meta=True,
+            )
         except Exception:
-            return []
-        return [row for row in rows if isinstance(row, Mapping)]
+            return [], None
+        clean_rows = [row for row in rows if isinstance(row, Mapping)]
+        last_id: Optional[str]
+        if isinstance(newest_exec_id, str) and newest_exec_id:
+            last_id = newest_exec_id
+        else:
+            last_id = None
+        return clean_rows, last_id
 
     @staticmethod
     def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
