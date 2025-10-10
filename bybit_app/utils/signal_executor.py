@@ -2033,10 +2033,67 @@ class SignalExecutor:
         if not plan_entries:
             return [], {}
 
+        existing_plan = ws_manager.current_tp_ladder_plan(symbol)
+        handshake_ttl = 0.0
+        if hasattr(ws_manager, "tp_ladder_handshake_ttl"):
+            try:
+                handshake_ttl = float(ws_manager.tp_ladder_handshake_ttl())
+            except Exception:  # pragma: no cover - defensive fallback
+                handshake_ttl = 0.0
+        if isinstance(existing_plan, Mapping):
+            existing_source = str(existing_plan.get("source") or "")
+            existing_status = str(existing_plan.get("status") or "")
+            existing_version = None
+            existing_updated = 0.0
+            if hasattr(ws_manager, "_coerce_plan_version"):
+                try:
+                    existing_version = ws_manager._coerce_plan_version(
+                        existing_plan.get("plan_version")
+                    )
+                except Exception:  # pragma: no cover - defensive fallback
+                    existing_version = None
+            if hasattr(ws_manager, "_coerce_timestamp"):
+                try:
+                    existing_updated = ws_manager._coerce_timestamp(
+                        existing_plan.get("updated_ts")
+                    )
+                except Exception:  # pragma: no cover - defensive fallback
+                    existing_updated = 0.0
+            current_version = (
+                ws_manager.current_tp_ladder_version(symbol)
+                if hasattr(ws_manager, "current_tp_ladder_version")
+                else 0
+            )
+            if (
+                existing_source == "ws_manager"
+                and existing_version is not None
+                and existing_version == current_version
+            ):
+                now = time.time()
+                if (
+                    existing_status.lower() == "pending"
+                    or (
+                        existing_updated > 0
+                        and handshake_ttl > 0
+                        and now - existing_updated <= handshake_ttl
+                    )
+                ):
+                    log(
+                        "guardian.auto.tp_ladder.skip",
+                        symbol=symbol,
+                        reason="ws_handshake",
+                    )
+                    return [], {}
+
         plan_signature = tuple(
             (entry["price_text"], entry["qty_text"]) for entry in plan_entries
         )
         plan_total_qty = sum(entry["qty"] for entry in plan_entries)
+        plan_version = (
+            ws_manager.next_tp_ladder_version(symbol)
+            if hasattr(ws_manager, "next_tp_ladder_version")
+            else None
+        )
         ws_manager.register_tp_ladder_plan(
             symbol,
             signature=plan_signature,
@@ -2044,6 +2101,7 @@ class SignalExecutor:
             qty=plan_total_qty,
             status="pending",
             source="executor",
+            plan_version=plan_version,
         )
 
         placed: list[Dict[str, object]] = []
@@ -2140,6 +2198,7 @@ class SignalExecutor:
                 qty=placed_qty_total,
                 status="active",
                 source="executor",
+                plan_version=plan_version,
             )
         else:
             ws_manager.clear_tp_ladder_plan(symbol, signature=plan_signature)

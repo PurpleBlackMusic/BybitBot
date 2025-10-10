@@ -31,6 +31,7 @@ from .trade_notifications import format_sell_close_message
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
+_TP_LADDER_HANDSHAKE_TTL = 5.0
 
 
 def _extract_error_code(exc: Exception) -> Optional[str]:
@@ -85,11 +86,71 @@ class WSManager:
         self._realtime_cache = get_realtime_cache()
         self._fill_lock = threading.Lock()
         self._tp_ladder_plan: dict[str, dict[str, object]] = {}
+        self._tp_ladder_version: dict[str, int] = {}
         self._inventory_snapshot: dict[str, dict[str, Decimal]] = {}
         self._inventory_baseline: dict[str, dict[str, Decimal]] = {}
         self._inventory_last_exec_id: Optional[str] = None
 
     # ----------------------- Public -----------------------
+    def tp_ladder_handshake_ttl(self) -> float:
+        return float(_TP_LADDER_HANDSHAKE_TTL)
+
+    def current_tp_ladder_plan(self, symbol: str) -> Mapping[str, object] | None:
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return None
+        with self._fill_lock:
+            payload = self._tp_ladder_plan.get(symbol_key)
+            if isinstance(payload, Mapping):
+                return dict(payload)
+        return None
+
+    def current_tp_ladder_version(self, symbol: str) -> int:
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return 0
+        with self._fill_lock:
+            value = self._tp_ladder_version.get(symbol_key, 0)
+        return int(value) if isinstance(value, int) else 0
+
+    def next_tp_ladder_version(self, symbol: str) -> int:
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return 0
+        with self._fill_lock:
+            current = self._tp_ladder_version.get(symbol_key, 0)
+        if isinstance(current, int):
+            return current + 1
+        return 1
+
+    @staticmethod
+    def _coerce_plan_version(value: object) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value != value:
+                return None
+            return int(value)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            try:
+                return int(candidate)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _coerce_timestamp(value: object) -> float:
+        try:
+            ts = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if ts != ts:
+            return 0.0
+        return ts
+
     def _refresh_settings(self) -> None:
         """Reload settings so WS endpoints respect latest configuration."""
         previous_testnet = self._last_settings_testnet
@@ -1167,6 +1228,7 @@ class WSManager:
         qty: object = None,
         status: str = "active",
         source: str = "executor",
+        plan_version: int | None = None,
     ) -> None:
         symbol_key = str(symbol or "").strip().upper()
         normalised_signature = self._normalise_tp_signature(signature)
@@ -1174,6 +1236,7 @@ class WSManager:
             return
         avg_cost_decimal = self._decimal_from(avg_cost)
         qty_decimal = self._decimal_from(qty)
+        version_value = self._coerce_plan_version(plan_version)
         payload: dict[str, object] = {
             "signature": normalised_signature,
             "avg_cost": avg_cost_decimal,
@@ -1182,7 +1245,11 @@ class WSManager:
             "status": status,
             "source": source,
         }
+        if version_value is not None:
+            payload["plan_version"] = version_value
         with self._fill_lock:
+            if version_value is not None:
+                self._tp_ladder_version[symbol_key] = version_value
             self._tp_ladder_plan[symbol_key] = payload
 
     def clear_tp_ladder_plan(
@@ -1206,6 +1273,7 @@ class WSManager:
                 ):
                     return
             self._tp_ladder_plan.pop(symbol_key, None)
+            self._tp_ladder_version.pop(symbol_key, None)
 
     def _regenerate_tp_ladder(
         self,
@@ -1312,12 +1380,41 @@ class WSManager:
         previous_signature = None
         previous_avg_cost = Decimal("0")
         previous_qty = Decimal("0")
+        previous_source = None
+        previous_status = None
+        previous_version = None
+        previous_updated_ts = 0.0
         if isinstance(previous_meta, Mapping):
             existing_sig = previous_meta.get("signature")
             if isinstance(existing_sig, tuple):
                 previous_signature = existing_sig
             previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
             previous_qty = self._decimal_from(previous_meta.get("qty"))
+            previous_source = str(previous_meta.get("source") or "")
+            previous_status = str(previous_meta.get("status") or "")
+            previous_version = self._coerce_plan_version(previous_meta.get("plan_version"))
+            previous_updated_ts = self._coerce_timestamp(previous_meta.get("updated_ts"))
+
+        current_version = self._tp_ladder_version.get(symbol)
+        if (
+            previous_source == "executor"
+            and previous_version is not None
+            and previous_version == current_version
+        ):
+            now = time.time()
+            if (
+                previous_status.lower() == "pending"
+                or (
+                    previous_updated_ts > 0
+                    and now - previous_updated_ts <= _TP_LADDER_HANDSHAKE_TTL
+                )
+            ):
+                log(
+                    "ws.private.tp_ladder.skip",
+                    symbol=symbol,
+                    reason="executor_handshake",
+                )
+                return
         if previous_signature == signature:
             log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
             return
@@ -1359,6 +1456,8 @@ class WSManager:
             )
             return
 
+        plan_version = self.next_tp_ladder_version(symbol)
+
         self._cancel_existing_tp_orders(api, symbol)
         self._execute_tp_plan(api, symbol, plan)
         self.register_tp_ladder_plan(
@@ -1368,6 +1467,7 @@ class WSManager:
             qty=available_qty,
             status="active",
             source="ws_manager",
+            plan_version=plan_version,
         )
 
     def private_snapshot(self) -> Mapping[str, object] | None:

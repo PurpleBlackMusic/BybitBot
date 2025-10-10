@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+import time
 from types import SimpleNamespace
 from typing import Iterable, Mapping
 
@@ -167,6 +168,7 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     ]
     signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
 
+    plan_version = manager.next_tp_ladder_version("BTCUSDT")
     manager.register_tp_ladder_plan(
         "BTCUSDT",
         signature=signature,
@@ -174,9 +176,15 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
         qty=Decimal("0.30"),
         status="pending",
         source="executor",
+        plan_version=plan_version,
     )
 
-    monkeypatch.setattr(manager, "_build_tp_plan", lambda **kwargs: plan)
+    plan_ref: dict[str, list[dict[str, object]]] = {"value": plan}
+
+    def build_plan(**kwargs):
+        return plan_ref["value"]
+
+    monkeypatch.setattr(manager, "_build_tp_plan", build_plan)
     monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
 
     cancel_calls: list[str] = []
@@ -215,6 +223,78 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
 
     assert cancel_calls == []
     assert execute_calls == []
+
+
+def test_ws_manager_executor_handshake_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    plan = [
+        {
+            "qty": Decimal("0.20"),
+            "qty_text": "0.20",
+            "price": Decimal("101.0"),
+            "price_text": "101.0",
+            "profit_labels": ["50"],
+        }
+    ]
+    signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
+
+    version = manager.next_tp_ladder_version("BTCUSDT")
+    manager.register_tp_ladder_plan(
+        "BTCUSDT",
+        signature=signature,
+        avg_cost=Decimal("100"),
+        qty=Decimal("0.20"),
+        status="active",
+        source="executor",
+        plan_version=version,
+    )
+
+    plan_ref: dict[str, list[dict[str, object]]] = {"value": plan}
+
+    def build_plan(**kwargs):
+        return plan_ref["value"]
+
+    monkeypatch.setattr(manager, "_build_tp_plan", build_plan)
+    monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
+
+    cancel_calls: list[str] = []
+    execute_calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    def fake_cancel(api_obj, symbol: str) -> None:
+        cancel_calls.append(symbol)
+
+    def fake_execute(api_obj, symbol: str, payload) -> None:
+        execute_calls.append((symbol, payload))
+
+    monkeypatch.setattr(manager, "_cancel_existing_tp_orders", fake_cancel)
+    monkeypatch.setattr(manager, "_execute_tp_plan", fake_execute)
+
+    limits_cache = {
+        "BTCUSDT": {
+            "qty_step": Decimal("0.01"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.01"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    # Initial regeneration skips because the executor just placed the ladder.
+    manager._regenerate_tp_ladder(
+        {"symbol": "BTCUSDT", "side": "Buy"},
+        {"BTCUSDT": {"position_qty": Decimal("0.20"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("50"), Decimal("1"))],
+        api=object(),
+        limits_cache=limits_cache,
+        settings=None,
+    )
+
+    assert cancel_calls == []
+    assert execute_calls == []
+
+    assert manager.current_tp_ladder_version("BTCUSDT") == version
 
 
 @pytest.mark.parametrize(
