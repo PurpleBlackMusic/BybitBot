@@ -251,3 +251,38 @@ def test_live_signal_fetcher_live_only_disables_cache(
     assert calls["count"] == 2
     assert first["symbol"] == "SOLUSDT"
     assert second["symbol"] == "DOGEUSDT"
+
+
+def test_live_signal_fetcher_runtime_live_only_forces_rescan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    clock = Clock(start=4_500.0)
+    monkeypatch.setattr(live_signal_module, "time", clock)
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    calls = {"count": 0}
+
+    def fake_scan(api, **kwargs):
+        calls["count"] += 1
+        symbol = "ADAUSDT" if calls["count"] == 1 else "XRPUSDT"
+        return [_make_opportunity(symbol)]
+
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", fake_scan)
+
+    monkeypatch.setattr(
+        live_signal_module,
+        "get_settings",
+        lambda: Settings(ai_live_only=True, ai_min_ev_bps=5.0),
+    )
+
+    fetcher = LiveSignalFetcher(data_dir=tmp_path, cache_ttl=60.0)
+
+    first = fetcher.fetch()
+    clock.advance(1.0)
+    second = fetcher.fetch()
+
+    assert calls["count"] == 2
+    assert first["symbol"] == "ADAUSDT"
+    assert second["symbol"] == "XRPUSDT"
+    assert fetcher.cache_ttl == 0.0
+    assert fetcher.stale_grace == 0.0
