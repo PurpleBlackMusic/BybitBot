@@ -22,6 +22,7 @@ from typing import (
 from .bybit_api import BybitAPI
 from .log import log
 from .paths import DATA_DIR
+from .market_features import build_feature_bundle
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import send_telegram
 
@@ -272,6 +273,11 @@ def scan_market_opportunities(
         bid = _safe_float(raw.get("bestBidPrice"))
         ask = _safe_float(raw.get("bestAskPrice"))
         spread_bps = _spread_bps(bid, ask)
+        feature_bundle = build_feature_bundle(raw)
+        blended_change = feature_bundle.get("blended_change_pct")
+        volatility_pct = feature_bundle.get("volatility_pct")
+        volume_spike_score = feature_bundle.get("volume_spike_score")
+        depth_imbalance = feature_bundle.get("depth_imbalance")
 
         force_include = symbol in wset
         if not force_include and turnover is not None and turnover < min_turnover:
@@ -306,6 +312,33 @@ def scan_market_opportunities(
         ev_bps = change_pct * 100.0 if change_pct is not None else None
         score = _edge_score(turnover, change_pct, spread_bps, boost=force_include)
 
+        direction = 0
+        if trend == "buy":
+            direction = 1
+        elif trend == "sell":
+            direction = -1
+
+        if probability is not None:
+            if blended_change is not None and direction != 0:
+                probability += 0.1 * direction * math.tanh(blended_change / 10.0)
+            if volume_spike_score is not None and direction != 0:
+                probability += 0.05 * direction * math.tanh(volume_spike_score)
+            if volatility_pct is not None:
+                probability -= 0.05 * math.tanh(volatility_pct / 50.0)
+            probability = max(0.0, min(1.0, probability))
+
+        feature_score = 0.0
+        if blended_change is not None:
+            feature_score += abs(blended_change) * 0.05
+        if volume_spike_score is not None and volume_spike_score > 0:
+            feature_score += volume_spike_score * 0.5
+        if depth_imbalance is not None and direction != 0:
+            feature_score += depth_imbalance * direction * 2.0
+        if volatility_pct is not None:
+            feature_score -= math.log1p(max(0.0, volatility_pct)) * 0.1
+
+        score += feature_score
+
         note_parts: List[str] = []
         if change_pct is not None:
             note_parts.append(f"24ч {change_pct:+.2f}%")
@@ -315,6 +348,14 @@ def scan_market_opportunities(
             note_parts.append(f"спред {spread_bps:.1f} б.п.")
         if quote_source == "USDC":
             note_parts.append("конвертировано из USDC")
+        if volatility_pct is not None:
+            note_parts.append(f"волатильность {volatility_pct:.1f}%")
+        if volume_spike_score is not None and volume_spike_score > 0:
+            note_parts.append(f"всплеск объёма ×{math.exp(volume_spike_score):.2f}")
+        if depth_imbalance is not None and direction != 0:
+            imbalance_pct = depth_imbalance * 100.0
+            side = "покупателей" if imbalance_pct > 0 else "продавцов"
+            note_parts.append(f"преимущество {side} {abs(imbalance_pct):.1f}%")
 
         entry = {
             "symbol": symbol,
@@ -327,6 +368,10 @@ def scan_market_opportunities(
             "change_pct": change_pct,
             "spread_bps": spread_bps,
             "volume": volume,
+            "volatility_pct": volatility_pct,
+            "volume_spike_score": volume_spike_score,
+            "depth_imbalance": depth_imbalance,
+            "blended_change_pct": blended_change,
             "source": "market_scanner",
             "actionable": actionable,
         }

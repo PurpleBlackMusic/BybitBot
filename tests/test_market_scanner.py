@@ -32,6 +32,15 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "bestBidPrice": "27000",
             "bestAskPrice": "27001",
             "volume24h": "3500",
+            "price1hPcnt": "1.8",
+            "price4hPcnt": "2.1",
+            "highPrice24h": "28200",
+            "lowPrice24h": "26000",
+            "lastPrice": "27100",
+            "volume1h": "400",
+            "prevVolume24h": "1200",
+            "bid1Size": "150",
+            "ask1Size": "120",
         },
         {
             "symbol": "ETHUSDT",
@@ -40,6 +49,15 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "bestBidPrice": "1800",
             "bestAskPrice": "1800.5",
             "volume24h": "2800",
+            "price1hPcnt": "1.3",
+            "price4hPcnt": "1.6",
+            "highPrice24h": "1880",
+            "lowPrice24h": "1720",
+            "lastPrice": "1805",
+            "volume1h": "350",
+            "prevVolume24h": "900",
+            "bid1Size": "90",
+            "ask1Size": "95",
         },
         {
             "symbol": "ADAUSDT",
@@ -48,6 +66,15 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "bestBidPrice": "0.5",
             "bestAskPrice": "0.501",
             "volume24h": "5000000",
+            "price1hPcnt": "-1.5",
+            "price4hPcnt": "-2.5",
+            "highPrice24h": "0.56",
+            "lowPrice24h": "0.45",
+            "lastPrice": "0.50",
+            "volume1h": "800000",
+            "prevVolume24h": "650000",
+            "bid1Size": "4000000",
+            "ask1Size": "5000000",
         },
         {
             "symbol": "LOWUSDT",
@@ -71,10 +98,21 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     )
 
     symbols = [entry["symbol"] for entry in opportunities]
-    assert symbols == ["BTCUSDT", "ETHUSDT", "ADAUSDT"]
+    assert symbols == ["BTCUSDT", "ADAUSDT", "ETHUSDT"]
     assert opportunities[0]["source"] == "market_scanner"
-    assert opportunities[2]["trend"] == "sell"
+    assert next(entry for entry in opportunities if entry["symbol"] == "ADAUSDT")[
+        "trend"
+    ] == "sell"
     assert opportunities[0]["note"]
+
+    top = opportunities[0]
+    assert top["volatility_pct"] and top["volatility_pct"] > 5
+    assert top["volume_spike_score"] and top["volume_spike_score"] > 0
+    assert "волатильность" in top["note"]
+
+    ada = next(entry for entry in opportunities if entry["symbol"] == "ADAUSDT")
+    assert ada["probability"] is not None and ada["probability"] < 0.3
+    assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
 
 
 def test_market_scanner_respects_whitelist(tmp_path: Path) -> None:
