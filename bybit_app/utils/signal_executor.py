@@ -1128,6 +1128,8 @@ class SignalExecutor:
 
         max_quote = usable_after_reserve if side == "Buy" else None
 
+        ledger_before = self._ledger_rows_snapshot(settings=settings)
+
         try:
             response = place_spot_market_with_tolerance(
                 api,
@@ -1250,7 +1252,7 @@ class SignalExecutor:
         if audit:
             order["order_audit"] = audit
         private_snapshot = ws_manager.private_snapshot()
-        ledger_rows = self._ledger_rows_snapshot(settings=settings)
+        ledger_rows_after = self._ledger_rows_snapshot(settings=settings)
 
         ladder_orders, execution_stats = self._place_tp_ladder(
             api,
@@ -1258,7 +1260,7 @@ class SignalExecutor:
             symbol,
             side,
             response,
-            ledger_rows=ledger_rows,
+            ledger_rows=ledger_rows_after,
             private_snapshot=private_snapshot,
         )
         if execution_stats:
@@ -1275,7 +1277,8 @@ class SignalExecutor:
             ladder_orders=ladder_orders,
             execution_stats=execution_stats,
             audit=audit,
-            ledger_rows=ledger_rows,
+            ledger_rows_before=ledger_before,
+            ledger_rows_after=ledger_rows_after,
         )
         self._clear_symbol_penalties(symbol)
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
@@ -1732,7 +1735,8 @@ class SignalExecutor:
         ladder_orders: Sequence[Mapping[str, object]] | None,
         execution_stats: Mapping[str, object] | None,
         audit: Mapping[str, object] | None,
-        ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
+        ledger_rows_before: Optional[Sequence[Mapping[str, object]]] = None,
+        ledger_rows_after: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> None:
         notify_enabled = bool(
             getattr(settings, "telegram_notify", False) or getattr(settings, "tg_trade_notifs", False)
@@ -1800,61 +1804,85 @@ class SignalExecutor:
         qty_text = self._format_decimal_step(executed_base, qty_step)
         price_text = self._format_decimal_step(avg_price, price_step)
 
-        target_price: Decimal | None = None
+        target_prices: list[Decimal] = []
         if ladder_orders:
-            first_order = ladder_orders[0]
-            if isinstance(first_order, Mapping):
-                target_price = self._decimal_from(first_order.get("price"))
+            for order in ladder_orders:
+                if not isinstance(order, Mapping):
+                    continue
+                target_price = self._decimal_from(order.get("price"))
                 if target_price <= 0:
-                    target_price = self._decimal_from(first_order.get("price_payload"))
+                    target_price = self._decimal_from(order.get("price_payload"))
+                if target_price > 0:
+                    target_prices.append(target_price)
 
-        target_text = "-"
-        if target_price and target_price > 0:
-            target_text = self._format_decimal_step(target_price, price_step)
+        targets_formatted: list[str] = []
+        if target_prices:
+            seen_targets: set[str] = set()
+            for target_price in target_prices:
+                formatted = self._format_decimal_step(target_price, price_step)
+                if formatted not in seen_targets:
+                    targets_formatted.append(formatted)
+                    seen_targets.add(formatted)
+        target_text = ", ".join(targets_formatted) if targets_formatted else "-"
+
+        rows_before = list(ledger_rows_before) if ledger_rows_before is not None else []
+        rows_after = (
+            list(ledger_rows_after)
+            if ledger_rows_after is not None
+            else self._ledger_rows_snapshot(settings=settings)
+        )
+
+        symbol_upper = symbol.upper()
+
+        def _realized_from_rows(rows: Sequence[Mapping[str, object]]) -> Decimal:
+            if not rows:
+                return Decimal("0")
+            pnl_snapshot = spot_inventory_and_pnl(events=rows, settings=settings)
+            symbol_stats = pnl_snapshot.get(symbol_upper) or pnl_snapshot.get(symbol)
+            if isinstance(symbol_stats, Mapping):
+                return self._decimal_from(symbol_stats.get("realized_pnl"))
+            return Decimal("0")
+
+        realized_before = _realized_from_rows(rows_before)
+        realized_after = _realized_from_rows(rows_after)
+        trade_realized_pnl = realized_after - realized_before
+
+        sold_total = Decimal("0")
+        for entry in rows_after:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("symbol") or "").upper() != symbol_upper:
+                continue
+            if str(entry.get("category") or "spot").lower() != "spot":
+                continue
+            if str(entry.get("side") or "").lower() == "sell":
+                sold_total += self._decimal_from(entry.get("execQty"))
 
         sell_budget = Decimal("0")
         if isinstance(execution_stats, Mapping):
             sell_budget = self._decimal_from(execution_stats.get("sell_budget_base"))
 
-        realized_pnl = Decimal("0")
-        sold_total = Decimal("0")
-        symbol_upper = symbol.upper()
-
-        rows = (
-            list(ledger_rows)
-            if ledger_rows is not None
-            else self._ledger_rows_snapshot(settings=settings)
-        )
-
-        if rows:
-            pnl_snapshot = spot_inventory_and_pnl(events=rows, settings=settings)
-            symbol_stats = pnl_snapshot.get(symbol_upper) or pnl_snapshot.get(symbol)
-            if isinstance(symbol_stats, Mapping):
-                realized_pnl = self._decimal_from(symbol_stats.get("realized_pnl"))
-
-            for entry in rows:
-                if not isinstance(entry, Mapping):
-                    continue
-                if str(entry.get("symbol") or "").upper() != symbol_upper:
-                    continue
-                if str(entry.get("category") or "spot").lower() != "spot":
-                    continue
-                if str(entry.get("side") or "").lower() == "sell":
-                    sold_total += self._decimal_from(entry.get("execQty"))
-
         sold_amount = sell_budget if sell_budget > 0 else sold_total
         sold_text = self._format_decimal_step(sold_amount, qty_step)
 
-        pnl_display = realized_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        pnl_display = trade_realized_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         pnl_text = f"{pnl_display:+.2f} USDT"
 
-        direction = "куплено" if side.lower() == "buy" else "продано"
         base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else symbol_upper
+        is_buy = side.lower() == "buy"
 
-        message = (
-            f"{direction} {qty_text} {base_asset} по {price_text}, "
-            f"цель {target_text}, продано {sold_text}, PnL {pnl_text}"
-        )
+        if is_buy:
+            message = (
+                f"🟢 {symbol_upper}: открытие {qty_text} {base_asset} по {price_text} "
+                f"(цели: {target_text})"
+            )
+        else:
+            message = (
+                f"🔴 {symbol_upper}: закрытие {qty_text} {base_asset} по {price_text}, "
+                f"PnL сделки {pnl_text}"
+            )
+            if sold_amount > 0 and sold_amount != executed_base:
+                message += f" (продано: {sold_text})"
         log(
             "telegram.trade.notify",
             symbol=symbol,

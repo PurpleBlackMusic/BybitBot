@@ -1283,10 +1283,9 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
     assert result.status == "filled"
     assert "text" in captured
     message = captured["text"]
-    assert message.startswith("куплено 0.5000 BTC по 101.00000000")
-    assert "цель 105.00000000" in message
-    assert "продано 0.3000" in message
-    assert "PnL" in message and "+2.00" in message
+    assert message.startswith("🟢 BTCUSDT: открытие 0.5000 BTC по 101.00000000")
+    assert "(цели: 105.00000000)" in message
+    assert "PnL" not in message
 
 
 def test_signal_executor_uses_execution_stats_for_notifications(
@@ -1356,8 +1355,110 @@ def test_signal_executor_uses_execution_stats_for_notifications(
     assert result.status == "filled"
     assert "text" in captured
     message = captured["text"]
-    assert message.startswith("куплено 0.250 ETH по 50.00000000") or message.startswith("куплено 0.250 ET")
-    assert "по 50" in message
+    assert message.startswith("🟢 ETHUSDT: открытие 0.250 ETH по 50.00000000")
+    assert "(цели: -)" in message
+
+
+def test_signal_executor_sell_notification_reports_realized_pnl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        telegram_notify=True,
+        tg_trade_notifs=True,
+        tg_trade_notifs_min_notional=5.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    response_payload = {
+        "ok": True,
+        "result": {
+            "orderId": "sell-filled",
+            "cumExecQty": "0.4",
+            "cumExecValue": "48.0",
+            "avgPrice": "120.0",
+        },
+        "_local": {
+            "order_audit": {"qty_step": "0.0001", "limit_price": "120.0"},
+            "order_payload": {"qty": "0.4", "price": "120.0"},
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: response_payload,
+    )
+
+    before_rows = [
+        {
+            "symbol": "ETHUSDT",
+            "category": "spot",
+            "side": "Buy",
+            "execPrice": "100.0",
+            "execQty": "0.4",
+            "execFee": "0.0",
+            "marker": "before",
+        }
+    ]
+    after_rows = before_rows + [
+        {
+            "symbol": "ETHUSDT",
+            "category": "spot",
+            "side": "Sell",
+            "execPrice": "120.0",
+            "execQty": "0.4",
+            "execFee": "0.0",
+            "marker": "after",
+        }
+    ]
+
+    snapshots = [before_rows, after_rows]
+
+    def fake_snapshot(self, limit: int = 2000, *, settings: Settings | None = None):
+        if snapshots:
+            return [dict(entry) for entry in snapshots.pop(0)]
+        return [dict(entry) for entry in after_rows]
+
+    monkeypatch.setattr(SignalExecutor, "_ledger_rows_snapshot", fake_snapshot)
+
+    def fake_spot_inventory_and_pnl(*, events=None, **_):
+        markers = {entry.get("marker") for entry in (events or []) if isinstance(entry, dict)}
+        realized = Decimal("7")
+        if "after" in markers:
+            realized = Decimal("11")
+        return {"ETHUSDT": {"realized_pnl": realized}}
+
+    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+
+    captured: dict[str, str] = {}
+
+    def fake_send(text: str):
+        captured["text"] = text
+        return {"ok": True}
+
+    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert "text" in captured
+    message = captured["text"]
+    assert message.startswith("🔴 ETHUSDT: закрытие 0.4000 ETH по 120.00000000")
+    assert "PnL сделки +4.00 USDT" in message
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
