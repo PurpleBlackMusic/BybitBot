@@ -121,6 +121,9 @@ class SignalExecutor:
         self._symbol_quarantine: Dict[str, float] = {}
         self._price_limit_backoff: Dict[str, Dict[str, object]] = {}
         self._daily_pnl_force_refresh = False
+        self._spot_inventory_snapshot: Optional[
+            Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
+        ] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -790,71 +793,142 @@ class SignalExecutor:
         if primary_symbol:
             summary_symbols.add(primary_symbol)
 
-        events_cache: Optional[List[Mapping[str, object]]] = None
+        cached_snapshot = self._spot_inventory_snapshot
+        if cached_snapshot is None:
+            events_cache: Optional[List[Mapping[str, object]]] = None
 
-        def _load_events() -> Optional[List[Mapping[str, object]]]:
-            nonlocal events_cache
-            if events_cache is None:
+            def _load_events(limit: Optional[int] = 5000) -> List[Mapping[str, object]]:
+                nonlocal events_cache
+                if events_cache is not None:
+                    return events_cache
                 try:
-                    events_cache = read_ledger(None, settings=settings)
+                    events_cache = read_ledger(limit, settings=settings)
                 except Exception as exc:  # pragma: no cover - defensive guard
                     log("guardian.auto.force_exit.ledger.error", err=str(exc))
                     events_cache = []
-            return events_cache
+                return events_cache
 
-        try:
-            inventory_result = spot_inventory_and_pnl(
-                settings=settings,
-                return_layers=True,
-            )
-        except TypeError:
-            events = _load_events() or []
-            if events:
-                inventory = spot_inventory_and_pnl(events=events, settings=settings)
-                states = self._build_position_layers(events)
-            else:
-                inventory = {}
-                states = {}
-        except Exception as exc:  # pragma: no cover - defensive guard
-            log("guardian.auto.force_exit.ledger.error", err=str(exc))
-            inventory = {}
-            states = {}
-        else:
-            if (
-                isinstance(inventory_result, tuple)
-                and len(inventory_result) == 2
-                and isinstance(inventory_result[0], Mapping)
-            ):
-                inventory = inventory_result[0]
-                states = inventory_result[1] if isinstance(inventory_result[1], Mapping) else {}
-            elif isinstance(inventory_result, Mapping):
-                inventory = inventory_result
-                events = _load_events() or []
-                states = self._build_position_layers(events) if events else {}
-            else:
-                inventory = {}
-                states = {}
-
-            need_overlay = False
-            if not inventory:
-                need_overlay = True
-            elif summary_symbols:
-                for symbol in summary_symbols:
-                    info = inventory.get(symbol)
-                    qty = _safe_float(info.get("position_qty")) if isinstance(info, Mapping) else None
-                    if qty is None or qty <= 0:
-                        need_overlay = True
-                        break
-
-            if need_overlay:
-                events = _load_events() or []
+            try:
+                inventory_result = spot_inventory_and_pnl(
+                    settings=settings,
+                    return_layers=True,
+                )
+            except TypeError:
+                events = _load_events()
                 if events:
-                    overlay_inventory = spot_inventory_and_pnl(events=events, settings=settings)
-                    overlay_states = self._build_position_layers(events)
-                    if overlay_inventory:
-                        inventory = {**inventory, **overlay_inventory}
-                    if overlay_states:
-                        states = {**states, **overlay_states}
+                    raw_inventory = spot_inventory_and_pnl(
+                        events=events, settings=settings
+                    )
+                    raw_states = self._build_position_layers(events)
+                else:
+                    raw_inventory = {}
+                    raw_states = {}
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("guardian.auto.force_exit.ledger.error", err=str(exc))
+                raw_inventory = {}
+                raw_states = {}
+            else:
+                if (
+                    isinstance(inventory_result, tuple)
+                    and len(inventory_result) == 2
+                    and isinstance(inventory_result[0], Mapping)
+                ):
+                    raw_inventory = inventory_result[0]
+                    raw_states = (
+                        inventory_result[1]
+                        if isinstance(inventory_result[1], Mapping)
+                        else {}
+                    )
+                elif isinstance(inventory_result, Mapping):
+                    raw_inventory = inventory_result
+                    events = _load_events()
+                    raw_states = self._build_position_layers(events) if events else {}
+                else:
+                    raw_inventory = {}
+                    raw_states = {}
+
+                need_overlay = False
+                has_data = (
+                    isinstance(raw_inventory, Mapping)
+                    and bool(raw_inventory)
+                ) or (isinstance(raw_states, Mapping) and bool(raw_states))
+
+                if summary_symbols:
+                    if not has_data:
+                        need_overlay = True
+                    else:
+                        for symbol in summary_symbols:
+                            info = (
+                                raw_inventory.get(symbol)
+                                if isinstance(raw_inventory, Mapping)
+                                else None
+                            )
+                            qty = (
+                                _safe_float(info.get("position_qty"))
+                                if isinstance(info, Mapping)
+                                else None
+                            )
+                            if qty is not None and qty > 0:
+                                continue
+                            state = (
+                                raw_states.get(symbol)
+                                if isinstance(raw_states, Mapping)
+                                else None
+                            )
+                            state_qty = (
+                                _safe_float(state.get("position_qty"))
+                                if isinstance(state, Mapping)
+                                else None
+                            )
+                            if state_qty is None or state_qty <= 0:
+                                need_overlay = True
+                                break
+
+                if need_overlay:
+                    events = _load_events()
+                    if events:
+                        overlay_inventory = spot_inventory_and_pnl(
+                            events=events, settings=settings
+                        )
+                        overlay_states = self._build_position_layers(events)
+                        if overlay_inventory:
+                            base_inventory: Dict[str, Mapping[str, object]] = {}
+                            if isinstance(raw_inventory, Mapping):
+                                base_inventory.update(raw_inventory)  # type: ignore[arg-type]
+                            base_inventory.update(overlay_inventory)
+                            raw_inventory = base_inventory
+                        if overlay_states:
+                            base_states: Dict[str, Dict[str, object]] = {}
+                            if isinstance(raw_states, Mapping):
+                                for key, value in raw_states.items():
+                                    if isinstance(key, str) and isinstance(value, Mapping):
+                                        base_states[key] = dict(value)
+                            for key, value in overlay_states.items():
+                                if isinstance(key, str) and isinstance(value, Mapping):
+                                    base_states[key] = dict(value)
+                            raw_states = base_states
+
+            inventory = (
+                {
+                    symbol: value
+                    for symbol, value in raw_inventory.items()
+                    if isinstance(symbol, str) and isinstance(value, Mapping)
+                }
+                if isinstance(raw_inventory, Mapping)
+                else {}
+            )
+            states: Dict[str, Dict[str, object]] = (
+                {
+                    symbol: dict(value)
+                    for symbol, value in raw_states.items()
+                    if isinstance(symbol, str) and isinstance(value, Mapping)
+                }
+                if isinstance(raw_states, Mapping)
+                else {}
+            )
+            self._spot_inventory_snapshot = (inventory, states)
+        else:
+            inventory, states = cached_snapshot
 
         portfolio_map: Dict[str, Mapping[str, object]] = {}
         portfolio_fn = getattr(self.bot, "portfolio_overview", None)
@@ -1355,6 +1429,7 @@ class SignalExecutor:
         return forced_summary, metadata
 
     def execute_once(self) -> ExecutionResult:
+        self._spot_inventory_snapshot = None
         summary = self._fetch_summary()
         settings = self._resolve_settings()
         forced_summary, forced_meta = self._maybe_force_exit(summary, settings)
