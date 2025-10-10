@@ -4,20 +4,11 @@ import json
 import time
 from pathlib import Path
 
+from bybit_app.utils.ai.models import MODEL_FEATURES
 from bybit_app.utils.market_scanner import scan_market_opportunities
 
 
-FEATURE_NAMES = [
-    "directional_change_pct",
-    "multiframe_change_pct",
-    "turnover_log",
-    "volatility_pct",
-    "volume_impulse",
-    "depth_imbalance",
-    "spread_bps",
-    "correlation_strength",
-    "maker_flag",
-]
+FEATURE_NAMES = list(MODEL_FEATURES)
 
 
 def _write_model(path: Path, *, weight: float) -> None:

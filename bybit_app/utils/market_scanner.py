@@ -20,7 +20,7 @@ from typing import (
 )
 
 from .bybit_api import BybitAPI
-from .ai.models import MarketModel, ensure_market_model
+from .ai.models import MarketModel, ensure_market_model, initialise_feature_map
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -291,17 +291,16 @@ def _model_feature_vector(
     if isinstance(correlation_strength, (int, float)):
         correlation_value = float(correlation_strength)
 
-    return {
-        "directional_change_pct": signed_change,
-        "multiframe_change_pct": multi_tf_value,
-        "turnover_log": turnover_log,
-        "volatility_pct": vol_value,
-        "volume_impulse": best_impulse,
-        "depth_imbalance": depth_value,
-        "spread_bps": spread_value,
-        "correlation_strength": correlation_value,
-        "maker_flag": 0.0,
-    }
+    features = initialise_feature_map()
+    features["directional_change_pct"] = signed_change
+    features["multiframe_change_pct"] = multi_tf_value
+    features["turnover_log"] = turnover_log
+    features["volatility_pct"] = vol_value
+    features["volume_impulse"] = best_impulse
+    features["depth_imbalance"] = depth_value
+    features["spread_bps"] = spread_value
+    features["correlation_strength"] = correlation_value
+    return features
 
 
 def load_market_snapshot(

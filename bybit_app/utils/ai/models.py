@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Mapping, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -24,10 +24,25 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "turnover_log",
     "volatility_pct",
     "volume_impulse",
+    "depth_imbalance",
+    "spread_bps",
+    "correlation_strength",
     "maker_flag",
     "hold_minutes",
     "position_closed_fraction",
 )
+
+
+def initialise_feature_map() -> Dict[str, float]:
+    """Return a mapping with all model features initialised to ``0.0``."""
+
+    return {name: 0.0 for name in MODEL_FEATURES}
+
+
+def feature_vector_from_map(features: Mapping[str, float]) -> List[float]:
+    """Convert a feature mapping into an ordered vector matching the model schema."""
+
+    return [float(features.get(name, 0.0)) for name in MODEL_FEATURES]
 
 
 @dataclass
@@ -146,16 +161,17 @@ class _SymbolState:
             if long_term_ref > 1e-9:
                 multiframe_change_pct = (record.price - long_term_ref) / long_term_ref * 100.0
 
-        vector = [
-            change_pct,
-            multiframe_change_pct,
-            math.log10(record.notional + 1.0),
-            volatility_pct,
-            volume_impulse,
-            1.0 if record.is_maker else 0.0,
-            avg_hold_minutes,
-            position_closed_fraction,
-        ]
+        feature_map = initialise_feature_map()
+        feature_map["directional_change_pct"] = change_pct
+        feature_map["multiframe_change_pct"] = multiframe_change_pct
+        feature_map["turnover_log"] = math.log10(record.notional + 1.0)
+        feature_map["volatility_pct"] = volatility_pct
+        feature_map["volume_impulse"] = volume_impulse
+        feature_map["maker_flag"] = 1.0 if record.is_maker else 0.0
+        feature_map["hold_minutes"] = avg_hold_minutes
+        feature_map["position_closed_fraction"] = position_closed_fraction
+
+        vector = feature_vector_from_map(feature_map)
 
         self.position_qty -= qty_to_close
         if self.position_qty <= 1e-9:
