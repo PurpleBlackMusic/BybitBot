@@ -6,7 +6,7 @@ import json
 import time
 import threading
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -208,21 +208,50 @@ def add_execution(
     """Сохраняем fill (частичный/полный) из топика execution. Ожидаем поля: symbol, side, orderLinkId, execPrice, execQty, execFee, execTime."""
 
     ledger_path = _ledger_path_for(settings, network=network)
+    price = _f(ev.get("execPrice"))
+    qty = _f(ev.get("execQty"))
+    fee_value = _f(ev.get("execFee"))
+
+    symbol_value = ev.get("symbol") or ev.get("ticker")
+    symbol_text = str(symbol_value or "").strip().upper()
+    base: Optional[str] = None
+    quote: Optional[str] = None
+    if symbol_text:
+        base, quote = symbol_resolver._split_symbol(symbol_text)  # type: ignore[attr-defined]
+        if isinstance(base, str):
+            base = base.strip().upper() or None
+        else:
+            base = None
+        if isinstance(quote, str):
+            quote = quote.strip().upper() or None
+        else:
+            quote = None
+
     rec = {
         "ts": int(time.time() * 1000),
         "symbol": ev.get("symbol"),
         "side": ev.get("side"),
         "orderId": ev.get("orderId"),
         "orderLinkId": ensure_link_id(_normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID"))),
-        "execPrice": _f(ev.get("execPrice")),
-        "execQty": _f(ev.get("execQty")),
-        "execFee": _f(ev.get("execFee")),
+        "execPrice": price,
+        "execQty": qty,
+        "execFee": fee_value,
         "execTime": ev.get("execTime") or ev.get("transactionTime") or ev.get("ts"),
         "category": ev.get("category") or ev.get("orderCategory") or "spot",
     }
     fee_currency = _extract_fee_currency(ev)
-    if fee_currency:
-        rec["feeCurrency"] = fee_currency
+    resolved_currency, inferred_currency = _resolve_fee_currency_with_inference(
+        ev,
+        explicit_currency=fee_currency,
+        base=base,
+        price=price,
+        qty=qty,
+        fee=fee_value,
+    )
+    if resolved_currency:
+        rec["feeCurrency"] = resolved_currency
+        if inferred_currency and isinstance(ev, MutableMapping):
+            ev.setdefault("feeCurrency", resolved_currency)
     key = _execution_key(ev)
     with _LOCK:
         if key and not _remember_key(ledger_path, key):
@@ -288,6 +317,55 @@ def _extract_fee_currency(ev: Mapping[str, object] | dict) -> Optional[str]:
     return None
 
 
+def _resolve_fee_currency_with_inference(
+    execution: Mapping[str, object] | dict,
+    *,
+    explicit_currency: Optional[str],
+    base: Optional[str],
+    price: Optional[float],
+    qty: Optional[float],
+    fee: Optional[float],
+) -> tuple[Optional[str], bool]:
+    if explicit_currency:
+        return explicit_currency, False
+
+    if fee is None or not base:
+        return None, False
+
+    if price is None or qty is None:
+        return None, False
+
+    abs_price = abs(price)
+    abs_qty = abs(qty)
+    if abs_price <= 0.0 or abs_qty <= 0.0:
+        return None, False
+
+    abs_fee = abs(fee)
+    if abs_fee <= 0.0:
+        return None, False
+
+    notional = abs_price * abs_qty
+    if notional <= 0.0:
+        return None, False
+
+    fee_per_qty = abs_fee / abs_qty
+    fee_per_notional = abs_fee / notional
+
+    # Typical spot trading fees are well below 0.5%, so treat a missing
+    # currency as base-denominated only when the raw fee resembles a base
+    # quantity (sub-percent of the filled size) *and* is tiny relative to
+    # the traded notional. This avoids multiplying already-quote-denominated
+    # fees by price and overstating losses.
+    if (
+        abs_price >= 5.0
+        and fee_per_qty < 0.005
+        and fee_per_notional < 0.0002
+    ):
+        return base, True
+
+    return None, False
+
+
 def execution_fee_in_quote(
     execution: Mapping[str, object] | dict,
     *,
@@ -324,11 +402,28 @@ def execution_fee_in_quote(
         else:
             quote = None
 
-    fee_currency = _extract_fee_currency(execution)
-
     resolved_price = _f(price)
     if resolved_price is None:
         resolved_price = _f(execution.get("execPrice"))
+
+    fee_currency = _extract_fee_currency(execution)
+    qty = _f(execution.get("execQty"))
+    fee_currency, inferred = _resolve_fee_currency_with_inference(
+        execution,
+        explicit_currency=fee_currency,
+        base=base,
+        price=resolved_price,
+        qty=qty,
+        fee=float(fee) if fee is not None else None,
+    )
+
+    if (
+        inferred
+        and fee_currency
+        and isinstance(execution, MutableMapping)
+        and "feeCurrency" not in execution
+    ):
+        execution["feeCurrency"] = fee_currency
 
     if fee_currency and quote and fee_currency == quote:
         return float(fee)
