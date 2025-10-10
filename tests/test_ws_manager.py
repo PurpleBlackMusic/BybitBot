@@ -974,6 +974,30 @@ def test_notify_sell_fills_recovers_missing_current_stats(
         manager._inventory_baseline[symbol] = dict(baseline)
         return baseline
 
+    reconstructed_calls: list[tuple[Mapping[str, Mapping[str, Decimal]], Iterable[Mapping[str, object]]]] = []
+
+    def fake_reconstruct(
+        previous_snapshot: Mapping[str, Mapping[str, Decimal]],
+        fills: Iterable[Mapping[str, object]],
+    ) -> tuple[Mapping[str, Mapping[str, float]], Mapping[str, Mapping[str, Decimal]]]:
+        reconstructed_calls.append((previous_snapshot, fills))
+        return (
+            {
+                "ETHUSDT": {
+                    "position_qty": 0.0,
+                    "avg_cost": 100.0,
+                    "realized_pnl": 6.0,
+                }
+            },
+            {
+                "ETHUSDT": {
+                    "position_qty": Decimal("0"),
+                    "avg_cost": Decimal("100"),
+                    "realized_pnl": Decimal("6"),
+                }
+            },
+        )
+
     monkeypatch.setattr(
         ws_manager_module,
         "format_sell_close_message",
@@ -985,6 +1009,7 @@ def test_notify_sell_fills_recovers_missing_current_stats(
         fake_enqueue,
     )
     monkeypatch.setattr(manager, "_recover_previous_stats", fake_recover)
+    monkeypatch.setattr(manager, "_reconstruct_inventory_from_fills", fake_reconstruct)
 
     fills = {
         "ETHUSDT": [
@@ -999,10 +1024,11 @@ def test_notify_sell_fills_recovers_missing_current_stats(
     manager._notify_sell_fills(fills, inventory_snapshot={}, previous_snapshot={})
 
     assert recover_calls and recover_calls[0][0] == "ETHUSDT"
+    assert reconstructed_calls
     assert messages == ["message"]
-    assert captured["pnl_text"] == "PnL n/a"
-    assert captured["remainder_text"] == "unknown"
-    assert captured["position_closed"] is False
+    assert captured["pnl_text"] == "+5.00 USDT"
+    assert captured["remainder_text"] == "0 ETH"
+    assert captured["position_closed"] is True
     assert "ETHUSDT" in manager._inventory_baseline
 
 

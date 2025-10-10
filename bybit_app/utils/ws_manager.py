@@ -801,6 +801,7 @@ class WSManager:
             symbol_upper = str(symbol or "").upper()
             current_stats = inventory_snapshot.get(symbol_upper) or inventory_snapshot.get(symbol)
             recovered_previous: Mapping[str, Decimal] | None = None
+            reconstructed_current: Mapping[str, Decimal] | None = None
             current_missing = not isinstance(current_stats, Mapping)
             if current_missing:
                 recovered_previous = self._recover_previous_stats(
@@ -808,7 +809,17 @@ class WSManager:
                     rows,
                 )
                 if isinstance(recovered_previous, Mapping):
-                    current_stats = recovered_previous
+                    reconstructed_current = self._rebuild_current_stats_from_fills(
+                        symbol_upper,
+                        recovered_previous,
+                        rows,
+                        inventory_snapshot,
+                    )
+                    if isinstance(reconstructed_current, Mapping):
+                        current_stats = reconstructed_current
+                        current_missing = False
+                    else:
+                        current_stats = recovered_previous
                 else:
                     current_stats = None
                 if not isinstance(current_stats, Mapping):
@@ -867,10 +878,9 @@ class WSManager:
             position_closed = False
             if isinstance(current_stats, Mapping) and not current_missing:
                 remaining_qty = self._decimal_from(current_stats.get("position_qty"))
+                remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
+                remainder_text = f"{remainder_qty_text} {base_asset}"
                 position_closed = remaining_qty <= Decimal("0")
-                if not position_closed:
-                    remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
-                    remainder_text = f"{remainder_qty_text} {base_asset}"
             else:
                 remainder_text = "unknown"
 
@@ -975,6 +985,27 @@ class WSManager:
             self._inventory_baseline[symbol] = dict(recovered)
             return recovered
         return None
+
+    def _rebuild_current_stats_from_fills(
+        self,
+        symbol: str,
+        recovered_previous: Mapping[str, Decimal],
+        fills: Sequence[Mapping[str, object]],
+        inventory_snapshot: Mapping[str, Mapping[str, Decimal]],
+    ) -> Mapping[str, Decimal] | None:
+        snapshot: dict[str, dict[str, Decimal]] = {}
+        for existing_symbol, stats in inventory_snapshot.items():
+            if isinstance(existing_symbol, str) and isinstance(stats, Mapping):
+                snapshot[existing_symbol] = dict(stats)
+        snapshot[symbol] = dict(recovered_previous)
+        reconstructed = self._reconstruct_inventory_from_fills(snapshot, fills)
+        if reconstructed is None:
+            return None
+        _, normalized_inventory = reconstructed
+        stats = normalized_inventory.get(symbol)
+        if not isinstance(stats, Mapping):
+            return None
+        return dict(stats)
 
     def _reconstruct_inventory_from_fills(
         self,
