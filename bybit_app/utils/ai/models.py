@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
 
 from ..paths import DATA_DIR
 from ..trade_analytics import ExecutionRecord, load_executions
@@ -214,6 +213,109 @@ def _logit(probability: float) -> float:
     return math.log(probability / (1.0 - probability))
 
 
+def _balanced_sample_weights(labels: np.ndarray) -> np.ndarray:
+    """Return per-sample weights that balance binary classes."""
+
+    total = len(labels)
+    positives = int(labels.sum())
+    negatives = total - positives
+
+    if positives <= 0 or negatives <= 0:
+        raise ValueError("Balanced weights require both classes to be present")
+
+    pos_weight = total / (2.0 * positives)
+    neg_weight = total / (2.0 * negatives)
+    return np.where(labels > 0, pos_weight, neg_weight)
+
+
+def _logistic_loss(
+    weights: np.ndarray,
+    intercept: float,
+    features: np.ndarray,
+    labels: np.ndarray,
+    sample_weights: np.ndarray,
+    l2: float,
+) -> float:
+    linear = intercept + features.dot(weights)
+    # Guard against floating point overflow when exponentiating
+    preds = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
+    preds = np.clip(preds, 1e-8, 1.0 - 1e-8)
+    losses = -(
+        labels * np.log(preds) + (1.0 - labels) * np.log(1.0 - preds)
+    )
+    weighted_loss = (sample_weights * losses).mean()
+    return float(weighted_loss + 0.5 * l2 * float(np.dot(weights, weights)))
+
+
+def _train_logistic_regression(
+    features: np.ndarray,
+    labels: np.ndarray,
+    *,
+    max_iter: int = 500,
+    initial_step: float = 0.2,
+    l2: float = 1e-2,
+    tolerance: float = 1e-6,
+) -> Tuple[np.ndarray, float]:
+    """Train a logistic regression classifier using gradient descent.
+
+    The implementation is intentionally lightweight to avoid heavy SciPy
+    dependencies while remaining numerically stable for small datasets.
+    """
+
+    if features.size == 0:
+        return np.zeros(features.shape[1], dtype=float), 0.0
+
+    weights = np.zeros(features.shape[1], dtype=float)
+    intercept = 0.0
+    sample_weights = _balanced_sample_weights(labels)
+
+    step = float(initial_step)
+    prev_loss = _logistic_loss(weights, intercept, features, labels, sample_weights, l2)
+
+    for _ in range(max_iter):
+        linear = intercept + features.dot(weights)
+        probs = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
+        errors = (probs - labels) * sample_weights
+        grad_weights = features.T.dot(errors) / len(labels) + l2 * weights
+        grad_intercept = float(errors.mean())
+
+        # Backtracking line search for stability
+        current_step = step
+        updated = False
+        while current_step > 1e-4:
+            candidate_weights = weights - current_step * grad_weights
+            candidate_intercept = intercept - current_step * grad_intercept
+            candidate_loss = _logistic_loss(
+                candidate_weights,
+                candidate_intercept,
+                features,
+                labels,
+                sample_weights,
+                l2,
+            )
+            if candidate_loss <= prev_loss:
+                weights = candidate_weights
+                intercept = candidate_intercept
+                step = current_step * 1.05  # slowly increase when successful
+                prev_loss = candidate_loss
+                updated = True
+                break
+            current_step *= 0.5
+
+        if not updated:
+            # Could not improve further; assume convergence
+            break
+
+        max_delta = max(
+            np.max(np.abs(current_step * grad_weights)),
+            abs(current_step * grad_intercept),
+        )
+        if max_delta < tolerance:
+            break
+
+    return weights, float(intercept)
+
+
 def train_market_model(
     *,
     data_dir: Path = DATA_DIR,
@@ -236,10 +338,7 @@ def train_market_model(
         intercept = _logit(probability)
         coefficients = np.zeros(len(MODEL_FEATURES), dtype=float)
     else:
-        model = LogisticRegression(max_iter=200, class_weight="balanced")
-        model.fit(normalized, labels)
-        intercept = float(model.intercept_[0])
-        coefficients = model.coef_[0]
+        coefficients, intercept = _train_logistic_regression(normalized, labels)
 
     payload = _serialize_model(
         coefficients=coefficients,

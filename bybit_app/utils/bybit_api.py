@@ -112,7 +112,31 @@ class BybitAPI:
         last_error: RuntimeError | None = None
 
         for attempt in range(attempts):
-            resp = self._req(method, path, params=params, body=body, signed=signed)
+            try:
+                resp = self._req(method, path, params=params, body=body, signed=signed)
+            except requests.exceptions.HTTPError as exc:
+                response = exc.response
+                status_code = response.status_code if response is not None else None
+                detail = ""
+                if response is not None:
+                    try:
+                        payload = response.json()
+                        if isinstance(payload, Mapping):
+                            detail = str(payload.get("retMsg") or payload.get("ret_message") or "").strip()
+                            if not detail:
+                                detail = str(payload.get("message", "")).strip()
+                    except ValueError:
+                        detail = response.text.strip()
+                    if not detail:
+                        detail = response.text.strip()
+                message = detail or str(exc)
+                if status_code == 401:
+                    raise RuntimeError(
+                        "Bybit authentication failed: please verify API key/secret, permissions, and network selection."
+                        f" ({message})"
+                    ) from exc
+                raise RuntimeError(f"HTTP error {status_code or 'unknown'} while calling {path}: {message}") from exc
+
             if not isinstance(resp, dict):
                 return resp
 
