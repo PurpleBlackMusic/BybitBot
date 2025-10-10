@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from pathlib import Path
 
@@ -169,6 +170,32 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
 def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+
+def test_default_ledger_path_prefers_most_recent(tmp_path: Path) -> None:
+    data_dir = tmp_path / "ai"
+    pnl_dir = data_dir / "pnl"
+    testnet_path = pnl_dir / "executions.testnet.jsonl"
+    mainnet_path = pnl_dir / "executions.mainnet.jsonl"
+
+    for path in (testnet_path, mainnet_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+
+    now = time.time()
+    os.utime(testnet_path, (now - 60, now - 60))
+    os.utime(mainnet_path, (now - 120, now - 120))
+
+    assert ai_models._default_ledger_path(data_dir) == testnet_path
+
+    os.utime(mainnet_path, (now + 60, now + 60))
+
+    assert ai_models._default_ledger_path(data_dir) == mainnet_path
+
+    os.utime(testnet_path, (now + 120, now + 120))
+    os.utime(mainnet_path, (now + 120, now + 120))
+
+    assert ai_models._default_ledger_path(data_dir) == mainnet_path
 
 
 def test_build_training_dataset_emits_recency_weights(tmp_path: Path) -> None:

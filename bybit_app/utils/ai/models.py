@@ -170,15 +170,36 @@ class _SymbolState:
 
 
 def _default_ledger_path(data_dir: Path) -> Path:
-    candidates = (
-        data_dir / "pnl" / "executions.testnet.jsonl",
-        data_dir / "pnl" / "executions.mainnet.jsonl",
-        data_dir / "pnl" / "executions.jsonl",
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[-1]
+    pnl_dir = data_dir / "pnl"
+    legacy_path = pnl_dir / "executions.jsonl"
+    testnet_path = pnl_dir / "executions.testnet.jsonl"
+    mainnet_path = pnl_dir / "executions.mainnet.jsonl"
+
+    existing_network_ledgers = [
+        path for path in (testnet_path, mainnet_path) if path.exists()
+    ]
+
+    if existing_network_ledgers:
+        if len(existing_network_ledgers) == 1:
+            return existing_network_ledgers[0]
+
+        # Both ledgers exist, prefer the most recently updated file.
+        testnet_mtime = testnet_path.stat().st_mtime
+        mainnet_mtime = mainnet_path.stat().st_mtime
+
+        if testnet_mtime > mainnet_mtime:
+            return testnet_path
+        if mainnet_mtime > testnet_mtime:
+            return mainnet_path
+
+        # If mtimes are equal choose the mainnet ledger for production bias.
+        return mainnet_path
+
+    if legacy_path.exists():
+        return legacy_path
+
+    # Default to the mainnet ledger path so future writes land in production.
+    return mainnet_path
 
 
 def build_training_dataset(
