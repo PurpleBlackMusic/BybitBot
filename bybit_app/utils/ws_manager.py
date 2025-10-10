@@ -128,8 +128,12 @@ class WSManager:
     def _fallback_public_to_mainnet(self, reason: str) -> None:
         if not self.s.testnet:
             return
-        self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
-        self._pub_fallback_timestamp = time.time()
+        mainnet_url = "wss://stream.bybit.com/v5/public/spot"
+        if self._pub_url_override != mainnet_url:
+            self._pub_url_override = mainnet_url
+            self._pub_fallback_timestamp = time.time()
+        elif self._pub_fallback_timestamp is None:
+            self._pub_fallback_timestamp = time.time()
         log("ws.public.testnet.network_error", reason=reason)
 
     @staticmethod
