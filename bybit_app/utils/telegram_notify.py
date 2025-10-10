@@ -16,17 +16,26 @@ from .log import log
 class TelegramDispatcher:
     """Asynchronous dispatcher for Telegram notifications."""
 
+    DEFAULT_QUEUE_MAXSIZE = 200
+
     def __init__(
         self,
         http_post: Callable[..., object] | None = None,
         rate_guard: Callable[[], None] | None = None,
+        queue_maxsize: int | None = None,
     ) -> None:
         self._http_post = http_post or requests.post
         self._rate_guard = rate_guard or _rate_guard
-        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        maxsize = queue_maxsize or self.DEFAULT_QUEUE_MAXSIZE
+        if maxsize <= 0:
+            raise ValueError("queue_maxsize must be positive")
+        self._queue_maxsize = maxsize
+        self._queue: "queue.Queue[str | None]" = queue.Queue(maxsize=maxsize)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._overflow_lock = threading.Lock()
+        self._dropped_messages = 0
 
     def enqueue_message(self, text: str) -> None:
         """Schedule message for asynchronous delivery without blocking."""
@@ -35,7 +44,7 @@ class TelegramDispatcher:
             raise TypeError("text must be a string")
 
         self._ensure_thread()
-        self._queue.put_nowait(text)
+        self._put_with_overflow_handling(text)
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Stop dispatcher thread waiting for outstanding work."""
@@ -45,7 +54,7 @@ class TelegramDispatcher:
             return
 
         self._stop_event.set()
-        self._queue.put_nowait(None)
+        self._put_with_overflow_handling(None, record_overflow=False, allow_drop=False)
         thread.join(timeout=timeout)
 
     def _ensure_thread(self) -> None:
@@ -86,6 +95,50 @@ class TelegramDispatcher:
             _send_telegram_http(text, http_post=self._http_post)
         except Exception as exc:  # pragma: no cover - defensive catch for worker loop
             log("telegram.error", error=str(exc))
+
+    def _put_with_overflow_handling(
+        self,
+        item: str | None,
+        *,
+        record_overflow: bool = True,
+        allow_drop: bool = True,
+    ) -> None:
+        while True:
+            try:
+                if allow_drop:
+                    self._queue.put_nowait(item)
+                else:
+                    self._queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                if not allow_drop:
+                    continue
+
+                dropped: str | None
+                try:
+                    dropped = self._queue.get_nowait()
+                except queue.Empty:  # pragma: no cover - defensive guard
+                    time.sleep(0)
+                    continue
+
+                if dropped is None:
+                    # Sentinel should stay at the back of the queue. Skip logging.
+                    continue
+
+                if record_overflow:
+                    self._record_overflow(dropped)
+
+    def _record_overflow(self, dropped: str) -> None:
+        with self._overflow_lock:
+            self._dropped_messages += 1
+            total = self._dropped_messages
+
+        log(
+            "telegram.queue_overflow",
+            dropped_message=dropped,
+            dropped_total=total,
+            queue_maxsize=self._queue_maxsize,
+        )
 
 
 def send_telegram(text: str):
