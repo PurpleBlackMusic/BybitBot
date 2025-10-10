@@ -283,6 +283,64 @@ def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch)
     assert result is True
 
 
+def test_execute_tp_plan_counts_success_after_reprice(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    class DummyAPI:
+        def __init__(self):
+            self.calls: list[dict[str, object]] = []
+
+        def place_order(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise RuntimeError("Bybit error 170372: price too high")
+
+    api = DummyAPI()
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {
+            "max_price": Decimal("100"),
+            "tick_size": Decimal("0.1"),
+            "min_order_amt": Decimal("5"),
+        },
+    )
+
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        notifications.append,
+    )
+
+    plan = [
+        {
+            "qty_text": "1",
+            "price_text": "120",
+            "profit_labels": ["test"],
+        }
+    ]
+
+    prepared = manager._prepare_tp_payloads("BTCUSDT", plan)
+    assert len(prepared) == 1
+
+    on_success_calls: list[int] = []
+
+    result = manager._execute_tp_plan(
+        api,
+        "BTCUSDT",
+        prepared,
+        on_first_success=lambda: on_success_calls.append(len(api.calls)),
+    )
+
+    assert result is True
+    assert notifications == []
+    assert len(api.calls) == 2
+    assert api.calls[1]["price"] == "100.0"
+    assert on_success_calls == [2]
+
+
 def test_previous_stats_from_ledger_retries_full_scan_on_limited_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
