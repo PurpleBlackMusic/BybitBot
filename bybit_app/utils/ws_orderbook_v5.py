@@ -39,13 +39,31 @@ class WSOrderbookV5:
                 verify_ssl = bool(getattr(settings, "verify_ssl", True))
             cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
             sslopt = {"cert_reqs": cert_reqs}
-            ws = websocket.WebSocketApp(self.url,
-                on_open=lambda w: self._on_open(w, topics),
-                on_message=self._on_msg,
-                on_error=lambda w, e: log("ws.orderbook.error", err=str(e)),
-                on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m))
-            self._ws = ws
-            ws.run_forever(sslopt=sslopt)
+            attempt = 0
+            backoff = 1.0
+            max_backoff = 60.0
+            while not self._stop:
+                attempt += 1
+                try:
+                    ws = websocket.WebSocketApp(
+                        self.url,
+                        on_open=lambda w: self._on_open(w, topics),
+                        on_message=self._on_msg,
+                        on_error=lambda w, e: log("ws.orderbook.error", err=str(e)),
+                        on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m),
+                    )
+                    self._ws = ws
+                    ws.run_forever(sslopt=sslopt)
+                except Exception as e:
+                    log("ws.orderbook.run_err", err=str(e))
+                finally:
+                    self._ws = None
+                if self._stop:
+                    break
+                sleep_for = min(backoff, max_backoff)
+                log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2, max_backoff)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         return True
