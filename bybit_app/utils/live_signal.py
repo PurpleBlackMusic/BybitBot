@@ -108,14 +108,38 @@ class LiveSignalFetcher:
         except Exception as exc:
             raise LiveSignalError(f"API клиент недоступен: {exc}") from exc
 
+        def _reuse_cached_status() -> Optional[Dict[str, object]]:
+            if self._cached_status is None:
+                return None
+
+            max_age = self.cache_ttl + self.stale_grace
+            if max_age <= 0:
+                return None
+
+            if now - self._cache_timestamp <= max_age:
+                cached = copy.deepcopy(self._cached_status)
+                cached["status_source"] = "live_cached"
+                return cached
+
+            return None
+
         try:
             opportunities = self._scan_market(settings, api)
         except LiveSignalError:
+            cached_status = _reuse_cached_status()
+            if cached_status is not None:
+                return cached_status
             raise
         except Exception as exc:
+            cached_status = _reuse_cached_status()
+            if cached_status is not None:
+                return cached_status
             raise LiveSignalError(f"Не удалось получить рыночные данные: {exc}") from exc
 
         if not opportunities:
+            cached_status = _reuse_cached_status()
+            if cached_status is not None:
+                return cached_status
             raise LiveSignalError(
                 "Рыночный сканер не вернул подходящих возможностей."
             )
