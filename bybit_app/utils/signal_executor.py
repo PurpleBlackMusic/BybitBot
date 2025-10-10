@@ -1815,6 +1815,7 @@ class SignalExecutor:
 
         filled_base_total = self._collect_filled_base_total(
             symbol,
+            settings=settings,
             order_id=order_id,
             order_link_id=order_link_id,
             executed_base=executed_base_raw,
@@ -2151,6 +2152,7 @@ class SignalExecutor:
         self,
         symbol: str,
         *,
+        settings: Settings,
         order_id: Optional[str],
         order_link_id: Optional[str],
         executed_base: Decimal,
@@ -2170,6 +2172,7 @@ class SignalExecutor:
 
         ledger_total = self._filled_base_from_ledger(
             symbol,
+            settings=settings,
             order_id=order_id,
             order_link_id=order_link_id,
             rows=ledger_rows,
@@ -2635,6 +2638,7 @@ class SignalExecutor:
         self,
         symbol: str,
         *,
+        settings: Settings,
         order_id: Optional[str],
         order_link_id: Optional[str],
         rows: Optional[Sequence[Mapping[str, object]]] = None,
@@ -2644,7 +2648,7 @@ class SignalExecutor:
 
         if rows is None:
             try:
-                rows = read_ledger(2000)
+                rows = read_ledger(2000, settings=settings)
             except Exception:
                 return Decimal("0")
         if not rows:

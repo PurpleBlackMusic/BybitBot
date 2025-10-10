@@ -967,6 +967,53 @@ def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyP
     assert Decimal(execution.get("filled_base_total")) == Decimal("0.5")
 
 
+def test_collect_filled_base_total_passes_settings_to_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(testnet=False)
+    bot = StubBot(summary, settings)
+
+    executor = SignalExecutor(bot)
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_filled_base_from_private_ws",
+        lambda self, symbol, **_: Decimal("0"),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_read_ledger(
+        n: int | None = 2000,
+        *,
+        settings: object | None = None,
+        **kwargs: object,
+    ) -> list[Mapping[str, object]]:
+        captured["n"] = n
+        captured["settings"] = settings
+        captured["kwargs"] = kwargs
+        return []
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+
+    total = executor._collect_filled_base_total(
+        "BTCUSDT",
+        settings=settings,
+        order_id="order-1",
+        order_link_id=None,
+        executed_base=Decimal("0"),
+        ws_rows=[],
+        ledger_rows=None,
+    )
+
+    assert total == Decimal("0")
+    assert captured["n"] == 2000
+    assert captured["settings"] is settings
+    assert isinstance(captured["settings"], Settings)
+    assert captured["settings"].testnet is False
+
+
 def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
