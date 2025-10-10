@@ -23,7 +23,7 @@ from .realtime_cache import get_realtime_cache
 from .spot_pnl import spot_inventory_and_pnl
 from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
-from .telegram_notify import send_telegram
+from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
 
 
@@ -819,8 +819,8 @@ class WSManager:
             )
 
             try:
-                send_telegram(message)
-            except Exception as exc:  # pragma: no cover - network/HTTP errors
+                enqueue_telegram_message(message)
+            except Exception as exc:  # pragma: no cover - defensive guard
                 log(
                     "telegram.trade.error",
                     symbol=symbol_upper,

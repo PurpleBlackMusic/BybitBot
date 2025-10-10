@@ -191,7 +191,11 @@ def test_ws_manager_send_sell_fill_notification(monkeypatch: pytest.MonkeyPatch)
         sent["message"] = message
 
     monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
-    monkeypatch.setattr(ws_manager_module, "send_telegram", fake_send_telegram)
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        fake_send_telegram,
+    )
 
     fill_row = {
         "symbol": "ETHUSDT",

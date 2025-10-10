@@ -35,7 +35,7 @@ from .spot_market import (
 from .pnl import read_ledger
 from .spot_pnl import spot_inventory_and_pnl
 from .symbols import ensure_usdt_symbol
-from .telegram_notify import send_telegram
+from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
 from .ws_manager import manager as ws_manager
 
@@ -1265,7 +1265,7 @@ class SignalExecutor:
         metadata["message"] = message_text
 
         try:
-            send_telegram(message_text)
+            enqueue_telegram_message(message_text)
         except Exception as exc:  # pragma: no cover - defensive guard
             log("guardian.auto.force_exit.telegram_error", err=str(exc))
 
@@ -2063,8 +2063,8 @@ class SignalExecutor:
             code=code_text,
         )
         try:
-            send_telegram(notify_text)
-        except Exception as exc:  # pragma: no cover - network/HTTP errors
+            enqueue_telegram_message(notify_text)
+        except Exception as exc:  # pragma: no cover - defensive guard
             log(
                 "telegram.validation.error",
                 symbol=symbol_text,
@@ -2245,7 +2245,7 @@ class SignalExecutor:
             price=str(avg_price),
             notional=str(executed_quote),
         )
-        send_telegram(message)
+        enqueue_telegram_message(message)
 
     def _build_tp_execution_stats(
         self,
