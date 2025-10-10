@@ -1644,7 +1644,7 @@ class SignalExecutor:
                 details = exc.details
 
             price_limit_hit = bool(details.get("price_limit_hit")) if details else False
-            if exc.code == "insufficient_liquidity" and price_limit_hit:
+            if price_limit_hit and exc.code in {"insufficient_liquidity", "price_deviation"}:
                 backoff_state = self._record_price_limit_hit(
                     symbol,
                     details,

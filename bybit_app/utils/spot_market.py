@@ -525,10 +525,14 @@ def _plan_limit_ioc_order(
             if price - max_price > _TOLERANCE_MARGIN:
                 price_limit_hit = True
                 break
+            if max_price - price <= _TOLERANCE_MARGIN:
+                price_limit_hit = True
         if side_normalised == "sell" and min_price is not None:
             if min_price - price > _TOLERANCE_MARGIN:
                 price_limit_hit = True
                 break
+            if price - min_price <= _TOLERANCE_MARGIN:
+                price_limit_hit = True
 
         worst_price = price
         if target_base is not None:
@@ -1648,6 +1652,36 @@ def prepare_spot_market_order(
         deviation=price_deviation,
     )
 
+    instrument_price_cap = _to_decimal(limit_map.get("max_price") or Decimal("0"))
+    if instrument_price_cap <= 0:
+        instrument_price_cap = None
+    instrument_price_floor = _to_decimal(limit_map.get("min_price") or Decimal("0"))
+    if instrument_price_floor <= 0:
+        instrument_price_floor = None
+
+    instrument_ceiling_enforced = False
+    instrument_floor_enforced = False
+
+    if instrument_price_cap is not None:
+        if max_price_allowed is None or instrument_price_cap < max_price_allowed:
+            max_price_allowed = instrument_price_cap
+            instrument_ceiling_enforced = True
+        elif (
+            max_price_allowed is not None
+            and abs(instrument_price_cap - max_price_allowed) <= _TOLERANCE_MARGIN
+        ):
+            instrument_ceiling_enforced = True
+
+    if instrument_price_floor is not None:
+        if min_price_allowed is None or instrument_price_floor > min_price_allowed:
+            min_price_allowed = instrument_price_floor
+            instrument_floor_enforced = True
+        elif (
+            min_price_allowed is not None
+            and abs(instrument_price_floor - min_price_allowed) <= _TOLERANCE_MARGIN
+        ):
+            instrument_floor_enforced = True
+
     asks, bids = _orderbook_snapshot(api, symbol)
     worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
         asks=asks,
@@ -1674,6 +1708,54 @@ def prepare_spot_market_order(
     elif target_base is not None:
         qty_base_raw = target_base
 
+    def _enforce_price_band() -> None:
+        if limit_price <= 0:
+            return
+
+        if (
+            side_normalised == "buy"
+            and max_price_allowed is not None
+            and limit_price - max_price_allowed > _TOLERANCE_MARGIN
+        ):
+            details: Dict[str, object] = {
+                "limit_price": _format_decimal(limit_price),
+                "side": side_normalised,
+            }
+            if price_hint is not None and not instrument_ceiling_enforced:
+                details["mark_price"] = _format_decimal(price_hint)
+                details["max_allowed"] = _format_decimal(max_price_allowed)
+            else:
+                details["price_cap"] = _format_decimal(max_price_allowed)
+                details["price_limit_hit"] = True
+
+            raise OrderValidationError(
+                "Ожидаемая цена превышает допустимый предел для инструмента.",
+                code="price_deviation",
+                details=details,
+            )
+
+        if (
+            side_normalised == "sell"
+            and min_price_allowed is not None
+            and min_price_allowed - limit_price > _TOLERANCE_MARGIN
+        ):
+            details = {
+                "limit_price": _format_decimal(limit_price),
+                "side": side_normalised,
+            }
+            if price_hint is not None and not instrument_floor_enforced:
+                details["mark_price"] = _format_decimal(price_hint)
+                details["min_allowed"] = _format_decimal(min_price_allowed)
+            else:
+                details["price_floor"] = _format_decimal(min_price_allowed)
+                details["price_limit_hit"] = True
+
+            raise OrderValidationError(
+                "Ожидаемая цена ниже допустимого предела для инструмента.",
+                code="price_deviation",
+                details=details,
+            )
+
     def _apply_validation_result(result: validators.SpotValidationResult) -> None:
         nonlocal validated, limit_price, qty_base, limit_notional
 
@@ -1693,6 +1775,8 @@ def prepare_spot_market_order(
         limit_price = price_candidate
         qty_base = qty_candidate
         limit_notional = result.notional
+
+        _enforce_price_band()
 
     validated = validators.validate_spot_rules(
         instrument=instrument_raw,
@@ -1956,34 +2040,7 @@ def prepare_spot_market_order(
                 },
             )
 
-    if (
-        max_price_allowed is not None
-        and limit_price - max_price_allowed > _TOLERANCE_MARGIN
-    ):
-        raise OrderValidationError(
-            "Ожидаемая цена превышает допустимое отклонение от mark.",
-            code="price_deviation",
-            details={
-                "limit_price": _format_decimal(limit_price),
-                "mark_price": _format_decimal(price_hint),
-                "max_allowed": _format_decimal(max_price_allowed),
-                "side": side_normalised,
-            },
-        )
-    if (
-        min_price_allowed is not None
-        and min_price_allowed - limit_price > _TOLERANCE_MARGIN
-    ):
-        raise OrderValidationError(
-            "Ожидаемая цена ниже допустимого отклонения от mark.",
-            code="price_deviation",
-            details={
-                "limit_price": _format_decimal(limit_price),
-                "mark_price": _format_decimal(price_hint),
-                "min_allowed": _format_decimal(min_price_allowed),
-                "side": side_normalised,
-            },
-        )
+    _enforce_price_band()
 
     if min_amount > 0 and effective_notional < min_amount:
         raise OrderValidationError(
