@@ -20,6 +20,7 @@ from .envs import (
     get_settings,
     creds_ok,
 )
+from .settings_loader import call_get_settings
 from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
@@ -3078,7 +3079,7 @@ class SignalExecutor:
         if isinstance(candidate, Settings):
             return candidate
 
-        return get_settings(force_reload=True)
+        return call_get_settings(get_settings, force_reload=True)
 
     def _apply_runtime_guards(self, settings: Settings) -> Optional[ExecutionResult]:
         guard = self._daily_loss_guard(settings)

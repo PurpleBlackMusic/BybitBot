@@ -139,6 +139,16 @@ def patch_tp_sources(
     )
 
 
+def test_signal_executor_resolves_stubbed_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    sentinel = Settings(ai_enabled=True)
+    monkeypatch.setattr(signal_executor_module, "get_settings", lambda: sentinel)
+
+    stub_bot = type("BotStub", (), {"settings": "not-settings"})()
+    executor = SignalExecutor(stub_bot)
+
+    assert executor._resolve_settings() is sentinel
+
+
 def test_signal_executor_skips_when_not_actionable() -> None:
     bot = StubBot({"actionable": False}, Settings(ai_enabled=True))
     executor = SignalExecutor(bot)
