@@ -47,7 +47,7 @@ def test_hold_duration_and_fraction_features() -> None:
 
     realised = state.realise_sell(sell_record)
     assert realised is not None
-    vector, _ = realised
+    vector, *_ = realised
     assert len(vector) == len(MODEL_FEATURES)
     features = dict(zip(MODEL_FEATURES, vector))
 
@@ -56,6 +56,35 @@ def test_hold_duration_and_fraction_features() -> None:
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)
+
+
+def test_multiframe_change_differs_from_directional() -> None:
+    state = _SymbolState()
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    state.register_buy(_record(side="buy", qty=1.0, price=50.0, timestamp=start))
+    state.register_buy(
+        _record(side="buy", qty=9.0, price=110.0, timestamp=start + timedelta(minutes=1))
+    )
+
+    sell_record = _record(
+        side="sell",
+        qty=10.0,
+        price=120.0,
+        timestamp=start + timedelta(minutes=2),
+    )
+
+    realised = state.realise_sell(sell_record)
+    assert realised is not None
+    vector, *_ = realised
+    features = dict(zip(MODEL_FEATURES, vector))
+
+    directional = features["directional_change_pct"]
+    multiframe = features["multiframe_change_pct"]
+
+    assert directional == pytest.approx((120.0 - 104.0) / 104.0 * 100.0, rel=1e-4)
+    assert multiframe == pytest.approx((120.0 - 80.0) / 80.0 * 100.0, rel=1e-4)
+    assert abs(multiframe - directional) > 1.0
 
 
 def test_scaling_output_matches_feature_count() -> None:
