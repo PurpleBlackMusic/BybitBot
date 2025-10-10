@@ -520,16 +520,16 @@ def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str
             elif side == "sell":
                 payload["spot_pnl"] += px * qty
                 payload["notional_sell"] += px * qty
-            payload["spot_fees"] += abs(fee)
-            payload["fees"] += abs(fee)
+            payload["spot_fees"] += fee
+            payload["fees"] += fee
         else:
             # для фьючей пока просто аккумулируем нотации и комиссию (точный PnL требует позиций, оставим в v7b)
             if side == "buy":
                 payload["notional_buy"] += px * qty
             else:
                 payload["notional_sell"] += px * qty
-            payload["fees"] += abs(fee)
-            payload["derivatives_fees"] += abs(fee)
+            payload["fees"] += fee
+            payload["derivatives_fees"] += fee
 
     for day_payload in by_day.values():
         for sym_payload in day_payload.values():
@@ -541,7 +541,7 @@ def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str
             sym_payload["categories"] = sorted(categories)
             spot_pnl = sym_payload.get("spot_pnl") or 0.0
             spot_fees = sym_payload.get("spot_fees") or 0.0
-            sym_payload["spot_net"] = spot_pnl - abs(spot_fees)
+            sym_payload["spot_net"] = spot_pnl - spot_fees
     return by_day
 
 
