@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import sys
 import ssl
+import json
 
 import pytest
 import threading
@@ -110,4 +111,73 @@ def test_ws_orderbook_v5_reconnects_until_stopped(monkeypatch):
     assert ob._ws is None
     assert stop_event.is_set()
     assert sleep_calls, "backoff sleep was not invoked"
+
+
+def test_ws_orderbook_v5_updates_topics_without_restarting(monkeypatch):
+    ready_event = threading.Event()
+    stop_event = threading.Event()
+    sent_payloads: list[str] = []
+
+    class _TrackingWebSocketApp:
+        instances: list["_TrackingWebSocketApp"] = []
+
+        def __init__(self, url, **kwargs):
+            self.url = url
+            self.on_open = kwargs.get("on_open")
+            self.on_message = kwargs.get("on_message")
+            self.on_error = kwargs.get("on_error")
+            self.on_close = kwargs.get("on_close")
+            self.sent: list[str] = []
+            _TrackingWebSocketApp.instances.append(self)
+
+        def run_forever(self, sslopt=None):
+            self.sslopt = sslopt or {}
+            if self.on_open:
+                self.on_open(self)
+            ready_event.set()
+            stop_event.wait()
+
+        def send(self, payload: str):
+            self.sent.append(payload)
+            sent_payloads.append(payload)
+
+        def close(self):
+            stop_event.set()
+            if self.on_close:
+                self.on_close(self, None, None)
+
+    dummy_module = SimpleNamespace(WebSocketApp=_TrackingWebSocketApp)
+    monkeypatch.setitem(sys.modules, "websocket", dummy_module)
+
+    _TrackingWebSocketApp.instances.clear()
+    sent_payloads.clear()
+
+    ob = WSOrderbookV5()
+
+    assert ob.start(["BTCUSDT"]) is True
+
+    assert ready_event.wait(timeout=1), "websocket thread did not call on_open"
+    first_thread = ob._thread
+    assert first_thread is not None and first_thread.is_alive()
+    assert len(_TrackingWebSocketApp.instances) == 1
+
+    initial_payloads = [json.loads(msg) for msg in sent_payloads]
+    assert initial_payloads and initial_payloads[-1]["op"] == "subscribe"
+    assert initial_payloads[-1]["args"] == [f"orderbook.{ob.levels}.BTCUSDT"]
+
+    sent_payloads.clear()
+
+    assert ob.start(["ETHUSDT"]) is True
+    assert ob._thread is first_thread
+    assert len(_TrackingWebSocketApp.instances) == 1
+
+    updated_payloads = [json.loads(msg) for msg in sent_payloads]
+    assert [p["op"] for p in updated_payloads] == ["unsubscribe", "subscribe"]
+    assert updated_payloads[0]["args"] == [f"orderbook.{ob.levels}.BTCUSDT"]
+    assert updated_payloads[1]["args"] == [f"orderbook.{ob.levels}.ETHUSDT"]
+
+    ob.stop()
+    assert stop_event.wait(timeout=1)
+    first_thread.join(timeout=1)
+    assert not first_thread.is_alive()
 
