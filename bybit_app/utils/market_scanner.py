@@ -241,9 +241,6 @@ def _model_feature_vector(
     turnover: Optional[float],
     volatility_pct: Optional[float],
     volume_impulse: Mapping[str, Optional[float]] | None,
-    depth_imbalance: Optional[float],
-    spread_bps: Optional[float],
-    correlation_strength: Optional[float],
 ) -> Dict[str, float]:
     direction = 0
     if trend == "buy":
@@ -277,30 +274,15 @@ def _model_feature_vector(
 
     best_impulse = _best_volume_impulse(volume_impulse if isinstance(volume_impulse, Mapping) else None)
 
-    depth_value = 0.0
-    if isinstance(depth_imbalance, (int, float)):
-        depth_value = float(depth_imbalance)
-        if direction != 0:
-            depth_value *= direction
-
-    spread_value = 0.0
-    if isinstance(spread_bps, (int, float)):
-        spread_value = float(spread_bps)
-
-    correlation_value = 0.0
-    if isinstance(correlation_strength, (int, float)):
-        correlation_value = float(correlation_strength)
-
     return {
         "directional_change_pct": signed_change,
         "multiframe_change_pct": multi_tf_value,
         "turnover_log": turnover_log,
         "volatility_pct": vol_value,
         "volume_impulse": best_impulse,
-        "depth_imbalance": depth_value,
-        "spread_bps": spread_value,
-        "correlation_strength": correlation_value,
         "maker_flag": 0.0,
+        "hold_minutes": 0.0,
+        "position_closed_fraction": 0.0,
     }
 
 
@@ -484,9 +466,6 @@ def scan_market_opportunities(
             turnover=turnover,
             volatility_pct=volatility_pct,
             volume_impulse=volume_impulse if isinstance(volume_impulse, Mapping) else None,
-            depth_imbalance=depth_imbalance,
-            spread_bps=spread_bps,
-            correlation_strength=correlation_strength,
         )
 
         if model is not None:

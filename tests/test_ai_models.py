@@ -47,12 +47,13 @@ def test_hold_duration_and_fraction_features() -> None:
 
     realised = state.realise_sell(sell_record)
     assert realised is not None
-    vector, _ = realised
+    vector, _, _ = realised
     assert len(vector) == len(MODEL_FEATURES)
     features = dict(zip(MODEL_FEATURES, vector))
 
     assert features["hold_minutes"] == pytest.approx(14.0, abs=1e-6)
     assert features["position_closed_fraction"] == pytest.approx(2.5 / 3.0, abs=1e-6)
+    assert set(features) == set(MODEL_FEATURES)
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)
@@ -65,3 +66,9 @@ def test_scaling_output_matches_feature_count() -> None:
     assert normalized.shape[1] == len(MODEL_FEATURES)
     assert means.shape[0] == len(MODEL_FEATURES)
     assert stds.shape[0] == len(MODEL_FEATURES)
+
+
+def test_removed_constant_features() -> None:
+    assert "depth_imbalance" not in MODEL_FEATURES
+    assert "spread_bps" not in MODEL_FEATURES
+    assert "correlation_strength" not in MODEL_FEATURES

@@ -13,10 +13,9 @@ FEATURE_NAMES = [
     "turnover_log",
     "volatility_pct",
     "volume_impulse",
-    "depth_imbalance",
-    "spread_bps",
-    "correlation_strength",
     "maker_flag",
+    "hold_minutes",
+    "position_closed_fraction",
 ]
 
 
