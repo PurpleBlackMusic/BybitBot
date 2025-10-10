@@ -162,6 +162,70 @@ def test_public_on_error_403_triggers_fallback(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
+def test_public_fallback_eventually_retries_testnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager.s.testnet = True
+
+    fake_time = {"now": 1_000.0}
+
+    def fake_time_fn() -> float:
+        return fake_time["now"]
+
+    monkeypatch.setattr(ws_manager_module.time, "time", fake_time_fn)
+    monkeypatch.setattr(
+        ws_manager_module,
+        "call_get_settings",
+        lambda getter, force_reload=True: manager.s,
+    )
+
+    manager._fallback_public_to_mainnet("network hiccup")
+    assert manager._pub_url_override == "wss://stream.bybit.com/v5/public/spot"
+
+    connection_urls: list[str] = []
+
+    class DummyWebSocketApp:
+        def __init__(
+            self,
+            url: str,
+            on_open: object,
+            on_message: object,
+            on_error: Callable[[object, object], None],
+            on_close: object,
+        ) -> None:
+            connection_urls.append(url)
+
+        def run_forever(self, sslopt: Optional[dict[str, object]] = None) -> None:
+            manager._pub_running = False
+
+    monkeypatch.setattr(
+        ws_manager_module.websocket,
+        "WebSocketApp",
+        DummyWebSocketApp,
+    )
+
+    class ImmediateThread:
+        def __init__(self, target: Callable[[], None], daemon: bool) -> None:
+            self._target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr(ws_manager_module.threading, "Thread", ImmediateThread)
+
+    manager.start_public(subs=())
+    assert connection_urls[-1] == "wss://stream.bybit.com/v5/public/spot"
+
+    fake_time["now"] += manager._PUBLIC_FALLBACK_RETRY_DELAY + 1.0
+
+    manager.start_public(subs=())
+
+    assert connection_urls[-1] == "wss://stream-testnet.bybit.com/v5/public/spot"
+    assert manager._pub_url_override is None
+
+
 def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
 

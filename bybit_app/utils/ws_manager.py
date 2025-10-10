@@ -52,6 +52,7 @@ class WSManager:
     """Минимальный, но стабильный менеджер WS с авто‑пингом и переподключением."""
 
     _LEDGER_RECOVERY_LIMIT = 800
+    _PUBLIC_FALLBACK_RETRY_DELAY = 60.0
 
     def __init__(self):
         self.s = get_settings()
@@ -65,6 +66,7 @@ class WSManager:
         self._pub_ping_thread: Optional[threading.Thread] = None
         self._pub_url_override: Optional[str] = None
         self._pub_current_url: Optional[str] = None
+        self._pub_fallback_timestamp: Optional[float] = None
 
         # private
         self._priv: Optional[WSPrivateV5] = None
@@ -99,12 +101,14 @@ class WSManager:
         except Exception as e:  # pragma: no cover - defensive, rare
             log("ws.settings.refresh.error", err=str(e))
         current_testnet = getattr(self.s, "testnet", None)
-        if (
-            self._pub_url_override is not None
-            and previous_testnet is False
-            and current_testnet is True
-        ):
-            self._pub_url_override = None
+        if not current_testnet:
+            self._pub_fallback_timestamp = None
+        elif self._pub_url_override is not None:
+            retry_delay = getattr(self, "_PUBLIC_FALLBACK_RETRY_DELAY", 60.0)
+            now = time.time()
+            if self._pub_fallback_timestamp is None or now - self._pub_fallback_timestamp >= retry_delay:
+                self._pub_url_override = None
+                self._pub_fallback_timestamp = None
         self._last_settings_testnet = current_testnet
 
     def _handle_private_beat(self) -> None:
@@ -125,6 +129,7 @@ class WSManager:
         if not self.s.testnet:
             return
         self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
+        self._pub_fallback_timestamp = time.time()
         log("ws.public.testnet.network_error", reason=reason)
 
     @staticmethod
