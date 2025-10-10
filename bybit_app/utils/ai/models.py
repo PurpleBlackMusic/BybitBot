@@ -27,9 +27,6 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "depth_imbalance",
     "spread_bps",
     "correlation_strength",
-    "maker_flag",
-    "hold_minutes",
-    "position_closed_fraction",
 )
 
 
@@ -74,7 +71,6 @@ class _SymbolState:
         "position_qty",
         "recent_prices",
         "recent_qtys",
-        "recent_buys",
         "price_history",
     )
 
@@ -83,7 +79,6 @@ class _SymbolState:
         self.position_qty = 0.0
         self.recent_prices: List[float] = []
         self.recent_qtys: List[float] = []
-        self.recent_buys: List[Tuple[float, Optional[float]]] = []
         self.price_history: Deque[float] = deque(maxlen=200)
 
     def register_buy(self, record: ExecutionRecord) -> None:
@@ -96,10 +91,6 @@ class _SymbolState:
         else:
             self.avg_cost = 0.0
         self._remember(record.price, abs(record.qty))
-        timestamp = record.timestamp.timestamp() if record.timestamp else None
-        self.recent_buys.append((abs(record.qty), timestamp))
-        if len(self.recent_buys) > 200:
-            self.recent_buys = self.recent_buys[-200:]
 
     def realise_sell(
         self, record: ExecutionRecord
@@ -116,30 +107,6 @@ class _SymbolState:
         change_pct = 0.0
         if self.avg_cost > 1e-9:
             change_pct = (record.price - self.avg_cost) / self.avg_cost * 100.0
-
-        sell_timestamp = record.timestamp.timestamp() if record.timestamp else None
-        qty_remaining = qty_to_close
-        weighted_minutes = 0.0
-        tracked_qty = 0.0
-        while qty_remaining > 1e-9 and self.recent_buys:
-            lot_qty, lot_ts = self.recent_buys[0]
-            take = min(lot_qty, qty_remaining)
-            if lot_ts is not None and sell_timestamp is not None:
-                duration_minutes = max((sell_timestamp - lot_ts) / 60.0, 0.0)
-                weighted_minutes += duration_minutes * take
-                tracked_qty += take
-            lot_qty -= take
-            qty_remaining -= take
-            if lot_qty <= 1e-9:
-                self.recent_buys.pop(0)
-            else:
-                self.recent_buys[0] = (lot_qty, lot_ts)
-
-        avg_hold_minutes = weighted_minutes / tracked_qty if tracked_qty > 1e-9 else 0.0
-        prior_position = self.position_qty if self.position_qty > 1e-9 else qty_to_close
-        position_closed_fraction = 0.0
-        if prior_position > 1e-9:
-            position_closed_fraction = min(qty_to_close / prior_position, 1.0)
 
         volatility_pct = 0.0
         if self.recent_prices:
@@ -167,9 +134,6 @@ class _SymbolState:
         feature_map["turnover_log"] = math.log10(record.notional + 1.0)
         feature_map["volatility_pct"] = volatility_pct
         feature_map["volume_impulse"] = volume_impulse
-        feature_map["maker_flag"] = 1.0 if record.is_maker else 0.0
-        feature_map["hold_minutes"] = avg_hold_minutes
-        feature_map["position_closed_fraction"] = position_closed_fraction
 
         vector = feature_vector_from_map(feature_map)
 
@@ -177,7 +141,6 @@ class _SymbolState:
         if self.position_qty <= 1e-9:
             self.position_qty = 0.0
             self.avg_cost = 0.0
-            self.recent_buys.clear()
 
         self._remember(record.price, abs(record.qty))
         return vector, realized_pnl, record.timestamp
