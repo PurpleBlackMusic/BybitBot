@@ -1143,6 +1143,70 @@ class WSManager:
             return True
         return False
 
+    @staticmethod
+    def _normalise_tp_signature(
+        signature: Iterable[tuple[object, object]] | None,
+    ) -> tuple[tuple[str, str], ...]:
+        normalised: list[tuple[str, str]] = []
+        if signature is None:
+            return tuple()
+        for price, qty in signature:
+            price_text = str(price or "").strip()
+            qty_text = str(qty or "").strip()
+            if not price_text or not qty_text:
+                continue
+            normalised.append((price_text, qty_text))
+        return tuple(normalised)
+
+    def register_tp_ladder_plan(
+        self,
+        symbol: str,
+        *,
+        signature: Iterable[tuple[object, object]] | None,
+        avg_cost: object = None,
+        qty: object = None,
+        status: str = "active",
+        source: str = "executor",
+    ) -> None:
+        symbol_key = str(symbol or "").strip().upper()
+        normalised_signature = self._normalise_tp_signature(signature)
+        if not symbol_key or not normalised_signature:
+            return
+        avg_cost_decimal = self._decimal_from(avg_cost)
+        qty_decimal = self._decimal_from(qty)
+        payload: dict[str, object] = {
+            "signature": normalised_signature,
+            "avg_cost": avg_cost_decimal,
+            "qty": qty_decimal,
+            "updated_ts": time.time(),
+            "status": status,
+            "source": source,
+        }
+        with self._fill_lock:
+            self._tp_ladder_plan[symbol_key] = payload
+
+    def clear_tp_ladder_plan(
+        self,
+        symbol: str,
+        *,
+        signature: Iterable[tuple[object, object]] | None = None,
+    ) -> None:
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return
+        with self._fill_lock:
+            if signature is not None:
+                existing = self._tp_ladder_plan.get(symbol_key)
+                if not isinstance(existing, Mapping):
+                    return
+                current_signature = existing.get("signature")
+                if (
+                    not isinstance(current_signature, tuple)
+                    or self._normalise_tp_signature(signature) != current_signature
+                ):
+                    return
+            self._tp_ladder_plan.pop(symbol_key, None)
+
     def _regenerate_tp_ladder(
         self,
         row: dict,
@@ -1297,12 +1361,14 @@ class WSManager:
 
         self._cancel_existing_tp_orders(api, symbol)
         self._execute_tp_plan(api, symbol, plan)
-        self._tp_ladder_plan[symbol] = {
-            "signature": signature,
-            "avg_cost": avg_cost,
-            "qty": available_qty,
-            "updated_ts": time.time(),
-        }
+        self.register_tp_ladder_plan(
+            symbol,
+            signature=signature,
+            avg_cost=avg_cost,
+            qty=available_qty,
+            status="active",
+            source="ws_manager",
+        )
 
     def private_snapshot(self) -> Mapping[str, object] | None:
         cache = self._realtime_cache
