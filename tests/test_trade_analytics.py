@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,7 +26,8 @@ def test_load_executions_normalises_json(tmp_path: Path) -> None:
             "execPrice": "27000",
             "execQty": "0.01",
             "execTime": now.timestamp(),
-            "execFee": "0.1",
+            "execFee": "0.00001",
+            "feeCurrency": "BTC",
             "isMaker": True,
         },
         {
@@ -43,6 +45,8 @@ def test_load_executions_normalises_json(tmp_path: Path) -> None:
     assert records[0].symbol == "BTCUSDT"
     assert records[0].side == "buy"
     assert records[0].notional == 270.0
+    assert records[0].raw_fee == pytest.approx(0.00001)
+    assert records[0].fee == pytest.approx(0.27)
     assert records[0].is_maker is True
     assert records[0].timestamp is not None
 

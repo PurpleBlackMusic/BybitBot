@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 from .file_io import tail_lines
-from .pnl import _ledger_path_for
+from .pnl import _ledger_path_for, execution_fee_in_quote
 
 
 @dataclass(frozen=True)
@@ -21,8 +21,9 @@ class ExecutionRecord:
     qty: float
     price: float
     fee: float
-    is_maker: Optional[bool]
-    timestamp: Optional[datetime]
+    raw_fee: float = 0.0
+    is_maker: Optional[bool] = None
+    timestamp: Optional[datetime] = None
 
     @property
     def notional(self) -> float:
@@ -85,12 +86,15 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
     if not symbol:
         return None
 
+    raw_fee = _to_float(payload.get("execFee") or payload.get("fee"))
+
     return ExecutionRecord(
         symbol=symbol,
         side=side,
         qty=qty,
         price=price,
-        fee=_to_float(payload.get("execFee") or payload.get("fee")),
+        fee=execution_fee_in_quote(payload, price=price),
+        raw_fee=raw_fee,
         is_maker=payload.get("isMaker") if isinstance(payload.get("isMaker"), bool) else None,
         timestamp=_parse_timestamp(
             payload.get("execTime")
