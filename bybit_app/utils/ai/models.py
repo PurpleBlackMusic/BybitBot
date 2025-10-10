@@ -30,6 +30,20 @@ MODEL_FEATURES: Tuple[str, ...] = (
 )
 
 
+def liquidity_feature(value: float) -> float:
+    """Return the liquidity feature value for a given quote notional.
+
+    The model expects liquidity inputs expressed in quote currency units of a
+    *single* trade.  Consumers should normalise aggregated statistics (for
+    example a 24h turnover) to an approximate trade-sized quantity before
+    calling this helper.
+    """
+
+    if value <= 0 or math.isnan(value):
+        return 0.0
+    return math.log10(float(value) + 1.0)
+
+
 def initialise_feature_map() -> Dict[str, float]:
     """Return a mapping with all model features initialised to ``0.0``."""
 
@@ -131,7 +145,7 @@ class _SymbolState:
         feature_map = initialise_feature_map()
         feature_map["directional_change_pct"] = change_pct
         feature_map["multiframe_change_pct"] = multiframe_change_pct
-        feature_map["turnover_log"] = math.log10(record.notional + 1.0)
+        feature_map["turnover_log"] = liquidity_feature(record.notional)
         feature_map["volatility_pct"] = volatility_pct
         feature_map["volume_impulse"] = volume_impulse
 

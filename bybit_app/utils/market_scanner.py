@@ -20,7 +20,12 @@ from typing import (
 )
 
 from .bybit_api import BybitAPI
-from .ai.models import MarketModel, ensure_market_model, initialise_feature_map
+from .ai.models import (
+    MarketModel,
+    ensure_market_model,
+    initialise_feature_map,
+    liquidity_feature,
+)
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -108,10 +113,21 @@ def _strength_from_change(change_pct: Optional[float]) -> float:
     return math.tanh(abs(change_pct) / 5.0)
 
 
-def _score_turnover(turnover: Optional[float]) -> float:
-    if turnover is None or turnover <= 0:
+TURNOVER_AVG_TRADES_PER_DAY = 4_000.0
+"""Approximate number of trades represented in a 24h turnover snapshot."""
+
+
+def _normalised_turnover(value: Optional[float]) -> float:
+    """Convert a 24h turnover metric to a single-trade estimate."""
+
+    if value is None or value <= 0:
         return 0.0
-    return math.log10(turnover + 1.0)
+    return float(value) / TURNOVER_AVG_TRADES_PER_DAY
+
+
+def _score_turnover(turnover: Optional[float]) -> float:
+    normalised = _normalised_turnover(turnover)
+    return liquidity_feature(normalised)
 
 
 def _logit(probability: float) -> float:
@@ -267,9 +283,7 @@ def _model_feature_vector(
         if direction < 0:
             multi_tf_value = -multi_tf_value
 
-    turnover_log = 0.0
-    if turnover is not None and turnover > 0:
-        turnover_log = math.log10(float(turnover) + 1.0)
+    turnover_log = liquidity_feature(_normalised_turnover(turnover))
 
     vol_value = 0.0
     if isinstance(volatility_pct, (int, float)):
