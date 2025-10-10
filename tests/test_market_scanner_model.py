@@ -59,7 +59,7 @@ def test_model_weights_affect_ranking(tmp_path: Path) -> None:
     first = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
-        cache_ttl=None,
+        cache_ttl=9999.0,
         min_turnover=0.0,
         max_spread_bps=120.0,
     )
@@ -71,7 +71,7 @@ def test_model_weights_affect_ranking(tmp_path: Path) -> None:
     second = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
-        cache_ttl=None,
+        cache_ttl=9999.0,
         min_turnover=0.0,
         max_spread_bps=120.0,
     )

@@ -361,7 +361,14 @@ def scan_market_opportunities(
     settings: Optional["Settings"] = None,
     testnet: Optional[bool] = None,
 ) -> List[Dict[str, object]]:
-    """Rank spot symbols by liquidity and momentum to surface opportunities."""
+    """Rank spot symbols by liquidity and momentum to surface opportunities.
+
+    Parameters
+    ----------
+    cache_ttl:
+        Lifetime in seconds for a cached market snapshot. A value of ``0`` forces
+        a refresh on every call.
+    """
 
     min_turnover = max(0.0, float(min_turnover))
     effective_change = float(min_change_pct) if min_change_pct is not None else 0.5
@@ -369,9 +376,18 @@ def scan_market_opportunities(
         effective_change = 0.05
     max_spread_bps = float(max_spread_bps)
 
+    if cache_ttl is None:
+        ttl_value = DEFAULT_CACHE_TTL
+    else:
+        try:
+            ttl_value = float(cache_ttl)
+        except (TypeError, ValueError):
+            ttl_value = DEFAULT_CACHE_TTL
+    cache_ttl = max(ttl_value, 0.0)
+
     snapshot = load_market_snapshot(data_dir, settings=settings, testnet=testnet)
     now = time.time()
-    if snapshot is not None and cache_ttl is not None and cache_ttl >= 0:
+    if snapshot is not None and cache_ttl >= 0:
         ts = _safe_float(snapshot.get("ts"))
         if ts is not None and now - ts > cache_ttl:
             snapshot = None

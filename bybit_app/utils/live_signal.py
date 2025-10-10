@@ -177,7 +177,7 @@ class LiveSignalFetcher:
                 max_spread_bps=max_spread if max_spread > 0 else 50.0,
                 whitelist=whitelist or (),
                 blacklist=blacklist or (),
-                cache_ttl=0.0 if self.live_only else None,
+                cache_ttl=0.0 if self.live_only else max(self.cache_ttl, 0.0),
                 settings=settings,
                 testnet=testnet,
             )
