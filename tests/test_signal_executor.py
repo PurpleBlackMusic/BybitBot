@@ -1,11 +1,13 @@
 import copy
 from decimal import Decimal
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Tuple, Union
 
 import time
 
 import pytest
 
+import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.signal_executor import (
@@ -2148,7 +2150,7 @@ def test_signal_executor_blocks_after_daily_loss_limit(
     stub_api = StubAPI(total=1000.0, available=800.0)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
 
-    def fake_daily_pnl() -> dict[str, dict[str, dict[str, float]]]:
+    def fake_daily_pnl(**_: object) -> dict[str, dict[str, dict[str, float]]]:
         return {
             day_key: {
                 "BTCUSDT": {
@@ -2181,7 +2183,7 @@ def test_signal_executor_daily_loss_ignores_derivatives(monkeypatch: pytest.Monk
     stub_api = StubAPI(total=1000.0, available=900.0)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
 
-    def fake_daily_pnl() -> dict[str, dict[str, dict[str, float]]]:
+    def fake_daily_pnl(**_: object) -> dict[str, dict[str, dict[str, float]]]:
         return {
             day_key: {
                 "BTCUSDT": {
@@ -2203,6 +2205,86 @@ def test_signal_executor_daily_loss_ignores_derivatives(monkeypatch: pytest.Monk
     assert result.status != "disabled"
     assert (result.context or {}).get("guard") != "daily_loss_limit"
     assert stub_api.orders == []
+
+
+def test_daily_loss_guard_uses_cached_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
+    bot = StubBot(summary, settings)
+
+    pnl_module.invalidate_daily_pnl_cache()
+
+    summary_dir = tmp_path / "pnl"
+    summary_dir.mkdir(exist_ok=True)
+    summary_path = summary_dir / "pnl_daily.json"
+    monkeypatch.setattr(pnl_module, "_SUMMARY", summary_path)
+
+    now_ts = time.time()
+    ledger_rows = [
+        {
+            "execTime": now_ts,
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execPrice": 100.0,
+            "execQty": 1.0,
+            "execFee": 1.0,
+            "category": "spot",
+        },
+        {
+            "execTime": now_ts,
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execPrice": 200.0,
+            "execQty": 1.0,
+            "execFee": 1.0,
+            "category": "spot",
+        },
+    ]
+
+    read_calls = {"count": 0}
+
+    def fake_read_ledger(
+        n: Optional[int] = 5000,
+        *,
+        settings: object | None = None,
+        network: object | None = None,
+        ledger_path: Optional[Union[str, Path]] = None,
+        last_exec_id: Optional[str] = None,
+        return_meta: bool = False,
+    ):
+        read_calls["count"] += 1
+        rows = [dict(row) for row in ledger_rows]
+        if return_meta:
+            return rows, None, True
+        return rows
+
+    monkeypatch.setattr(pnl_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(signal_executor_module, "daily_pnl", pnl_module.daily_pnl)
+
+    def fake_resolve_wallet(
+        self, *, require_success: bool
+    ) -> Tuple[Optional[object], Tuple[float, float]]:
+        return None, (1000.0, 1000.0)
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+
+    executor = SignalExecutor(bot)
+
+    try:
+        first = executor.execute_once()
+        second = executor.execute_once()
+
+        assert read_calls["count"] == 1
+        assert first.status == "disabled"
+        assert second.status == "disabled"
+    finally:
+        pnl_module.invalidate_daily_pnl_cache()
 
 
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:
