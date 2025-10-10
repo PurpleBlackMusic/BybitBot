@@ -295,35 +295,92 @@ def read_ledger(
             return [], None, True
         return []
 
-    parsed_rows = _parse_ledger_file(ledger_path)
-    if not parsed_rows:
-        if return_meta:
-            return [], None, True
-        return []
-
-    rows: List[Mapping[str, object]] = []
-    marker_found = last_exec_id is None
+    maxlen = n if (n is not None and n > 0) else None
     last_seen_exec_id: Optional[str] = None
 
-    for payload, entry_id in parsed_rows:
-        if entry_id:
-            last_seen_exec_id = entry_id
-        if marker_found:
-            rows.append(payload)
-            if n is not None and n > 0 and len(rows) > n:
-                rows.pop(0)
-            continue
+    if last_exec_id is None:
+        window = maxlen
+        rows: List[Mapping[str, object]] = []
+        while True:
+            if window is None:
+                buffer: deque[str] = deque()
+            else:
+                buffer = deque(maxlen=window)
 
-        if entry_id == last_exec_id:
-            marker_found = True
+            with ledger_path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    if not raw_line.strip():
+                        continue
+                    buffer.append(raw_line)
 
-    if not marker_found and last_exec_id is not None:
-        rows = [payload for payload, _ in parsed_rows]
-        if n is not None and n > 0:
-            rows = rows[-n:]
+            rows = []
+            seen_exec_id: Optional[str] = None
+            for raw_line in buffer:
+                try:
+                    payload = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, Mapping):
+                    continue
+                entry_id = _ledger_entry_id(payload)
+                if entry_id:
+                    seen_exec_id = entry_id
+                rows.append(payload)
+
+            last_seen_exec_id = seen_exec_id
+
+            if window is None:
+                break
+
+            if rows and maxlen is not None and len(rows) >= maxlen:
+                if len(rows) > maxlen:
+                    rows = rows[-maxlen:]
+                break
+
+            if len(buffer) < window:
+                break
+
+            window = max(window * 2, window + 1)
+
+        if maxlen is not None and len(rows) > maxlen:
+            rows = rows[-maxlen:]
+
+        if return_meta:
+            return rows, last_seen_exec_id, True
+        return rows
+
+    fallback: deque[Mapping[str, object]] = deque(maxlen=maxlen)
+    after_marker: deque[Mapping[str, object]] = deque(maxlen=maxlen)
+    marker_found = False
+
+    with ledger_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                continue
+            try:
+                payload = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+
+            entry_id = _ledger_entry_id(payload)
+            if entry_id:
+                last_seen_exec_id = entry_id
+
+            if marker_found:
+                after_marker.append(payload)
+                continue
+
+            fallback.append(payload)
+            if entry_id == last_exec_id:
+                marker_found = True
+                after_marker.clear()
+
+    rows = list(after_marker if marker_found else fallback)
 
     if return_meta:
-        return rows, last_seen_exec_id, marker_found or last_exec_id is None
+        return rows, last_seen_exec_id, marker_found
     return rows
 
 
