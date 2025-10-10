@@ -6,7 +6,7 @@ import threading
 import time
 import ssl
 import random
-from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Iterable, Mapping, Optional, Sequence
 
 import websocket  # websocket-client
@@ -23,6 +23,8 @@ from .realtime_cache import get_realtime_cache
 from .spot_pnl import spot_inventory_and_pnl
 from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
+from .telegram_notify import send_telegram
+from .trade_notifications import format_sell_close_message
 
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
@@ -78,6 +80,7 @@ class WSManager:
         self._realtime_cache = get_realtime_cache()
         self._fill_lock = threading.Lock()
         self._tp_ladder_plan: dict[str, dict[str, object]] = {}
+        self._inventory_snapshot: dict[str, dict[str, Decimal]] = {}
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -626,7 +629,15 @@ class WSManager:
             return
 
         with self._fill_lock:
+            previous_inventory = {
+                symbol: dict(stats)
+                for symbol, stats in self._inventory_snapshot.items()
+                if isinstance(stats, Mapping)
+            }
+
             inventory: dict[str, dict[str, object]] = {}
+            normalized_inventory = previous_inventory
+            inventory_updated = False
             try:
                 inventory = spot_inventory_and_pnl(settings=self.s)
             except Exception as exc:
@@ -640,17 +651,30 @@ class WSManager:
                     self._realtime_cache.update_private("inventory", snapshot)
                 except Exception as exc:
                     log("ws.private.inventory.cache.error", err=str(exc))
+                normalized_inventory = self._normalise_inventory_snapshot(inventory)
+                inventory_updated = True
 
             buy_fill_rows: dict[str, dict[str, object]] = {}
+            sell_fill_rows: dict[str, list[dict[str, object]]] = {}
             for row in fills:
                 raw_symbol = row.get("symbol")
                 symbol = str(raw_symbol or "").strip().upper()
                 if not symbol:
                     continue
                 side = str(row.get("side") or row.get("orderSide") or "").strip().lower()
-                if side != "buy":
-                    continue
-                buy_fill_rows[symbol] = row
+                if side == "buy":
+                    buy_fill_rows[symbol] = row
+                elif side == "sell":
+                    sell_fill_rows.setdefault(symbol, []).append(row)
+
+            if sell_fill_rows and inventory_updated:
+                self._notify_sell_fills(
+                    sell_fill_rows,
+                    normalized_inventory,
+                    previous_inventory,
+                )
+
+            self._inventory_snapshot = normalized_inventory
 
             if not buy_fill_rows:
                 return
@@ -687,6 +711,175 @@ class WSManager:
                         err=str(exc),
                         symbol=symbol,
                     )
+
+    def _notify_sell_fills(
+        self,
+        fills_by_symbol: Mapping[str, Sequence[Mapping[str, object]]],
+        inventory_snapshot: Mapping[str, Mapping[str, Decimal]],
+        previous_snapshot: Mapping[str, Mapping[str, Decimal]],
+    ) -> None:
+        settings = self.s
+        notify_enabled = bool(
+            getattr(settings, "telegram_notify", False)
+            or getattr(settings, "tg_trade_notifs", False)
+        )
+        if not notify_enabled:
+            log("telegram.trade.skip", reason="notifications_disabled")
+            return
+
+        for symbol, rows in fills_by_symbol.items():
+            if not rows:
+                continue
+            symbol_upper = str(symbol or "").upper()
+            current_stats = inventory_snapshot.get(symbol_upper) or inventory_snapshot.get(symbol)
+            if not isinstance(current_stats, Mapping):
+                log(
+                    "telegram.trade.skip",
+                    symbol=symbol_upper,
+                    reason="inventory_missing",
+                )
+                continue
+            previous_stats = previous_snapshot.get(symbol_upper) or previous_snapshot.get(symbol)
+            if not isinstance(previous_stats, Mapping):
+                log(
+                    "telegram.trade.skip",
+                    symbol=symbol_upper,
+                    reason="missing_previous_inventory",
+                )
+                continue
+
+            total_qty = Decimal("0")
+            total_quote = Decimal("0")
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                qty = self._decimal_from(row.get("execQty"))
+                if qty <= 0:
+                    qty = self._decimal_from(row.get("lastExecQty"))
+                price = self._decimal_from(row.get("execPrice"))
+                if qty <= 0:
+                    continue
+                total_qty += qty
+                if price > 0:
+                    total_quote += price * qty
+
+            if total_qty <= 0:
+                log(
+                    "telegram.trade.skip",
+                    symbol=symbol_upper,
+                    reason="no_sell_qty",
+                )
+                continue
+
+            avg_price = Decimal("0")
+            if total_quote > 0:
+                avg_price = total_quote / total_qty
+            else:
+                for row in rows:
+                    price = self._decimal_from(row.get("execPrice"))
+                    if price > 0:
+                        avg_price = price
+                        break
+
+            if avg_price <= 0:
+                log(
+                    "telegram.trade.skip",
+                    symbol=symbol_upper,
+                    reason="invalid_avg_price",
+                )
+                continue
+
+            current_realized = self._decimal_from(current_stats.get("realized_pnl"))
+            previous_realized = self._decimal_from(previous_stats.get("realized_pnl"))
+            trade_realized = current_realized - previous_realized
+            remaining_qty = self._decimal_from(current_stats.get("position_qty"))
+
+            base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else symbol_upper
+            qty_step = self._infer_step_from_rows(rows, "execQty")
+            price_step = self._infer_step_from_rows(rows, "execPrice")
+            qty_text = self._format_decimal_step(total_qty, qty_step)
+            price_text = self._format_decimal_step(avg_price, price_step)
+            pnl_display = trade_realized.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            pnl_text = f"{pnl_display:+.2f} USDT"
+
+            remainder_text = None
+            position_closed = remaining_qty <= Decimal("0")
+            if not position_closed:
+                remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
+                remainder_text = f"{remainder_qty_text} {base_asset}"
+
+            message = format_sell_close_message(
+                symbol=symbol_upper,
+                qty_text=qty_text,
+                base_asset=base_asset,
+                price_text=price_text,
+                pnl_text=pnl_text,
+                remainder_text=remainder_text,
+                position_closed=position_closed,
+            )
+
+            try:
+                send_telegram(message)
+            except Exception as exc:  # pragma: no cover - network/HTTP errors
+                log(
+                    "telegram.trade.error",
+                    symbol=symbol_upper,
+                    error=str(exc),
+                )
+            else:
+                log(
+                    "telegram.trade.notify",
+                    symbol=symbol_upper,
+                    side="sell",
+                    qty=str(total_qty),
+                    price=str(avg_price),
+                    pnl=str(trade_realized),
+                )
+
+    @staticmethod
+    def _normalise_inventory_snapshot(
+        inventory: Mapping[str, Mapping[str, object]] | None,
+    ) -> dict[str, dict[str, Decimal]]:
+        snapshot: dict[str, dict[str, Decimal]] = {}
+        if not isinstance(inventory, Mapping):
+            return snapshot
+
+        for key, stats in inventory.items():
+            if not isinstance(stats, Mapping):
+                continue
+            symbol = str(key or "").upper()
+            if not symbol:
+                continue
+            snapshot[symbol] = {
+                "position_qty": WSManager._decimal_from(stats.get("position_qty")),
+                "avg_cost": WSManager._decimal_from(stats.get("avg_cost")),
+                "realized_pnl": WSManager._decimal_from(stats.get("realized_pnl")),
+            }
+
+        return snapshot
+
+    @staticmethod
+    def _infer_step_from_rows(
+        rows: Sequence[Mapping[str, object]],
+        key: str,
+        default: Decimal = Decimal("0.00000001"),
+    ) -> Decimal:
+        step: Decimal | None = None
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            value = WSManager._decimal_from(row.get(key))
+            if value <= 0:
+                continue
+            exponent = value.normalize().as_tuple().exponent
+            candidate = Decimal("1")
+            if exponent < 0:
+                candidate = Decimal("1").scaleb(exponent)
+            if step is None or candidate < step:
+                step = candidate
+        if step is None:
+            return default
+        return step
 
     def _is_fill_row(self, row: dict) -> bool:
         if not isinstance(row, dict):

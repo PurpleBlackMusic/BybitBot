@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Iterable
 
@@ -159,6 +160,52 @@ def test_ws_manager_status_detects_connected_socket() -> None:
 
     status = manager.status()
     assert status["public"]["running"] is True
+
+
+def test_ws_manager_send_sell_fill_notification(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+
+    manager._inventory_snapshot = {
+        "ETHUSDT": {
+            "position_qty": Decimal("0.4000"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
+
+    def fake_spot_inventory_and_pnl(*args, **kwargs):
+        assert kwargs.get("settings") is manager.s
+        return {
+            "ETHUSDT": {
+                "position_qty": 0.3,
+                "avg_cost": 100.0,
+                "realized_pnl": 1.88,
+            }
+        }
+
+    sent: dict[str, str] = {}
+
+    def fake_send_telegram(message: str):
+        sent["message"] = message
+
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+    monkeypatch.setattr(ws_manager_module, "send_telegram", fake_send_telegram)
+
+    fill_row = {
+        "symbol": "ETHUSDT",
+        "side": "Sell",
+        "execQty": "0.1000",
+        "execPrice": "120",
+        "execFee": "0.12",
+    }
+
+    manager._handle_execution_fill([fill_row])
+
+    assert sent["message"] == (
+        "🔴 ETHUSDT: закрытие 0.1 ETH по 120, PnL сделки +1.88 USDT (осталось: 0.3 ETH)"
+    )
 
 def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
