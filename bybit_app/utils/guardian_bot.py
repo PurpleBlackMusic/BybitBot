@@ -3625,7 +3625,7 @@ class GuardianBot:
             return {}
 
         hold_samples: List[float] = []
-        pnl_samples: List[float] = []
+        loss_samples: List[float] = []
 
         for trade in trades:
             hold_value = self._coerce_float(trade.get("hold_sec"))
@@ -3634,7 +3634,9 @@ class GuardianBot:
 
             pnl_value = self._coerce_float(trade.get("bps_realized"))
             if pnl_value is not None and math.isfinite(pnl_value):
-                pnl_samples.append(float(pnl_value))
+                pnl_float = float(pnl_value)
+                if pnl_float < 0:
+                    loss_samples.append(pnl_float)
 
         defaults: Dict[str, object] = {}
 
@@ -3648,15 +3650,19 @@ class GuardianBot:
                 defaults["hold_minutes"] = round(hold_median / 60.0, 4)
                 defaults["hold_sample_count"] = len(hold_samples)
 
-        if len(pnl_samples) >= 1:
+        if loss_samples:
             try:
-                quartiles = quantiles(pnl_samples, n=4, method="inclusive")
+                quartiles = quantiles(loss_samples, n=4, method="inclusive")
             except (StatisticsError, ValueError):
                 quartiles = []
             exit_threshold = quartiles[0] if quartiles else None
-            if exit_threshold is not None and math.isfinite(exit_threshold):
+            if (
+                exit_threshold is not None
+                and math.isfinite(exit_threshold)
+                and exit_threshold < 0
+            ):
                 defaults["exit_bps"] = round(float(exit_threshold), 4)
-                defaults["bps_sample_count"] = len(pnl_samples)
+                defaults["bps_sample_count"] = len(loss_samples)
 
         return defaults
 

@@ -267,6 +267,51 @@ def test_signal_executor_force_exit_uses_trade_stats_defaults(
     assert any(event == "guardian.auto.force_exit.defaults" for event, _ in events)
 
 
+def test_signal_executor_force_exit_skips_positive_exit_bps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": False, "mode": "buy", "symbol": "ADAUSDT"}
+    settings = Settings(ai_enabled=True, ai_max_hold_minutes=0.0, ai_min_exit_bps=None)
+    bot = StubBot(summary, settings)
+
+    def fake_trade_statistics(limit: Optional[int] = None) -> dict:
+        return {
+            "auto_exit_defaults": {
+                "hold_minutes": 15.0,
+                "hold_sample_count": 12,
+                "exit_bps": 15.0,
+                "bps_sample_count": 12,
+            }
+        }
+
+    monkeypatch.setattr(bot, "trade_statistics", fake_trade_statistics)
+
+    positions = {
+        "ADAUSDT": {
+            "qty": 10.0,
+            "avg_cost": 1.0,
+            "realized_pnl": 0.0,
+            "hold_seconds": 60.0,
+            "price": 1.02,
+            "pnl_value": 0.2,
+            "pnl_bps": 5.0,
+            "quote_notional": 10.2,
+        }
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_open_positions",
+        lambda self, settings, summary: positions,
+    )
+
+    executor = SignalExecutor(bot)
+    forced_summary, metadata = executor._maybe_force_exit(summary, settings)
+
+    assert forced_summary is None
+    assert metadata is None
+
+
 def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,
