@@ -42,6 +42,7 @@ _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
 
 _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
+_PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -207,11 +208,18 @@ class SignalExecutor:
             if expiry <= timestamp:
                 self._symbol_quarantine.pop(symbol, None)
 
-    def _quarantine_symbol(self, symbol: str, now: Optional[float] = None) -> None:
+    def _quarantine_symbol(
+        self,
+        symbol: str,
+        now: Optional[float] = None,
+        *,
+        ttl: Optional[float] = None,
+    ) -> None:
         if not symbol:
             return
         timestamp = self._current_time() if now is None else now
-        expiry = timestamp + _VALIDATION_PENALTY_TTL
+        ttl_value = _VALIDATION_PENALTY_TTL if ttl is None else max(float(ttl), 0.0)
+        expiry = timestamp + ttl_value
         previous = self._symbol_quarantine.get(symbol)
         if previous is not None and previous >= expiry:
             return
@@ -1143,6 +1151,58 @@ class SignalExecutor:
                 error=exc.to_dict(),
                 context=validation_context,
             )
+
+            details: Mapping[str, object] | None = None
+            if isinstance(exc.details, Mapping):
+                details = exc.details
+
+            price_limit_hit = bool(details.get("price_limit_hit")) if details else False
+            if exc.code == "insufficient_liquidity" and price_limit_hit:
+                quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
+                self._quarantine_symbol(symbol, ttl=quarantine_ttl)
+                quarantine_until = self._symbol_quarantine.get(symbol)
+                if quarantine_until is not None:
+                    validation_context["quarantine_until"] = quarantine_until
+                validation_context["quarantine_ttl"] = quarantine_ttl
+
+                info_parts: List[str] = []
+                if details:
+                    price_cap = details.get("price_cap")
+                    price_floor = details.get("price_floor")
+                    if price_cap:
+                        info_parts.append(f"лимит цены {price_cap}")
+                    elif price_floor:
+                        info_parts.append(f"лимит цены {price_floor}")
+                    requested = details.get("requested_quote") or details.get("requested_base")
+                    available = details.get("available_quote") or details.get("available_base")
+                    if requested and available:
+                        info_parts.append(
+                            f"доступно {available} из {requested}"
+                        )
+
+                quarantine_minutes = quarantine_ttl / 60.0
+                info_parts.append(
+                    "ждём восстановления ликвидности ≈{duration:.1f} мин".format(
+                        duration=quarantine_minutes
+                    )
+                )
+
+                extra_text = " — " + "; ".join(info_parts) if info_parts else ""
+                reason_text = f"Ордер пропущен ({exc.code}): {exc}{extra_text}"
+
+                self._maybe_notify_validation_skip(
+                    settings=settings,
+                    symbol=symbol,
+                    side=side,
+                    code=exc.code,
+                    message=f"{exc}{extra_text}",
+                )
+
+                return self._decision(
+                    "skipped",
+                    reason=reason_text,
+                    context=validation_context,
+                )
 
             skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
             if exc.code in skip_codes:

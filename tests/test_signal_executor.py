@@ -1602,6 +1602,77 @@ def test_signal_executor_restores_quarantine_state(monkeypatch: pytest.MonkeyPat
     assert call_counter["value"] == 0
 
 
+def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    call_counter = {"value": 0}
+
+    def fake_place(*_args, **_kwargs):
+        call_counter["value"] += 1
+        raise OrderValidationError(
+            "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
+            code="insufficient_liquidity",
+            details={
+                "requested_quote": "100.0",
+                "available_quote": "42.0",
+                "side": "buy",
+                "price_cap": "123.45",
+                "price_limit_hit": True,
+            },
+        )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    base_time = 1700000000.0
+    time_state = {"value": base_time}
+
+    def fake_now(self):
+        current = time_state["value"]
+        time_state["value"] += 30.0
+        return current
+
+    monkeypatch.setattr(SignalExecutor, "_current_time", fake_now)
+
+    executor = SignalExecutor(bot)
+
+    first_result = executor.execute_once()
+
+    assert first_result.status == "skipped"
+    assert first_result.reason is not None
+    assert "ждём восстановления ликвидности" in first_result.reason
+    assert first_result.context is not None
+    assert first_result.context.get("validation_code") == "insufficient_liquidity"
+    assert first_result.context.get("quarantine_ttl") == pytest.approx(
+        signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL
+    )
+
+    quarantine_until = executor._symbol_quarantine.get("ETHUSDT")
+    assert quarantine_until is not None
+    assert quarantine_until >= base_time + signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL
+
+    second_result = executor.execute_once()
+
+    assert second_result.status == "skipped"
+    assert call_counter["value"] == 1
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
