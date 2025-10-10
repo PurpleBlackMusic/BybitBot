@@ -39,13 +39,10 @@ def test_model_features_layout() -> None:
         "depth_imbalance",
         "spread_bps",
         "correlation_strength",
-        "maker_flag",
-        "hold_minutes",
-        "position_closed_fraction",
     )
 
 
-def test_hold_duration_and_fraction_features() -> None:
+def test_sell_vector_contains_expected_metrics() -> None:
     state = _SymbolState()
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
@@ -67,8 +64,9 @@ def test_hold_duration_and_fraction_features() -> None:
     assert len(vector) == len(MODEL_FEATURES)
     features = dict(zip(MODEL_FEATURES, vector))
 
-    assert features["hold_minutes"] == pytest.approx(14.0, abs=1e-6)
-    assert features["position_closed_fraction"] == pytest.approx(2.5 / 3.0, abs=1e-6)
+    avg_cost = (2.0 * 100.0 + 1.0 * 102.0) / 3.0
+    assert features["directional_change_pct"] == pytest.approx((110.0 - avg_cost) / avg_cost * 100.0)
+    assert features["volume_impulse"] > 0.0
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)
