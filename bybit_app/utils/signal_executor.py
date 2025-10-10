@@ -36,6 +36,7 @@ from .pnl import read_ledger
 from .spot_pnl import spot_inventory_and_pnl
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import send_telegram
+from .trade_notifications import format_sell_close_message
 from .ws_manager import manager as ws_manager
 
 _PERCENT_TOLERANCE_MIN = 0.05
@@ -1877,12 +1878,18 @@ class SignalExecutor:
                 f"(цели: {target_text})"
             )
         else:
-            message = (
-                f"🔴 {symbol_upper}: закрытие {qty_text} {base_asset} по {price_text}, "
-                f"PnL сделки {pnl_text}"
+            message = format_sell_close_message(
+                symbol=symbol_upper,
+                qty_text=qty_text,
+                base_asset=base_asset,
+                price_text=price_text,
+                pnl_text=pnl_text,
+                sold_text=(
+                    sold_text
+                    if sold_amount > 0 and sold_amount != executed_base
+                    else None
+                ),
             )
-            if sold_amount > 0 and sold_amount != executed_base:
-                message += f" (продано: {sold_text})"
         log(
             "telegram.trade.notify",
             symbol=symbol,
