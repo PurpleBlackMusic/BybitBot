@@ -3077,7 +3077,7 @@ class SignalExecutor:
 
             spot_fees = _safe_float(payload.get("spot_fees"))
             if spot_fees is not None:
-                net_result += spot_pnl - abs(spot_fees)
+                net_result += spot_pnl - spot_fees
                 continue
 
             categories = payload.get("categories")
@@ -3090,7 +3090,7 @@ class SignalExecutor:
                 continue
 
             fees = _safe_float(payload.get("fees")) or 0.0
-            net_result += (spot_pnl or 0.0) - abs(fees)
+            net_result += (spot_pnl or 0.0) - fees
 
         if net_result >= 0.0:
             return None

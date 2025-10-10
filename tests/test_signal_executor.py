@@ -2594,6 +2594,61 @@ def test_fee_conversion_prevents_daily_loss_false_alarm(
     assert context.get("loss_percent") == pytest.approx(2.0)
 
 
+def test_signal_executor_daily_loss_treats_rebates_as_benefit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = time.time()
+    now_ms = int(now * 1000)
+    events = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "100",
+            "execQty": "1",
+            "execFee": "-0.01",
+            "feeCurrency": "BTC",
+            "category": "spot",
+            "execTime": now_ms,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "execPrice": "100",
+            "execQty": "1",
+            "execFee": "-0.01",
+            "feeCurrency": "BTC",
+            "category": "spot",
+            "execTime": now_ms + 1000,
+        },
+    ]
+
+    summary = pnl_module._build_daily_summary(events)
+    day_key = time.strftime("%Y-%m-%d", time.gmtime(now))
+    day_bucket = summary.get(day_key, {})
+    symbol_bucket = day_bucket.get("BTCUSDT", {})
+    assert symbol_bucket.get("spot_pnl") == pytest.approx(0.0)
+    assert symbol_bucket.get("spot_fees") == pytest.approx(-2.0)
+    assert symbol_bucket.get("spot_net") == pytest.approx(2.0)
+
+    summary_path = tmp_path / "pnl_daily.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pnl_module, "_SUMMARY", summary_path)
+    monkeypatch.setattr(pnl_module, "read_ledger", lambda *_, **__: events)
+    pnl_module.invalidate_daily_pnl_cache()
+
+    monkeypatch.setattr(
+        signal_executor_module, "daily_pnl", lambda **_: summary
+    )
+
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
+    bot = StubBot({"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}, settings)
+    executor = SignalExecutor(bot)
+    executor._current_time = lambda: now  # type: ignore[assignment]
+
+    guard = executor._daily_loss_guard(settings)
+    assert guard is None
+
+
 def test_signal_executor_blocks_after_daily_loss_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
