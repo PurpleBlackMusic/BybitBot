@@ -14,6 +14,7 @@ import numpy as np
 
 from ..paths import DATA_DIR
 from ..trade_analytics import ExecutionRecord, load_executions
+from ..log import log
 
 MODEL_FILENAME = "model.json"
 MODEL_FEATURES: Tuple[str, ...] = (
@@ -85,7 +86,9 @@ class _SymbolState:
         if len(self.recent_buys) > 200:
             self.recent_buys = self.recent_buys[-200:]
 
-    def realise_sell(self, record: ExecutionRecord) -> Optional[Tuple[List[float], float]]:
+    def realise_sell(
+        self, record: ExecutionRecord
+    ) -> Optional[Tuple[List[float], float, Optional[datetime]]]:
         qty_to_close = min(abs(record.qty), self.position_qty)
         if qty_to_close <= 1e-9:
             self._remember(record.price, abs(record.qty))
@@ -158,7 +161,7 @@ class _SymbolState:
             self.recent_buys.clear()
 
         self._remember(record.price, abs(record.qty))
-        return vector, realized_pnl
+        return vector, realized_pnl, record.timestamp
 
     def _remember(self, price: float, qty: float) -> None:
         self.recent_prices.append(price)
@@ -186,14 +189,15 @@ def build_training_dataset(
     data_dir: Path = DATA_DIR,
     ledger_path: Optional[Path] = None,
     limit: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return feature matrix and labels derived from the execution ledger."""
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return feature matrix, labels and recency weights from the execution ledger."""
 
     path = Path(ledger_path) if ledger_path is not None else _default_ledger_path(Path(data_dir))
     records = load_executions(path, limit)
     states: dict[str, _SymbolState] = {}
     feature_rows: List[List[float]] = []
     targets: List[int] = []
+    timestamps: List[Optional[float]] = []
 
     for record in records:
         if record.side == "buy":
@@ -206,16 +210,37 @@ def build_training_dataset(
         realised = state.realise_sell(record)
         if realised is None:
             continue
-        vector, pnl = realised
+        vector, pnl, realised_ts = realised
         feature_rows.append(vector)
         targets.append(1 if pnl > 0 else 0)
+        timestamps.append(realised_ts.timestamp() if realised_ts is not None else None)
 
     if not feature_rows:
-        return np.empty((0, len(MODEL_FEATURES))), np.empty((0,))
+        empty_matrix = np.empty((0, len(MODEL_FEATURES)))
+        empty_vector = np.empty((0,))
+        return empty_matrix, empty_vector, empty_vector
+
+    max_ts = max((ts for ts in timestamps if ts is not None), default=None)
+    half_life = 6 * 3600.0  # six hours
+    weights: List[float] = []
+    for ts in timestamps:
+        if max_ts is None or ts is None:
+            weight = 1.0
+        else:
+            age = max(max_ts - ts, 0.0)
+            weight = math.exp(-age / half_life)
+        weights.append(weight)
+
+    # If timestamps were missing, fall back to a simple linear decay based on order
+    if max_ts is None and feature_rows:
+        total = len(feature_rows)
+        for index in range(total):
+            weights[index] = 1.0 - (index / max(total - 1, 1)) * 0.5
 
     matrix = np.array(feature_rows, dtype=float)
     labels = np.array(targets, dtype=int)
-    return matrix, labels
+    recency_weights = np.array(weights, dtype=float)
+    return matrix, labels, recency_weights
 
 
 def _ensure_scaling(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -287,10 +312,59 @@ def _logistic_loss(
     return float(weighted_loss + 0.5 * l2 * float(np.dot(weights, weights)))
 
 
+def _normalise_sample_weights(sample_weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(sample_weights, dtype=float)
+    weights = np.where(weights > 0, weights, 0.0)
+    mean = float(weights.mean())
+    if not math.isfinite(mean) or mean <= 0:
+        return np.ones_like(weights, dtype=float)
+    return weights / mean
+
+
+def _weighted_average(values: np.ndarray, weights: np.ndarray) -> float:
+    total_weight = float(np.sum(weights))
+    if not math.isfinite(total_weight) or total_weight <= 0:
+        return float(np.mean(values))
+    return float(np.dot(values, weights) / total_weight)
+
+
+def _weighted_log_loss(
+    labels: np.ndarray, probabilities: np.ndarray, weights: np.ndarray
+) -> float:
+    probs = np.clip(probabilities, 1e-8, 1.0 - 1e-8)
+    losses = -(labels * np.log(probs) + (1.0 - labels) * np.log(1.0 - probs))
+    return _weighted_average(losses, weights)
+
+
+def _weighted_accuracy(labels: np.ndarray, predictions: np.ndarray, weights: np.ndarray) -> float:
+    correct = (predictions == labels).astype(float)
+    return _weighted_average(correct, weights)
+
+
+def _evaluate_training_metrics(
+    coefficients: np.ndarray,
+    intercept: float,
+    features: np.ndarray,
+    labels: np.ndarray,
+    sample_weights: np.ndarray,
+) -> Tuple[float, float]:
+    if len(labels) == 0:
+        return 0.0, 0.0
+
+    linear = intercept + features.dot(coefficients)
+    probabilities = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
+    weights = _normalise_sample_weights(sample_weights)
+    predictions = (probabilities >= 0.5).astype(int)
+    accuracy = _weighted_accuracy(labels, predictions, weights)
+    log_loss_value = _weighted_log_loss(labels, probabilities, weights)
+    return float(accuracy), float(log_loss_value)
+
+
 def _train_logistic_regression(
     features: np.ndarray,
     labels: np.ndarray,
     *,
+    sample_weights: Optional[np.ndarray] = None,
     max_iter: int = 500,
     initial_step: float = 0.2,
     l2: float = 1e-2,
@@ -307,7 +381,12 @@ def _train_logistic_regression(
 
     weights = np.zeros(features.shape[1], dtype=float)
     intercept = 0.0
-    sample_weights = _balanced_sample_weights(labels)
+    if sample_weights is None:
+        sample_weights = np.ones(len(labels), dtype=float)
+    elif len(sample_weights) != len(labels):
+        raise ValueError("Sample weights must align with labels")
+    else:
+        sample_weights = _normalise_sample_weights(sample_weights)
 
     step = float(initial_step)
     prev_loss = _logistic_loss(weights, intercept, features, labels, sample_weights, l2)
@@ -366,19 +445,43 @@ def train_market_model(
 ) -> Optional[MarketModel]:
     """Train a logistic regression model and persist it to disk."""
 
-    matrix, labels = build_training_dataset(data_dir=data_dir, ledger_path=ledger_path, limit=limit)
+    matrix, labels, recency_weights = build_training_dataset(
+        data_dir=data_dir, ledger_path=ledger_path, limit=limit
+    )
     if len(matrix) < max(min_samples, 1):
         return None
 
     unique = set(int(label) for label in labels)
     normalized, means, stds = _ensure_scaling(matrix)
 
+    if len(recency_weights) == 0:
+        recency_weights = np.ones(len(labels), dtype=float)
+
+    metrics_weights: np.ndarray
     if len(unique) < 2:
         probability = float(labels.mean()) if len(labels) else 0.5
         intercept = _logit(probability)
         coefficients = np.zeros(len(MODEL_FEATURES), dtype=float)
+        metrics_weights = _normalise_sample_weights(recency_weights)
     else:
-        coefficients, intercept = _train_logistic_regression(normalized, labels)
+        class_weights = _balanced_sample_weights(labels)
+        combined_weights = class_weights * recency_weights
+        coefficients, intercept = _train_logistic_regression(
+            normalized, labels, sample_weights=combined_weights
+        )
+        metrics_weights = _normalise_sample_weights(combined_weights)
+
+    accuracy, log_loss_value = _evaluate_training_metrics(
+        coefficients, intercept, normalized, labels, metrics_weights
+    )
+
+    log(
+        "market_model.training_metrics",
+        samples=int(len(labels)),
+        accuracy=float(accuracy),
+        log_loss=float(log_loss_value),
+        positive_rate=float(labels.mean() if len(labels) else 0.0),
+    )
 
     payload = _serialize_model(
         coefficients=coefficients,

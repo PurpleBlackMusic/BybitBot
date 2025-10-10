@@ -3,7 +3,9 @@ import time
 from pathlib import Path
 
 import pytest
+import numpy as np
 
+from bybit_app.utils.ai import models as ai_models
 from bybit_app.utils.market_scanner import (
     MarketScanner,
     MarketScannerError,
@@ -162,6 +164,192 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert ada["probability"] < opportunities[1]["probability"]
     assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
     assert ada["model_metrics"]["correlation"] >= -0.5
+
+
+def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+
+def test_build_training_dataset_emits_recency_weights(tmp_path: Path) -> None:
+    now = time.time()
+    ledger_path = tmp_path / "executions.jsonl"
+    records = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "0.1",
+            "execPrice": "10000",
+            "execFee": "-0.1",
+            "isMaker": True,
+            "execTime": now - 5 * 3600,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "0.1",
+            "execPrice": "10300",
+            "execFee": "0.1",
+            "isMaker": False,
+            "execTime": now - 5 * 3600 + 120,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "0.2",
+            "execPrice": "11000",
+            "execFee": "-0.2",
+            "isMaker": True,
+            "execTime": now - 600,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "0.2",
+            "execPrice": "10800",
+            "execFee": "0.2",
+            "isMaker": False,
+            "execTime": now - 480,
+        },
+    ]
+    _write_ledger(ledger_path, records)
+
+    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+
+    assert matrix.shape[0] == 2
+    assert labels.tolist() == [1, 0]
+    assert np.all(recency > 0)
+    assert recency[0] < recency[1] <= 1.0
+
+
+def test_train_market_model_logs_metrics_and_uses_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = time.time()
+    ledger_path = tmp_path / "executions.jsonl"
+    records = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "0.1",
+            "execPrice": "10000",
+            "execFee": "-0.1",
+            "isMaker": True,
+            "execTime": now - 6 * 3600,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "0.1",
+            "execPrice": "10500",
+            "execFee": "0.1",
+            "isMaker": False,
+            "execTime": now - 6 * 3600 + 60,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "0.2",
+            "execPrice": "11000",
+            "execFee": "-0.2",
+            "isMaker": True,
+            "execTime": now - 900,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "0.2",
+            "execPrice": "10700",
+            "execFee": "0.2",
+            "isMaker": False,
+            "execTime": now - 840,
+        },
+    ]
+    _write_ledger(ledger_path, records)
+
+    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+    class_weights = ai_models._balanced_sample_weights(labels)
+    expected = class_weights * recency
+
+    captured_weights: dict[str, np.ndarray] = {}
+    original_train = ai_models._train_logistic_regression
+
+    def capture_train(
+        features: np.ndarray,
+        captured_labels: np.ndarray,
+        *,
+        sample_weights: np.ndarray | None = None,
+        **kwargs,
+    ) -> tuple[np.ndarray, float]:
+        if sample_weights is not None:
+            captured_weights["passed"] = np.array(sample_weights, copy=True)
+        return original_train(
+            features,
+            captured_labels,
+            sample_weights=sample_weights,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(ai_models, "_train_logistic_regression", capture_train)
+
+    loss_weights: list[np.ndarray] = []
+    original_loss = ai_models._logistic_loss
+
+    def capture_loss(
+        weights: np.ndarray,
+        intercept: float,
+        features: np.ndarray,
+        captured_labels: np.ndarray,
+        sample_weights: np.ndarray,
+        l2: float,
+    ) -> float:
+        loss_weights.append(np.array(sample_weights, copy=True))
+        return original_loss(
+            weights,
+            intercept,
+            features,
+            captured_labels,
+            sample_weights,
+            l2,
+        )
+
+    monkeypatch.setattr(ai_models, "_logistic_loss", capture_loss)
+
+    logged: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(
+        event: str,
+        *,
+        severity: str | None = None,
+        exc: BaseException | None = None,
+        **payload: object,
+    ) -> None:
+        logged.append((event, payload))
+
+    monkeypatch.setattr(ai_models, "log", fake_log)
+
+    model_path = tmp_path / "ai" / "model.json"
+    model = ai_models.train_market_model(
+        data_dir=tmp_path,
+        ledger_path=ledger_path,
+        model_path=model_path,
+        min_samples=1,
+    )
+
+    assert model is not None
+    assert "passed" in captured_weights
+    np.testing.assert_allclose(captured_weights["passed"], expected)
+    assert loss_weights
+    for weights in loss_weights:
+        assert np.isclose(weights.mean(), 1.0)
+
+    assert logged
+    event, payload = logged[-1]
+    assert event == "market_model.training_metrics"
+    assert payload["samples"] == 2
+    assert 0.0 <= payload["accuracy"] <= 1.0
+    assert payload["log_loss"] >= 0.0
+    assert payload["positive_rate"] == pytest.approx(float(labels.mean()))
 
 
 def test_market_scanner_respects_whitelist(tmp_path: Path) -> None:
