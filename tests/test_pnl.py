@@ -39,3 +39,17 @@ def test_read_ledger_streams_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     expected_ids = [str(total - n + i) for i in range(n)]
     assert [row["execId"] for row in rows] == expected_ids
     assert call_count == n
+
+
+def test_execution_fee_in_quote_infers_base_for_low_price_fill() -> None:
+    execution = {
+        "execFee": "0.1",
+        "execQty": "100",
+        "execPrice": "0.02",
+        "symbol": "ABCUSDT",
+    }
+
+    fee_in_quote = pnl_module.execution_fee_in_quote(execution)
+
+    assert fee_in_quote == pytest.approx(0.1 * 0.02)
+    assert execution.get("feeCurrency") == "ABC"

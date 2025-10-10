@@ -351,17 +351,23 @@ def _resolve_fee_currency_with_inference(
     fee_per_qty = abs_fee / abs_qty
     fee_per_notional = abs_fee / notional
 
-    # Typical spot trading fees are well below 0.5%, so treat a missing
-    # currency as base-denominated only when the raw fee resembles a base
-    # quantity (sub-percent of the filled size) *and* is tiny relative to
-    # the traded notional. This avoids multiplying already-quote-denominated
-    # fees by price and overstating losses.
-    if (
-        abs_price >= 5.0
-        and fee_per_qty < 0.005
-        and fee_per_notional < 0.0002
-    ):
-        return base, True
+    # Typical spot trading fees are well below 0.5% of the base quantity.
+    # When the implied base fee rate (fee/qty) sits within that range we
+    # treat the fee as base-denominated unless the raw value also looks like
+    # a normal quote fee (i.e. a tiny fraction of the traded notional). This
+    # keeps base-fee inference active for low-priced instruments without
+    # misclassifying obvious quote-denominated charges.
+    NORMAL_BASE_FEE_UPPER = 0.005  # 0.5%
+    OBVIOUS_QUOTE_MIN = 0.0002  # 0.02% of notional
+    OBVIOUS_QUOTE_MAX = 0.002  # 0.2% of notional
+    TYPICAL_FEE_RATE = 0.001  # 0.1%
+
+    if 0.0 < fee_per_qty <= NORMAL_BASE_FEE_UPPER:
+        if fee_per_notional <= OBVIOUS_QUOTE_MIN or fee_per_notional >= OBVIOUS_QUOTE_MAX:
+            return base, True
+
+        if abs(fee_per_qty - TYPICAL_FEE_RATE) < abs(fee_per_notional - TYPICAL_FEE_RATE):
+            return base, True
 
     return None, False
 
