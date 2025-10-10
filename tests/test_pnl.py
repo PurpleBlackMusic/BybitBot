@@ -41,6 +41,19 @@ def test_read_ledger_streams_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert call_count == n
 
 
+def test_read_ledger_missing_path_returns_marker_false(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.jsonl"
+
+    rows, last_seen, marker_found = read_ledger(
+        ledger_path=missing_path,
+        return_meta=True,
+    )
+
+    assert rows == []
+    assert last_seen is None
+    assert marker_found is False
+
+
 def test_execution_fee_in_quote_infers_base_for_low_price_fill() -> None:
     execution = {
         "execFee": "0.1",
