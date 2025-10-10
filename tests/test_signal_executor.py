@@ -1809,9 +1809,11 @@ def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyP
     )
 
     call_counter = {"value": 0}
+    call_records: list[dict[str, object]] = []
 
     def fake_place(*_args, **_kwargs):
         call_counter["value"] += 1
+        call_records.append(dict(_kwargs))
         raise OrderValidationError(
             "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
             code="insufficient_liquidity",
@@ -1847,6 +1849,13 @@ def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyP
     assert "ждём восстановления ликвидности" in first_result.reason
     assert first_result.context is not None
     assert first_result.context.get("validation_code") == "insufficient_liquidity"
+    assert call_counter["value"] == 1
+    assert call_records and "qty" in call_records[0]
+    initial_qty = float(call_records[0]["qty"])
+    initial_tol = float(call_records[0]["tol_value"])
+    backoff_meta = first_result.context.get("price_limit_backoff")
+    assert isinstance(backoff_meta, dict)
+    assert backoff_meta.get("retries") == 1
     assert first_result.context.get("quarantine_ttl") == pytest.approx(
         signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL
     )
@@ -1855,10 +1864,32 @@ def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyP
     assert quarantine_until is not None
     assert quarantine_until >= base_time + signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL
 
+    backoff_state = executor._price_limit_backoff.get("ETHUSDT")
+    assert backoff_state is not None
+    assert backoff_state.get("retries") == 1
+
+    # advance time beyond quarantine to allow a second attempt
+    time_state["value"] = quarantine_until + 120.0
+
     second_result = executor.execute_once()
 
     assert second_result.status == "skipped"
-    assert call_counter["value"] == 1
+    assert second_result.reason is not None
+    assert call_counter["value"] == 2
+    assert len(call_records) == 2
+    followup_qty = float(call_records[1]["qty"])
+    followup_tol = float(call_records[1]["tol_value"])
+    assert followup_qty < initial_qty
+    assert followup_tol > initial_tol
+    assert executor._price_limit_backoff["ETHUSDT"]["retries"] == 2
+    assert (
+        executor._price_limit_backoff["ETHUSDT"]["quarantine_ttl"]
+        > signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL
+    )
+    assert second_result.context is not None
+    followup_backoff = second_result.context.get("price_limit_backoff")
+    assert isinstance(followup_backoff, dict)
+    assert followup_backoff.get("retries") == 2
 
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
