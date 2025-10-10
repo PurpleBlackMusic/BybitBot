@@ -1536,14 +1536,25 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
 
     monkeypatch.setattr(SignalExecutor, "_ledger_rows_snapshot", fake_snapshot)
 
-    def fake_spot_inventory_and_pnl(*, events=None, **_):
-        markers = {entry.get("marker") for entry in (events or []) if isinstance(entry, dict)}
-        realized = Decimal("7")
-        if "after" in markers:
-            realized = Decimal("11")
-        return {"ETHUSDT": {"realized_pnl": realized}}
+    helper_calls: list[tuple[int, int]] = []
 
-    monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+    def fake_realized_delta(
+        self,
+        rows_before,
+        rows_after,
+        symbol,
+        *,
+        new_rows=None,
+    ):
+        helper_calls.append(
+            (
+                len(rows_before or []),
+                0 if new_rows is None else len(new_rows),
+            )
+        )
+        return Decimal("4")
+
+    monkeypatch.setattr(SignalExecutor, "_realized_delta", fake_realized_delta)
 
     captured: dict[str, str] = {}
 
@@ -1565,6 +1576,125 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
     message = captured["text"]
     assert message.startswith("🔴 ETHUSDT: закрытие 0.4000 ETH по 120.00000000")
     assert "PnL сделки +4.00 USDT" in message
+    assert helper_calls == [(len(before_rows), 1)]
+
+def test_signal_executor_incremental_pnl_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        telegram_notify=True,
+        tg_trade_notifs=True,
+        tg_trade_notifs_min_notional=0.0,
+    )
+    bot = StubBot({"actionable": True, "mode": "sell", "symbol": "BTCUSDT"}, settings)
+    executor = SignalExecutor(bot)
+
+    filler_rows = [
+        {
+            "symbol": "ETHUSDT",
+            "category": "spot",
+            "side": "Buy",
+            "execPrice": 10.0 + (idx % 3),
+            "execQty": 0.5,
+            "execFee": 0.0,
+        }
+        for idx in range(300)
+    ]
+    btc_buys = [
+        {
+            "symbol": "BTCUSDT",
+            "category": "spot",
+            "side": "Buy",
+            "execPrice": 100.0,
+            "execQty": 0.1,
+            "execFee": 0.0,
+        }
+        for _ in range(10)
+    ]
+    existing_sell = {
+        "symbol": "BTCUSDT",
+        "category": "spot",
+        "side": "Sell",
+        "execPrice": 110.0,
+        "execQty": 0.2,
+        "execFee": 0.0,
+    }
+    ledger_rows_before = filler_rows + btc_buys + [existing_sell]
+    new_sell = {
+        "symbol": "BTCUSDT",
+        "category": "spot",
+        "side": "Sell",
+        "execPrice": 120.0,
+        "execQty": 0.3,
+        "execFee": 0.0,
+    }
+    ledger_rows_after = list(ledger_rows_before) + [new_sell]
+
+    response_payload = {
+        "result": {
+            "orderId": "sell-order",
+            "cumExecQty": "0.3",
+            "cumExecValue": "36",
+            "avgPrice": "120",
+        }
+    }
+    execution_stats = {
+        "executed_base": "0.3",
+        "executed_quote": "36",
+        "avg_price": "120",
+    }
+    audit_payload = {"qty_step": "0.01", "limit_price": "120"}
+
+    messages: list[str] = []
+
+    def fake_send(message: str) -> None:
+        messages.append(message)
+
+    monkeypatch.setattr(signal_executor_module, "enqueue_telegram_message", fake_send)
+
+    original_realized = SignalExecutor._realized_delta
+    helper_calls: list[Decimal] = []
+    helper_new_rows: list[int] = []
+
+    def tracking_realized(
+        self,
+        rows_before,
+        rows_after,
+        symbol,
+        *,
+        new_rows=None,
+    ):
+        helper_new_rows.append(0 if new_rows is None else len(new_rows))
+        result = original_realized(
+            self,
+            rows_before,
+            rows_after,
+            symbol,
+            new_rows=new_rows,
+        )
+        helper_calls.append(result)
+        return result
+
+    monkeypatch.setattr(SignalExecutor, "_realized_delta", tracking_realized)
+
+    executor._maybe_notify_trade(
+        settings=settings,
+        symbol="BTCUSDT",
+        side="sell",
+        response=response_payload,
+        ladder_orders=None,
+        execution_stats=execution_stats,
+        audit=audit_payload,
+        ledger_rows_before=ledger_rows_before,
+        ledger_rows_after=ledger_rows_after,
+    )
+
+    assert helper_calls, "helper should be invoked"
+    assert helper_new_rows == [1]
+    assert helper_calls[0].quantize(Decimal("0.01")) == Decimal("6.00")
+
+    assert messages, "notification should be sent"
+    assert "+6.00 USDT" in messages[0]
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
