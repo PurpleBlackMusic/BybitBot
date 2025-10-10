@@ -745,6 +745,55 @@ def test_sell_fill_recovery_uses_limited_ledger(monkeypatch: pytest.MonkeyPatch)
     assert captured["message"] == "ok"
 
 
+def test_notify_sell_fills_reload_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    initial_settings = SimpleNamespace(telegram_notify=False, tg_trade_notifs=False)
+    updated_settings = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+
+    settings_calls: list[int] = []
+
+    def fake_get_settings(*args, **kwargs):  # type: ignore[no-untyped-def]
+        settings_calls.append(len(settings_calls))
+        return initial_settings if len(settings_calls) == 1 else updated_settings
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", fake_get_settings)
+
+    notifications: list[str] = []
+
+    def fake_enqueue(message: str) -> None:
+        notifications.append(message)
+
+    logged: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **payload: object) -> None:
+        logged.append((event, dict(payload)))
+
+    monkeypatch.setattr(ws_manager_module, "enqueue_telegram_message", fake_enqueue)
+    monkeypatch.setattr(ws_manager_module, "log", fake_log)
+    monkeypatch.setattr(ws_manager_module, "format_sell_close_message", lambda **_: "ok")
+
+    manager = WSManager()
+
+    fills = {
+        "BTCUSDT": [
+            {"execQty": "1", "execPrice": "100", "symbol": "BTCUSDT"},
+        ]
+    }
+    inventory_snapshot = {
+        "BTCUSDT": {
+            "position_qty": Decimal("0"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
+
+    manager._notify_sell_fills(fills, inventory_snapshot, inventory_snapshot)
+
+    assert notifications == ["ok"]
+    assert all(reason != "notifications_disabled" for _, payload in logged for reason in [payload.get("reason")])
+    assert manager.s is updated_settings
+    assert len(settings_calls) >= 2
+
+
 def test_ws_manager_realtime_private_rows_filters_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
 

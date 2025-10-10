@@ -770,7 +770,16 @@ class WSManager:
         inventory_snapshot: Mapping[str, Mapping[str, Decimal]],
         previous_snapshot: Mapping[str, Mapping[str, Decimal]],
     ) -> None:
-        settings = self.s
+        try:
+            settings = get_settings()
+        except Exception as exc:  # pragma: no cover - defensive, rare
+            log("ws.notify.settings.reload.error", err=str(exc))
+            settings = self.s
+        else:
+            if settings is not None:
+                self.s = settings
+            else:  # pragma: no cover - defensive, unexpected
+                settings = self.s
         notify_enabled = bool(
             getattr(settings, "telegram_notify", False)
             or getattr(settings, "tg_trade_notifs", False)
