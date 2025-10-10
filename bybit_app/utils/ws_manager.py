@@ -22,7 +22,7 @@ from .store import JLStore
 from .log import log
 from .ws_private_v5 import WSPrivateV5
 from .realtime_cache import get_realtime_cache
-from .spot_pnl import spot_inventory_and_pnl
+from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
 from .telegram_notify import enqueue_telegram_message
@@ -659,6 +659,21 @@ class WSManager:
                 inventory = spot_inventory_and_pnl(settings=self.s)
             except Exception as exc:
                 log("ws.private.inventory.error", err=str(exc))
+                fallback = self._reconstruct_inventory_from_fills(
+                    previous_inventory,
+                    fills,
+                )
+                if fallback is not None:
+                    inventory, normalized_inventory = fallback
+                    inventory_updated = True
+                    snapshot = {
+                        "ts": int(time.time() * 1000),
+                        "positions": inventory,
+                    }
+                    try:
+                        self._realtime_cache.update_private("inventory", snapshot)
+                    except Exception as cache_exc:  # pragma: no cover - defensive guard
+                        log("ws.private.inventory.cache.error", err=str(cache_exc))
             else:
                 snapshot = {
                     "ts": int(time.time() * 1000),
@@ -903,6 +918,42 @@ class WSManager:
             self._inventory_baseline[symbol] = dict(recovered)
             return recovered
         return None
+
+    def _reconstruct_inventory_from_fills(
+        self,
+        previous_snapshot: Mapping[str, Mapping[str, Decimal]],
+        fills: Sequence[Mapping[str, object]],
+    ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, Decimal]]] | None:
+        if not fills and not previous_snapshot:
+            return None
+
+        inventory: dict[str, dict[str, float]] = {}
+        layers: dict[str, dict[str, object]] = {}
+
+        for symbol, stats in previous_snapshot.items():
+            if not isinstance(symbol, str) or not isinstance(stats, Mapping):
+                continue
+            position_qty = float(self._decimal_from(stats.get("position_qty")))
+            avg_cost = float(self._decimal_from(stats.get("avg_cost")))
+            realized_pnl = float(self._decimal_from(stats.get("realized_pnl")))
+            inventory[symbol] = {
+                "position_qty": position_qty,
+                "avg_cost": avg_cost,
+                "realized_pnl": realized_pnl,
+            }
+            layers[symbol] = {
+                "position_qty": position_qty,
+                "layers": [],
+            }
+
+        try:
+            _replay_events(fills, inventory, layers)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("ws.private.inventory.replay.error", err=str(exc))
+            return None
+
+        normalized_inventory = self._normalise_inventory_snapshot(inventory)
+        return inventory, normalized_inventory
 
     def _previous_stats_from_ledger(
         self,

@@ -381,6 +381,61 @@ def test_ws_manager_sell_notification_after_restart(monkeypatch: pytest.MonkeyPa
         "🔴 ETHUSDT: закрытие 0.1 ETH по 120, PnL сделки +1.88 USDT (осталось: 0.3 ETH)"
     )
 
+
+def test_ws_manager_replays_inventory_when_snapshot_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+
+    manager._inventory_snapshot = {
+        "ETHUSDT": {
+            "position_qty": Decimal("0.4000"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
+    manager._inventory_baseline = {}
+
+    def failing_inventory(**_):
+        raise RuntimeError("ledger unavailable")
+
+    sent: dict[str, str] = {}
+
+    def fake_send_telegram(message: str) -> None:
+        sent["message"] = message
+
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", failing_inventory)
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        fake_send_telegram,
+    )
+
+    sell_row = {
+        "symbol": "ETHUSDT",
+        "side": "Sell",
+        "execQty": "0.1000",
+        "execPrice": "120",
+        "execFee": "0.12",
+    }
+
+    manager._handle_execution_fill([sell_row])
+
+    assert sent["message"] == (
+        "🔴 ETHUSDT: закрытие 0.1 ETH по 120, PnL сделки +1.88 USDT (осталось: 0.3 ETH)"
+    )
+
+    baseline = manager._inventory_baseline["ETHUSDT"]
+    assert baseline["position_qty"].quantize(Decimal("0.0001")) == Decimal("0.3000")
+    assert baseline["avg_cost"].quantize(Decimal("0.0001")) == Decimal("100.0000")
+    assert baseline["realized_pnl"].quantize(Decimal("0.01")) == Decimal("1.88")
+
+    snapshot = manager._inventory_snapshot["ETHUSDT"]
+    assert snapshot["position_qty"].quantize(Decimal("0.0001")) == Decimal("0.3000")
+    assert snapshot["realized_pnl"].quantize(Decimal("0.01")) == Decimal("1.88")
+
 def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
     manager.s = SimpleNamespace(testnet=True)
