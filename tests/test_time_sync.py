@@ -74,3 +74,65 @@ def test_check_time_drift_seconds_handles_exceptions(monkeypatch: pytest.MonkeyP
 
     assert time_sync.check_time_drift_seconds() == 0.0
     assert events == [("time.drift.error", {"err": "boom"})]
+
+
+class _DummyResponse:
+    def __init__(self, payload: dict[str, object]):
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class _DummySession:
+    def __init__(self, response: _DummyResponse):
+        self._response = response
+        self.closed = False
+        self.requests: list[tuple[str, dict[str, object]]] = []
+
+    def get(self, url: str, *, timeout: float, verify: bool) -> _DummyResponse:
+        self.requests.append((url, {"timeout": timeout, "verify": verify}))
+        return self._response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _install_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    times = iter([0.0, 0.0, 0.1, 0.1])
+    monkeypatch.setattr(time_sync.time, "time", lambda: next(times))
+
+
+def test_synced_clock_refresh_closes_local_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"time": 1_000.0}
+    response = _DummyResponse(payload)
+    dummy_session = _DummySession(response)
+    monkeypatch.setattr(time_sync.requests, "Session", lambda: dummy_session)
+    monkeypatch.setattr(time_sync, "extract_server_epoch", lambda payload: 123.0)
+    _install_time(monkeypatch)
+
+    clock = time_sync._SyncedClock()
+    clock._refresh("https://example.com", session=None, timeout=5.0, verify=True)
+
+    assert dummy_session.closed is True
+
+
+def test_synced_clock_refresh_keeps_external_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"time": 1_000.0}
+    response = _DummyResponse(payload)
+    external_session = _DummySession(response)
+
+    def boom_session():  # pragma: no cover - ensures factory is unused
+        raise AssertionError("requests.Session should not be called")
+
+    monkeypatch.setattr(time_sync.requests, "Session", boom_session)
+    monkeypatch.setattr(time_sync, "extract_server_epoch", lambda payload: 123.0)
+    _install_time(monkeypatch)
+
+    clock = time_sync._SyncedClock()
+    clock._refresh("https://example.com", session=external_session, timeout=5.0, verify=False)
+
+    assert external_session.closed is False
