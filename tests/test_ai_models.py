@@ -29,6 +29,19 @@ def _record(
     )
 
 
+def test_model_features_layout() -> None:
+    assert MODEL_FEATURES == (
+        "directional_change_pct",
+        "multiframe_change_pct",
+        "turnover_log",
+        "volatility_pct",
+        "volume_impulse",
+        "maker_flag",
+        "hold_minutes",
+        "position_closed_fraction",
+    )
+
+
 def test_hold_duration_and_fraction_features() -> None:
     state = _SymbolState()
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)

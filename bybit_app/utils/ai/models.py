@@ -24,9 +24,6 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "turnover_log",
     "volatility_pct",
     "volume_impulse",
-    "depth_imbalance",
-    "spread_bps",
-    "correlation_strength",
     "maker_flag",
     "hold_minutes",
     "position_closed_fraction",
@@ -155,9 +152,6 @@ class _SymbolState:
             math.log10(record.notional + 1.0),
             volatility_pct,
             volume_impulse,
-            0.0,
-            0.0,
-            0.0,
             1.0 if record.is_maker else 0.0,
             avg_hold_minutes,
             position_closed_fraction,
@@ -471,7 +465,8 @@ def train_market_model(
     if len(unique) < 2:
         probability = float(labels.mean()) if len(labels) else 0.5
         intercept = _logit(probability)
-        coefficients = np.zeros(len(MODEL_FEATURES), dtype=float)
+        feature_count = matrix.shape[1]
+        coefficients = np.zeros(feature_count, dtype=float)
         metrics_weights = _normalise_sample_weights(recency_weights)
     else:
         class_weights = _balanced_sample_weights(labels)
