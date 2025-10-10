@@ -72,7 +72,10 @@ class MarketModel:
         """Predict the probability for the provided feature mapping."""
 
         vector = np.array([float(features.get(name, 0.0)) for name in self.feature_names])
-        normalized = (vector - np.array(self.feature_means)) / np.array(self.feature_stds)
+        means = np.array(self.feature_means)
+        stds = np.array(self.feature_stds)
+        safe_stds = np.where(np.abs(stds) < 1e-8, 1e-8, stds)
+        normalized = (vector - means) / safe_stds
         logit = float(self.intercept + np.dot(self.coefficients, normalized))
         return 1.0 / (1.0 + math.exp(-logit))
 
