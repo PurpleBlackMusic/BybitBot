@@ -173,6 +173,26 @@ def test_ws_private_v5_validates_credentials(monkeypatch: pytest.MonkeyPatch) ->
     assert events == [("ws.private.disabled", {"reason": "missing credentials"})]
 
 
+def test_ws_private_v5_start_supports_keywordless_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(api_key="abc", api_secret="def", verify_ssl=True)
+    monkeypatch.setattr(ws_private_v5, "get_settings", lambda: settings)
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(ws_private_v5, "log", lambda event, **payload: events.append((event, payload)))
+
+    _install_thread_stub(monkeypatch)
+    messages = [json.dumps({"op": "auth", "success": True})]
+    sent = _install_websocket_stub(monkeypatch, messages)
+
+    client = WSPrivateV5(reconnect=False)
+    assert client.start() is True
+
+    assert all(event != "ws.private.disabled" for event, _ in events)
+    assert any(json.loads(msg).get("op") == "auth" for msg in sent)
+
+
 def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         ws_private_v5,
