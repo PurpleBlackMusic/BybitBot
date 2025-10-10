@@ -6,6 +6,7 @@ import threading
 import time
 import ssl
 import random
+from collections import Counter
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -16,6 +17,7 @@ from copy import deepcopy
 from .envs import get_settings, get_api_client, creds_ok
 from .helpers import ensure_link_id
 from .paths import DATA_DIR
+from .pnl import read_ledger
 from .store import JLStore
 from .log import log
 from .ws_private_v5 import WSPrivateV5
@@ -81,6 +83,7 @@ class WSManager:
         self._fill_lock = threading.Lock()
         self._tp_ladder_plan: dict[str, dict[str, object]] = {}
         self._inventory_snapshot: dict[str, dict[str, Decimal]] = {}
+        self._inventory_baseline: dict[str, dict[str, Decimal]] = {}
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -252,6 +255,9 @@ class WSManager:
             settings = get_settings()
         except Exception:
             settings = None
+        if settings is not None:
+            self.s = settings
+        self._prime_inventory_snapshot()
         if settings is not None and not creds_ok(settings):
             log("ws.private.disabled", reason="missing credentials")
             self._priv = None
@@ -634,6 +640,11 @@ class WSManager:
                 for symbol, stats in self._inventory_snapshot.items()
                 if isinstance(stats, Mapping)
             }
+            if not self._inventory_baseline and previous_inventory:
+                self._inventory_baseline = {
+                    symbol: dict(stats)
+                    for symbol, stats in previous_inventory.items()
+                }
 
             inventory: dict[str, dict[str, object]] = {}
             normalized_inventory = previous_inventory
@@ -741,6 +752,11 @@ class WSManager:
                 continue
             previous_stats = previous_snapshot.get(symbol_upper) or previous_snapshot.get(symbol)
             if not isinstance(previous_stats, Mapping):
+                previous_stats = self._recover_previous_stats(
+                    symbol_upper,
+                    rows,
+                )
+            if not isinstance(previous_stats, Mapping):
                 log(
                     "telegram.trade.skip",
                     symbol=symbol_upper,
@@ -835,6 +851,110 @@ class WSManager:
                     price=str(avg_price),
                     pnl=str(trade_realized),
                 )
+
+    def _prime_inventory_snapshot(self) -> None:
+        with self._fill_lock:
+            needs_bootstrap = not self._inventory_snapshot or not self._inventory_baseline
+        if not needs_bootstrap:
+            return
+        try:
+            inventory = spot_inventory_and_pnl(settings=self.s)
+        except Exception as exc:
+            log("ws.private.inventory.bootstrap.error", err=str(exc))
+            return
+        normalized = self._normalise_inventory_snapshot(inventory)
+        with self._fill_lock:
+            if not self._inventory_snapshot:
+                self._inventory_snapshot = normalized
+            if not self._inventory_baseline:
+                self._inventory_baseline = {
+                    symbol: dict(stats)
+                    for symbol, stats in normalized.items()
+                }
+
+    def _recover_previous_stats(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, object]],
+    ) -> Mapping[str, Decimal] | None:
+        recovered = self._previous_stats_from_ledger(symbol, rows)
+        if isinstance(recovered, Mapping):
+            return recovered
+        baseline = self._inventory_baseline.get(symbol)
+        if isinstance(baseline, Mapping):
+            return dict(baseline)
+        return None
+
+    def _previous_stats_from_ledger(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, object]],
+    ) -> Mapping[str, Decimal] | None:
+        try:
+            ledger_rows = read_ledger(None, settings=self.s)
+        except Exception as exc:
+            log("ws.private.inventory.ledger.error", err=str(exc))
+            return None
+        if not ledger_rows:
+            return None
+
+        signature_counts: Counter[tuple[object, ...]] = Counter()
+        for row in rows:
+            signature = self._row_signature(row)
+            if signature is not None:
+                signature_counts[signature] += 1
+
+        if not signature_counts:
+            return None
+
+        filtered_rows: list[Mapping[str, object]] = []
+        removed = False
+        for row in ledger_rows:
+            if not isinstance(row, Mapping):
+                continue
+            signature = self._row_signature(row)
+            if signature is not None and signature_counts.get(signature, 0) > 0:
+                signature_counts[signature] -= 1
+                removed = True
+                continue
+            filtered_rows.append(row)
+
+        if not removed:
+            return None
+
+        try:
+            inventory = spot_inventory_and_pnl(events=filtered_rows, settings=self.s)
+        except Exception as exc:
+            log("ws.private.inventory.recover.error", err=str(exc))
+            return None
+
+        normalized = self._normalise_inventory_snapshot(inventory)
+        stats = normalized.get(symbol)
+        if not isinstance(stats, Mapping):
+            return None
+        return dict(stats)
+
+    @staticmethod
+    def _row_signature(row: Mapping[str, object] | None) -> tuple[object, ...] | None:
+        if not isinstance(row, Mapping):
+            return None
+        for key in ("execId", "executionId", "tradeId"):
+            value = row.get(key)
+            if value is not None and value != "":
+                return ("exec_id", str(value))
+        symbol = str(row.get("symbol") or "").upper()
+        side = str(row.get("side") or row.get("orderSide") or "").lower()
+        qty = str(row.get("execQty") or row.get("lastExecQty") or "")
+        price = str(row.get("execPrice") or "")
+        ts = str(
+            row.get("execTime")
+            or row.get("transactTime")
+            or row.get("time")
+            or ""
+        )
+        if not symbol and not qty and not price:
+            return None
+        return ("fields", symbol, side, qty, price, ts)
 
     @staticmethod
     def _normalise_inventory_snapshot(
