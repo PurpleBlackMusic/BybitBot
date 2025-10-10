@@ -967,6 +967,36 @@ def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
     assert details.get("price_limit_hit") is True
 
 
+def test_prepare_spot_market_rejects_quantised_price_above_instrument_cap():
+    orderbook = {"result": {"a": [["100.05", "2"]], "b": [["99.5", "2"]]}}
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    limits = _basic_limits()
+    limits["max_price"] = "100.05"
+    limits["tick_size"] = "0.1"
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("10"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("0.5"),
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("1000")},
+            limits=limits,
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "price_deviation"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("price_limit_hit") is True
+    assert details.get("price_cap") == "100.05"
+    assert details.get("limit_price") == "100.1"
+
+
 def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(twap_enabled=True, twap_slices=6)
     api = DummyAPI(_universe_payload([]))

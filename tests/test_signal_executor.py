@@ -2672,6 +2672,68 @@ def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyP
     assert isinstance(followup_backoff, dict)
     assert followup_backoff.get("retries") == 2
 
+
+def test_signal_executor_skips_price_limit_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    call_counter = {"value": 0}
+
+    def fake_place(*_args, **_kwargs):
+        call_counter["value"] += 1
+        raise OrderValidationError(
+            "Ожидаемая цена превышает допустимый предел для инструмента.",
+            code="price_deviation",
+            details={
+                "side": "buy",
+                "limit_price": "100.1",
+                "price_cap": "100.05",
+                "price_limit_hit": True,
+            },
+        )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    base_time = 1700000000.0
+    time_state = {"value": base_time}
+
+    def fake_now(self):
+        current = time_state["value"]
+        time_state["value"] += 30.0
+        return current
+
+    monkeypatch.setattr(SignalExecutor, "_current_time", fake_now)
+
+    executor = SignalExecutor(bot)
+
+    first_result = executor.execute_once()
+
+    assert first_result.status == "skipped"
+    assert call_counter["value"] == 1
+
+    second_result = executor.execute_once()
+
+    assert second_result.status == "skipped"
+    assert call_counter["value"] == 1
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
