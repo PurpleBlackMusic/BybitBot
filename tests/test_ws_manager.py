@@ -98,6 +98,54 @@ def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) ->
     assert status["private"]["running"] is True
 
 
+def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    class DummyAPI:
+        def __init__(self):
+            self.calls = 0
+
+        def place_order(self, **kwargs):
+            self.calls += 1
+            call_log.append(kwargs)
+            if self.calls == 1:
+                raise RuntimeError("Bybit error 170372: price too high")
+
+    call_log: list[dict[str, object]] = []
+    api = DummyAPI()
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {
+            "max_price": Decimal("100"),
+            "tick_size": Decimal("0.1"),
+            "min_order_amt": Decimal("5"),
+        },
+    )
+
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        notifications.append,
+    )
+
+    plan = [
+        {
+            "qty_text": "1",
+            "price_text": "120",
+            "profit_labels": ["test"],
+        }
+    ]
+
+    manager._execute_tp_plan(api, "BTCUSDT", plan)
+
+    assert len(call_log) == 2
+    assert call_log[1]["price"] == "100.0"
+    assert notifications == []
+
+
 @pytest.mark.parametrize(
     "verify_flag, expected_cert",
     (
