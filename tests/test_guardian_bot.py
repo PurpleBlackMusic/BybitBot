@@ -312,6 +312,23 @@ def test_guardian_summary_flags_low_confidence_under_defaults(tmp_path: Path) ->
     )
 
 
+def test_reload_settings_handles_stubbed_get_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bot = GuardianBot(data_dir=tmp_path)
+    bot._snapshot = object()
+
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "get_settings",
+        lambda: guardian_bot_module.Settings(),
+    )
+
+    bot.reload_settings()
+
+    assert bot._snapshot is None
+
+
 def test_guardian_summary_reports_effective_thresholds(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",

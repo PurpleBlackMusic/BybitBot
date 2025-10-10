@@ -19,6 +19,7 @@ WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 
 from .envs import Settings, active_dry_run, get_settings, get_api_client
+from .settings_loader import call_get_settings
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for
 from .trade_analytics import (
@@ -351,7 +352,7 @@ class GuardianBot:
 
     def reload_settings(self) -> None:
         if not self._custom_settings:
-            self._settings = get_settings(force_reload=True)
+            self._settings = call_get_settings(get_settings, force_reload=True)
         self._snapshot = None
         self._ledger_signature = None
         self._ledger_view = None
