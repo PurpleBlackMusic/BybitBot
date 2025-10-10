@@ -32,7 +32,7 @@ from .spot_market import (
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
-from .pnl import daily_pnl, read_ledger
+from .pnl import daily_pnl, read_ledger, invalidate_daily_pnl_cache
 from .spot_pnl import spot_inventory_and_pnl, _inventory_from_events, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -120,6 +120,7 @@ class SignalExecutor:
         self._validation_penalties: Dict[str, Dict[str, List[float]]] = {}
         self._symbol_quarantine: Dict[str, float] = {}
         self._price_limit_backoff: Dict[str, Dict[str, object]] = {}
+        self._daily_pnl_force_refresh = False
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -261,6 +262,13 @@ class SignalExecutor:
             if expiry_value is not None and expiry_value > timestamp:
                 continue
             self._price_limit_backoff.pop(symbol, None)
+
+    def _mark_daily_pnl_stale(self) -> None:
+        self._daily_pnl_force_refresh = True
+        try:
+            invalidate_daily_pnl_cache()
+        except Exception:
+            pass
 
     def _quarantine_symbol(
         self,
@@ -1691,6 +1699,7 @@ class SignalExecutor:
             ledger_rows_after=ledger_rows_after,
         )
         self._clear_symbol_penalties(symbol)
+        self._mark_daily_pnl_stale()
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
 
     # ------------------------------------------------------------------
@@ -2844,10 +2853,23 @@ class SignalExecutor:
         if limit_pct <= 0.0:
             return None
 
+        force_refresh = self._daily_pnl_force_refresh
         try:
+            if force_refresh:
+                aggregated = daily_pnl(force_refresh=True)
+            else:
+                aggregated = daily_pnl()
+        except TypeError:
             aggregated = daily_pnl()
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
         except Exception:
+            if force_refresh:
+                self._daily_pnl_force_refresh = True
             return None
+        else:
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
 
         if not isinstance(aggregated, Mapping):
             return None

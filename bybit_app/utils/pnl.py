@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import time
@@ -21,6 +22,8 @@ _RECENT_CACHE_SIZE = 2048
 _RECENT_KEYS: dict[Path, deque[str]] = {}
 _RECENT_KEY_SET: dict[Path, set[str]] = {}
 _RECENT_WARMED: set[Path] = set()
+_DAILY_PNL_DEFAULT_TTL = 30.0
+_DAILY_PNL_CACHE: dict[str, object] = {}
 
 
 def _normalise_network_marker(value: object | None) -> Optional[str]:
@@ -324,13 +327,8 @@ def read_ledger(
     return rows
 
 
-def daily_pnl():
-    """Грубая агрегация PnL по группам OCO на основе fills.
-    Для spot считаем: + (sell fills) - (buy fills) - fees.
-    Для futures линейно не считаем (оставим на потом) — суммируем signed qty*price и fee как черновик.
-    """
-    rows = read_ledger(100000)
-    by_day = {}
+def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str, dict[str, float]]]:
+    by_day: dict[str, dict[str, dict[str, float]]] = {}
     for r in rows:
         raw_ts = r.get("execTime") or r.get("ts")
         ts = None
@@ -399,6 +397,60 @@ def daily_pnl():
             spot_pnl = sym_payload.get("spot_pnl") or 0.0
             spot_fees = sym_payload.get("spot_fees") or 0.0
             sym_payload["spot_net"] = spot_pnl - abs(spot_fees)
-    # сохранить сводку
-    _SUMMARY.write_text(json.dumps(by_day, ensure_ascii=False, indent=2), encoding="utf-8")
     return by_day
+
+
+def invalidate_daily_pnl_cache() -> None:
+    with _LOCK:
+        _DAILY_PNL_CACHE.clear()
+
+
+def _cache_expired(entry: dict[str, object], now: float) -> bool:
+    expires_at = entry.get("expires_at")
+    if expires_at is None:
+        return False
+    try:
+        return float(expires_at) <= now
+    except (TypeError, ValueError):
+        return True
+
+
+def daily_pnl(
+    *, ttl: float | None = None, force_refresh: bool = False
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Грубая агрегация PnL по группам OCO на основе fills.
+    Для spot считаем: + (sell fills) - (buy fills) - fees.
+    Для futures линейно не считаем (оставим на потом) — суммируем signed qty*price и fee как черновик.
+    """
+
+    resolved_ttl = _DAILY_PNL_DEFAULT_TTL if ttl is None else max(float(ttl), 0.0)
+    use_cache = resolved_ttl > 0.0 and not force_refresh
+    now = time.time()
+
+    if use_cache:
+        with _LOCK:
+            entry = dict(_DAILY_PNL_CACHE)
+        cached_data = entry.get("data") if entry else None
+        if cached_data is not None and not _cache_expired(entry, now):
+            return copy.deepcopy(cached_data)
+
+    rows = read_ledger(100000)
+    summary = _build_daily_summary(rows)
+
+    payload = json.dumps(summary, ensure_ascii=False, indent=2)
+    _SUMMARY.write_text(payload, encoding="utf-8")
+
+    store_time = time.time()
+    expires_at = store_time + resolved_ttl if resolved_ttl > 0.0 else None
+    with _LOCK:
+        _DAILY_PNL_CACHE.clear()
+        _DAILY_PNL_CACHE.update(
+            {
+                "data": summary,
+                "timestamp": store_time,
+                "expires_at": expires_at,
+                "ttl": resolved_ttl,
+            }
+        )
+
+    return copy.deepcopy(summary)
