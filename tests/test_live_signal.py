@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import bybit_app.utils.live_signal as live_signal_module
+import bybit_app.utils.market_scanner as market_scanner_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.live_signal import LiveSignalError, LiveSignalFetcher
 
@@ -57,6 +58,78 @@ def test_live_signal_fetcher_reuses_cache_within_ttl(
     assert calls["count"] == 1
     assert second == first
     assert second["status_source"] == "live"
+
+
+def test_live_signal_fetcher_refreshes_snapshot_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    clock = Clock(start=4_000.0)
+    monkeypatch.setattr(live_signal_module, "time", clock)
+    monkeypatch.setattr(market_scanner_module, "time", clock)
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    stale_snapshot = {
+        "ts": clock.time() - 1_000.0,
+        "rows": [
+            {
+                "symbol": "AAAUSDT",
+                "price24hPcnt": 2.0,
+                "turnover24h": 2_000_000.0,
+                "bestBidPrice": 1.0,
+                "bestAskPrice": 1.01,
+                "volume24h": 1_000_000.0,
+            }
+        ],
+    }
+    market_scanner_module.save_market_snapshot(stale_snapshot, data_dir=tmp_path)
+
+    def fake_feature_bundle(raw: dict[str, object]) -> dict[str, object]:
+        return {
+            "blended_change_pct": raw.get("price24hPcnt", 0.0),
+            "volatility_pct": 5.0,
+            "volatility_windows": {},
+            "volume_spike_score": 0.0,
+            "volume_impulse": {},
+            "depth_imbalance": 0.0,
+            "correlations": {},
+            "correlation_strength": 0.0,
+        }
+
+    monkeypatch.setattr(market_scanner_module, "build_feature_bundle", fake_feature_bundle)
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+
+    fetch_calls = {"count": 0}
+
+    def fake_fetch_snapshot(api, category: str = "spot") -> dict[str, object]:
+        fetch_calls["count"] += 1
+        return {
+            "ts": clock.time(),
+            "rows": [
+                {
+                    "symbol": "AAAUSDT",
+                    "price24hPcnt": 3.5,
+                    "turnover24h": 3_000_000.0,
+                    "bestBidPrice": 2.0,
+                    "bestAskPrice": 2.01,
+                    "volume24h": 1_500_000.0,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        market_scanner_module, "fetch_market_snapshot", fake_fetch_snapshot
+    )
+
+    fetcher = LiveSignalFetcher(
+        settings=Settings(ai_live_only=False, ai_min_ev_bps=5.0),
+        data_dir=tmp_path,
+        cache_ttl=30.0,
+    )
+
+    result = fetcher.fetch()
+
+    assert fetch_calls["count"] == 1
+    assert result["symbol"] == "AAAUSDT"
 
 
 def test_live_signal_fetcher_threads_network_flag(
