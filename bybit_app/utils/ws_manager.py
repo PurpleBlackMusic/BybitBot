@@ -131,7 +131,8 @@ class WSManager:
     def _is_network_error(error: object) -> bool:
         if isinstance(error, OSError):
             return True
-        text = str(error or "").lower()
+        text_raw = str(error or "")
+        text = text_raw.lower()
         network_signals = (
             "name or service not known",
             "temporary failure in name resolution",
@@ -140,7 +141,15 @@ class WSManager:
             "connection refused",
             "cannot assign requested address",
         )
-        return any(token in text for token in network_signals)
+        if any(token in text for token in network_signals):
+            return True
+
+        if re.search(r"\b4\d{2}\b", text_raw) and any(
+            marker in text for marker in ("handshake", "http", "forbidden")
+        ):
+            return True
+
+        return False
 
     def start_public(self, subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
         subs = tuple(subs)
