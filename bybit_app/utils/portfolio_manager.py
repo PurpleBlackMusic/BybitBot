@@ -148,7 +148,7 @@ class PortfolioManager:
             self._locked -= allocation.notional
             if self._locked < 0:
                 self._locked = Decimal("0")
-        self._cooldowns[canonical] = current
+            self._cooldowns[canonical] = current
 
     def update_notional(self, symbol: object, notional: float | Decimal) -> None:
         canonical = _normalise_symbol(symbol)
