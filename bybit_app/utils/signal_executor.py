@@ -2861,9 +2861,32 @@ class SignalExecutor:
         for payload in day_bucket.values():
             if not isinstance(payload, Mapping):
                 continue
-            spot_pnl = _safe_float(payload.get("spot_pnl")) or 0.0
+
+            spot_net = _safe_float(payload.get("spot_net"))
+            if spot_net is not None:
+                net_result += spot_net
+                continue
+
+            spot_pnl = _safe_float(payload.get("spot_pnl"))
+            if spot_pnl is None:
+                continue
+
+            spot_fees = _safe_float(payload.get("spot_fees"))
+            if spot_fees is not None:
+                net_result += spot_pnl - abs(spot_fees)
+                continue
+
+            categories = payload.get("categories")
+            if isinstance(categories, Sequence) and not isinstance(categories, (str, bytes)):
+                if all(str(cat).lower() != "spot" for cat in categories):
+                    continue
+
+            category = payload.get("category")
+            if isinstance(category, str) and category.strip().lower() != "spot":
+                continue
+
             fees = _safe_float(payload.get("fees")) or 0.0
-            net_result += spot_pnl - abs(fees)
+            net_result += (spot_pnl or 0.0) - abs(fees)
 
         if net_result >= 0.0:
             return None
