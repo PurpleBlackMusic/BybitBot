@@ -20,6 +20,7 @@ from typing import (
 )
 
 from .bybit_api import BybitAPI
+from .ai.models import MarketModel, ensure_market_model
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -232,6 +233,77 @@ def _weighted_opportunity_model(
     return probability, score, metrics
 
 
+def _model_feature_vector(
+    *,
+    trend: str,
+    change_pct: Optional[float],
+    blended_change: Optional[float],
+    turnover: Optional[float],
+    volatility_pct: Optional[float],
+    volume_impulse: Mapping[str, Optional[float]] | None,
+    depth_imbalance: Optional[float],
+    spread_bps: Optional[float],
+    correlation_strength: Optional[float],
+) -> Dict[str, float]:
+    direction = 0
+    if trend == "buy":
+        direction = 1
+    elif trend == "sell":
+        direction = -1
+
+    signed_change = 0.0
+    if change_pct is not None:
+        signed_change = float(change_pct)
+        if direction < 0:
+            signed_change = -signed_change
+
+    multi_tf = blended_change
+    if multi_tf is None:
+        multi_tf = change_pct
+    if multi_tf is None:
+        multi_tf_value = signed_change
+    else:
+        multi_tf_value = float(multi_tf)
+        if direction < 0:
+            multi_tf_value = -multi_tf_value
+
+    turnover_log = 0.0
+    if turnover is not None and turnover > 0:
+        turnover_log = math.log10(float(turnover) + 1.0)
+
+    vol_value = 0.0
+    if isinstance(volatility_pct, (int, float)):
+        vol_value = float(volatility_pct)
+
+    best_impulse = _best_volume_impulse(volume_impulse if isinstance(volume_impulse, Mapping) else None)
+
+    depth_value = 0.0
+    if isinstance(depth_imbalance, (int, float)):
+        depth_value = float(depth_imbalance)
+        if direction != 0:
+            depth_value *= direction
+
+    spread_value = 0.0
+    if isinstance(spread_bps, (int, float)):
+        spread_value = float(spread_bps)
+
+    correlation_value = 0.0
+    if isinstance(correlation_strength, (int, float)):
+        correlation_value = float(correlation_strength)
+
+    return {
+        "directional_change_pct": signed_change,
+        "multiframe_change_pct": multi_tf_value,
+        "turnover_log": turnover_log,
+        "volatility_pct": vol_value,
+        "volume_impulse": best_impulse,
+        "depth_imbalance": depth_value,
+        "spread_bps": spread_value,
+        "correlation_strength": correlation_value,
+        "maker_flag": 0.0,
+    }
+
+
 def load_market_snapshot(
     data_dir: Path = DATA_DIR,
     *,
@@ -343,6 +415,12 @@ def scan_market_opportunities(
     wset = _normalise_symbol_set(whitelist or ())
     bset = _normalise_symbol_set(blacklist or ())
 
+    try:
+        model: Optional[MarketModel] = ensure_market_model(data_dir=data_dir)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log("market_scanner.model.error", err=str(exc))
+        model = None
+
     for raw in rows:
         if not isinstance(raw, dict):
             continue
@@ -399,14 +477,49 @@ def scan_market_opportunities(
             if strength < 0.1:
                 continue
 
-        probability, score, model_metrics = _weighted_opportunity_model(
-            change_pct=change_pct,
+        feature_vector = _model_feature_vector(
             trend=trend,
+            change_pct=change_pct,
+            blended_change=blended_change,
             turnover=turnover,
+            volatility_pct=volatility_pct,
+            volume_impulse=volume_impulse if isinstance(volume_impulse, Mapping) else None,
+            depth_imbalance=depth_imbalance,
             spread_bps=spread_bps,
-            features=feature_bundle,
-            force_include=force_include,
+            correlation_strength=correlation_strength,
         )
+
+        if model is not None:
+            probability = model.predict_proba(feature_vector)
+            score = probability * 100.0
+            prob_clamped = min(max(probability, 1e-6), 1.0 - 1e-6)
+            logit = math.log(prob_clamped / (1.0 - prob_clamped))
+            model_metrics: Dict[str, object] = {
+                "model": "logistic_regression",
+                "features": feature_vector,
+                "logit": logit,
+                "trained_at": model.trained_at,
+                "samples": model.samples,
+            }
+        else:
+            probability, score, fallback_metrics = _weighted_opportunity_model(
+                change_pct=change_pct,
+                trend=trend,
+                turnover=turnover,
+                spread_bps=spread_bps,
+                features=feature_bundle,
+                force_include=force_include,
+            )
+            fallback_details = dict(fallback_metrics)
+            model_metrics = dict(fallback_details)
+            model_metrics.update(
+                {
+                    "model": "logistic_regression",
+                    "features": feature_vector,
+                    "warning": "model_unavailable",
+                    "fallback": fallback_details,
+                }
+            )
 
         direction = 0
         if trend == "buy":
