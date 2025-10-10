@@ -14,9 +14,11 @@ class WSOrderbookV5:
         self.levels = levels
         self._book: Dict[str, Dict[str, List[Tuple[float,float]]]] = {}  # {sym: {'b':[(px,qty)], 'a':[]}, 'ts': ms}
         self._lock = threading.Lock()
+        self._topic_lock = threading.Lock()
         self._stop = False
         self._ws = None
         self._thread = None
+        self._topics: set[str] = set()
 
     def start(self, symbols: list[str]):
         try:
@@ -24,10 +26,26 @@ class WSOrderbookV5:
         except Exception as e:
             log("ws.orderbook.disabled", reason="no websocket-client", err=str(e))
             return False
+        new_topics = {f"orderbook.{self.levels}.{s}" for s in symbols}
+        with self._topic_lock:
+            old_topics = set(self._topics)
+            self._topics = new_topics
+
         if self._thread and self._thread.is_alive():
+            to_unsubscribe = sorted(old_topics - new_topics)
+            to_subscribe = sorted(new_topics - old_topics)
+            ws = self._ws
+            if ws is not None:
+                for op, args in (("unsubscribe", to_unsubscribe), ("subscribe", to_subscribe)):
+                    if not args:
+                        continue
+                    try:
+                        ws.send(json.dumps({"op": op, "args": args}))
+                    except Exception as e:
+                        log("ws.orderbook.send_err", err=str(e))
             return True
         self._stop = False
-        topics = [f"orderbook.{self.levels}.{s}" for s in symbols]
+
         def run():
             import websocket, ssl
             try:
@@ -47,7 +65,7 @@ class WSOrderbookV5:
                 try:
                     ws = websocket.WebSocketApp(
                         self.url,
-                        on_open=lambda w: self._on_open(w, topics),
+                        on_open=lambda w: self._on_open(w),
                         on_message=self._on_msg,
                         on_error=lambda w, e: log("ws.orderbook.error", err=str(e)),
                         on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m),
@@ -75,7 +93,11 @@ class WSOrderbookV5:
         except Exception:
             pass
 
-    def _on_open(self, ws, topics):
+    def _on_open(self, ws):
+        with self._topic_lock:
+            topics = sorted(self._topics)
+        if not topics:
+            return
         sub = {"op": "subscribe", "args": topics}
         try:
             ws.send(json.dumps(sub))
