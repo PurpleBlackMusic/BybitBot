@@ -8,7 +8,7 @@ import ssl
 import random
 from collections import Counter
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 import websocket  # websocket-client
 
@@ -1359,8 +1359,27 @@ class WSManager:
             )
             return
 
-        self._cancel_existing_tp_orders(api, symbol)
-        self._execute_tp_plan(api, symbol, plan)
+        prepared_payloads = self._prepare_tp_payloads(symbol, plan)
+        if not prepared_payloads:
+            return
+
+        def _cancel_existing() -> None:
+            self._cancel_existing_tp_orders(api, symbol)
+
+        executed = self._execute_tp_plan(
+            api,
+            symbol,
+            prepared_payloads,
+            on_first_success=_cancel_existing,
+        )
+        if not executed:
+            log(
+                "ws.private.tp_ladder.restore_previous",
+                symbol=symbol,
+                reason="no_new_orders",
+            )
+            return
+
         self.register_tp_ladder_plan(
             symbol,
             signature=signature,
@@ -1667,23 +1686,21 @@ class WSManager:
 
         return plan
 
-    def _execute_tp_plan(
-        self,
-        api,
-        symbol: str,
-        plan: list[dict[str, object]],
-    ) -> None:
+    def _prepare_tp_payloads(
+        self, symbol: str, plan: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
         if not plan:
-            return
+            return []
 
         timestamp = int(time.time() * 1000)
+        prepared: list[dict[str, object]] = []
         for rung_index, entry in enumerate(plan, start=1):
             qty_text = str(entry.get("qty_text") or "0")
             price_text = str(entry.get("price_text") or "0")
             if qty_text == "0" or price_text == "0":
                 continue
             profit_labels = entry.get("profit_labels") or []
-            profit_text = ",".join(profit_labels) if profit_labels else "-"
+            profit_text = ",".join(str(label) for label in profit_labels) if profit_labels else "-"
             link_seed = f"AI-TP-{symbol}-{timestamp}-{rung_index}"
             link_id = ensure_link_id(link_seed) or link_seed
             payload = {
@@ -1697,9 +1714,46 @@ class WSManager:
                 "orderLinkId": link_id,
                 "orderFilter": "Order",
             }
-            final_payload = payload
+            prepared.append(
+                {
+                    "rung_index": rung_index,
+                    "qty_text": qty_text,
+                    "price_text": price_text,
+                    "profit_text": profit_text,
+                    "payload": payload,
+                }
+            )
+
+        return prepared
+
+    def _execute_tp_plan(
+        self,
+        api,
+        symbol: str,
+        prepared_plan: list[dict[str, object]],
+        *,
+        on_first_success: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        if not prepared_plan:
+            return False
+
+        success_count = 0
+        cancel_invoked = False
+
+        for staged in prepared_plan:
+            rung_index = int(staged.get("rung_index") or len(prepared_plan))
+            qty_text = str(staged.get("qty_text") or "0")
+            price_text = str(staged.get("price_text") or "0")
+            if qty_text == "0" or price_text == "0":
+                continue
+            profit_text = str(staged.get("profit_text") or "-")
+            payload = staged.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+
+            final_payload = dict(payload)
             try:
-                api.place_order(**payload)
+                api.place_order(**final_payload)
             except Exception as exc:
                 error_code = _extract_error_code(exc)
                 if error_code in _TP_LADDER_SKIP_CODES:
@@ -1732,6 +1786,19 @@ class WSManager:
                         rung=rung_index,
                     )
                     continue
+
+            if not cancel_invoked and on_first_success is not None:
+                try:
+                    on_first_success()
+                except Exception as exc:  # pragma: no cover - defensive
+                    log(
+                        "ws.private.tp_ladder.cancel_callback.error",
+                        err=str(exc),
+                        symbol=symbol,
+                    )
+                cancel_invoked = True
+
+            success_count += 1
             log(
                 "ws.private.tp_ladder.place",
                 symbol=symbol,
@@ -1740,6 +1807,8 @@ class WSManager:
                 price=price_text,
                 profit_bps=profit_text,
             )
+
+        return success_count > 0
 
     def _reprice_tp_rung_to_ceiling(
         self,

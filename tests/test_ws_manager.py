@@ -139,11 +139,103 @@ def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch)
         }
     ]
 
-    manager._execute_tp_plan(api, "BTCUSDT", plan)
+    prepared = manager._prepare_tp_payloads("BTCUSDT", plan)
+    assert len(prepared) == 1
+
+    result = manager._execute_tp_plan(
+        api,
+        "BTCUSDT",
+        prepared,
+        on_first_success=lambda: None,
+    )
 
     assert len(call_log) == 2
     assert call_log[1]["price"] == "100.0"
     assert notifications == []
+    assert result is True
+
+
+def test_regenerate_tp_ladder_preserves_existing_on_total_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+
+    previous_plan = [
+        {"price_text": "101.0", "qty_text": "0.10"},
+        {"price_text": "102.0", "qty_text": "0.10"},
+    ]
+    previous_signature = tuple(
+        (entry["price_text"], entry["qty_text"]) for entry in previous_plan
+    )
+    manager.register_tp_ladder_plan(
+        "BTCUSDT",
+        signature=previous_signature,
+        avg_cost=Decimal("100"),
+        qty=Decimal("0.20"),
+        status="active",
+        source="ws_manager",
+    )
+
+    before_plan = dict(manager._tp_ladder_plan.get("BTCUSDT") or {})
+
+    monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
+
+    class DummyAPI:
+        def __init__(self):
+            self.place_calls: list[dict[str, object]] = []
+            self.cancelled: list[dict[str, object]] = []
+
+        def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            raise RuntimeError("Bybit error 170131: below minimum qty")
+
+        def open_orders(self, **kwargs):
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "old-order",
+                            "orderLinkId": "AI-TP-BTC-OLD",
+                        }
+                    ]
+                }
+            }
+
+        def cancel_batch(self, **kwargs):
+            self.cancelled.append(kwargs)
+
+    api = DummyAPI()
+
+    limits_cache = {
+        "BTCUSDT": {
+            "qty_step": Decimal("0.01"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.01"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    manager._regenerate_tp_ladder(
+        {"symbol": "BTCUSDT", "side": "Buy"},
+        {"BTCUSDT": {"position_qty": Decimal("0.20"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("50"), Decimal("0.5")), (Decimal("100"), Decimal("0.5"))],
+        api=api,
+        limits_cache=limits_cache,
+        settings=SimpleNamespace(
+            spot_tp_reprice_threshold_bps=0,
+            spot_tp_reprice_qty_buffer=None,
+        ),
+    )
+
+    assert len(api.place_calls) >= 2
+    assert api.cancelled == []
+
+    current_plan = manager._tp_ladder_plan.get("BTCUSDT") or {}
+    assert current_plan.get("signature") == previous_signature
+    assert current_plan.get("updated_ts") == before_plan.get("updated_ts")
 
 
 def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,7 +282,9 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         manager,
         "_execute_tp_plan",
-        lambda api_obj, symbol, payload: execute_calls.append((symbol, payload)),
+        lambda api_obj, symbol, payload, on_first_success=None: execute_calls.append(
+            (symbol, payload)
+        ),
     )
 
     limits_cache = {
