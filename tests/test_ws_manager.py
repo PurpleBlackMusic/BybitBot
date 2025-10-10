@@ -592,10 +592,13 @@ def test_refresh_settings_handles_typeerror(monkeypatch: pytest.MonkeyPatch) -> 
     assert events == []
 
 
-def test_public_network_error_on_testnet_keeps_testnet_url(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_public_network_error_on_testnet_switches_to_mainnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = WSManager()
     settings = SimpleNamespace(testnet=True)
     manager.s = settings
+    manager._last_settings_testnet = settings.testnet
 
     monkeypatch.setattr(
         ws_manager_module,
@@ -603,7 +606,6 @@ def test_public_network_error_on_testnet_keeps_testnet_url(monkeypatch: pytest.M
         lambda *, force_reload=False: settings,
     )
 
-    manager._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
     monkeypatch.setattr(manager, "_is_network_error", lambda error: True)
 
     error = OSError("temporary failure")
@@ -611,8 +613,79 @@ def test_public_network_error_on_testnet_keeps_testnet_url(monkeypatch: pytest.M
         manager._fallback_public_to_mainnet(str(error))
 
     resolved_url = manager._public_url()
-    assert resolved_url.endswith("stream-testnet.bybit.com/v5/public/spot")
+    assert resolved_url == "wss://stream.bybit.com/v5/public/spot"
+    assert manager._pub_url_override == "wss://stream.bybit.com/v5/public/spot"
+
+
+def test_public_override_resets_when_settings_return_to_testnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    initial_settings = SimpleNamespace(testnet=True)
+    manager.s = initial_settings
+    manager._last_settings_testnet = initial_settings.testnet
+
+    manager._fallback_public_to_mainnet("network error")
+
+    mainnet_settings = SimpleNamespace(testnet=False)
+    restored_settings = SimpleNamespace(testnet=True)
+    settings_iter = iter([mainnet_settings, restored_settings])
+
+    def fake_get_settings(*, force_reload: bool = False):
+        try:
+            return next(settings_iter)
+        except StopIteration:
+            return restored_settings
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", fake_get_settings)
+
+    url_while_mainnet = manager._public_url()
+    assert url_while_mainnet == "wss://stream.bybit.com/v5/public/spot"
+    assert manager._pub_url_override == "wss://stream.bybit.com/v5/public/spot"
+
+    restored_url = manager._public_url()
+    assert restored_url == "wss://stream-testnet.bybit.com/v5/public/spot"
     assert manager._pub_url_override is None
+
+
+def test_start_public_uses_mainnet_after_testnet_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(testnet=True, verify_ssl=True)
+    manager.s = settings
+    manager._last_settings_testnet = settings.testnet
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda *args, **kwargs: settings)
+
+    manager._fallback_public_to_mainnet("network error")
+
+    captured: dict[str, object] = {}
+
+    class DummyWebSocketApp:
+        def __init__(self, url: str, **kwargs):
+            captured["url"] = url
+
+        def run_forever(self, **kwargs):
+            manager._pub_running = False
+
+    class ImmediateThread:
+        def __init__(self, target, daemon: bool = False):
+            self._target = target
+            self.daemon = daemon
+
+        def start(self):
+            self._target()
+
+        def is_alive(self):  # pragma: no cover - parity with threading.Thread
+            return False
+
+    monkeypatch.setattr(ws_manager_module.websocket, "WebSocketApp", DummyWebSocketApp)
+    monkeypatch.setattr(ws_manager_module.threading, "Thread", ImmediateThread)
+
+    assert manager.start_public(subs=("tickers.BTCUSDT",)) is True
+    assert captured.get("url") == "wss://stream.bybit.com/v5/public/spot"
 
 
 def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) -> None:

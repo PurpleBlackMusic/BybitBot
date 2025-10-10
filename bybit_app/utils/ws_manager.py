@@ -54,6 +54,7 @@ class WSManager:
 
     def __init__(self):
         self.s = get_settings()
+        self._last_settings_testnet: Optional[bool] = getattr(self.s, "testnet", None)
 
         # public
         self._pub_running: bool = False
@@ -91,6 +92,7 @@ class WSManager:
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
         """Reload settings so WS endpoints respect latest configuration."""
+        previous_testnet = self._last_settings_testnet
         try:
             self.s = get_settings(force_reload=True)
         except TypeError:
@@ -98,6 +100,14 @@ class WSManager:
             self.s = get_settings()
         except Exception as e:  # pragma: no cover - defensive, rare
             log("ws.settings.refresh.error", err=str(e))
+        current_testnet = getattr(self.s, "testnet", None)
+        if (
+            self._pub_url_override is not None
+            and previous_testnet is False
+            and current_testnet is True
+        ):
+            self._pub_url_override = None
+        self._last_settings_testnet = current_testnet
 
     def _handle_private_beat(self) -> None:
         now = time.time()
@@ -111,14 +121,12 @@ class WSManager:
             if self.s.testnet
             else "wss://stream.bybit.com/v5/public/spot"
         )
-        if not self.s.testnet and self._pub_url_override is not None:
-            self._pub_url_override = None
         return self._pub_url_override or base_url
 
     def _fallback_public_to_mainnet(self, reason: str) -> None:
         if not self.s.testnet:
             return
-        self._pub_url_override = None
+        self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
         log("ws.public.testnet.network_error", reason=reason)
 
     @staticmethod
