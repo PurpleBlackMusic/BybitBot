@@ -4,7 +4,7 @@ from .helpers import ensure_link_id
 import uuid
 from .bybit_api import BybitAPI
 from .log import log
-from .telegram_notify import send_telegram
+from .telegram_notify import enqueue_telegram_message
 from .oco_guard import register_group
 
 def place_spot_oco(api: BybitAPI, symbol: str, side: str, qty: str, price: str, take_profit: str, stop_loss: str, group: str | None = None):
@@ -22,5 +22,7 @@ def place_spot_oco(api: BybitAPI, symbol: str, side: str, qty: str, price: str, 
         sl = api.place_order(category="spot", symbol=symbol, side="Buy", orderType="Market", qty=qty, triggerDirection=1, triggerPrice=stop_loss, orderFilter="tpslOrder", orderLinkId=ensure_link_id(sl_link))
     log("oco.exits", tp=tp, sl=sl, group=group)
     register_group(group, symbol=symbol, category="spot", primary=primary_link, tp=tp_link, sl=sl_link)
-    send_telegram(f"✅ OCO создан [{group}] {symbol} {side} qty={qty} entry={price} TP={take_profit} SL={stop_loss}")
+    enqueue_telegram_message(
+        f"✅ OCO создан [{group}] {symbol} {side} qty={qty} entry={price} TP={take_profit} SL={stop_loss}"
+    )
     return {"group": group, "primary": primary, "tp": tp, "sl": sl}

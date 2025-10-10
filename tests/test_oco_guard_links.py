@@ -80,7 +80,11 @@ def test_load_normalizes_existing_records(temp_store):
 def test_handle_private_updates_long_group(temp_store, monkeypatch):
     calls, stub_amend = _stub_amend_calls()
     monkeypatch.setattr(oco_guard, "_amend_qty", stub_amend)
-    monkeypatch.setattr(oco_guard, "send_telegram", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        oco_guard,
+        "enqueue_telegram_message",
+        lambda *args, **kwargs: None,
+    )
 
     group = "OCO-" + "Z" * 30
     primary = f"{group}-PRIMARY"
@@ -119,7 +123,11 @@ def test_handle_private_closes_on_fill(temp_store, monkeypatch):
 
     api = DummyAPI()
     monkeypatch.setattr(oco_guard, "_api", lambda: api)
-    monkeypatch.setattr(oco_guard, "send_telegram", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        oco_guard,
+        "enqueue_telegram_message",
+        lambda *args, **kwargs: None,
+    )
 
     group = "OCO-" + "W" * 31
     primary = f"{group}-PRIMARY"

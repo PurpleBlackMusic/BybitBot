@@ -636,7 +636,11 @@ def test_signal_executor_guard_forces_sell_on_time_and_loss(
         sent_messages.append(text)
         return {"ok": True}
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     monkeypatch.setattr(
         signal_executor_module,
@@ -925,7 +929,11 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     )
     monkeypatch.setattr(signal_executor_module, "read_ledger", lambda n=2000, **_: [])
     monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", lambda events=None: {})
-    monkeypatch.setattr(signal_executor_module, "send_telegram", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        lambda *args, **kwargs: None,
+    )
 
     response_payload = {
         "retCode": 0,
@@ -1361,7 +1369,11 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
         captured["text"] = text
         return {"ok": True}
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -1433,7 +1445,11 @@ def test_signal_executor_uses_execution_stats_for_notifications(
         captured["text"] = text
         return {"ok": True}
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -1535,7 +1551,11 @@ def test_signal_executor_sell_notification_reports_realized_pnl(
         captured["text"] = text
         return {"ok": True}
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -1611,7 +1631,11 @@ def test_signal_executor_notifies_on_price_deviation(monkeypatch: pytest.MonkeyP
     def fake_send(text: str) -> None:
         captured.append(text)
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()
@@ -1657,7 +1681,11 @@ def test_signal_executor_does_not_notify_validation_when_disabled(
     def fake_send(_text: str) -> None:
         called["value"] = True
 
-    monkeypatch.setattr(signal_executor_module, "send_telegram", fake_send)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "enqueue_telegram_message",
+        fake_send,
+    )
 
     executor = SignalExecutor(bot)
     result = executor.execute_once()

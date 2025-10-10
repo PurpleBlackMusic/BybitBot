@@ -24,7 +24,7 @@ from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
 from .symbols import ensure_usdt_symbol
-from .telegram_notify import send_telegram
+from .telegram_notify import enqueue_telegram_message
 
 if TYPE_CHECKING:  # pragma: no cover - for type checking only
     from .portfolio_manager import PortfolioManager
@@ -637,7 +637,7 @@ class MarketScanner:
         candle_limit: int = 120,
         mode: str = "breakout",
         portfolio_manager: Optional["PortfolioManager"] = None,
-        telegram_sender: Callable[[str], object] = send_telegram,
+        telegram_sender: Callable[[str], object] = enqueue_telegram_message,
         category: str = "spot",
     ) -> None:
         self.api = api

@@ -1,12 +1,136 @@
-
 from __future__ import annotations
-import requests, time
+
+import atexit
+import queue
+import threading
+import time
 from collections import deque
+from typing import Callable, Optional
+
+import requests
+
 from .envs import get_settings
 from .log import log
 
 
+class TelegramDispatcher:
+    """Asynchronous dispatcher for Telegram notifications."""
+
+    def __init__(
+        self,
+        http_post: Callable[..., object] | None = None,
+        rate_guard: Callable[[], None] | None = None,
+    ) -> None:
+        self._http_post = http_post or requests.post
+        self._rate_guard = rate_guard or _rate_guard
+        self._queue: "queue.Queue[str | None]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def enqueue_message(self, text: str) -> None:
+        """Schedule message for asynchronous delivery without blocking."""
+
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+
+        self._ensure_thread()
+        self._queue.put_nowait(text)
+
+    def shutdown(self, *, timeout: float | None = None) -> None:
+        """Stop dispatcher thread waiting for outstanding work."""
+
+        thread = self._thread
+        if not thread:
+            return
+
+        self._stop_event.set()
+        self._queue.put_nowait(None)
+        thread.join(timeout=timeout)
+
+    def _ensure_thread(self) -> None:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            thread = threading.Thread(target=self._run, name="telegram-dispatcher", daemon=True)
+            self._thread = thread
+            thread.start()
+
+    def _run(self) -> None:
+        while True:
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stop_event.is_set():
+                    break
+                continue
+
+            if item is None:
+                if self._stop_event.is_set() and self._queue.empty():
+                    break
+                continue
+
+            self._deliver(item)
+
+        # Drain leftover sentinel items to keep queue consistent.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _deliver(self, text: str) -> None:
+        try:
+            self._rate_guard()
+            _send_telegram_http(text, http_post=self._http_post)
+        except Exception as exc:  # pragma: no cover - defensive catch for worker loop
+            log("telegram.error", error=str(exc))
+
+
 def send_telegram(text: str):
+    """Send Telegram message synchronously respecting rate limits."""
+
+    _rate_guard()
+    return _send_telegram_http(text)
+
+
+# Soft rate limiting to respect Telegram Bot API guidance
+# - ~1 msg/second per chat; ~20 msg/minute in groups; ~30 msg/sec global
+# We implement per-chat guard (simple) to avoid spamming when loops misbehave.
+RATE_STATE = {"last_ts": 0.0, "window": deque(maxlen=60)}  # last 60 timestamps
+_RATE_LOCK = threading.Lock()
+
+
+def _rate_guard() -> None:
+    while True:
+        with _RATE_LOCK:
+            now = time.time()
+
+            # purge old timestamps first
+            window = RATE_STATE["window"]
+            while window and now - window[0] > 60.0:
+                window.popleft()
+
+            wait_for = 0.0
+            gap = now - RATE_STATE["last_ts"]
+            if gap < 1.0:
+                wait_for = max(wait_for, 1.0 - gap)
+
+            if len(window) >= 20 and window:
+                wait_for = max(wait_for, 60.0 - (now - window[0]))
+
+            if wait_for <= 0.0:
+                RATE_STATE["last_ts"] = now
+                window.append(now)
+                return
+
+        time.sleep(wait_for)
+
+
+def _send_telegram_http(text: str, http_post: Callable[..., object] | None = None):
+    http = http_post or requests.post
+
     s = get_settings()
     if not s.telegram_token or not s.telegram_chat_id:
         return {"ok": False, "error": "telegram_not_configured"}
@@ -14,10 +138,8 @@ def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{s.telegram_token}/sendMessage"
     payload = {"chat_id": s.telegram_chat_id, "text": text}
 
-    _rate_guard()
-
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = http(url, json=payload, timeout=10)
     except Exception as exc:  # pragma: no cover - network/runtime guard
         log("telegram.error", error=str(exc))
         return {"ok": False, "error": str(exc)}
@@ -28,7 +150,7 @@ def send_telegram(text: str):
     except ValueError:
         response_data = None
 
-    success = response.ok and not (
+    success = getattr(response, "ok", False) and not (
         isinstance(response_data, dict) and response_data.get("ok") is False
     )
 
@@ -41,48 +163,32 @@ def send_telegram(text: str):
                 or ""
             )
         if not description:
-            description = response.text or response.reason
+            description = getattr(response, "text", "") or getattr(response, "reason", "")
         log(
             "telegram.error",
-            status=response.status_code,
+            status=getattr(response, "status_code", None),
             error=description,
         )
         return {
             "ok": False,
-            "status": response.status_code,
+            "status": getattr(response, "status_code", None),
             "error": description,
             "response": response_data,
         }
 
-    log("telegram.send", status=response.status_code)
-    return {"ok": True, "status": response.status_code, "response": response_data}
+    log("telegram.send", status=getattr(response, "status_code", None))
+    return {"ok": True, "status": getattr(response, "status_code", None), "response": response_data}
 
 
-# Soft rate limiting to respect Telegram Bot API guidance
-# - ~1 msg/second per chat; ~20 msg/minute in groups; ~30 msg/sec global
-# We implement per-chat guard (simple) to avoid spamming when loops misbehave.
-RATE_STATE = {"last_ts": 0.0, "window": deque(maxlen=60)}  # last 60 timestamps
+dispatcher = TelegramDispatcher()
 
 
-def _rate_guard() -> None:
-    now = time.time()
+def enqueue_telegram_message(text: str) -> None:
+    dispatcher.enqueue_message(text)
 
-    gap = now - RATE_STATE["last_ts"]
-    if gap < 1.0:
-        time.sleep(1.0 - gap)
-        now = time.time()
 
-    window = RATE_STATE["window"]
-    while window and now - window[0] > 60.0:
-        window.popleft()
+def shutdown_telegram_dispatcher(*, timeout: float | None = None) -> None:
+    dispatcher.shutdown(timeout=timeout)
 
-    if len(window) >= 20:
-        wait_for = 60.0 - (now - window[0])
-        if wait_for > 0:
-            time.sleep(wait_for)
-            now = time.time()
-            while window and now - window[0] > 60.0:
-                window.popleft()
 
-    window.append(now)
-    RATE_STATE["last_ts"] = now
+atexit.register(dispatcher.shutdown)

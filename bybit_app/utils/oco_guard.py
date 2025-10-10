@@ -5,7 +5,7 @@ import json, time, threading
 from .paths import DATA_DIR
 from .log import log
 from .envs import get_api_client
-from .telegram_notify import send_telegram
+from .telegram_notify import enqueue_telegram_message
 
 STORE = DATA_DIR / "oco_groups.json"
 _LOCK = threading.Lock()
@@ -193,7 +193,7 @@ def handle_private(msg: dict):
                     cat = str(ev.get("category", "spot") or "spot")
                     api.cancel_order(category=cat, symbol=sym, orderLinkId=ensure_link_id(other_link))
                     log("oco.guard.cancel_other", group=group_name, cancelled_link=other_link)
-                    send_telegram(
+                    enqueue_telegram_message(
                         f"🧹 OCO [{group_name}] исполнено {link.split('-')[-1]}, вторая нога отменена."
                     )
                 except Exception as e:
