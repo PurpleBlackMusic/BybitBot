@@ -98,7 +98,7 @@ class _SymbolState:
     def register_buy(self, record: ExecutionRecord) -> None:
         total_cost = self.avg_cost * self.position_qty
         total_cost += record.price * abs(record.qty)
-        total_cost += abs(record.fee)
+        total_cost += record.fee
         self.position_qty += abs(record.qty)
         if self.position_qty > 1e-9:
             self.avg_cost = total_cost / self.position_qty
@@ -114,7 +114,7 @@ class _SymbolState:
             self._remember(record.price, abs(record.qty))
             return None
 
-        proceeds = record.price * qty_to_close - abs(record.fee)
+        proceeds = record.price * qty_to_close - record.fee
         cost_basis = self.avg_cost * qty_to_close
         realized_pnl = proceeds - cost_basis
 

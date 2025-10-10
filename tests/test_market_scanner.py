@@ -222,6 +222,39 @@ def test_build_training_dataset_emits_recency_weights(tmp_path: Path) -> None:
     assert recency[0] < recency[1] <= 1.0
 
 
+def test_build_training_dataset_handles_negative_fees(tmp_path: Path) -> None:
+    now = time.time()
+    ledger_path = tmp_path / "executions.jsonl"
+    records = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "1",
+            "execPrice": "100",
+            "execFee": "-0.1",
+            "isMaker": True,
+            "execTime": now - 120,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "1",
+            "execPrice": "100",
+            "execFee": "-0.1",
+            "isMaker": True,
+            "execTime": now - 60,
+        },
+    ]
+    _write_ledger(ledger_path, records)
+
+    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+
+    assert matrix.shape == (1, len(ai_models.MODEL_FEATURES))
+    assert labels.tolist() == [1]
+    assert recency.shape == (1,)
+    assert recency[0] > 0
+
+
 def test_train_market_model_logs_metrics_and_uses_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
