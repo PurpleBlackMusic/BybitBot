@@ -34,13 +34,28 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "volume24h": "3500",
             "price1hPcnt": "1.8",
             "price4hPcnt": "2.1",
+            "price7dPcnt": "6.2",
             "highPrice24h": "28200",
             "lowPrice24h": "26000",
             "lastPrice": "27100",
+            "highPrice1h": "27500",
+            "lowPrice1h": "26800",
+            "closePrice1h": "27100",
+            "highPrice4h": "28400",
+            "lowPrice4h": "26300",
+            "closePrice4h": "27120",
+            "highPrice7d": "30000",
+            "lowPrice7d": "24800",
+            "closePrice7d": "27200",
             "volume1h": "400",
-            "prevVolume24h": "1200",
+            "prevVolume1h": "150",
+            "volume4h": "1200",
+            "prevVolume4h": "500",
+            "prevVolume24h": "300",
             "bid1Size": "150",
             "ask1Size": "120",
+            "corr_btc": "0.45",
+            "corr_market": "0.35",
         },
         {
             "symbol": "ETHUSDT",
@@ -51,13 +66,25 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "volume24h": "2800",
             "price1hPcnt": "1.3",
             "price4hPcnt": "1.6",
+            "price7dPcnt": "5.1",
             "highPrice24h": "1880",
             "lowPrice24h": "1720",
             "lastPrice": "1805",
+            "highPrice1h": "1825",
+            "lowPrice1h": "1780",
+            "closePrice1h": "1805",
+            "highPrice4h": "1875",
+            "lowPrice4h": "1710",
+            "closePrice4h": "1800",
             "volume1h": "350",
+            "prevVolume1h": "420",
+            "volume4h": "1400",
+            "prevVolume4h": "1550",
             "prevVolume24h": "900",
             "bid1Size": "90",
             "ask1Size": "95",
+            "corr_btc": "0.92",
+            "corr_market": "0.88",
         },
         {
             "symbol": "ADAUSDT",
@@ -68,13 +95,25 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "volume24h": "5000000",
             "price1hPcnt": "-1.5",
             "price4hPcnt": "-2.5",
+            "price7dPcnt": "-4.2",
             "highPrice24h": "0.56",
             "lowPrice24h": "0.45",
             "lastPrice": "0.50",
+            "highPrice1h": "0.53",
+            "lowPrice1h": "0.48",
+            "closePrice1h": "0.50",
+            "highPrice4h": "0.57",
+            "lowPrice4h": "0.44",
+            "closePrice4h": "0.50",
             "volume1h": "800000",
+            "prevVolume1h": "920000",
+            "volume4h": "2500000",
+            "prevVolume4h": "2750000",
             "prevVolume24h": "650000",
             "bid1Size": "4000000",
             "ask1Size": "5000000",
+            "corr_btc": "0.28",
+            "corr_market": "0.31",
         },
         {
             "symbol": "LOWUSDT",
@@ -98,7 +137,7 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     )
 
     symbols = [entry["symbol"] for entry in opportunities]
-    assert symbols == ["BTCUSDT", "ADAUSDT", "ETHUSDT"]
+    assert symbols == ["BTCUSDT", "ETHUSDT", "ADAUSDT"]
     assert opportunities[0]["source"] == "market_scanner"
     assert next(entry for entry in opportunities if entry["symbol"] == "ADAUSDT")[
         "trend"
@@ -107,12 +146,22 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
 
     top = opportunities[0]
     assert top["volatility_pct"] and top["volatility_pct"] > 5
+    assert top["volatility_windows"]["1h"] is not None
     assert top["volume_spike_score"] and top["volume_spike_score"] > 0
+    assert top["volume_impulse"]["1h"] and top["volume_impulse"]["1h"] > 0
+    assert top["correlations"] and "btc" in top["correlations"]
+    assert top["model_metrics"]["bias"] < 0
+    assert 0 <= top["probability"] <= 1
+    assert top["score"] > 0
     assert "волатильность" in top["note"]
+    assert "импульс объёма" in top["note"]
 
     ada = next(entry for entry in opportunities if entry["symbol"] == "ADAUSDT")
-    assert ada["probability"] is not None and ada["probability"] < 0.3
+    assert ada["probability"] is not None
+    assert ada["probability"] < opportunities[0]["probability"]
+    assert ada["probability"] < opportunities[1]["probability"]
     assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
+    assert ada["model_metrics"]["correlation"] >= -0.5
 
 
 def test_market_scanner_respects_whitelist(tmp_path: Path) -> None:
@@ -219,6 +268,105 @@ def test_market_scanner_converts_usdc_symbols(tmp_path: Path) -> None:
     assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
     conversion = opportunities[0].get("quote_conversion")
     assert conversion == {"from": "USDC", "to": "USDT", "original": "SOLUSDC"}
+
+
+def test_weighted_model_sorts_by_risk_features(tmp_path: Path) -> None:
+    rows = [
+        {
+            "symbol": "ALPHAUSDT",
+            "turnover24h": "3200000",
+            "price24hPcnt": "3.2",
+            "bestBidPrice": "14.8",
+            "bestAskPrice": "14.82",
+            "volume24h": "980000",
+            "price1hPcnt": "1.1",
+            "price4hPcnt": "2.4",
+            "highPrice24h": "15.4",
+            "lowPrice24h": "13.2",
+            "lastPrice": "14.9",
+            "highPrice1h": "15.0",
+            "lowPrice1h": "14.2",
+            "closePrice1h": "14.8",
+            "volume1h": "52000",
+            "prevVolume1h": "18000",
+            "prevVolume24h": "35000",
+            "bid1Size": "12000",
+            "ask1Size": "8000",
+            "corr_btc": "0.28",
+            "corr_market": "0.32",
+        },
+        {
+            "symbol": "BETAUSDT",
+            "turnover24h": "4500000",
+            "price24hPcnt": "3.5",
+            "bestBidPrice": "8.1",
+            "bestAskPrice": "8.12",
+            "volume24h": "1200000",
+            "price1hPcnt": "1.4",
+            "price4hPcnt": "3.1",
+            "highPrice24h": "8.9",
+            "lowPrice24h": "7.0",
+            "lastPrice": "8.05",
+            "highPrice1h": "8.4",
+            "lowPrice1h": "7.7",
+            "closePrice1h": "8.0",
+            "volume1h": "62000",
+            "prevVolume1h": "91000",
+            "prevVolume24h": "180000",
+            "bid1Size": "5000",
+            "ask1Size": "7500",
+            "corr_btc": "0.95",
+            "corr_market": "0.91",
+            "highPrice4h": "9.1",
+            "lowPrice4h": "6.8",
+            "closePrice4h": "8.0",
+        },
+        {
+            "symbol": "GAMMAUSDT",
+            "turnover24h": "9000000",
+            "price24hPcnt": "0.9",
+            "bestBidPrice": "2.02",
+            "bestAskPrice": "2.025",
+            "volume24h": "4500000",
+            "price1hPcnt": "0.4",
+            "price4hPcnt": "0.8",
+            "highPrice24h": "2.2",
+            "lowPrice24h": "1.8",
+            "lastPrice": "2.03",
+            "highPrice1h": "2.05",
+            "lowPrice1h": "1.95",
+            "closePrice1h": "2.02",
+            "volume1h": "210000",
+            "prevVolume1h": "200000",
+            "prevVolume24h": "430000",
+            "bid1Size": "180000",
+            "ask1Size": "160000",
+            "corr_btc": "0.55",
+            "corr_market": "0.52",
+        },
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=2_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=60.0,
+    )
+
+    ordered = [entry["symbol"] for entry in opportunities]
+    assert ordered[:3] == ["ALPHAUSDT", "GAMMAUSDT", "BETAUSDT"]
+
+    alpha = opportunities[0]
+    beta = next(entry for entry in opportunities if entry["symbol"] == "BETAUSDT")
+
+    assert alpha["model_metrics"]["correlation"] > beta["model_metrics"]["correlation"]
+    assert beta["model_metrics"]["correlation"] < -0.4
+    assert alpha["volume_impulse"]["1h"] > 0
+    assert beta["volume_impulse"]["1h"] is not None and beta["volume_impulse"]["1h"] < 0
+    assert opportunities[0]["probability"] > opportunities[-1]["probability"]
 
 
 def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
