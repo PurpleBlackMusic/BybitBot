@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Optional
 
 import pytest
 import ssl
@@ -96,6 +96,70 @@ def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) ->
     status = manager.status()
     assert status["public"]["running"] is True
     assert status["private"]["running"] is True
+
+
+def test_public_on_error_403_triggers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s.testnet = True
+
+    logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **kwargs: object) -> None:
+        logs.append((event, kwargs))
+
+    monkeypatch.setattr(ws_manager_module, "log", fake_log)
+
+    callbacks: dict[str, object] = {}
+
+    class DummyWebSocketApp:
+        def __init__(
+            self,
+            url: str,
+            on_open: object,
+            on_message: object,
+            on_error: Callable[[object, object], None],
+            on_close: object,
+        ) -> None:
+            callbacks["on_error"] = on_error
+
+        def run_forever(self, sslopt: Optional[dict[str, object]] = None) -> None:
+            callbacks["run_forever_called"] = True
+            manager._pub_running = False
+
+    monkeypatch.setattr(
+        ws_manager_module.websocket,
+        "WebSocketApp",
+        DummyWebSocketApp,
+    )
+
+    class DummyThread:
+        def __init__(self, target: Callable[[], None], daemon: bool) -> None:
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:  # pragma: no cover - thread body not needed for this test
+            callbacks["thread_target"] = self.target
+
+    monkeypatch.setattr(ws_manager_module.threading, "Thread", DummyThread)
+
+    manager.start_public(subs=())
+
+    assert "thread_target" in callbacks
+    thread_target = callbacks["thread_target"]
+    assert callable(thread_target)
+    thread_target()
+
+    assert "on_error" in callbacks
+    on_error = callbacks["on_error"]
+    assert callable(on_error)
+
+    on_error(None, "Handshake status 403 Forbidden")
+
+    assert manager._pub_url_override == "wss://stream.bybit.com/v5/public/spot"
+    assert logs[-1] == (
+        "ws.public.testnet.network_error",
+        {"reason": "Handshake status 403 Forbidden"},
+    )
 
 
 def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
