@@ -204,6 +204,9 @@ class WSManager:
             while self._pub_running:
                 current_url = self._public_url()
                 self._pub_current_url = current_url
+                verify_ssl = bool(getattr(self.s, "verify_ssl", True))
+                cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
+                sslopt = {"cert_reqs": cert_reqs}
                 ws = websocket.WebSocketApp(
                     current_url,
                     on_open=on_open,
@@ -212,7 +215,7 @@ class WSManager:
                     on_close=on_close,
                 )
                 self._pub_ws = ws
-                ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+                ws.run_forever(sslopt=sslopt)
                 if not self._pub_running:
                     break
                 # экспоненциальный backoff (cap 60s) + джиттер
