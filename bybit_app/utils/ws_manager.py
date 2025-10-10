@@ -798,20 +798,6 @@ class WSManager:
                     reason="inventory_missing",
                 )
                 continue
-            previous_stats = previous_snapshot.get(symbol_upper) or previous_snapshot.get(symbol)
-            if not isinstance(previous_stats, Mapping):
-                previous_stats = self._recover_previous_stats(
-                    symbol_upper,
-                    rows,
-                )
-            if not isinstance(previous_stats, Mapping):
-                log(
-                    "telegram.trade.skip",
-                    symbol=symbol_upper,
-                    reason="missing_previous_inventory",
-                )
-                continue
-
             total_qty = Decimal("0")
             total_quote = Decimal("0")
             for row in rows:
@@ -853,9 +839,6 @@ class WSManager:
                 )
                 continue
 
-            current_realized = self._decimal_from(current_stats.get("realized_pnl"))
-            previous_realized = self._decimal_from(previous_stats.get("realized_pnl"))
-            trade_realized = current_realized - previous_realized
             remaining_qty = self._decimal_from(current_stats.get("position_qty"))
 
             base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else symbol_upper
@@ -863,14 +846,36 @@ class WSManager:
             price_step = self._infer_step_from_rows(rows, "execPrice")
             qty_text = self._format_decimal_step(total_qty, qty_step)
             price_text = self._format_decimal_step(avg_price, price_step)
-            pnl_display = trade_realized.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            pnl_text = f"{pnl_display:+.2f} USDT"
 
             remainder_text = None
             position_closed = remaining_qty <= Decimal("0")
             if not position_closed:
                 remainder_qty_text = self._format_decimal_step(remaining_qty, qty_step)
                 remainder_text = f"{remainder_qty_text} {base_asset}"
+
+            previous_stats = previous_snapshot.get(symbol_upper) or previous_snapshot.get(symbol)
+            if not isinstance(previous_stats, Mapping):
+                previous_stats = self._recover_previous_stats(
+                    symbol_upper,
+                    rows,
+                )
+
+            fallback_notification = False
+            trade_realized: Decimal | None = None
+            if isinstance(previous_stats, Mapping):
+                current_realized = self._decimal_from(current_stats.get("realized_pnl"))
+                previous_realized = self._decimal_from(previous_stats.get("realized_pnl"))
+                trade_realized = current_realized - previous_realized
+                pnl_display = trade_realized.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                pnl_text = f"{pnl_display:+.2f} USDT"
+            else:
+                log(
+                    "telegram.trade.previous_stats.missing",
+                    symbol=symbol_upper,
+                    reason="missing_previous_inventory",
+                )
+                fallback_notification = True
+                pnl_text = "PnL n/a"
 
             message = format_sell_close_message(
                 symbol=symbol_upper,
@@ -891,14 +896,17 @@ class WSManager:
                     error=str(exc),
                 )
             else:
-                log(
-                    "telegram.trade.notify",
-                    symbol=symbol_upper,
-                    side="sell",
-                    qty=str(total_qty),
-                    price=str(avg_price),
-                    pnl=str(trade_realized),
-                )
+                log_payload = {
+                    "symbol": symbol_upper,
+                    "side": "sell",
+                    "qty": str(total_qty),
+                    "price": str(avg_price),
+                }
+                if fallback_notification:
+                    log_payload.update({"pnl": "n/a", "fallback": True})
+                else:
+                    log_payload["pnl"] = str(trade_realized)
+                log("telegram.trade.notify", **log_payload)
 
     def _prime_inventory_snapshot(self) -> None:
         with self._fill_lock:
@@ -979,14 +987,11 @@ class WSManager:
         last_exec_id = self._inventory_last_exec_id
         read_kwargs: dict[str, object] = {"settings": self.s}
         limited_read = False
+        if limit is not None:
+            read_kwargs["n"] = limit
+            limited_read = True
         if last_exec_id:
             read_kwargs["last_exec_id"] = last_exec_id
-            if limit:
-                read_kwargs["n"] = limit
-        else:
-            if limit:
-                read_kwargs["n"] = limit
-                limited_read = True
         try:
             ledger_rows = read_ledger(**read_kwargs)
         except Exception as exc:

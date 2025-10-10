@@ -155,6 +155,138 @@ def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch)
     assert result is True
 
 
+def test_previous_stats_from_ledger_retries_full_scan_on_limited_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager._inventory_last_exec_id = "last-exec"
+
+    rows = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "execQty": "1",
+            "execPrice": "100",
+            "execTime": "123",
+        }
+    ]
+
+    ledger_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    ledger_sequences = [
+        [
+            {
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "execQty": "1",
+                "execPrice": "100",
+            }
+        ],
+        [
+            {
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "execQty": "1",
+                "execPrice": "100",
+                "execTime": "123",
+            },
+            {
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "execQty": "2",
+                "execPrice": "95",
+                "execTime": "100",
+            },
+        ],
+    ]
+    ledger_iter = iter(ledger_sequences)
+
+    def fake_read_ledger(*args, **kwargs):
+        ledger_calls.append((args, kwargs))
+        return next(ledger_iter)
+
+    captured_events: list[list[Mapping[str, object]]] = []
+
+    def fake_spot_inventory_and_pnl(events, settings):
+        captured_events.append(list(events))
+        return {
+            "BTCUSDT": {
+                "position_qty": Decimal("0"),
+                "avg_cost": Decimal("0"),
+                "realized_pnl": Decimal("0"),
+            }
+        }
+
+    monkeypatch.setattr(ws_manager_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+
+    stats = manager._previous_stats_from_ledger("BTCUSDT", rows)
+
+    assert stats == {
+        "position_qty": Decimal("0"),
+        "avg_cost": Decimal("0"),
+        "realized_pnl": Decimal("0"),
+    }
+    assert len(ledger_calls) == 2
+    first_args, first_kwargs = ledger_calls[0]
+    assert first_args == ()
+    assert first_kwargs["last_exec_id"] == "last-exec"
+    assert first_kwargs.get("n") == manager._LEDGER_RECOVERY_LIMIT
+    second_args, second_kwargs = ledger_calls[1]
+    assert second_args == (None,)
+    assert second_kwargs == {"settings": manager.s}
+    assert captured_events[0] == [ledger_sequences[1][1]]
+
+
+def test_notify_sell_fills_sends_fallback_message_when_previous_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: settings)
+    manager.s = settings
+    monkeypatch.setattr(manager, "_recover_previous_stats", lambda symbol, rows: None)
+
+    sent_messages: list[str] = []
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        lambda message: sent_messages.append(message),
+    )
+
+    logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **kwargs):
+        logs.append((event, kwargs))
+
+    monkeypatch.setattr(ws_manager_module, "log", fake_log)
+
+    fills = {
+        "BTCUSDT": [
+            {
+                "execQty": "1",
+                "execPrice": "100",
+            }
+        ]
+    }
+    inventory_snapshot = {
+        "BTCUSDT": {
+            "position_qty": Decimal("0"),
+            "avg_cost": Decimal("0"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
+
+    manager._notify_sell_fills(fills, inventory_snapshot, previous_snapshot={})
+
+    assert sent_messages and "PnL n/a" in sent_messages[0]
+    assert any(event == "telegram.trade.previous_stats.missing" for event, _ in logs)
+    assert any(
+        event == "telegram.trade.notify" and entry.get("fallback")
+        for event, entry in logs
+    )
+
+
 def test_regenerate_tp_ladder_preserves_existing_on_total_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
