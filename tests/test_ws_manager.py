@@ -146,6 +146,77 @@ def test_execute_tp_plan_reprices_above_ceiling(monkeypatch: pytest.MonkeyPatch)
     assert notifications == []
 
 
+def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    plan = [
+        {
+            "qty": Decimal("0.20"),
+            "qty_text": "0.20",
+            "price": Decimal("101.0"),
+            "price_text": "101.0",
+            "profit_labels": ["50"],
+        },
+        {
+            "qty": Decimal("0.10"),
+            "qty_text": "0.10",
+            "price": Decimal("102.0"),
+            "price_text": "102.0",
+            "profit_labels": ["100"],
+        },
+    ]
+    signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
+
+    manager.register_tp_ladder_plan(
+        "BTCUSDT",
+        signature=signature,
+        avg_cost=Decimal("100"),
+        qty=Decimal("0.30"),
+        status="pending",
+        source="executor",
+    )
+
+    monkeypatch.setattr(manager, "_build_tp_plan", lambda **kwargs: plan)
+    monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
+
+    cancel_calls: list[str] = []
+    execute_calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    monkeypatch.setattr(
+        manager,
+        "_cancel_existing_tp_orders",
+        lambda api_obj, symbol: cancel_calls.append(symbol),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_execute_tp_plan",
+        lambda api_obj, symbol, payload: execute_calls.append((symbol, payload)),
+    )
+
+    limits_cache = {
+        "BTCUSDT": {
+            "qty_step": Decimal("0.01"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.01"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    manager._regenerate_tp_ladder(
+        {"symbol": "BTCUSDT", "side": "Buy"},
+        {"BTCUSDT": {"position_qty": Decimal("0.30"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("50"), Decimal("0.6"))],
+        api=object(),
+        limits_cache=limits_cache,
+        settings=None,
+    )
+
+    assert cancel_calls == []
+    assert execute_calls == []
+
+
 @pytest.mark.parametrize(
     "verify_flag, expected_cert",
     (

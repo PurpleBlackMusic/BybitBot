@@ -1996,8 +1996,7 @@ class SignalExecutor:
                 aggregated.append({"price": price, "qty": qty, "steps": [step_cfg]})
 
         base_timestamp = int(time.time() * 1000)
-        placed: list[Dict[str, object]] = []
-        rung_index = 0
+        plan_entries: list[Dict[str, object]] = []
 
         for entry in aggregated:
             qty = self._round_to_step(entry["qty"], qty_step, rounding=ROUND_DOWN)
@@ -2005,7 +2004,6 @@ class SignalExecutor:
                 continue
             if min_qty > 0 and qty < min_qty:
                 continue
-            rung_index += 1
             price = self._round_to_step(entry["price"], price_step, rounding=ROUND_UP)
             price = self._clamp_price_to_band(
                 price,
@@ -2021,6 +2019,40 @@ class SignalExecutor:
             price_text = self._format_price_step(price, price_step)
             profit_labels = [str(step.profit_bps.normalize()) for step in entry["steps"]]
             profit_text = ",".join(profit_labels)
+            plan_entries.append(
+                {
+                    "rung": len(plan_entries) + 1,
+                    "qty": qty,
+                    "qty_text": qty_text,
+                    "price": price,
+                    "price_text": price_text,
+                    "profit_text": profit_text,
+                }
+            )
+
+        if not plan_entries:
+            return [], {}
+
+        plan_signature = tuple(
+            (entry["price_text"], entry["qty_text"]) for entry in plan_entries
+        )
+        plan_total_qty = sum(entry["qty"] for entry in plan_entries)
+        ws_manager.register_tp_ladder_plan(
+            symbol,
+            signature=plan_signature,
+            avg_cost=avg_price,
+            qty=plan_total_qty,
+            status="pending",
+            source="executor",
+        )
+
+        placed: list[Dict[str, object]] = []
+
+        for entry in plan_entries:
+            rung_index = int(entry["rung"])
+            qty_text = str(entry["qty_text"])
+            price_text = str(entry["price_text"])
+            profit_text = str(entry["profit_text"])
             link_seed = f"AI-TP-{symbol}-{base_timestamp}-{rung_index}"
             link_id = ensure_link_id(link_seed) or link_seed
             payload = {
@@ -2092,6 +2124,25 @@ class SignalExecutor:
             if order_id:
                 record["orderId"] = order_id
             placed.append(record)
+
+        if placed:
+            placed_signature = tuple(
+                (str(record.get("price") or ""), str(record.get("qty") or ""))
+                for record in placed
+            )
+            placed_qty_total = sum(
+                self._decimal_from(record.get("qty")) for record in placed
+            )
+            ws_manager.register_tp_ladder_plan(
+                symbol,
+                signature=placed_signature,
+                avg_cost=avg_price,
+                qty=placed_qty_total,
+                status="active",
+                source="executor",
+            )
+        else:
+            ws_manager.clear_tp_ladder_plan(symbol, signature=plan_signature)
 
         execution_stats = self._build_tp_execution_stats(
             executed_base=executed_base,

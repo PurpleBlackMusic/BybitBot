@@ -823,6 +823,33 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     def fake_place(api_obj, **kwargs):
         return response_payload
 
+    register_calls: list[dict[str, object]] = []
+    original_register = signal_executor_module.ws_manager.register_tp_ladder_plan
+
+    def register_spy(symbol: str, **kwargs: object) -> None:
+        register_calls.append(
+            {
+                "symbol": symbol,
+                "status": kwargs.get("status"),
+                "signature": tuple(
+                    tuple(pair) for pair in kwargs.get("signature") or ()
+                ),
+            }
+        )
+        original_register(symbol, **kwargs)
+
+    cancel_calls: list[str] = []
+
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "register_tp_ladder_plan",
+        register_spy,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "_cancel_existing_tp_orders",
+        lambda api_obj, symbol: cancel_calls.append(symbol),
+    )
     monkeypatch.setattr(
         signal_executor_module, "place_spot_market_with_tolerance", fake_place
     )
@@ -846,6 +873,13 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.context is not None
     execution_payload = result.context.get("execution", {})
     assert Decimal(execution_payload.get("avg_price")) == Decimal("100")
+
+    assert [call["status"] for call in register_calls] == ["pending", "active"]
+    assert all(call["symbol"] == "BTCUSDT" for call in register_calls)
+    assert register_calls[0]["signature"] == register_calls[1]["signature"]
+    assert cancel_calls == []
+
+    signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
