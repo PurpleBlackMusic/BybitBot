@@ -36,7 +36,16 @@ def _avg(values: list[float]) -> Optional[float]:
     return sum(values) / len(values)
 
 
-def compute_multi_timeframe_momentum(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
+def _range_volatility(high: Optional[float], low: Optional[float], ref: Optional[float]) -> Optional[float]:
+    if high is None or low is None or ref is None or ref <= 0:
+        return None
+    value = (high - low) / ref * 100.0
+    if value < 0:
+        value = 0.0
+    return value
+
+
+def compute_multi_timeframe_momentum(row: Mapping[str, object]) -> Dict[str, object]:
     """Estimate momentum using multiple percentage change windows."""
 
     timeframe_fields = {
@@ -70,45 +79,86 @@ def compute_multi_timeframe_momentum(row: Mapping[str, object]) -> Dict[str, Opt
     }
 
 
-def compute_intraday_volatility(row: Mapping[str, object]) -> Optional[float]:
-    """Compute an intraday volatility proxy based on price extremes."""
+def compute_volatility_windows(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
+    """Return volatility estimations for several rolling windows."""
 
-    high = _safe_float(
-        row.get("highPrice24h")
-        or row.get("high24h")
-        or row.get("high")
-        or row.get("highPrice")
-    )
-    low = _safe_float(
-        row.get("lowPrice24h")
-        or row.get("low24h")
-        or row.get("low")
-        or row.get("lowPrice")
-    )
-    close = _safe_float(row.get("lastPrice") or row.get("close") or row.get("closePrice"))
-    if high is None or low is None or close is None or close <= 0:
-        return None
-    range_pct = (high - low) / close * 100.0
-    if range_pct < 0:
-        range_pct = 0.0
-    return range_pct
+    window_specs = {
+        "1h": ("highPrice1h", "lowPrice1h", "closePrice1h"),
+        "4h": ("highPrice4h", "lowPrice4h", "closePrice4h"),
+        "24h": ("highPrice24h", "lowPrice24h", "lastPrice"),
+        "7d": ("highPrice7d", "lowPrice7d", "closePrice7d"),
+    }
+    fallback_percent_fields = {
+        "1h": "price1hPcnt",
+        "4h": "price4hPcnt",
+        "24h": "price24hPcnt",
+        "7d": "price7dPcnt",
+    }
+
+    results: Dict[str, Optional[float]] = {}
+    last_price = _safe_float(row.get("lastPrice") or row.get("close") or row.get("closePrice"))
+
+    for window, (high_key, low_key, ref_key) in window_specs.items():
+        high = _safe_float(row.get(high_key))
+        low = _safe_float(row.get(low_key))
+        reference = _safe_float(row.get(ref_key)) or last_price
+        volatility = _range_volatility(high, low, reference)
+        if volatility is None:
+            pct_field = fallback_percent_fields.get(window)
+            if pct_field:
+                change_pct = _normalise_percent(row.get(pct_field))
+                volatility = abs(change_pct) if change_pct is not None else None
+        results[window] = volatility
+
+    overall = results.get("24h")
+    if overall is None:
+        values = [value for value in results.values() if value is not None]
+        overall = _avg(values)
+
+    return {
+        "windows": results,
+        "overall": overall,
+    }
 
 
-def compute_volume_spike(row: Mapping[str, object]) -> Optional[float]:
-    """Measure volume expansion versus previous periods."""
+def compute_volume_impulse(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
+    """Measure volume expansion versus previous periods and trend impulses."""
 
-    vol_24h = _safe_float(row.get("volume24h") or row.get("turnover24h"))
-    vol_1h = _safe_float(row.get("volume1h") or row.get("turnover1h"))
-    prev_vol_24h = _safe_float(row.get("prevVolume24h") or row.get("volume24hPrev"))
+    window_pairs = {
+        "1h": ("volume1h", "prevVolume1h"),
+        "4h": ("volume4h", "prevVolume4h"),
+        "24h": ("volume24h", "prevVolume24h"),
+    }
+    impulses: Dict[str, Optional[float]] = {}
 
-    candidates = [value for value in [vol_1h, prev_vol_24h] if value is not None and value > 0]
-    baseline = _avg(candidates)
-    if vol_24h is None or vol_24h <= 0 or baseline is None or baseline <= 0:
-        return None
-    spike_ratio = vol_24h / baseline
-    if spike_ratio <= 0:
-        return None
-    return math.log(spike_ratio)
+    for window, (current_key, prev_key) in window_pairs.items():
+        current = _safe_float(row.get(current_key) or row.get(current_key.replace("volume", "turnover")))
+        previous = _safe_float(row.get(prev_key) or row.get(prev_key.replace("volume", "turnover")))
+        if current is None or current <= 0:
+            impulses[window] = None
+            continue
+        baseline_candidates = [value for value in [previous] if value is not None and value > 0]
+        if window != "24h":
+            # incorporate slower lookback where available
+            longer_key = "prevVolume24h" if window == "1h" else "prevVolume7d"
+            longer = _safe_float(row.get(longer_key))
+            if longer is not None and longer > 0:
+                baseline_candidates.append(longer)
+        baseline = _avg(baseline_candidates)
+        if baseline is None or baseline <= 0:
+            impulses[window] = None
+            continue
+        ratio = current / baseline
+        impulses[window] = math.log(ratio) if ratio > 0 else None
+
+    # compatibility helper with older callers expecting "volume_spike_score"
+    spike_candidates = [value for value in impulses.values() if value is not None]
+    spike = max(spike_candidates) if spike_candidates else None
+
+    return {
+        "impulses": impulses,
+        "spike_score": spike,
+    }
 
 
 def compute_orderbook_depth_signal(row: Mapping[str, object]) -> Optional[float]:
@@ -122,19 +172,54 @@ def compute_orderbook_depth_signal(row: Mapping[str, object]) -> Optional[float]
     return float(imbalance)
 
 
-def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
-    momentum = compute_multi_timeframe_momentum(row)
-    volatility = compute_intraday_volatility(row)
-    volume_spike = compute_volume_spike(row)
-    depth_signal = compute_orderbook_depth_signal(row)
+def compute_cross_market_correlation(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
+    """Extract correlation metrics against reference benchmarks when provided."""
 
-    bundle: Dict[str, Optional[float]] = {
-        "blended_change_pct": momentum["blended_change_pct"],
+    correlations: Dict[str, Optional[float]] = {}
+    for key, value in row.items():
+        if not isinstance(key, str):
+            continue
+        lowered = key.lower()
+        if "corr" not in lowered and not lowered.startswith("beta_"):
+            continue
+        cleaned = lowered
+        if lowered.startswith("corr_"):
+            cleaned = lowered.split("corr_", 1)[-1]
+        elif lowered.endswith("corr"):
+            cleaned = lowered.rsplit("corr", 1)[0]
+        elif lowered.startswith("beta_"):
+            cleaned = lowered.split("beta_", 1)[-1]
+        cleaned = cleaned.strip("_") or lowered
+        correlations[cleaned] = _safe_float(value)
+
+    if not correlations:
+        return {"correlations": {}, "avg_abs": None}
+
+    magnitudes = [abs(val) for val in correlations.values() if val is not None]
+    avg_abs = _avg(magnitudes) if magnitudes else None
+    return {"correlations": correlations, "avg_abs": avg_abs}
+
+
+def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
+    momentum = compute_multi_timeframe_momentum(row)
+    volatility = compute_volatility_windows(row)
+    volume = compute_volume_impulse(row)
+    depth_signal = compute_orderbook_depth_signal(row)
+    correlation = compute_cross_market_correlation(row)
+
+    blended_change = momentum["blended_change_pct"]
+    if blended_change is None:
+        blended_change = momentum["dominant_change_pct"]
+
+    return {
+        "blended_change_pct": blended_change,
         "dominant_change_pct": momentum["dominant_change_pct"],
-        "volatility_pct": volatility,
-        "volume_spike_score": volume_spike,
+        "timeframe_contributions": momentum["timeframe_contributions"],
+        "volatility_pct": volatility["overall"],
+        "volatility_windows": volatility["windows"],
+        "volume_spike_score": volume["spike_score"],
+        "volume_impulse": volume["impulses"],
         "depth_imbalance": depth_signal,
+        "correlations": correlation["correlations"],
+        "correlation_strength": correlation["avg_abs"],
     }
-    if bundle["blended_change_pct"] is None:
-        bundle["blended_change_pct"] = momentum["dominant_change_pct"]
-    return bundle

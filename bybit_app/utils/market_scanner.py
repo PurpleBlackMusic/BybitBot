@@ -107,42 +107,129 @@ def _strength_from_change(change_pct: Optional[float]) -> float:
     return math.tanh(abs(change_pct) / 5.0)
 
 
-def _probability_from_change(change_pct: Optional[float], trend: str) -> Optional[float]:
-    if change_pct is None:
-        return None
-    strength = _strength_from_change(change_pct)
-    if trend == "buy":
-        return 0.5 + strength / 2.0
-    if trend == "sell":
-        return 0.5 - strength / 2.0
-    return 0.5
-
-
 def _score_turnover(turnover: Optional[float]) -> float:
     if turnover is None or turnover <= 0:
         return 0.0
     return math.log10(turnover + 1.0)
 
 
-def _edge_score(
-    turnover: Optional[float],
-    change_pct: Optional[float],
-    spread_bps: Optional[float],
+def _logit(probability: float) -> float:
+    probability = max(min(probability, 1.0 - 1e-6), 1e-6)
+    return math.log(probability / (1.0 - probability))
+
+
+def _sigmoid(value: float) -> float:
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _best_volume_impulse(impulses: Mapping[str, Optional[float]] | None) -> float:
+    if not impulses:
+        return 0.0
+    best = 0.0
+    for value in impulses.values():
+        if value is None:
+            continue
+        if abs(value) > abs(best):
+            best = float(value)
+    return best
+
+
+def _weighted_opportunity_model(
     *,
-    boost: bool = False,
-) -> float:
-    strength = _strength_from_change(change_pct)
-    liquidity = _score_turnover(turnover)
-    if spread_bps is not None and spread_bps > 0:
-        penalty = math.sqrt(spread_bps)
+    change_pct: Optional[float],
+    trend: str,
+    turnover: Optional[float],
+    spread_bps: Optional[float],
+    features: Mapping[str, object],
+    force_include: bool = False,
+) -> Tuple[float, float, Dict[str, float]]:
+    base_probability = 0.5
+    if change_pct is not None:
+        strength = _strength_from_change(change_pct)
+        if trend == "buy":
+            base_probability = 0.5 + strength / 2.0
+        elif trend == "sell":
+            base_probability = 0.5 - strength / 2.0
+    base_logit = _logit(base_probability)
+
+    direction = 0
+    if trend == "buy":
+        direction = 1
+    elif trend == "sell":
+        direction = -1
+
+    components: Dict[str, float] = {"bias": -0.2}
+
+    blended = features.get("blended_change_pct")
+    if blended is not None and direction != 0:
+        components["multi_tf"] = direction * math.tanh(float(blended) / 8.0) * 0.8
     else:
-        penalty = 1.0
-    score = 0.0
-    if penalty > 0:
-        score = (liquidity * strength) / penalty
-    if boost:
-        score += 5.0
-    return score
+        components["multi_tf"] = 0.0
+
+    strength_component = 0.0
+    if change_pct is not None and direction != 0:
+        strength_component = direction * _strength_from_change(change_pct)
+    components["momentum"] = strength_component
+
+    impulses = features.get("volume_impulse")
+    best_impulse = _best_volume_impulse(impulses if isinstance(impulses, Mapping) else None)
+    components["volume"] = max(min(best_impulse, 1.5), -1.5) * 0.7
+
+    volatility_pct = features.get("volatility_pct")
+    if isinstance(volatility_pct, (int, float)):
+        components["volatility"] = -math.tanh(float(volatility_pct) / 70.0) * 0.9
+    else:
+        components["volatility"] = 0.0
+
+    depth_imbalance = features.get("depth_imbalance")
+    if isinstance(depth_imbalance, (int, float)) and direction != 0:
+        components["orderbook"] = float(depth_imbalance) * direction * 1.2
+    else:
+        components["orderbook"] = 0.0
+
+    correlation_strength = features.get("correlation_strength")
+    if isinstance(correlation_strength, (int, float)):
+        components["correlation"] = -float(correlation_strength) * 0.6
+    else:
+        components["correlation"] = 0.0
+
+    liquidity_raw = _score_turnover(turnover)
+    components["liquidity"] = min(liquidity_raw / 6.0, 1.2)
+
+    if spread_bps is not None:
+        components["spread"] = -min(max(spread_bps, 0.0) / 120.0, 1.0)
+    else:
+        components["spread"] = 0.0
+
+    if force_include:
+        components["bias"] += 0.4
+
+    logit = base_logit + sum(components.values())
+    probability = _sigmoid(logit)
+
+    score = probability * 100.0
+    score += max(0.0, liquidity_raw) * 3.0
+    score += max(0.0, best_impulse) * 15.0
+    if isinstance(volatility_pct, (int, float)):
+        score -= max(0.0, float(volatility_pct)) * 0.4
+    if isinstance(depth_imbalance, (int, float)) and direction != 0:
+        score += max(-10.0, min(10.0, float(depth_imbalance) * direction * 50.0))
+
+    if score < 0:
+        score = 0.0
+
+    metrics = dict(components)
+    metrics.update(
+        {
+            "base_probability": base_probability,
+            "base_logit": base_logit,
+            "final_logit": logit,
+            "liquidity_raw": liquidity_raw,
+            "best_volume_impulse": best_impulse,
+        }
+    )
+
+    return probability, score, metrics
 
 
 def load_market_snapshot(
@@ -276,8 +363,12 @@ def scan_market_opportunities(
         feature_bundle = build_feature_bundle(raw)
         blended_change = feature_bundle.get("blended_change_pct")
         volatility_pct = feature_bundle.get("volatility_pct")
+        volatility_windows = feature_bundle.get("volatility_windows")
         volume_spike_score = feature_bundle.get("volume_spike_score")
+        volume_impulse = feature_bundle.get("volume_impulse")
         depth_imbalance = feature_bundle.get("depth_imbalance")
+        correlations = feature_bundle.get("correlations")
+        correlation_strength = feature_bundle.get("correlation_strength")
 
         force_include = symbol in wset
         if not force_include and turnover is not None and turnover < min_turnover:
@@ -308,9 +399,14 @@ def scan_market_opportunities(
             if strength < 0.1:
                 continue
 
-        probability = _probability_from_change(change_pct, trend)
-        ev_bps = change_pct * 100.0 if change_pct is not None else None
-        score = _edge_score(turnover, change_pct, spread_bps, boost=force_include)
+        probability, score, model_metrics = _weighted_opportunity_model(
+            change_pct=change_pct,
+            trend=trend,
+            turnover=turnover,
+            spread_bps=spread_bps,
+            features=feature_bundle,
+            force_include=force_include,
+        )
 
         direction = 0
         if trend == "buy":
@@ -318,26 +414,7 @@ def scan_market_opportunities(
         elif trend == "sell":
             direction = -1
 
-        if probability is not None:
-            if blended_change is not None and direction != 0:
-                probability += 0.1 * direction * math.tanh(blended_change / 10.0)
-            if volume_spike_score is not None and direction != 0:
-                probability += 0.05 * direction * math.tanh(volume_spike_score)
-            if volatility_pct is not None:
-                probability -= 0.05 * math.tanh(volatility_pct / 50.0)
-            probability = max(0.0, min(1.0, probability))
-
-        feature_score = 0.0
-        if blended_change is not None:
-            feature_score += abs(blended_change) * 0.05
-        if volume_spike_score is not None and volume_spike_score > 0:
-            feature_score += volume_spike_score * 0.5
-        if depth_imbalance is not None and direction != 0:
-            feature_score += depth_imbalance * direction * 2.0
-        if volatility_pct is not None:
-            feature_score -= math.log1p(max(0.0, volatility_pct)) * 0.1
-
-        score += feature_score
+        ev_bps = change_pct * 100.0 if change_pct is not None else None
 
         note_parts: List[str] = []
         if change_pct is not None:
@@ -356,6 +433,19 @@ def scan_market_opportunities(
             imbalance_pct = depth_imbalance * 100.0
             side = "покупателей" if imbalance_pct > 0 else "продавцов"
             note_parts.append(f"преимущество {side} {abs(imbalance_pct):.1f}%")
+        if correlation_strength is not None and correlation_strength > 0:
+            note_parts.append(f"корреляция {correlation_strength * 100:.0f}%")
+        if isinstance(volume_impulse, Mapping):
+            best_window = None
+            best_value = 0.0
+            for window, value in volume_impulse.items():
+                if value is None:
+                    continue
+                if abs(value) > abs(best_value):
+                    best_window = window
+                    best_value = float(value)
+            if best_window is not None and best_value > 0:
+                note_parts.append(f"импульс объёма {best_window} ×{math.exp(best_value):.2f}")
 
         entry = {
             "symbol": symbol,
@@ -369,9 +459,14 @@ def scan_market_opportunities(
             "spread_bps": spread_bps,
             "volume": volume,
             "volatility_pct": volatility_pct,
+            "volatility_windows": volatility_windows,
             "volume_spike_score": volume_spike_score,
+            "volume_impulse": volume_impulse,
             "depth_imbalance": depth_imbalance,
             "blended_change_pct": blended_change,
+            "correlations": correlations,
+            "correlation_strength": correlation_strength,
+            "model_metrics": model_metrics,
             "source": "market_scanner",
             "actionable": actionable,
         }
