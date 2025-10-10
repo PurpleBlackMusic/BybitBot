@@ -116,17 +116,21 @@ class SignalExecutor:
         self._settings_override = settings
         self._validation_penalties: Dict[str, Dict[str, List[float]]] = {}
         self._symbol_quarantine: Dict[str, float] = {}
+        self._price_limit_backoff: Dict[str, Dict[str, object]] = {}
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
+        self._purge_price_limit_backoff()
         return {
             "validation_penalties": copy.deepcopy(self._validation_penalties),
             "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
+            "price_limit_backoff": copy.deepcopy(self._price_limit_backoff),
         }
 
     def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
         self._validation_penalties = {}
         self._symbol_quarantine = {}
+        self._price_limit_backoff = {}
         if not state:
             return
 
@@ -175,7 +179,40 @@ class SignalExecutor:
             if restored_quarantine:
                 self._symbol_quarantine = restored_quarantine
 
+        backoff_state = (
+            state.get("price_limit_backoff")
+            if isinstance(state, Mapping)
+            else None
+        )
+        if isinstance(backoff_state, Mapping):
+            restored_backoff: Dict[str, Dict[str, object]] = {}
+            for symbol, payload in backoff_state.items():
+                if not isinstance(symbol, str) or not isinstance(payload, Mapping):
+                    continue
+                cleaned: Dict[str, object] = {}
+                for key, value in payload.items():
+                    if key in {
+                        "retries",
+                        "available_quote",
+                        "available_base",
+                        "requested_quote",
+                        "requested_base",
+                        "price_cap",
+                        "price_floor",
+                        "last_notional",
+                        "last_slippage",
+                        "expires_at",
+                        "quarantine_ttl",
+                        "last_updated",
+                    }:
+                        cleaned[key] = value
+                if cleaned:
+                    restored_backoff[symbol] = cleaned
+            if restored_backoff:
+                self._price_limit_backoff = restored_backoff
+
         self._purge_validation_penalties()
+        self._purge_price_limit_backoff()
 
     # ------------------------------------------------------------------
     # state helpers
@@ -208,6 +245,20 @@ class SignalExecutor:
             if expiry <= timestamp:
                 self._symbol_quarantine.pop(symbol, None)
 
+    def _purge_price_limit_backoff(self, now: Optional[float] = None) -> None:
+        if not self._price_limit_backoff:
+            return
+        timestamp = self._current_time() if now is None else now
+        for symbol, payload in list(self._price_limit_backoff.items()):
+            expires_at = payload.get("expires_at")
+            try:
+                expiry_value = float(expires_at) if expires_at is not None else None
+            except (TypeError, ValueError):
+                expiry_value = None
+            if expiry_value is not None and expiry_value > timestamp:
+                continue
+            self._price_limit_backoff.pop(symbol, None)
+
     def _quarantine_symbol(
         self,
         symbol: str,
@@ -225,6 +276,141 @@ class SignalExecutor:
             return
         self._symbol_quarantine[symbol] = expiry
         log("guardian.auto.symbol.quarantine", symbol=symbol, until=expiry)
+
+    def _record_price_limit_hit(
+        self,
+        symbol: str,
+        details: Optional[Mapping[str, object]],
+        *,
+        last_notional: float,
+        last_slippage: float,
+    ) -> Dict[str, object]:
+        if not symbol:
+            return {}
+
+        now = self._current_time()
+        self._purge_price_limit_backoff(now)
+
+        state = self._price_limit_backoff.get(symbol, {})
+        try:
+            retries = int(state.get("retries", 0)) + 1
+        except (TypeError, ValueError):
+            retries = 1
+
+        payload: Dict[str, object] = {
+            "retries": retries,
+            "last_notional": float(last_notional),
+            "last_slippage": float(last_slippage),
+            "last_updated": now,
+        }
+
+        if details:
+            for key in (
+                "available_quote",
+                "available_base",
+                "requested_quote",
+                "requested_base",
+            ):
+                value = _safe_float(details.get(key))
+                if value is not None and math.isfinite(value):
+                    payload[key] = value
+            for key in ("price_cap", "price_floor"):
+                value = _safe_float(details.get(key))
+                if value is not None and math.isfinite(value):
+                    payload[key] = value
+
+        multiplier = min(1.0 + 0.5 * max(retries - 1, 0), 4.0)
+        quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL * multiplier, _VALIDATION_PENALTY_TTL)
+        payload["quarantine_ttl"] = quarantine_ttl
+        payload["expires_at"] = now + max(quarantine_ttl * 2.0, _PRICE_LIMIT_LIQUIDITY_TTL)
+
+        self._price_limit_backoff[symbol] = payload
+        return payload
+
+    def _apply_price_limit_backoff(
+        self,
+        symbol: str,
+        side: str,
+        notional_quote: float,
+        slippage_pct: float,
+        min_notional: float,
+    ) -> Tuple[float, float, Optional[Dict[str, object]]]:
+        if not symbol:
+            return notional_quote, slippage_pct, None
+
+        state = self._price_limit_backoff.get(symbol)
+        if not state:
+            return notional_quote, slippage_pct, None
+
+        adjustments: Dict[str, object] = {}
+        try:
+            retries = int(state.get("retries", 0))
+        except (TypeError, ValueError):
+            retries = 0
+        adjustments["retries"] = retries
+
+        requested_key = "requested_quote" if side == "Buy" else "requested_base"
+        available_key = "available_quote" if side == "Buy" else "available_base"
+        requested = _safe_float(state.get(requested_key))
+        available = _safe_float(state.get(available_key))
+        price_cap = _safe_float(state.get("price_cap"))
+        price_floor = _safe_float(state.get("price_floor"))
+
+        candidate_notional = notional_quote
+        ratio: Optional[float] = None
+        if requested is not None and requested > 0 and available is not None and available >= 0:
+            ratio = max(min(available / requested, 1.0), 0.0)
+        if available is not None and available > 0:
+            if side == "Buy":
+                candidate_notional = min(candidate_notional, available * 0.98)
+                adjustments["available_quote"] = available
+            else:
+                price_hint = price_cap if price_cap and price_cap > 0 else price_floor
+                if price_hint and price_hint > 0:
+                    candidate_notional = min(candidate_notional, available * price_hint * 0.98)
+                adjustments["available_base"] = available
+        if ratio is not None:
+            candidate_notional = min(candidate_notional, notional_quote * max(ratio * 0.98, 0.0))
+
+        adjusted_notional = max(min(candidate_notional, notional_quote), 0.0)
+        if min_notional > 0 and adjusted_notional > 0 and adjusted_notional < min_notional:
+            adjusted_notional = min_notional
+        if not math.isclose(adjusted_notional, notional_quote, rel_tol=1e-9, abs_tol=1e-9):
+            adjustments["notional_quote"] = adjusted_notional
+
+        base_slippage = slippage_pct
+        previous_slippage = _safe_float(state.get("last_slippage"))
+        if previous_slippage is not None and previous_slippage > base_slippage:
+            base_slippage = previous_slippage
+        growth = 1.0 + min(max(retries, 0), 4) * 0.25
+        expanded_slippage = _normalise_slippage_percent(base_slippage * growth)
+        if expanded_slippage > slippage_pct:
+            slippage_pct = expanded_slippage
+            adjustments["slippage_percent"] = slippage_pct
+
+        if price_cap:
+            adjustments["price_cap"] = price_cap
+        if price_floor:
+            adjustments["price_floor"] = price_floor
+
+        now = self._current_time()
+        state["last_notional"] = adjusted_notional
+        state["last_slippage"] = slippage_pct
+        state["last_updated"] = now
+        expires_at = state.get("quarantine_ttl")
+        ttl = _safe_float(expires_at)
+        if ttl is not None and ttl > 0:
+            state["expires_at"] = now + max(ttl * 2.0, _PRICE_LIMIT_LIQUIDITY_TTL)
+        self._price_limit_backoff[symbol] = state
+
+        if not adjustments:
+            return adjusted_notional, slippage_pct, None
+        return adjusted_notional, slippage_pct, adjustments
+
+    def _clear_price_limit_backoff(self, symbol: str) -> None:
+        if not symbol:
+            return
+        self._price_limit_backoff.pop(symbol, None)
 
     def _record_validation_penalty(self, symbol: str, code: Optional[str]) -> None:
         if not symbol or not code:
@@ -258,6 +444,7 @@ class SignalExecutor:
             return
         self._validation_penalties.pop(symbol, None)
         self._symbol_quarantine.pop(symbol, None)
+        self._price_limit_backoff.pop(symbol, None)
 
     def _filter_quarantined_candidates(
         self, candidates: List[Tuple[str, Optional[Dict[str, object]]]]
@@ -974,6 +1161,7 @@ class SignalExecutor:
             )
 
         self._purge_validation_penalties()
+        self._purge_price_limit_backoff()
         self._ensure_ws_activity(settings)
         if not getattr(settings, "ai_enabled", False):
             return self._decision(
@@ -1075,6 +1263,13 @@ class SignalExecutor:
 
         adjusted_notional = max(adjusted_notional, 0.0)
 
+        price_limit_meta: Optional[Dict[str, object]] = None
+        adjusted_notional, slippage_pct, backoff_meta = self._apply_price_limit_backoff(
+            symbol, side, adjusted_notional, slippage_pct, min_notional
+        )
+        if backoff_meta:
+            price_limit_meta = backoff_meta
+
         order_context = {
             "symbol": symbol,
             "side": side,
@@ -1091,6 +1286,8 @@ class SignalExecutor:
             order_context["symbol_meta"] = symbol_meta
         if forced_exit_meta:
             order_context["forced_exit"] = copy.deepcopy(forced_exit_meta)
+        if price_limit_meta:
+            order_context["price_limit_backoff"] = price_limit_meta
 
         if adjusted_notional <= 0 or adjusted_notional < min_notional:
             order_context["min_notional"] = min_notional
@@ -1160,12 +1357,22 @@ class SignalExecutor:
 
             price_limit_hit = bool(details.get("price_limit_hit")) if details else False
             if exc.code == "insufficient_liquidity" and price_limit_hit:
-                quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
+                backoff_state = self._record_price_limit_hit(
+                    symbol,
+                    details,
+                    last_notional=adjusted_notional,
+                    last_slippage=slippage_pct,
+                )
+                quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl"))
+                if quarantine_ttl is None or quarantine_ttl <= 0:
+                    quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
                 self._quarantine_symbol(symbol, ttl=quarantine_ttl)
                 quarantine_until = self._symbol_quarantine.get(symbol)
                 if quarantine_until is not None:
                     validation_context["quarantine_until"] = quarantine_until
                 validation_context["quarantine_ttl"] = quarantine_ttl
+                if backoff_state:
+                    validation_context["price_limit_backoff"] = backoff_state
 
                 info_parts: List[str] = []
                 if details:
@@ -1205,9 +1412,12 @@ class SignalExecutor:
                     reason=reason_text,
                     context=validation_context,
                 )
+            else:
+                self._clear_price_limit_backoff(symbol)
 
             skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
             if exc.code in skip_codes:
+                self._clear_price_limit_backoff(symbol)
                 self._maybe_notify_validation_skip(
                     settings=settings,
                     symbol=symbol,
@@ -1221,6 +1431,7 @@ class SignalExecutor:
                     context=validation_context,
                 )
 
+            self._clear_price_limit_backoff(symbol)
             return ExecutionResult(
                 status="rejected",
                 reason=f"Ордер отклонён биржей ({exc.code}): {exc}",
