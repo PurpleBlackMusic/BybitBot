@@ -2024,7 +2024,7 @@ class GuardianBot:
             ev_ready = ev_value is None or ev_value >= min_ev
             actionable = trend_hint in {"buy", "sell"} and probability_ready and ev_ready
 
-            entry["ev_ready"] = bool(ev_value is not None and ev_value >= min_ev)
+            entry["ev_ready"] = bool(ev_ready)
             entry["probability_ready"] = probability_ready
             entry["probability_gap_pct"] = (
                 round(probability_gap * 100.0, 2) if probability_gap is not None else None
