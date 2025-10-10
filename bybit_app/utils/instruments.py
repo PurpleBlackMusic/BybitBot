@@ -14,6 +14,7 @@ _MAINNET_URL = "https://api.bybit.com/v5/market/instruments-info"
 
 _CACHE: dict[str, Set[str]] = {}
 _LOCK = threading.Lock()
+_IN_FLIGHT: dict[str, threading.Event] = {}
 
 
 def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[str]:
@@ -92,9 +93,25 @@ def get_listed_spot_symbols(
     """
 
     cache_key = "spot_testnet" if testnet else "spot_mainnet"
+    fetch_required = False
+    event: threading.Event | None = None
+
     with _LOCK:
         if not force_refresh and cache_key in _CACHE:
             return set(_CACHE[cache_key])
+
+        event = _IN_FLIGHT.get(cache_key)
+        if event is None:
+            event = threading.Event()
+            _IN_FLIGHT[cache_key] = event
+            fetch_required = True
+
+    if not fetch_required:
+        assert event is not None  # for type-checkers
+        event.wait()
+        with _LOCK:
+            cached = _CACHE.get(cache_key)
+        return set(cached or set())
 
     try:
         symbols = _fetch_spot_symbols(testnet=testnet, timeout=timeout)
@@ -102,10 +119,16 @@ def get_listed_spot_symbols(
         log("instruments.fetch.error", scope="spot", testnet=testnet, err=str(exc))
         with _LOCK:
             cached = _CACHE.get(cache_key)
+            in_flight = _IN_FLIGHT.pop(cache_key, None)
+        if in_flight is not None:
+            in_flight.set()
         return set(cached or set())
 
     with _LOCK:
         _CACHE[cache_key] = set(symbols)
+        in_flight = _IN_FLIGHT.pop(cache_key, None)
+    if in_flight is not None:
+        in_flight.set()
     log(
         "instruments.fetch.success",
         scope="spot",
