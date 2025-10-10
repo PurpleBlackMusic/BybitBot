@@ -221,6 +221,13 @@ def test_ws_manager_send_sell_fill_notification(monkeypatch: pytest.MonkeyPatch)
             "realized_pnl": Decimal("0"),
         }
     }
+    manager._inventory_baseline = {
+        "ETHUSDT": {
+            "position_qty": Decimal("0.4000"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
 
     def fake_spot_inventory_and_pnl(*args, **kwargs):
         assert kwargs.get("settings") is manager.s
@@ -253,6 +260,74 @@ def test_ws_manager_send_sell_fill_notification(monkeypatch: pytest.MonkeyPatch)
     }
 
     manager._handle_execution_fill([fill_row])
+
+    assert sent["message"] == (
+        "🔴 ETHUSDT: закрытие 0.1 ETH по 120, PnL сделки +1.88 USDT (осталось: 0.3 ETH)"
+    )
+
+
+def test_ws_manager_sell_notification_after_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+    manager._realtime_cache = SimpleNamespace(update_private=lambda *args, **kwargs: None)
+
+    manager._inventory_snapshot = {}
+    manager._inventory_baseline = {}
+
+    buy_row = {
+        "execId": "buy1",
+        "symbol": "ETHUSDT",
+        "side": "Buy",
+        "execQty": "0.4000",
+        "execPrice": "100",
+        "execFee": "0",
+    }
+    sell_row = {
+        "execId": "sell1",
+        "symbol": "ETHUSDT",
+        "side": "Sell",
+        "execQty": "0.1000",
+        "execPrice": "120",
+        "execFee": "0.12",
+    }
+
+    def fake_read_ledger(n: int | None = 5000, *, settings=None, **_):
+        assert settings is manager.s
+        return [dict(buy_row), dict(sell_row)]
+
+    def fake_spot_inventory_and_pnl(*, events=None, settings=None, **_):
+        assert settings is manager.s
+        if events is not None:
+            return {
+                "ETHUSDT": {
+                    "position_qty": 0.4,
+                    "avg_cost": 100.0,
+                    "realized_pnl": 0.0,
+                }
+            }
+        return {
+            "ETHUSDT": {
+                "position_qty": 0.3,
+                "avg_cost": 100.0,
+                "realized_pnl": 1.88,
+            }
+        }
+
+    sent: dict[str, str] = {}
+
+    def fake_send_telegram(message: str):
+        sent["message"] = message
+
+    monkeypatch.setattr(pnl_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(ws_manager_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+    monkeypatch.setattr(
+        ws_manager_module,
+        "enqueue_telegram_message",
+        fake_send_telegram,
+    )
+
+    manager._handle_execution_fill([sell_row])
 
     assert sent["message"] == (
         "🔴 ETHUSDT: закрытие 0.1 ETH по 120, PnL сделки +1.88 USDT (осталось: 0.3 ETH)"
