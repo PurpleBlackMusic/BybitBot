@@ -1275,6 +1275,118 @@ class WSManager:
             exec_id=exec_marker,
         )
 
+    @staticmethod
+    def _normalise_tp_ladder_payload(
+        ladder: Iterable[object] | None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        if ladder is None:
+            return tuple()
+        if isinstance(ladder, (str, bytes)):
+            return tuple()
+        normalised: list[tuple[str, str, str]] = []
+        for entry in ladder:
+            price_text = ""
+            qty_text = ""
+            profit_text = ""
+            if isinstance(entry, Mapping):
+                price_candidate = entry.get("price_text") or entry.get("price")
+                qty_candidate = entry.get("qty_text") or entry.get("qty")
+                profit_candidate = (
+                    entry.get("profit_text")
+                    or entry.get("profit_bps")
+                    or entry.get("profit_labels")
+                )
+                if isinstance(profit_candidate, Sequence) and not isinstance(
+                    profit_candidate, (str, bytes)
+                ):
+                    labels = [
+                        str(label).strip()
+                        for label in profit_candidate
+                        if str(label or "").strip()
+                    ]
+                    profit_candidate = ",".join(labels) if labels else ""
+                if price_candidate is not None:
+                    price_text = str(price_candidate).strip()
+                if qty_candidate is not None:
+                    qty_text = str(qty_candidate).strip()
+                if profit_candidate is not None:
+                    profit_text = str(profit_candidate).strip()
+            elif isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
+                if entry:
+                    price_text = str(entry[0] or "").strip()
+                if len(entry) > 1:
+                    qty_text = str(entry[1] or "").strip()
+                if len(entry) > 2:
+                    profit_text = str(entry[2] or "").strip()
+            if not price_text or not qty_text:
+                continue
+            normalised.append((price_text, qty_text, profit_text))
+        return tuple(normalised)
+
+    @staticmethod
+    def _ladder_payload_from_plan(
+        plan: Sequence[Mapping[str, object]] | None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        if not plan:
+            return tuple()
+        prepared: list[tuple[str, str, str]] = []
+        for entry in plan:
+            if not isinstance(entry, Mapping):
+                continue
+            price_text = str(entry.get("price_text") or "").strip()
+            qty_text = str(entry.get("qty_text") or "").strip()
+            if not price_text or not qty_text:
+                continue
+            profit_text = str(entry.get("profit_text") or "").strip()
+            if not profit_text or profit_text == "-":
+                profit_labels = entry.get("profit_labels")
+                if isinstance(profit_labels, Sequence) and not isinstance(
+                    profit_labels, (str, bytes)
+                ):
+                    labels = [
+                        str(label).strip()
+                        for label in profit_labels
+                        if str(label or "").strip()
+                    ]
+                    profit_text = ",".join(labels) if labels else profit_text
+            prepared.append((price_text, qty_text, profit_text))
+        return tuple(prepared)
+
+    @staticmethod
+    def _plan_from_executor_signature(
+        signature: tuple[tuple[object, object], ...] | None,
+        ladder: tuple[tuple[str, str, str], ...] | None = None,
+    ) -> list[dict[str, object]]:
+        plan: list[dict[str, object]] = []
+        if not isinstance(signature, tuple):
+            return plan
+        for index, entry in enumerate(signature, start=1):
+            if not isinstance(entry, Sequence) or len(entry) < 2:
+                continue
+            price_text = str(entry[0] or "").strip()
+            qty_text = str(entry[1] or "").strip()
+            if not price_text or not qty_text:
+                continue
+            profit_text = "-"
+            if (
+                isinstance(ladder, tuple)
+                and 0 <= index - 1 < len(ladder)
+                and isinstance(ladder[index - 1], Sequence)
+                and len(ladder[index - 1]) >= 3
+            ):
+                candidate = ladder[index - 1][2]
+                if isinstance(candidate, str) and candidate.strip():
+                    profit_text = candidate.strip()
+            plan.append(
+                {
+                    "rung": index,
+                    "price_text": price_text,
+                    "qty_text": qty_text,
+                    "profit_text": profit_text,
+                }
+            )
+        return plan
+
     def register_tp_ladder_plan(
         self,
         symbol: str,
@@ -1285,6 +1397,7 @@ class WSManager:
         status: str = "active",
         source: str = "executor",
         handshake: Iterable[object] | None = None,
+        ladder: Iterable[object] | None = None,
     ) -> None:
         symbol_key = str(symbol or "").strip().upper()
         normalised_signature = self._normalise_tp_signature(signature)
@@ -1293,6 +1406,7 @@ class WSManager:
         avg_cost_decimal = self._decimal_from(avg_cost)
         qty_decimal = self._decimal_from(qty)
         handshake_tuple = self._normalise_tp_handshake(handshake)
+        ladder_payload = self._normalise_tp_ladder_payload(ladder)
         payload: dict[str, object] = {
             "signature": normalised_signature,
             "avg_cost": avg_cost_decimal,
@@ -1303,6 +1417,8 @@ class WSManager:
         }
         if handshake_tuple:
             payload["handshake"] = handshake_tuple
+        if ladder_payload:
+            payload["ladder"] = ladder_payload
         with self._fill_lock:
             self._tp_ladder_plan[symbol_key] = payload
 
@@ -1372,15 +1488,69 @@ class WSManager:
             return
 
         settings_obj = settings
-        if config is None:
-            if settings_obj is None:
-                try:
-                    settings_obj = get_settings()
-                except Exception:
-                    settings_obj = None
-            config = self._resolve_tp_config(settings_obj) if settings_obj else []
-        if not config:
-            return
+
+        previous_meta = self._tp_ladder_plan.get(symbol) or {}
+        current_handshake = self._tp_handshake_from_row(row)
+        previous_signature: tuple[tuple[object, object], ...] | None = None
+        previous_avg_cost = Decimal("0")
+        previous_qty = Decimal("0")
+        previous_source = ""
+        previous_status = ""
+        previous_handshake: tuple[str, ...] = tuple()
+        previous_ladder: tuple[tuple[str, str, str], ...] = tuple()
+        if isinstance(previous_meta, Mapping):
+            existing_sig = previous_meta.get("signature")
+            if isinstance(existing_sig, tuple):
+                previous_signature = existing_sig
+            previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
+            previous_qty = self._decimal_from(previous_meta.get("qty"))
+            previous_source = str(previous_meta.get("source") or "").strip().lower()
+            previous_status = str(previous_meta.get("status") or "").strip().lower()
+            existing_handshake = previous_meta.get("handshake")
+            if isinstance(existing_handshake, tuple):
+                previous_handshake = self._normalise_tp_handshake(existing_handshake)
+            previous_ladder = self._normalise_tp_ladder_payload(
+                previous_meta.get("ladder")
+            )
+
+        normalised_handshake = self._normalise_tp_handshake(current_handshake)
+        plan: list[dict[str, object]] = []
+        signature_override: tuple[tuple[object, object], ...] | None = None
+        ladder_override: tuple[tuple[str, str, str], ...] | None = None
+        if (
+            normalised_handshake
+            and len(normalised_handshake) > 1
+            and normalised_handshake == previous_handshake
+            and previous_source == "executor"
+            and previous_status in {"pending", "active"}
+            and previous_signature is not None
+        ):
+            plan = self._plan_from_executor_signature(previous_signature, previous_ladder)
+            if plan:
+                signature_override = previous_signature
+                ladder_override = previous_ladder
+                log(
+                    "ws.private.tp_ladder.executor_plan",
+                    symbol=symbol,
+                    reason="adopt",
+                )
+
+        config_values = config
+        if not plan:
+            if config_values is None:
+                if settings_obj is None:
+                    try:
+                        settings_obj = get_settings()
+                    except Exception:
+                        settings_obj = None
+                config_values = (
+                    self._resolve_tp_config(settings_obj) if settings_obj else []
+                )
+            if not config_values:
+                return
+        else:
+            if config_values is None:
+                config_values = []
 
         if api is None:
             try:
@@ -1424,95 +1594,75 @@ class WSManager:
         if available_qty <= 0:
             return
 
-        plan = self._build_tp_plan(
-            total_qty=available_qty,
-            avg_cost=avg_cost,
-            config=config,
-            qty_step=qty_step,
-            price_step=price_step,
-            min_qty=min_qty,
-            min_notional=min_notional,
-            min_price=price_band_min,
-            max_price=price_band_max,
-        )
         if not plan:
-            return
+            plan = self._build_tp_plan(
+                total_qty=available_qty,
+                avg_cost=avg_cost,
+                config=config_values,
+                qty_step=qty_step,
+                price_step=price_step,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                min_price=price_band_min,
+                max_price=price_band_max,
+            )
+            if not plan:
+                return
 
         signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
-        previous_meta = self._tp_ladder_plan.get(symbol) or {}
-        current_handshake = self._tp_handshake_from_row(row)
-        previous_signature = None
-        previous_avg_cost = Decimal("0")
-        previous_qty = Decimal("0")
-        previous_source = ""
-        previous_status = ""
-        previous_handshake: tuple[str, ...] = tuple()
-        if isinstance(previous_meta, Mapping):
-            existing_sig = previous_meta.get("signature")
-            if isinstance(existing_sig, tuple):
-                previous_signature = existing_sig
-            previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
-            previous_qty = self._decimal_from(previous_meta.get("qty"))
-            previous_source = str(previous_meta.get("source") or "").strip().lower()
-            previous_status = str(previous_meta.get("status") or "").strip().lower()
-            existing_handshake = previous_meta.get("handshake")
-            if isinstance(existing_handshake, tuple):
-                previous_handshake = self._normalise_tp_handshake(existing_handshake)
+        ladder_payload = (
+            ladder_override
+            if ladder_override is not None
+            else self._ladder_payload_from_plan(plan)
+        )
 
-        normalised_handshake = self._normalise_tp_handshake(current_handshake)
-        if (
-            normalised_handshake
-            and len(normalised_handshake) > 1
-            and normalised_handshake == previous_handshake
-            and previous_source == "executor"
-            and previous_status in {"pending", "active"}
-        ):
-            log(
-                "ws.private.tp_ladder.skip",
-                symbol=symbol,
-                reason="executor_handshake",
-            )
-            return
-        if previous_signature == signature:
+        if signature_override is None and previous_signature == signature:
             log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
             return
 
-        threshold_bps = Decimal("0")
-        qty_threshold = qty_step
-        if settings_obj is None:
-            try:
-                settings_obj = get_settings()
-            except Exception:
-                settings_obj = None
-        if settings_obj is not None:
-            threshold_raw = getattr(settings_obj, "spot_tp_reprice_threshold_bps", 0) or 0
-            threshold_bps = self._decimal_from(threshold_raw)
-            qty_threshold_raw = getattr(settings_obj, "spot_tp_reprice_qty_buffer", None)
-            if qty_threshold_raw is not None:
-                candidate = self._decimal_from(qty_threshold_raw)
-                if candidate > qty_threshold:
-                    qty_threshold = candidate
+        if signature_override is None:
+            threshold_bps = Decimal("0")
+            qty_threshold = qty_step
+            if settings_obj is None:
+                try:
+                    settings_obj = get_settings()
+                except Exception:
+                    settings_obj = None
+            if settings_obj is not None:
+                threshold_raw = getattr(
+                    settings_obj, "spot_tp_reprice_threshold_bps", 0
+                ) or 0
+                threshold_bps = self._decimal_from(threshold_raw)
+                qty_threshold_raw = getattr(
+                    settings_obj, "spot_tp_reprice_qty_buffer", None
+                )
+                if qty_threshold_raw is not None:
+                    candidate = self._decimal_from(qty_threshold_raw)
+                    if candidate > qty_threshold:
+                        qty_threshold = candidate
 
-        price_change = abs(avg_cost - previous_avg_cost)
-        allowed_delta = Decimal("0")
-        if threshold_bps > 0 and avg_cost > 0:
-            allowed_delta = (avg_cost * threshold_bps) / Decimal("10000")
-        qty_change = abs(available_qty - previous_qty)
-        if (
-            previous_signature is not None
-            and allowed_delta > 0
-            and price_change < allowed_delta
-            and qty_threshold > 0
-            and qty_change <= qty_threshold
-        ):
-            log(
-                "ws.private.tp_ladder.skip",
-                symbol=symbol,
-                reason="below_threshold",
-                price_change=str(price_change.normalize()),
-                qty_change=str(qty_change.normalize()),
-            )
-            return
+            price_change = abs(avg_cost - previous_avg_cost)
+            allowed_delta = Decimal("0")
+            if threshold_bps > 0 and avg_cost > 0:
+                allowed_delta = (avg_cost * threshold_bps) / Decimal("10000")
+            qty_change = abs(available_qty - previous_qty)
+            if (
+                previous_signature is not None
+                and allowed_delta > 0
+                and price_change < allowed_delta
+                and qty_threshold > 0
+                and qty_change <= qty_threshold
+            ):
+                log(
+                    "ws.private.tp_ladder.skip",
+                    symbol=symbol,
+                    reason="below_threshold",
+                    price_change=str(price_change.normalize()),
+                    qty_change=str(qty_change.normalize()),
+                )
+                return
+        else:
+            log("ws.private.tp_ladder.executor_plan", symbol=symbol, reason="confirmed")
 
         prepared_payloads = self._prepare_tp_payloads(symbol, plan)
         if not prepared_payloads:
@@ -1543,6 +1693,7 @@ class WSManager:
             status="active",
             source="ws_manager",
             handshake=current_handshake,
+            ladder=ladder_payload,
         )
 
     def private_snapshot(self) -> Mapping[str, object] | None:

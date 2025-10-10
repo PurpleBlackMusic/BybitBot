@@ -2051,6 +2051,7 @@ class SignalExecutor:
             status="pending",
             source="executor",
             handshake=handshake,
+            ladder=plan_entries,
         )
 
         placed: list[Dict[str, object]] = []
@@ -2126,7 +2127,10 @@ class SignalExecutor:
                 "orderLinkId": link_id,
                 "qty": qty_text,
                 "price": price_text,
+                "qty_text": qty_text,
+                "price_text": price_text,
                 "profit_bps": profit_text,
+                "profit_text": profit_text,
             }
             if order_id:
                 record["orderId"] = order_id
@@ -2148,6 +2152,7 @@ class SignalExecutor:
                 status="active",
                 source="executor",
                 handshake=handshake,
+                ladder=placed,
             )
         else:
             ws_manager.clear_tp_ladder_plan(
