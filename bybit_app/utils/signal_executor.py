@@ -1817,6 +1817,12 @@ class SignalExecutor:
             "execution", snapshot=private_snapshot
         )
         order_rows = ws_manager.realtime_private_rows("order", snapshot=private_snapshot)
+        handshake = ws_manager.resolve_tp_handshake(
+            symbol,
+            order_id=order_id,
+            order_link_id=order_link_id,
+            execution_rows=execution_rows,
+        )
 
         filled_base_total = self._collect_filled_base_total(
             symbol,
@@ -2044,6 +2050,7 @@ class SignalExecutor:
             qty=plan_total_qty,
             status="pending",
             source="executor",
+            handshake=handshake,
         )
 
         placed: list[Dict[str, object]] = []
@@ -2140,9 +2147,14 @@ class SignalExecutor:
                 qty=placed_qty_total,
                 status="active",
                 source="executor",
+                handshake=handshake,
             )
         else:
-            ws_manager.clear_tp_ladder_plan(symbol, signature=plan_signature)
+            ws_manager.clear_tp_ladder_plan(
+                symbol,
+                signature=plan_signature,
+                handshake=handshake,
+            )
 
         execution_stats = self._build_tp_execution_stats(
             executed_base=executed_base,
