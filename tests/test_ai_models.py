@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
 
-from bybit_app.utils.ai.models import MODEL_FEATURES, _SymbolState, _ensure_scaling
+from bybit_app.utils.ai.models import (
+    MODEL_FEATURES,
+    _SymbolState,
+    _ensure_scaling,
+    liquidity_feature,
+)
 from bybit_app.utils.trade_analytics import ExecutionRecord
 
 
@@ -67,6 +73,7 @@ def test_sell_vector_contains_expected_metrics() -> None:
     avg_cost = (2.0 * 100.0 + 1.0 * 102.0) / 3.0
     assert features["directional_change_pct"] == pytest.approx((110.0 - avg_cost) / avg_cost * 100.0)
     assert features["volume_impulse"] > 0.0
+    assert features["turnover_log"] == pytest.approx(liquidity_feature(sell_record.notional))
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)
@@ -108,3 +115,12 @@ def test_scaling_output_matches_feature_count() -> None:
     assert normalized.shape[1] == len(MODEL_FEATURES)
     assert means.shape[0] == len(MODEL_FEATURES)
     assert stds.shape[0] == len(MODEL_FEATURES)
+
+
+def test_liquidity_feature_matches_logarithm() -> None:
+    assert liquidity_feature(0.0) == 0.0
+    assert liquidity_feature(-10.0) == 0.0
+
+    value = 512.5
+    expected = math.log10(value + 1.0)
+    assert liquidity_feature(value) == pytest.approx(expected)
