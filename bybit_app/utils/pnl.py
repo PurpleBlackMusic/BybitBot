@@ -481,7 +481,7 @@ def read_ledger(
     ledger_path = resolved_path
     if not ledger_path.exists():
         if return_meta:
-            return [], None, True
+            return [], None, False
         return []
 
     maxlen = n if (n is not None and n > 0) else None
