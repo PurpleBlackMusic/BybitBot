@@ -26,3 +26,6 @@ def test_ttlkv_persists_and_expires(tmp_path: Path, monkeypatch):
 
     # but without ttl we still read stored value
     assert kv.get("foo") == {"bar": 1}
+
+    kv.delete("foo")
+    assert kv.get("foo") is None

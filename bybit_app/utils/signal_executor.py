@@ -2027,6 +2027,7 @@ class SignalExecutor:
                     "price": price,
                     "price_text": price_text,
                     "profit_text": profit_text,
+                    "profit_labels": profit_labels,
                 }
             )
 
@@ -2044,6 +2045,7 @@ class SignalExecutor:
             qty=plan_total_qty,
             status="pending",
             source="executor",
+            plan=plan_entries,
         )
 
         placed: list[Dict[str, object]] = []
@@ -2140,6 +2142,7 @@ class SignalExecutor:
                 qty=placed_qty_total,
                 status="active",
                 source="executor",
+                plan=placed,
             )
         else:
             ws_manager.clear_tp_ladder_plan(symbol, signature=plan_signature)

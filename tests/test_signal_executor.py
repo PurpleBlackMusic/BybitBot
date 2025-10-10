@@ -5,6 +5,7 @@ from typing import Mapping, Optional, Tuple, Union
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
 import bybit_app.utils.spot_pnl as spot_pnl_module
 import bybit_app.utils.spot_fifo as spot_fifo_module
+import bybit_app.utils.tp_ladder_store as tp_ladder_store
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.signal_executor import (
     AutomationLoop,
@@ -19,6 +21,7 @@ from bybit_app.utils.signal_executor import (
     SignalExecutor,
 )
 from bybit_app.utils.spot_market import OrderValidationError, SpotTradeSnapshot
+from bybit_app.utils.ws_manager import WSManager
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +31,16 @@ def _stub_ws_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
         "autostart",
         lambda include_private=True: (False, False),
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_tp_store(tmp_path_factory: pytest.TempPathFactory):
+    path = tmp_path_factory.mktemp("tp_store") / "tp_ladder.json"
+    tp_ladder_store.reset(path)
+    try:
+        yield
+    finally:
+        tp_ladder_store.reset(path)
 
 
 class StubBot:
@@ -880,6 +893,121 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert cancel_calls == []
 
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
+
+
+def test_executor_ladder_signature_persisted_for_ws_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.75"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.75",
+            "cumExecValue": "75",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: response_payload,
+    )
+
+    executor_manager = WSManager()
+    monkeypatch.setattr(signal_executor_module, "ws_manager", executor_manager)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+    assert result.status == "filled"
+
+    plan_meta = executor_manager._tp_ladder_plan.get("BTCUSDT")
+    assert isinstance(plan_meta, Mapping)
+    expected_signature = plan_meta.get("signature")
+    assert isinstance(expected_signature, tuple) and expected_signature
+    expected_plan = plan_meta.get("plan")
+    assert isinstance(expected_plan, tuple) and expected_plan
+
+    stored_record = tp_ladder_store.read("BTCUSDT")
+    assert isinstance(stored_record, Mapping)
+    serialised_pairs: list[tuple[str, str]] = []
+    for pair in stored_record.get("signature", []):
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            serialised_pairs.append((str(pair[0]), str(pair[1])))
+    stored_signature = tuple(serialised_pairs)
+    assert stored_signature == expected_signature
+
+    manager = WSManager()
+    monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
+
+    def fail_build(**kwargs):
+        raise AssertionError("_build_tp_plan should not be invoked when executor plan is present")
+
+    monkeypatch.setattr(manager, "_build_tp_plan", fail_build)
+    def fail_prepare(symbol, plan):
+        raise AssertionError("_prepare_tp_payloads should not run for executor ladder")
+
+    def fail_execute(*args, **kwargs):
+        raise AssertionError("_execute_tp_plan should not run for executor ladder")
+
+    monkeypatch.setattr(manager, "_prepare_tp_payloads", fail_prepare)
+    monkeypatch.setattr(manager, "_execute_tp_plan", fail_execute)
+
+    limits_cache = {
+        "BTCUSDT": {
+            "qty_step": Decimal("0.01"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.01"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    manager._regenerate_tp_ladder(
+        {"symbol": "BTCUSDT", "side": "Buy"},
+        {"BTCUSDT": {"position_qty": Decimal("0.75"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("50"), Decimal("0.6")), (Decimal("100"), Decimal("0.4"))],
+        api=StubAPI(),
+        limits_cache=limits_cache,
+        settings=SimpleNamespace(
+            spot_tp_reprice_threshold_bps=0,
+            spot_tp_reprice_qty_buffer=None,
+        ),
+    )
+
+    refreshed_meta = manager._tp_ladder_plan.get("BTCUSDT")
+    assert isinstance(refreshed_meta, Mapping)
+    assert refreshed_meta.get("signature") == expected_signature
+    assert refreshed_meta.get("plan") == expected_plan
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:

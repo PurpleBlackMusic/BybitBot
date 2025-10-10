@@ -10,8 +10,19 @@ import ssl
 
 from bybit_app.utils import ws_manager as ws_manager_module
 import bybit_app.utils.pnl as pnl_module
+import bybit_app.utils.tp_ladder_store as tp_ladder_store
 from bybit_app.utils.ws_manager import WSManager
 from bybit_app.utils.ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
+
+
+@pytest.fixture(autouse=True)
+def _reset_tp_store(tmp_path_factory: pytest.TempPathFactory) -> Iterable[None]:
+    path = tmp_path_factory.mktemp("tp_store") / "tp_ladder.json"
+    tp_ladder_store.reset(path)
+    try:
+        yield
+    finally:
+        tp_ladder_store.reset(path)
 
 
 def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:

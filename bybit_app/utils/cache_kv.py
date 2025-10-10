@@ -98,3 +98,10 @@ class TTLKV:
             self._ensure_fresh()
             self._data[key] = {"ts": time.time(), "val": val}
             self._flush()
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            self._ensure_fresh()
+            if key in self._data:
+                self._data.pop(key, None)
+                self._flush()

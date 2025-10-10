@@ -27,6 +27,9 @@ from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
 from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
+from .tp_ladder_store import delete as tp_store_delete
+from .tp_ladder_store import read as tp_store_read
+from .tp_ladder_store import write as tp_store_write
 
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
@@ -1158,6 +1161,166 @@ class WSManager:
             normalised.append((price_text, qty_text))
         return tuple(normalised)
 
+    @staticmethod
+    def _normalise_tp_plan(
+        plan: Iterable[Mapping[str, object]] | None,
+    ) -> tuple[dict[str, object], ...]:
+        normalised: list[dict[str, object]] = []
+        if plan is None:
+            return tuple()
+        for entry in plan:
+            if not isinstance(entry, Mapping):
+                continue
+            price_text = str(
+                entry.get("price_text")
+                or entry.get("price")
+                or ""
+            ).strip()
+            qty_text = str(entry.get("qty_text") or entry.get("qty") or "").strip()
+            if not price_text or not qty_text:
+                continue
+            profit_labels: list[str] = []
+            labels_candidate = entry.get("profit_labels")
+            if isinstance(labels_candidate, (list, tuple, set)):
+                for label in labels_candidate:
+                    label_text = str(label or "").strip()
+                    if label_text:
+                        profit_labels.append(label_text)
+            else:
+                profit_text = entry.get("profit_text")
+                if isinstance(profit_text, str):
+                    for token in profit_text.split(","):
+                        token_text = token.strip()
+                        if token_text and token_text != "-":
+                            profit_labels.append(token_text)
+            normalised.append(
+                {
+                    "price_text": price_text,
+                    "qty_text": qty_text,
+                    "profit_labels": tuple(profit_labels),
+                }
+            )
+        return tuple(normalised)
+
+    @staticmethod
+    def _inflate_tp_plan(
+        plan: Iterable[Mapping[str, object]] | None,
+    ) -> list[dict[str, object]]:
+        inflated: list[dict[str, object]] = []
+        if plan is None:
+            return inflated
+        for entry in plan:
+            if not isinstance(entry, Mapping):
+                continue
+            price_text = str(entry.get("price_text") or "").strip()
+            qty_text = str(entry.get("qty_text") or "").strip()
+            if not price_text or not qty_text:
+                continue
+            profit_labels_raw = entry.get("profit_labels")
+            profit_labels: list[str] = []
+            if isinstance(profit_labels_raw, (list, tuple)):
+                for label in profit_labels_raw:
+                    label_text = str(label or "").strip()
+                    if label_text:
+                        profit_labels.append(label_text)
+            inflated.append(
+                {
+                    "price_text": price_text,
+                    "qty_text": qty_text,
+                    "profit_labels": profit_labels,
+                }
+            )
+        return inflated
+
+    def _persist_tp_ladder_plan(self, symbol_key: str, payload: Mapping[str, object]) -> None:
+        signature = payload.get("signature")
+        if not isinstance(signature, tuple):
+            return
+        data: dict[str, object] = {
+            "signature": [list(pair) for pair in signature],
+            "avg_cost": str(payload.get("avg_cost") or "0"),
+            "qty": str(payload.get("qty") or "0"),
+            "updated_ts": float(payload.get("updated_ts") or 0.0),
+            "status": str(payload.get("status") or ""),
+            "source": str(payload.get("source") or ""),
+        }
+        plan_entries = payload.get("plan")
+        if isinstance(plan_entries, tuple):
+            serialised_plan: list[dict[str, object]] = []
+            for entry in plan_entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                price_text = str(entry.get("price_text") or "").strip()
+                qty_text = str(entry.get("qty_text") or "").strip()
+                if not price_text or not qty_text:
+                    continue
+                profit_labels = entry.get("profit_labels")
+                labels: list[str] = []
+                if isinstance(profit_labels, (list, tuple)):
+                    for label in profit_labels:
+                        label_text = str(label or "").strip()
+                        if label_text:
+                            labels.append(label_text)
+                serialised_plan.append(
+                    {
+                        "price_text": price_text,
+                        "qty_text": qty_text,
+                        "profit_labels": labels,
+                    }
+                )
+            if serialised_plan:
+                data["plan"] = serialised_plan
+        try:
+            tp_store_write(symbol_key, data)
+        except Exception:
+            pass
+
+    def _restore_tp_ladder_plan(self, symbol_key: str) -> Mapping[str, object] | None:
+        try:
+            record = tp_store_read(symbol_key)
+        except Exception:
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        signature = self._normalise_tp_signature(record.get("signature"))
+        if not signature:
+            return None
+        restored: dict[str, object] = {
+            "signature": signature,
+            "avg_cost": self._decimal_from(record.get("avg_cost")),
+            "qty": self._decimal_from(record.get("qty")),
+            "updated_ts": float(record.get("updated_ts") or 0.0),
+            "status": str(record.get("status") or ""),
+            "source": str(record.get("source") or ""),
+        }
+        plan_entries = record.get("plan")
+        normalised_plan = self._normalise_tp_plan(
+            plan_entries if isinstance(plan_entries, Sequence) else None
+        )
+        if normalised_plan:
+            restored["plan"] = normalised_plan
+        with self._fill_lock:
+            current = self._tp_ladder_plan.get(symbol_key)
+            current_ts = 0.0
+            if isinstance(current, Mapping):
+                try:
+                    current_ts = float(current.get("updated_ts") or 0.0)
+                except Exception:
+                    current_ts = 0.0
+            if current is None or current_ts < restored["updated_ts"]:
+                self._tp_ladder_plan[symbol_key] = restored
+        return restored
+
+    def _get_tp_ladder_meta(self, symbol: str) -> Mapping[str, object] | None:
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            return None
+        with self._fill_lock:
+            meta = self._tp_ladder_plan.get(symbol_key)
+        if isinstance(meta, Mapping):
+            return meta
+        return self._restore_tp_ladder_plan(symbol_key)
+
     def register_tp_ladder_plan(
         self,
         symbol: str,
@@ -1167,6 +1330,7 @@ class WSManager:
         qty: object = None,
         status: str = "active",
         source: str = "executor",
+        plan: Iterable[Mapping[str, object]] | None = None,
     ) -> None:
         symbol_key = str(symbol or "").strip().upper()
         normalised_signature = self._normalise_tp_signature(signature)
@@ -1174,6 +1338,7 @@ class WSManager:
             return
         avg_cost_decimal = self._decimal_from(avg_cost)
         qty_decimal = self._decimal_from(qty)
+        normalised_plan = self._normalise_tp_plan(plan)
         payload: dict[str, object] = {
             "signature": normalised_signature,
             "avg_cost": avg_cost_decimal,
@@ -1182,8 +1347,11 @@ class WSManager:
             "status": status,
             "source": source,
         }
+        if normalised_plan:
+            payload["plan"] = normalised_plan
         with self._fill_lock:
             self._tp_ladder_plan[symbol_key] = payload
+        self._persist_tp_ladder_plan(symbol_key, payload)
 
     def clear_tp_ladder_plan(
         self,
@@ -1206,6 +1374,10 @@ class WSManager:
                 ):
                     return
             self._tp_ladder_plan.pop(symbol_key, None)
+        try:
+            tp_store_delete(symbol_key)
+        except Exception:
+            pass
 
     def _regenerate_tp_ladder(
         self,
@@ -1293,34 +1465,54 @@ class WSManager:
         if available_qty <= 0:
             return
 
-        plan = self._build_tp_plan(
-            total_qty=available_qty,
-            avg_cost=avg_cost,
-            config=config,
-            qty_step=qty_step,
-            price_step=price_step,
-            min_qty=min_qty,
-            min_notional=min_notional,
-            min_price=price_band_min,
-            max_price=price_band_max,
-        )
-        if not plan:
-            return
+        plan: list[dict[str, object]] | None = None
+        signature: tuple[tuple[str, str], ...] | None = None
 
-        signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
-        previous_meta = self._tp_ladder_plan.get(symbol) or {}
+        previous_meta = self._get_tp_ladder_meta(symbol) or {}
         previous_signature = None
         previous_avg_cost = Decimal("0")
         previous_qty = Decimal("0")
+        previous_source = ""
+        stored_plan = None
         if isinstance(previous_meta, Mapping):
             existing_sig = previous_meta.get("signature")
             if isinstance(existing_sig, tuple):
                 previous_signature = existing_sig
             previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
             previous_qty = self._decimal_from(previous_meta.get("qty"))
+            previous_source = str(previous_meta.get("source") or "")
+            stored_plan = previous_meta.get("plan")
+
+        if previous_source == "executor" and stored_plan:
+            plan = self._inflate_tp_plan(stored_plan)
+            if previous_signature is not None:
+                signature = previous_signature
+
+        if plan is None:
+            plan = self._build_tp_plan(
+                total_qty=available_qty,
+                avg_cost=avg_cost,
+                config=config,
+                qty_step=qty_step,
+                price_step=price_step,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                min_price=price_band_min,
+                max_price=price_band_max,
+            )
+            if not plan:
+                return
+            signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
+        elif signature is None:
+            signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
+
         if previous_signature == signature:
             log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
             return
+
+        register_qty = available_qty
+        if previous_source == "executor" and stored_plan and previous_qty > 0:
+            register_qty = previous_qty
 
         threshold_bps = Decimal("0")
         qty_threshold = qty_step
@@ -1384,9 +1576,10 @@ class WSManager:
             symbol,
             signature=signature,
             avg_cost=avg_cost,
-            qty=available_qty,
+            qty=register_qty,
             status="active",
             source="ws_manager",
+            plan=plan,
         )
 
     def private_snapshot(self) -> Mapping[str, object] | None:
