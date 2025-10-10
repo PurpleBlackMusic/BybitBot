@@ -26,7 +26,7 @@ from .trade_analytics import (
     aggregate_execution_metrics,
     normalise_execution_payload,
 )
-from .trade_pairs import pair_trades
+from .trade_pairs import pair_trades, pair_trades_cache_signature
 from .spot_pnl import spot_inventory_and_pnl
 from .symbols import ensure_usdt_symbol
 from .live_checks import api_key_status, bybit_realtime_status
@@ -113,6 +113,8 @@ class GuardianBot:
         self._digest_cache: Optional[Dict[str, object]] = None
         self._watchlist_breakdown_cache_signature: Optional[int] = None
         self._watchlist_breakdown_cache: Optional[Dict[str, object]] = None
+        self._pair_trades_signature: Optional[Tuple[int, int, int]] = None
+        self._pair_trades_cache: Optional[Tuple[Dict[str, object], ...]] = None
         self._live_fetcher: Optional[LiveSignalFetcher] = None
         self._listed_spot_symbols: Optional[Set[str]] = None
 
@@ -3620,8 +3622,34 @@ class GuardianBot:
         """Derive adaptive exit thresholds from paired trade statistics."""
 
         try:
-            trades = pair_trades(settings=self.settings)
+            signature = pair_trades_cache_signature(settings=self.settings)
         except Exception:
+            signature = None
+
+        trades: Optional[List[Dict[str, object]]] = None
+
+        if (
+            signature is not None
+            and self._pair_trades_signature == signature
+            and self._pair_trades_cache is not None
+        ):
+            trades = [copy.deepcopy(item) for item in self._pair_trades_cache]
+        else:
+            try:
+                trades = pair_trades(settings=self.settings)
+            except Exception:
+                self._pair_trades_signature = None
+                self._pair_trades_cache = None
+                return {}
+
+            if signature is not None:
+                self._pair_trades_signature = signature
+                self._pair_trades_cache = tuple(copy.deepcopy(item) for item in trades)
+            else:
+                self._pair_trades_signature = None
+                self._pair_trades_cache = None
+
+        if not trades:
             return {}
 
         hold_samples: List[float] = []

@@ -1,14 +1,80 @@
 
 from __future__ import annotations
+
 import json
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
 LED: Path | None = None
 TRD = DATA_DIR / "pnl" / "trades.jsonl"
+
+FileSignature = Tuple[int, int]
+CacheSignature = Tuple[FileSignature, FileSignature, int]
+
+
+@dataclass
+class _PairTradeCacheEntry:
+    signature: CacheSignature
+    trades: Tuple[Dict[str, Any], ...]
+
+
+_PAIR_CACHE: Dict[Tuple[Path, Path, int], _PairTradeCacheEntry] = {}
+
+
+def _normalise_path(path: Path) -> Path:
+    try:
+        return path.resolve(strict=False)
+    except TypeError:  # pragma: no cover - defensive
+        return Path(str(path))
+
+
+def _normalise_window(window_ms: int | float) -> int:
+    try:
+        return int(window_ms)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _file_signature(path: Path) -> FileSignature:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (0, 0)
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _cache_key(decisions_path: Path, ledger_path: Path, window_ms: int) -> Tuple[Path, Path, int]:
+    return (
+        _normalise_path(decisions_path),
+        _normalise_path(ledger_path),
+        window_ms,
+    )
+
+
+def _cache_signature(decisions_path: Path, ledger_path: Path, window_ms: int) -> CacheSignature:
+    return (
+        _file_signature(decisions_path),
+        _file_signature(ledger_path),
+        window_ms,
+    )
+
+
+def pair_trades_cache_signature(
+    window_ms: int = 7 * 24 * 3600 * 1000,
+    *,
+    settings: object | None = None,
+    network: object | None = None,
+) -> CacheSignature:
+    """Return a signature that describes the cache key for trade pairs."""
+
+    window = _normalise_window(window_ms)
+    ledger_path = _resolve_ledger_path(settings=settings, network=network)
+    return _cache_signature(DEC, ledger_path, window)
 
 def _read_jsonl(p: Path) -> list[dict]:
     if not p.exists(): return []
@@ -40,8 +106,17 @@ def pair_trades(
     Линкуем через orderLinkId при наличии, иначе по времени и символу.
     Выход: список трейдов с метриками: r_mult, bps_realized, hold_sec, fees.
     """
+    window = _normalise_window(window_ms)
+    ledger_path = _resolve_ledger_path(settings=settings, network=network)
+    cache_key = _cache_key(DEC, ledger_path, window)
+    signature = _cache_signature(DEC, ledger_path, window)
+
+    cached = _PAIR_CACHE.get(cache_key)
+    if cached is not None and cached.signature == signature:
+        return [deepcopy(trade) for trade in cached.trades]
+
     decs = _read_jsonl(DEC)
-    exes = _read_jsonl(_resolve_ledger_path(settings=settings, network=network))
+    exes = _read_jsonl(ledger_path)
     # Сортируем по времени
     decs.sort(key=lambda d: d.get("ts", 0))
     exes.sort(key=lambda e: e.get("execTime") or e.get("ts") or 0)
@@ -419,4 +494,7 @@ def pair_trades(
 
     # записываем
     _write_jsonl(TRD, trades)
+    cached_payload = tuple(deepcopy(trade) for trade in trades)
+    _PAIR_CACHE[cache_key] = _PairTradeCacheEntry(signature=signature, trades=cached_payload)
+
     return trades
