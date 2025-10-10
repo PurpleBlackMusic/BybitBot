@@ -211,6 +211,47 @@ def test_signal_executor_maps_usdc_symbol(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.order["symbol"] == "ADAUSDT"
 
 
+def test_signal_sizing_factor_uses_performance_metrics() -> None:
+    base_summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "ETHUSDT",
+        "probability": 0.68,
+        "ev_bps": 25.0,
+    }
+
+    low_metrics = {
+        "primary_watch": {
+            "win_rate_pct": 38.0,
+            "realized_bps_avg": -15.0,
+            "median_hold_sec": 2.5 * 60.0 * 60.0,
+        }
+    }
+
+    high_metrics = {
+        "primary_watch": {
+            "win_rate_pct": 70.0,
+            "realized_bps_avg": 25.0,
+            "median_hold_sec": 10.0 * 60.0,
+        }
+    }
+
+    settings = Settings(ai_enabled=True)
+    low_summary = copy.deepcopy(base_summary)
+    low_summary.update(low_metrics)
+    high_summary = copy.deepcopy(base_summary)
+    high_summary.update(high_metrics)
+
+    executor = SignalExecutor(StubBot(base_summary, settings))
+
+    low_factor = executor._signal_sizing_factor(low_summary, settings)
+    high_factor = executor._signal_sizing_factor(high_summary, settings)
+
+    assert low_factor < high_factor
+    assert low_factor < 0.55
+    assert high_factor > 0.8
+
+
 def test_signal_executor_force_exit_uses_trade_stats_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
