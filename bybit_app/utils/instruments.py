@@ -62,6 +62,37 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
     except requests.exceptions.RequestException as exc:
         if not testnet:
             raise
+
+        if isinstance(exc, requests.exceptions.HTTPError):
+            log("instruments.fetch.testnet_http_error", scope="spot", err=str(exc))
+            try:
+                fallback_symbols = _fetch(_MAINNET_URL)
+            except requests.exceptions.RequestException as fallback_exc:
+                log(
+                    "instruments.fetch.catalogue_unavailable",
+                    scope="spot",
+                    testnet=True,
+                    err=str(fallback_exc),
+                )
+                with _LOCK:
+                    cached = set(_CACHE.get("spot_testnet") or set())
+                if cached:
+                    log(
+                        "instruments.fetch.testnet_cache_fallback",
+                        scope="spot",
+                        count=len(cached),
+                    )
+                    return cached
+                return set()
+
+            log(
+                "instruments.fetch.testnet_mainnet_fallback",
+                scope="spot",
+                count=len(fallback_symbols),
+                err=str(exc),
+            )
+            return fallback_symbols
+
         log("instruments.fetch.testnet_failed", scope="spot", err=str(exc))
         with _LOCK:
             cached = set(_CACHE.get("spot_testnet") or set())

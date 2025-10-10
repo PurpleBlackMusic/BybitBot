@@ -90,16 +90,42 @@ def test_get_listed_spot_symbols_uses_cache(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_get_listed_spot_symbols_testnet_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "result": {
+            "list": [
+                {"symbol": "MAINUSDT"},
+            ]
+        }
+    }
+
+    calls: list[str] = []
+
     def fake_get(url, params=None, timeout=None):
+        calls.append(url)
         if "api-testnet" in url:
             raise instruments.requests.exceptions.HTTPError("403 Client Error")
-        pytest.fail("mainnet catalogue should not be requested")
+        assert url == instruments._MAINNET_URL
+        return _FakeResponse(payload)
+
+    events: list[tuple[str, dict]] = []
+
+    def fake_log(event: str, **payload):
+        events.append((event, dict(payload)))
 
     monkeypatch.setattr(instruments.requests, "get", fake_get)
+    monkeypatch.setattr(instruments, "log", fake_log)
 
     result = instruments.get_listed_spot_symbols(testnet=True, force_refresh=True)
 
-    assert result == set()
+    assert result == {"MAINUSDT"}
+    assert calls == [instruments._TESTNET_URL, instruments._MAINNET_URL]
+
+    fallback_events = [payload for event, payload in events if event == "instruments.fetch.testnet_mainnet_fallback"]
+    assert fallback_events and fallback_events[0]["count"] == 1
+
+    second = instruments.get_listed_spot_symbols(testnet=True)
+    assert second == {"MAINUSDT"}
+    assert calls == [instruments._TESTNET_URL, instruments._MAINNET_URL]
 
 
 def test_get_listed_spot_symbols_concurrent_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
