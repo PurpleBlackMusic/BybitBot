@@ -129,7 +129,12 @@ class _SyncedClock:
                 return
 
             url = base_url.rstrip("/") + "/v5/market/time"
-            http = session or requests.Session()
+            close_http = False
+            if session is None:
+                http = requests.Session()
+                close_http = True
+            else:
+                http = session
             start = time.time()
             try:
                 response = http.get(url, timeout=timeout, verify=verify)
@@ -139,6 +144,9 @@ class _SyncedClock:
                 log("time.sync.error", err=str(exc), base=url)
                 self._expiry = time.time() + 5.0
                 return
+            finally:
+                if close_http:
+                    http.close()
 
             server_epoch = extract_server_epoch(payload)
             if server_epoch is None:
