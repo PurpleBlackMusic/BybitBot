@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import pytest
 import ssl
@@ -408,6 +408,87 @@ def test_ws_manager_refreshes_settings_before_resolving_urls(monkeypatch: pytest
     priv_url = manager._private_url()
     assert priv_url.endswith("stream-testnet.bybit.com/v5/private")
     assert manager.s is refreshed_private
+
+
+def test_sell_fill_recovery_uses_limited_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    manager.s = SimpleNamespace(telegram_notify=True, tg_trade_notifs=False)
+
+    symbol = "BTCUSDT"
+    buy_row = {
+        "execId": "1",
+        "symbol": symbol,
+        "side": "Buy",
+        "execQty": "2",
+        "execPrice": "10",
+        "execTime": "1",
+    }
+    sell_row = {
+        "execId": "2",
+        "symbol": symbol,
+        "side": "Sell",
+        "execQty": "1",
+        "execPrice": "15",
+        "execTime": "2",
+    }
+
+    ledger_rows = [buy_row, sell_row]
+    read_calls: list[dict[str, object]] = []
+
+    def fake_read_ledger(
+        n: object = None,
+        *,
+        settings: object | None = None,
+        last_exec_id: object | None = None,
+        **kwargs: object,
+    ) -> list[dict[str, object]]:
+        read_calls.append({"n": n, "last_exec_id": last_exec_id})
+        return ledger_rows
+
+    expected_filtered = [buy_row]
+
+    def fake_spot_inventory_and_pnl(
+        *, events: Iterable[Mapping[str, object]] | None = None, settings: object | None = None
+    ) -> Mapping[str, Mapping[str, Decimal]]:
+        assert events is not None
+        assert list(events) == expected_filtered
+        return {
+            symbol: {
+                "position_qty": Decimal("2"),
+                "avg_cost": Decimal("10"),
+                "realized_pnl": Decimal("0"),
+            }
+        }
+
+    captured: dict[str, object] = {}
+
+    def fake_format_sell_close_message(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "ok"
+
+    def fake_enqueue(message: str) -> None:
+        captured["message"] = message
+
+    monkeypatch.setattr(ws_manager_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(ws_manager_module, "spot_inventory_and_pnl", fake_spot_inventory_and_pnl)
+    monkeypatch.setattr(ws_manager_module, "format_sell_close_message", fake_format_sell_close_message)
+    monkeypatch.setattr(ws_manager_module, "enqueue_telegram_message", fake_enqueue)
+
+    inventory_snapshot = {
+        symbol: {
+            "position_qty": Decimal("1"),
+            "avg_cost": Decimal("10"),
+            "realized_pnl": Decimal("5"),
+        }
+    }
+
+    manager._notify_sell_fills({symbol: [sell_row]}, inventory_snapshot, {})
+
+    assert read_calls == [
+        {"n": WSManager._LEDGER_RECOVERY_LIMIT, "last_exec_id": None}
+    ]
+    assert captured["pnl_text"] == "+5.00 USDT"
+    assert captured["message"] == "ok"
 
 
 def test_ws_manager_realtime_private_rows_filters_payload(monkeypatch: pytest.MonkeyPatch) -> None:

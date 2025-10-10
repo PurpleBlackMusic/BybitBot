@@ -50,6 +50,8 @@ def _safe_float(value: object) -> Optional[float]:
 class WSManager:
     """Минимальный, но стабильный менеджер WS с авто‑пингом и переподключением."""
 
+    _LEDGER_RECOVERY_LIMIT = 800
+
     def __init__(self):
         self.s = get_settings()
 
@@ -84,6 +86,7 @@ class WSManager:
         self._tp_ladder_plan: dict[str, dict[str, object]] = {}
         self._inventory_snapshot: dict[str, dict[str, Decimal]] = {}
         self._inventory_baseline: dict[str, dict[str, Decimal]] = {}
+        self._inventory_last_exec_id: Optional[str] = None
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -688,7 +691,14 @@ class WSManager:
                     previous_inventory,
                 )
 
+            last_exec_id = self._inventory_last_exec_id
+            for row in rows:
+                marker = self._ledger_entry_id(row)
+                if marker:
+                    last_exec_id = marker
+
             self._inventory_snapshot = normalized_inventory
+            self._inventory_last_exec_id = last_exec_id
 
             if not buy_fill_rows:
                 return
@@ -893,8 +903,20 @@ class WSManager:
         symbol: str,
         rows: Sequence[Mapping[str, object]],
     ) -> Mapping[str, Decimal] | None:
+        limit = self._LEDGER_RECOVERY_LIMIT
+        last_exec_id = self._inventory_last_exec_id
+        read_kwargs: dict[str, object] = {"settings": self.s}
+        limited_read = False
+        if last_exec_id:
+            read_kwargs["last_exec_id"] = last_exec_id
+            if limit:
+                read_kwargs["n"] = limit
+        else:
+            if limit:
+                read_kwargs["n"] = limit
+                limited_read = True
         try:
-            ledger_rows = read_ledger(None, settings=self.s)
+            ledger_rows = read_ledger(**read_kwargs)
         except Exception as exc:
             log("ws.private.inventory.ledger.error", err=str(exc))
             return None
@@ -910,17 +932,32 @@ class WSManager:
         if not signature_counts:
             return None
 
-        filtered_rows: list[Mapping[str, object]] = []
-        removed = False
-        for row in ledger_rows:
-            if not isinstance(row, Mapping):
-                continue
-            signature = self._row_signature(row)
-            if signature is not None and signature_counts.get(signature, 0) > 0:
-                signature_counts[signature] -= 1
-                removed = True
-                continue
-            filtered_rows.append(row)
+        def _filter_rows(
+            candidates: Sequence[Mapping[str, object]]
+        ) -> tuple[list[Mapping[str, object]], bool]:
+            counts = Counter(signature_counts)
+            filtered: list[Mapping[str, object]] = []
+            removed_any = False
+            for candidate in candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                signature = self._row_signature(candidate)
+                if signature is not None and counts.get(signature, 0) > 0:
+                    counts[signature] -= 1
+                    removed_any = True
+                    continue
+                filtered.append(candidate)
+            return filtered, removed_any
+
+        filtered_rows, removed = _filter_rows(ledger_rows)
+
+        if not removed and limited_read:
+            try:
+                ledger_rows = read_ledger(None, settings=self.s)
+            except Exception as exc:
+                log("ws.private.inventory.ledger.error", err=str(exc))
+                return None
+            filtered_rows, removed = _filter_rows(ledger_rows)
 
         if not removed:
             return None
@@ -941,10 +978,9 @@ class WSManager:
     def _row_signature(row: Mapping[str, object] | None) -> tuple[object, ...] | None:
         if not isinstance(row, Mapping):
             return None
-        for key in ("execId", "executionId", "tradeId"):
-            value = row.get(key)
-            if value is not None and value != "":
-                return ("exec_id", str(value))
+        entry_id = WSManager._ledger_entry_id(row)
+        if entry_id:
+            return ("exec_id", entry_id)
         symbol = str(row.get("symbol") or "").upper()
         side = str(row.get("side") or row.get("orderSide") or "").lower()
         qty = str(row.get("execQty") or row.get("lastExecQty") or "")
@@ -958,6 +994,27 @@ class WSManager:
         if not symbol and not qty and not price:
             return None
         return ("fields", symbol, side, qty, price, ts)
+
+    @staticmethod
+    def _ledger_entry_id(row: Mapping[str, object] | None) -> Optional[str]:
+        if not isinstance(row, Mapping):
+            return None
+        for key in (
+            "execId",
+            "executionId",
+            "execID",
+            "execKey",
+            "tradeId",
+            "fillId",
+            "matchId",
+        ):
+            value = row.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
 
     @staticmethod
     def _normalise_inventory_snapshot(
