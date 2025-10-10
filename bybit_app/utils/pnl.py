@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple, Union
 
 from .envs import get_settings
 from .helpers import ensure_link_id
@@ -250,18 +250,78 @@ def _f(x):
         return None
 
 
+def _ledger_entry_id(ev: Mapping[str, object]) -> Optional[str]:
+    for key in ("execKey", "execId", "executionId", "execID", "fillId", "tradeId", "matchId"):
+        candidate = _normalise_id(ev.get(key))
+        if candidate:
+            return candidate
+    return None
+
+
+def _parse_ledger_file(path: Path) -> List[Tuple[Mapping[str, object], Optional[str]]]:
+    rows: List[Tuple[Mapping[str, object], Optional[str]]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, Mapping):
+                rows.append((payload, _ledger_entry_id(payload)))
+    return rows
+
+
 def read_ledger(
-    n: int = 5000,
+    n: Optional[int] = 5000,
     *,
     settings: object | None = None,
     network: object | None = None,
+    ledger_path: Optional[Union[str, Path]] = None,
+    last_exec_id: Optional[str] = None,
+    return_meta: bool = False,
 ):
-    ledger_path = _ledger_path_for(settings, network=network)
+    if ledger_path is None:
+        resolved_path = _ledger_path_for(settings, network=network)
+    else:
+        resolved_path = Path(ledger_path)
+    ledger_path = resolved_path
     if not ledger_path.exists():
+        if return_meta:
+            return [], None, True
         return []
-    with ledger_path.open("r", encoding="utf-8") as f:
-        lines = [json.loads(l) for l in f if l.strip()]
-    return lines[-n:]
+
+    parsed_rows = _parse_ledger_file(ledger_path)
+    if not parsed_rows:
+        if return_meta:
+            return [], None, True
+        return []
+
+    rows: List[Mapping[str, object]] = []
+    marker_found = last_exec_id is None
+    last_seen_exec_id: Optional[str] = None
+
+    for payload, entry_id in parsed_rows:
+        if entry_id:
+            last_seen_exec_id = entry_id
+        if marker_found:
+            rows.append(payload)
+            if n is not None and n > 0 and len(rows) > n:
+                rows.pop(0)
+            continue
+
+        if entry_id == last_exec_id:
+            marker_found = True
+
+    if not marker_found and last_exec_id is not None:
+        rows = [payload for payload, _ in parsed_rows]
+        if n is not None and n > 0:
+            rows = rows[-n:]
+
+    if return_meta:
+        return rows, last_seen_exec_id, marker_found or last_exec_id is None
+    return rows
 
 
 def daily_pnl():
