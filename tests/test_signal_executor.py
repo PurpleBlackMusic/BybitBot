@@ -2172,6 +2172,39 @@ def test_signal_executor_blocks_after_daily_loss_limit(
     assert stub_api.orders == []
 
 
+def test_signal_executor_daily_loss_ignores_derivatives(monkeypatch: pytest.MonkeyPatch) -> None:
+    day_key = time.strftime("%Y-%m-%d", time.gmtime())
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
+    bot = StubBot(summary, settings)
+
+    stub_api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
+
+    def fake_daily_pnl() -> dict[str, dict[str, dict[str, float]]]:
+        return {
+            day_key: {
+                "BTCUSDT": {
+                    "categories": ["linear"],
+                    "spot_pnl": 0.0,
+                    "spot_fees": 0.0,
+                    "spot_net": 0.0,
+                    "fees": -45.0,
+                    "derivatives_fees": -45.0,
+                }
+            }
+        }
+
+    monkeypatch.setattr(signal_executor_module, "daily_pnl", fake_daily_pnl)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status != "disabled"
+    assert (result.context or {}).get("guard") != "daily_loss_limit"
+    assert stub_api.orders == []
+
+
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)

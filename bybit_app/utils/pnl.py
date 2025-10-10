@@ -356,26 +356,49 @@ def daily_pnl():
             by_day[day] = {}
         if sym not in by_day[day]:
             by_day[day][sym] = {
+                "categories": [],
                 "spot_pnl": 0.0,
+                "spot_fees": 0.0,
                 "fees": 0.0,
+                "derivatives_fees": 0.0,
                 "notional_buy": 0.0,
                 "notional_sell": 0.0,
             }
+
+        payload = by_day[day][sym]
+
+        if cat and cat not in payload["categories"]:
+            payload["categories"].append(cat)
+
         if cat == "spot":
             if side == "buy":
-                by_day[day][sym]["spot_pnl"] -= px * qty
-                by_day[day][sym]["notional_buy"] += px * qty
+                payload["spot_pnl"] -= px * qty
+                payload["notional_buy"] += px * qty
             elif side == "sell":
-                by_day[day][sym]["spot_pnl"] += px * qty
-                by_day[day][sym]["notional_sell"] += px * qty
-            by_day[day][sym]["fees"] += abs(fee or 0.0)
+                payload["spot_pnl"] += px * qty
+                payload["notional_sell"] += px * qty
+            payload["spot_fees"] += abs(fee or 0.0)
+            payload["fees"] += abs(fee or 0.0)
         else:
             # для фьючей пока просто аккумулируем нотации и комиссию (точный PnL требует позиций, оставим в v7b)
             if side == "buy":
-                by_day[day][sym]["notional_buy"] += px * qty
+                payload["notional_buy"] += px * qty
             else:
-                by_day[day][sym]["notional_sell"] += px * qty
-            by_day[day][sym]["fees"] += abs(fee or 0.0)
+                payload["notional_sell"] += px * qty
+            payload["fees"] += abs(fee or 0.0)
+            payload["derivatives_fees"] += abs(fee or 0.0)
+
+    for day_payload in by_day.values():
+        for sym_payload in day_payload.values():
+            categories = {
+                str(cat).lower()
+                for cat in sym_payload.get("categories", [])
+                if isinstance(cat, str) and cat.strip()
+            }
+            sym_payload["categories"] = sorted(categories)
+            spot_pnl = sym_payload.get("spot_pnl") or 0.0
+            spot_fees = sym_payload.get("spot_fees") or 0.0
+            sym_payload["spot_net"] = spot_pnl - abs(spot_fees)
     # сохранить сводку
     _SUMMARY.write_text(json.dumps(by_day, ensure_ascii=False, indent=2), encoding="utf-8")
     return by_day
