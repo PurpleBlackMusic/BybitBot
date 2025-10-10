@@ -3717,6 +3717,47 @@ class SignalExecutor:
             if edge_score is not None and edge_score > 0:
                 contributions.append(math.tanh(edge_score / 6.0))
 
+            # Normalise performance metrics from the guardian watch to gently
+            # bias allocations.  The thresholds are intentionally broad to
+            # avoid overfitting:
+            #   • win_rate_pct       – flat below ~42%, capped above ~65%
+            #   • realized_bps_avg   – neutral around 0bps, saturated by ±20bps
+            #   • median_hold_sec    – faster exits (<15m) scale up, slow exits
+            #                          (>2h) scale down
+
+            def _normalise(value: Optional[float], lower: float, upper: float) -> Optional[float]:
+                if value is None:
+                    return None
+                if value <= lower:
+                    return 0.0
+                if value >= upper:
+                    return 1.0
+                return (value - lower) / (upper - lower)
+
+            win_rate = _safe_float(primary.get("win_rate_pct"))
+            if win_rate is not None:
+                normalised = _normalise(win_rate, 42.0, 65.0)
+                if normalised is not None:
+                    contributions.append(normalised)
+
+            realised = _safe_float(primary.get("realized_bps_avg"))
+            if realised is not None:
+                normalised = _normalise(realised, -10.0, 20.0)
+                if normalised is not None:
+                    contributions.append(normalised)
+
+            median_hold = _safe_float(primary.get("median_hold_sec"))
+            if median_hold is not None and median_hold > 0:
+                fast_floor = 15.0 * 60.0
+                slow_ceiling = 2.0 * 60.0 * 60.0
+                if median_hold <= fast_floor:
+                    contributions.append(1.0)
+                elif median_hold >= slow_ceiling:
+                    contributions.append(0.0)
+                else:
+                    span = slow_ceiling - fast_floor
+                    contributions.append(1.0 - ((median_hold - fast_floor) / span))
+
         confidence_score = _safe_float(summary.get("confidence_score"))
         if confidence_score is not None:
             contributions.append(max(0.0, min(confidence_score, 1.0)))
