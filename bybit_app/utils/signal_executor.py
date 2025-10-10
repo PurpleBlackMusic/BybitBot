@@ -32,7 +32,7 @@ from .spot_market import (
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
-from .pnl import read_ledger
+from .pnl import daily_pnl, read_ledger
 from .spot_pnl import spot_inventory_and_pnl, _inventory_from_events, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -2822,11 +2822,94 @@ class SignalExecutor:
         return get_settings(force_reload=True)
 
     def _apply_runtime_guards(self, settings: Settings) -> Optional[ExecutionResult]:
+        guard = self._daily_loss_guard(settings)
+        if guard is not None:
+            message, context = guard
+            return self._decision("disabled", reason=message, context=context)
+
         guard = self._private_ws_guard(settings)
         if guard is not None:
             message, context = guard
             return self._decision("disabled", reason=message, context=context)
         return None
+
+    def _daily_loss_guard(
+        self, settings: Settings
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        try:
+            limit_pct = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            limit_pct = 0.0
+
+        if limit_pct <= 0.0:
+            return None
+
+        try:
+            aggregated = daily_pnl()
+        except Exception:
+            return None
+
+        if not isinstance(aggregated, Mapping):
+            return None
+
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(self._current_time()))
+        day_bucket = aggregated.get(day_key)
+        if not isinstance(day_bucket, Mapping):
+            return None
+
+        net_result = 0.0
+        for payload in day_bucket.values():
+            if not isinstance(payload, Mapping):
+                continue
+            spot_pnl = _safe_float(payload.get("spot_pnl")) or 0.0
+            fees = _safe_float(payload.get("fees")) or 0.0
+            net_result += spot_pnl - abs(fees)
+
+        if net_result >= 0.0:
+            return None
+
+        try:
+            _, wallet_totals = self._resolve_wallet(require_success=False)
+        except Exception:
+            return None
+
+        if not isinstance(wallet_totals, Sequence) or len(wallet_totals) < 1:
+            return None
+
+        total_equity = _safe_float(wallet_totals[0])
+        if total_equity is None or total_equity <= 0.0:
+            return None
+
+        loss_value = -net_result
+        loss_pct = (loss_value / total_equity) * 100.0 if total_equity > 0 else 0.0
+
+        if loss_pct <= limit_pct:
+            return None
+
+        context: Dict[str, object] = {
+            "guard": "daily_loss_limit",
+            "day": day_key,
+            "daily_pnl": net_result,
+            "loss_value": loss_value,
+            "loss_percent": loss_pct,
+            "limit_percent": limit_pct,
+            "total_equity": total_equity,
+        }
+
+        log(
+            "guardian.auto.guard.daily_loss",
+            loss=round(loss_value, 2),
+            percent=round(loss_pct, 4),
+            limit=limit_pct,
+            equity=round(total_equity, 2),
+        )
+
+        message = (
+            "Дневной убыток {loss:.2f} USDT ({percent:.2f}% капитала) превысил лимит {limit:.2f}% —"
+            " автоматика приостановлена до конца суток"
+        ).format(loss=loss_value, percent=loss_pct, limit=limit_pct)
+        context["message"] = message
+        return message, context
 
     def _private_ws_guard(
         self, settings: Settings

@@ -2137,6 +2137,41 @@ def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.Monkey
     assert all(event != "guardian.auto.ws.autostart.error" for event, _ in logged_events)
 
 
+def test_signal_executor_blocks_after_daily_loss_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    day_key = time.strftime("%Y-%m-%d", time.gmtime())
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=2.5)
+    bot = StubBot(summary, settings)
+
+    stub_api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
+
+    def fake_daily_pnl() -> dict[str, dict[str, dict[str, float]]]:
+        return {
+            day_key: {
+                "BTCUSDT": {
+                    "spot_pnl": -150.0,
+                    "fees": 5.0,
+                }
+            }
+        }
+
+    monkeypatch.setattr(signal_executor_module, "daily_pnl", fake_daily_pnl)
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "disabled"
+    assert result.reason is not None and "Дневной убыток" in result.reason
+    assert result.context is not None
+    assert result.context.get("guard") == "daily_loss_limit"
+    assert result.context.get("loss_value") == pytest.approx(155.0)
+    assert result.context.get("loss_percent") == pytest.approx(15.5)
+    assert stub_api.orders == []
+
+
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)
