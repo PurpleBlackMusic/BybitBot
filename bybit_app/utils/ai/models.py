@@ -77,7 +77,12 @@ class MarketModel:
         safe_stds = np.where(np.abs(stds) < 1e-8, 1e-8, stds)
         normalized = (vector - means) / safe_stds
         logit = float(self.intercept + np.dot(self.coefficients, normalized))
-        return 1.0 / (1.0 + math.exp(-logit))
+        if logit >= 0:
+            exp_term = math.exp(-logit)
+            return 1.0 / (1.0 + exp_term)
+
+        exp_term = math.exp(logit)
+        return exp_term / (1.0 + exp_term)
 
 
 class _SymbolState:
