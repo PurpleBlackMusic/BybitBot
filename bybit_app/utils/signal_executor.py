@@ -777,14 +777,76 @@ class SignalExecutor:
     def _collect_open_positions(
         self, settings: Settings, summary: Mapping[str, object]
     ) -> Dict[str, Dict[str, object]]:
+        summary_symbols: Set[str] = set()
+        primary_symbol = _safe_symbol(summary.get("symbol")) if isinstance(summary, Mapping) else None
+        if primary_symbol:
+            summary_symbols.add(primary_symbol)
+
+        events_cache: Optional[List[Mapping[str, object]]] = None
+
+        def _load_events() -> Optional[List[Mapping[str, object]]]:
+            nonlocal events_cache
+            if events_cache is None:
+                try:
+                    events_cache = read_ledger(None, settings=settings)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    log("guardian.auto.force_exit.ledger.error", err=str(exc))
+                    events_cache = []
+            return events_cache
+
         try:
-            events = read_ledger(5000, settings=settings)
+            inventory_result = spot_inventory_and_pnl(
+                settings=settings,
+                return_layers=True,
+            )
+        except TypeError:
+            events = _load_events() or []
+            if events:
+                inventory = spot_inventory_and_pnl(events=events, settings=settings)
+                states = self._build_position_layers(events)
+            else:
+                inventory = {}
+                states = {}
         except Exception as exc:  # pragma: no cover - defensive guard
             log("guardian.auto.force_exit.ledger.error", err=str(exc))
-            events = []
+            inventory = {}
+            states = {}
+        else:
+            if (
+                isinstance(inventory_result, tuple)
+                and len(inventory_result) == 2
+                and isinstance(inventory_result[0], Mapping)
+            ):
+                inventory = inventory_result[0]
+                states = inventory_result[1] if isinstance(inventory_result[1], Mapping) else {}
+            elif isinstance(inventory_result, Mapping):
+                inventory = inventory_result
+                events = _load_events() or []
+                states = self._build_position_layers(events) if events else {}
+            else:
+                inventory = {}
+                states = {}
 
-        inventory = spot_inventory_and_pnl(events=events, settings=settings)
-        states = self._build_position_layers(events)
+            need_overlay = False
+            if not inventory:
+                need_overlay = True
+            elif summary_symbols:
+                for symbol in summary_symbols:
+                    info = inventory.get(symbol)
+                    qty = _safe_float(info.get("position_qty")) if isinstance(info, Mapping) else None
+                    if qty is None or qty <= 0:
+                        need_overlay = True
+                        break
+
+            if need_overlay:
+                events = _load_events() or []
+                if events:
+                    overlay_inventory = spot_inventory_and_pnl(events=events, settings=settings)
+                    overlay_states = self._build_position_layers(events)
+                    if overlay_inventory:
+                        inventory = {**inventory, **overlay_inventory}
+                    if overlay_states:
+                        states = {**states, **overlay_states}
 
         portfolio_map: Dict[str, Mapping[str, object]] = {}
         portfolio_fn = getattr(self.bot, "portfolio_overview", None)
