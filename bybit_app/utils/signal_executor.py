@@ -33,7 +33,7 @@ from .spot_market import (
     resolve_trade_symbol,
 )
 from .pnl import read_ledger
-from .spot_pnl import spot_inventory_and_pnl
+from .spot_pnl import spot_inventory_and_pnl, _inventory_from_events, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
@@ -2244,27 +2244,18 @@ class SignalExecutor:
 
         symbol_upper = symbol.upper()
 
-        def _realized_from_rows(rows: Sequence[Mapping[str, object]]) -> Decimal:
-            if not rows:
-                return Decimal("0")
-            pnl_snapshot = spot_inventory_and_pnl(events=rows, settings=settings)
-            symbol_stats = pnl_snapshot.get(symbol_upper) or pnl_snapshot.get(symbol)
-            if isinstance(symbol_stats, Mapping):
-                return self._decimal_from(symbol_stats.get("realized_pnl"))
-            return Decimal("0")
-
-        realized_before = _realized_from_rows(rows_before)
-        realized_after = _realized_from_rows(rows_after)
-        trade_realized_pnl = realized_after - realized_before
+        new_symbol_rows = self._extract_new_symbol_rows(
+            rows_before, rows_after, symbol_upper
+        )
+        trade_realized_pnl = self._realized_delta(
+            rows_before,
+            rows_after,
+            symbol_upper,
+            new_rows=new_symbol_rows,
+        )
 
         sold_total = Decimal("0")
-        for entry in rows_after:
-            if not isinstance(entry, Mapping):
-                continue
-            if str(entry.get("symbol") or "").upper() != symbol_upper:
-                continue
-            if str(entry.get("category") or "spot").lower() != "spot":
-                continue
+        for entry in new_symbol_rows:
             if str(entry.get("side") or "").lower() == "sell":
                 sold_total += self._decimal_from(entry.get("execQty"))
 
@@ -2335,6 +2326,90 @@ class SignalExecutor:
             stats["filled_base_total"] = self._format_decimal_step(filled_base_total, qty_step)
 
         return stats
+
+    @staticmethod
+    def _filter_symbol_ledger_rows(
+        rows: Sequence[Mapping[str, object]],
+        symbol: str,
+    ) -> list[Mapping[str, object]]:
+        symbol_upper = symbol.upper()
+        filtered: list[Mapping[str, object]] = []
+        for entry in rows:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("category") or "spot").lower() != "spot":
+                continue
+            if str(entry.get("symbol") or "").strip().upper() != symbol_upper:
+                continue
+            filtered.append(entry)
+        return filtered
+
+    @classmethod
+    def _extract_new_symbol_rows(
+        cls,
+        rows_before: Sequence[Mapping[str, object]],
+        rows_after: Sequence[Mapping[str, object]],
+        symbol: str,
+    ) -> list[Mapping[str, object]]:
+        before_filtered = cls._filter_symbol_ledger_rows(rows_before, symbol)
+        after_filtered = cls._filter_symbol_ledger_rows(rows_after, symbol)
+        prefix = 0
+        limit = min(len(before_filtered), len(after_filtered))
+        while prefix < limit and cls._ledger_rows_equivalent(
+            before_filtered[prefix], after_filtered[prefix]
+        ):
+            prefix += 1
+        return after_filtered[prefix:]
+
+    @staticmethod
+    def _ledger_rows_equivalent(
+        a: Mapping[str, object], b: Mapping[str, object]
+    ) -> bool:
+        if a is b:
+            return True
+        if not isinstance(a, Mapping) or not isinstance(b, Mapping):
+            return False
+        try:
+            return dict(a) == dict(b)
+        except Exception:
+            return a == b
+
+    def _realized_delta(
+        self,
+        rows_before: Sequence[Mapping[str, object]],
+        rows_after: Sequence[Mapping[str, object]],
+        symbol: str,
+        *,
+        new_rows: Optional[Sequence[Mapping[str, object]]] = None,
+    ) -> Decimal:
+        symbol_upper = symbol.upper()
+        before_filtered = self._filter_symbol_ledger_rows(rows_before, symbol_upper)
+        candidate_rows = (
+            list(new_rows)
+            if new_rows is not None
+            else self._extract_new_symbol_rows(rows_before, rows_after, symbol_upper)
+        )
+        if not candidate_rows:
+            return Decimal("0")
+
+        inventory, layers = _inventory_from_events(before_filtered)
+        before_state = inventory.get(symbol_upper)
+        realized_before = (
+            self._decimal_from(before_state.get("realized_pnl"))
+            if isinstance(before_state, Mapping)
+            else Decimal("0")
+        )
+
+        _replay_events(candidate_rows, inventory, layers)
+
+        after_state = inventory.get(symbol_upper)
+        realized_after = (
+            self._decimal_from(after_state.get("realized_pnl"))
+            if isinstance(after_state, Mapping)
+            else Decimal("0")
+        )
+
+        return realized_after - realized_before
 
     def _filled_base_from_private_ws(
         self,
