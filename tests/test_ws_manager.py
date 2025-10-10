@@ -279,7 +279,13 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
         handshake=handshake,
     )
 
-    monkeypatch.setattr(manager, "_build_tp_plan", lambda **kwargs: plan)
+    build_calls: list[dict[str, object]] = []
+
+    def build_plan(**kwargs: object) -> list[dict[str, object]]:
+        build_calls.append(kwargs)
+        return plan
+
+    monkeypatch.setattr(manager, "_build_tp_plan", build_plan)
     monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
 
     cancel_calls: list[str] = []
@@ -293,9 +299,10 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         manager,
         "_execute_tp_plan",
-        lambda api_obj, symbol, payload, on_first_success=None: execute_calls.append(
-            (symbol, payload)
-        ),
+        lambda api_obj, symbol, payload, on_first_success=None: (
+            execute_calls.append((symbol, payload)),
+            True,
+        )[1],
     )
 
     limits_cache = {
@@ -319,10 +326,23 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     )
 
     assert cancel_calls == []
-    assert execute_calls == []
+    assert execute_calls
+    assert not build_calls  # adopted executor ladder without rebuilding
+    executed_symbol, payload = execute_calls[0]
+    assert executed_symbol == "BTCUSDT"
+    assert [entry.get("price_text") for entry in payload] == [
+        "101.0",
+        "102.0",
+    ]
+    assert [entry.get("qty_text") for entry in payload] == ["0.20", "0.10"]
 
     plan_state = manager._tp_ladder_plan.get("BTCUSDT") or {}
     assert plan_state.get("handshake") == handshake
+    ladder_payload = plan_state.get("ladder")
+    if ladder_payload is not None:
+        assert isinstance(ladder_payload, tuple)
+        assert ladder_payload[0][0] == "101.0"
+        assert ladder_payload[0][1] == "0.20"
 
 
 @pytest.mark.parametrize(

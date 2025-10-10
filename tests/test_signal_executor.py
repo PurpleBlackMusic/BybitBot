@@ -10,6 +10,7 @@ import pytest
 
 import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
+import bybit_app.utils.ws_manager as ws_manager_module
 import bybit_app.utils.spot_pnl as spot_pnl_module
 import bybit_app.utils.spot_fifo as spot_fifo_module
 from bybit_app.utils.envs import Settings
@@ -19,6 +20,7 @@ from bybit_app.utils.signal_executor import (
     SignalExecutor,
 )
 from bybit_app.utils.spot_market import OrderValidationError, SpotTradeSnapshot
+from bybit_app.utils.ws_manager import WSManager
 
 
 @pytest.fixture(autouse=True)
@@ -835,6 +837,9 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
                     tuple(pair) for pair in kwargs.get("signature") or ()
                 ),
                 "handshake": tuple(kwargs.get("handshake") or ()),
+                "ladder": tuple(
+                    tuple(rung) for rung in kwargs.get("ladder") or ()
+                ),
             }
         )
         original_register(symbol, **kwargs)
@@ -882,6 +887,164 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert cancel_calls == []
 
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
+
+
+def test_executor_and_ws_manager_share_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+    monkeypatch.setattr(signal_executor_module, "ws_manager", manager)
+    monkeypatch.setattr(ws_manager_module, "manager", manager)
+
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    patch_tp_sources(monkeypatch, Decimal("0.75"))
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda _api, _symbol: {
+            "qty_step": Decimal("0.05"),
+            "min_order_qty": Decimal("0.05"),
+            "tick_size": Decimal("0.1"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        },
+    )
+    monkeypatch.setattr(
+        ws_manager_module,
+        "_instrument_limits",
+        lambda _api, _symbol: {
+            "qty_step": Decimal("0.05"),
+            "min_order_qty": Decimal("0.05"),
+            "tick_size": Decimal("0.1"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        },
+    )
+
+    execution_rows = [
+        {
+            "symbol": "BTCUSDT",
+            "orderId": "primary",
+            "execId": "fill-1",
+            "execQty": "0.75",
+        }
+    ]
+
+    def fake_realtime_rows(topic_keyword: str, snapshot=None):
+        keyword = topic_keyword.lower()
+        if "execution" in keyword:
+            return execution_rows
+        if "order" in keyword:
+            return []
+        return []
+
+    monkeypatch.setattr(manager, "realtime_private_rows", fake_realtime_rows)
+
+    class LadderAPI:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def place_order(self, **kwargs: object) -> Mapping[str, object]:
+            self.calls.append(kwargs)
+            return {"orderId": f"tp-{len(self.calls)}"}
+
+    api = LadderAPI()
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.75",
+            "cumExecValue": "75",
+        },
+    }
+
+    executor = SignalExecutor(bot)
+    placed_orders, _ = executor._place_tp_ladder(
+        api,
+        settings,
+        "BTCUSDT",
+        "Buy",
+        response_payload,
+        ledger_rows=[],
+        private_snapshot=None,
+    )
+
+    assert placed_orders
+    plan_state = manager._tp_ladder_plan.get("BTCUSDT") or {}
+    stored_signature = plan_state.get("signature")
+    stored_ladder = plan_state.get("ladder")
+    assert isinstance(stored_signature, tuple)
+    assert isinstance(stored_ladder, tuple)
+
+    fill_row = {
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "orderId": "primary",
+        "execId": "fill-1",
+        "execQty": "0.75",
+        "execPrice": "100",
+    }
+
+    monkeypatch.setattr(manager, "_reserved_sell_qty", lambda symbol: Decimal("0"))
+
+    execute_payloads: list[list[dict[str, object]]] = []
+    monkeypatch.setattr(
+        manager,
+        "_execute_tp_plan",
+        lambda api_obj, symbol, payload, on_first_success=None: (
+            execute_payloads.append(payload),
+            True,
+        )[1],
+    )
+    monkeypatch.setattr(
+        manager,
+        "_cancel_existing_tp_orders",
+        lambda api_obj, symbol: None,
+    )
+
+    limits_cache = {
+        "BTCUSDT": {
+            "qty_step": Decimal("0.05"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.05"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    manager._regenerate_tp_ladder(
+        fill_row,
+        {"BTCUSDT": {"position_qty": Decimal("0.75"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("5"), Decimal("1"))],
+        api=object(),
+        limits_cache=limits_cache,
+        settings=None,
+    )
+
+    assert execute_payloads
+    payload_prices = [entry.get("price_text") for entry in execute_payloads[0]]
+    payload_qtys = [entry.get("qty_text") for entry in execute_payloads[0]]
+    expected_prices = [pair[0] for pair in stored_signature]
+    expected_qtys = [pair[1] for pair in stored_signature]
+    assert payload_prices == expected_prices
+    assert payload_qtys == expected_qtys
+
+    refreshed_state = manager._tp_ladder_plan.get("BTCUSDT") or {}
+    assert refreshed_state.get("ladder") == stored_ladder
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
