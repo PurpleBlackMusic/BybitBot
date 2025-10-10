@@ -16,6 +16,7 @@ def pnl_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     trade_pairs.DEC = pnl / "decisions.jsonl"
     trade_pairs.LED = pnl / "executions.testnet.jsonl"
     trade_pairs.TRD = pnl / "trades.jsonl"
+    trade_pairs._PAIR_CACHE.clear()
     return pnl
 
 
@@ -1029,3 +1030,86 @@ def test_unlinked_sell_skips_when_unlinked_qty_is_insufficient(pnl_dir: Path) ->
     assert unlinked_trade["exit_ts"] == 40
     assert linked_trade["entry_ts"] == 20
     assert linked_trade["exit_ts"] == 50
+
+
+def test_pair_trades_uses_cache_for_repeated_calls(
+    pnl_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decisions = [{"symbol": "BTCUSDT", "ts": 1}]
+    large_ledger: list[dict[str, object]] = []
+    for idx in range(100):
+        ts_base = idx * 1000
+        large_ledger.append(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "execTime": ts_base + 10,
+                "execPrice": 100 + idx,
+                "execQty": 1.0,
+                "execFee": 0.1,
+            }
+        )
+        large_ledger.append(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "execTime": ts_base + 20,
+                "execPrice": 105 + idx,
+                "execQty": 1.0,
+                "execFee": 0.05,
+            }
+        )
+
+    (pnl_dir / "decisions.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in decisions), encoding="utf-8"
+    )
+    ledger_path = pnl_dir / "executions.testnet.jsonl"
+    ledger_path.write_text(
+        "\n".join(json.dumps(row) for row in large_ledger), encoding="utf-8"
+    )
+
+    original_read = trade_pairs._read_jsonl
+    read_calls: list[Path] = []
+
+    def counting_read(path: Path) -> list[dict]:
+        read_calls.append(Path(path))
+        return original_read(path)
+
+    monkeypatch.setattr(trade_pairs, "_read_jsonl", counting_read)
+
+    first = trade_pairs.pair_trades()
+    second = trade_pairs.pair_trades()
+
+    assert first is not second
+    assert first == second
+    assert len(read_calls) == 2
+
+    # Modify ledger to invalidate cache and force another read
+    extra_buy = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "execTime": 200000,
+        "execPrice": 110,
+        "execQty": 1.0,
+        "execFee": 0.02,
+    }
+    extra_sell = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "Sell",
+        "execTime": 200010,
+        "execPrice": 125,
+        "execQty": 1.0,
+        "execFee": 0.02,
+    }
+    large_ledger.extend([extra_buy, extra_sell])
+    ledger_path.write_text(
+        "\n".join(json.dumps(row) for row in large_ledger), encoding="utf-8"
+    )
+
+    third = trade_pairs.pair_trades()
+    assert len(read_calls) == 4
+    assert len(third) == len(first) + 1
