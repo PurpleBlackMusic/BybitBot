@@ -422,6 +422,49 @@ def test_signal_executor_force_exit_ignores_stale_summary_price(
     assert metadata is None
 
 
+def test_collect_open_positions_avoids_full_ledger_on_empty_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    read_calls = {"count": 0}
+
+    def fake_read_ledger(*args, **kwargs):
+        read_calls["count"] += 1
+        return []
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+
+    def fake_inventory(
+        *,
+        events=None,
+        settings=None,
+        return_layers: bool = False,
+        **_,
+    ):
+        assert events is None
+        if return_layers:
+            return {}, {}
+        return {}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "spot_inventory_and_pnl",
+        fake_inventory,
+    )
+
+    positions = executor._collect_open_positions(settings, summary)
+    assert positions == {}
+
+    repeated = executor._collect_open_positions(settings, summary)
+    assert repeated == {}
+
+    assert read_calls["count"] <= 1
+
+
 def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,
