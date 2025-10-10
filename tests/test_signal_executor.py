@@ -10,6 +10,7 @@ import pytest
 
 import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
+from bybit_app.utils import tp_ladder_store
 import bybit_app.utils.spot_pnl as spot_pnl_module
 import bybit_app.utils.spot_fifo as spot_fifo_module
 from bybit_app.utils.envs import Settings
@@ -19,6 +20,7 @@ from bybit_app.utils.signal_executor import (
     SignalExecutor,
 )
 from bybit_app.utils.spot_market import OrderValidationError, SpotTradeSnapshot
+from bybit_app.utils.ws_manager import WSManager
 
 
 @pytest.fixture(autouse=True)
@@ -880,6 +882,127 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert cancel_calls == []
 
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
+
+
+def test_executor_ladder_persisted_for_ws_manager(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tp_ladder_store.reset_tp_ladder_store()
+    tp_ladder_store.get_tp_ladder_store(path=tmp_path / "tp_ladders.json")
+
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    executor_manager = WSManager()
+    monkeypatch.setattr(signal_executor_module, "ws_manager", executor_manager)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.75"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.75",
+            "cumExecValue": "75",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: response_payload,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+    assert result.status == "filled"
+
+    symbol_key = "BTCUSDT"
+    executor_plan = executor_manager._tp_ladder_plan.get(symbol_key)
+    assert isinstance(executor_plan, Mapping)
+    signature = executor_plan.get("signature")
+    plan_entries = executor_plan.get("plan")
+    assert signature
+    assert plan_entries
+
+    restored_manager = WSManager()
+    restored_state = restored_manager._tp_ladder_plan.get(symbol_key)
+    assert isinstance(restored_state, Mapping)
+    assert restored_state.get("signature") == signature
+    assert restored_state.get("plan") == plan_entries
+
+    cancel_calls: list[str] = []
+    execute_calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    monkeypatch.setattr(
+        restored_manager,
+        "_cancel_existing_tp_orders",
+        lambda api_obj, symbol: cancel_calls.append(symbol),
+    )
+    monkeypatch.setattr(
+        restored_manager,
+        "_execute_tp_plan",
+        lambda api_obj, symbol, payload: execute_calls.append((symbol, payload)),
+    )
+    monkeypatch.setattr(
+        restored_manager,
+        "_reserved_sell_qty",
+        lambda symbol: Decimal("0"),
+    )
+
+    limits_cache = {
+        symbol_key: {
+            "qty_step": Decimal("0.01"),
+            "tick_size": Decimal("0.1"),
+            "min_order_qty": Decimal("0.01"),
+            "min_order_amt": Decimal("5"),
+            "min_price": Decimal("0"),
+            "max_price": Decimal("0"),
+        }
+    }
+
+    restored_manager._regenerate_tp_ladder(
+        {"symbol": symbol_key, "side": "Buy"},
+        {symbol_key: {"position_qty": Decimal("0.75"), "avg_cost": Decimal("100")}},
+        config=[(Decimal("50"), Decimal("0.6"))],
+        api=object(),
+        limits_cache=limits_cache,
+        settings=None,
+    )
+
+    assert cancel_calls == []
+    assert execute_calls == []
+
+    final_state = restored_manager._tp_ladder_plan.get(symbol_key)
+    assert isinstance(final_state, Mapping)
+    assert final_state.get("signature") == signature
+    assert final_state.get("plan") == plan_entries
+
+    tp_ladder_store.reset_tp_ladder_store()
 
 
 def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) -> None:
