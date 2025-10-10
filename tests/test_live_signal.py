@@ -169,7 +169,7 @@ def test_live_signal_fetcher_threads_network_flag(
     assert test_status["symbol"] == "TESTCOINUSDT"
 
 
-def test_live_signal_fetcher_reports_failure_when_scan_empty(
+def test_live_signal_fetcher_returns_cached_when_scan_empty_within_grace(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     clock = Clock(start=2_000.0)
@@ -192,6 +192,7 @@ def test_live_signal_fetcher_reports_failure_when_scan_empty(
 
     initial = fetcher.fetch()
     assert initial["symbol"] == "ETHUSDT"
+    assert initial["status_source"] == "live"
 
     def failing_scan(api, **kwargs):
         call_order.append("fail")
@@ -199,14 +200,54 @@ def test_live_signal_fetcher_reports_failure_when_scan_empty(
 
     monkeypatch.setattr(live_signal_module, "scan_market_opportunities", failing_scan)
 
-    clock.advance(30.0)
+    window = fetcher.cache_ttl + fetcher.stale_grace
+    clock.advance(window - 5.0)
+
+    fallback = fetcher.fetch()
+
+    assert fallback["symbol"] == "ETHUSDT"
+    assert fallback["status_source"] == "live_cached"
+    assert call_order == ["first", "fail"]
+    assert fetcher._cached_status == initial
+
+
+def test_live_signal_fetcher_raises_when_scan_empty_and_cache_stale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    clock = Clock(start=2_500.0)
+    monkeypatch.setattr(live_signal_module, "time", clock)
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    call_order: list[str] = []
+
+    def initial_scan(api, **kwargs):
+        call_order.append("first")
+        return [_make_opportunity("LTCUSDT")]
+
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", initial_scan)
+
+    fetcher = LiveSignalFetcher(
+        settings=Settings(ai_live_only=False, ai_min_ev_bps=6.0),
+        data_dir=tmp_path,
+        cache_ttl=15.0,
+    )
+
+    _ = fetcher.fetch()
+
+    def failing_scan(api, **kwargs):
+        call_order.append("fail")
+        return []
+
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", failing_scan)
+
+    window = fetcher.cache_ttl + fetcher.stale_grace
+    clock.advance(window + 1.0)
 
     with pytest.raises(LiveSignalError) as exc:
         fetcher.fetch()
 
     assert "не вернул" in str(exc.value).lower()
     assert call_order == ["first", "fail"]
-    assert fetcher._cached_status == initial
 
 
 def test_live_signal_fetcher_raises_when_api_missing(monkeypatch, tmp_path) -> None:
