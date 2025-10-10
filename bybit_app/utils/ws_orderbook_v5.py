@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, time, threading
 from typing import Dict, List, Tuple
 from .log import log
+from .envs import get_settings
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
@@ -29,13 +30,22 @@ class WSOrderbookV5:
         topics = [f"orderbook.{self.levels}.{s}" for s in symbols]
         def run():
             import websocket, ssl
+            try:
+                settings = get_settings()
+            except Exception:
+                settings = None
+            verify_ssl = True
+            if settings is not None:
+                verify_ssl = bool(getattr(settings, "verify_ssl", True))
+            cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
+            sslopt = {"cert_reqs": cert_reqs}
             ws = websocket.WebSocketApp(self.url,
                 on_open=lambda w: self._on_open(w, topics),
                 on_message=self._on_msg,
                 on_error=lambda w, e: log("ws.orderbook.error", err=str(e)),
                 on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m))
             self._ws = ws
-            ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+            ws.run_forever(sslopt=sslopt)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         return True
