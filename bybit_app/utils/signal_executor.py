@@ -690,6 +690,9 @@ class SignalExecutor:
         except (TypeError, ValueError):
             pnl_limit = None
 
+        if pnl_limit is not None and pnl_limit >= 0:
+            pnl_limit = None
+
         defaults_applied: Dict[str, object] = {}
         defaults_meta: Dict[str, object] = {}
 
@@ -712,7 +715,11 @@ class SignalExecutor:
                     defaults_applied["hold_minutes"] = hold_limit_minutes
 
                 exit_default = resolved_defaults.get("exit_bps")
-                if pnl_limit is None and isinstance(exit_default, (int, float)):
+                if (
+                    pnl_limit is None
+                    and isinstance(exit_default, (int, float))
+                    and exit_default < 0
+                ):
                     pnl_limit = float(exit_default)
                     defaults_applied["exit_bps"] = pnl_limit
 
