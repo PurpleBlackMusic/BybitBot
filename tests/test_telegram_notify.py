@@ -10,12 +10,23 @@ from bybit_app.utils import telegram_notify
 
 
 class _FakeResponse:
-    def __init__(self) -> None:
-        self.ok = True
-        self.status_code = 200
+    def __init__(
+        self,
+        *,
+        ok: bool = True,
+        payload: dict[str, object] | None = None,
+        status_code: int = 200,
+        text: str = "",
+        reason: str = "",
+    ) -> None:
+        self.ok = ok
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {"ok": ok}
+        self.text = text
+        self.reason = reason
 
     def json(self) -> dict[str, object]:
-        return {"ok": True}
+        return self._payload
 
 
 def _patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -24,6 +35,20 @@ def _patch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         "get_settings",
         lambda: SimpleNamespace(telegram_token="token", telegram_chat_id="chat"),
     )
+
+
+def _make_dispatcher(**kwargs: object) -> telegram_notify.TelegramDispatcher:
+    params = {
+        "http_post": kwargs.get("http_post"),
+        "rate_guard": kwargs.get("rate_guard", lambda: None),
+        "max_attempts": kwargs.get("max_attempts", 5),
+        "initial_backoff": kwargs.get("initial_backoff", 0.0),
+        "max_backoff": kwargs.get("max_backoff", 0.0),
+        "sleep": kwargs.get("sleep", lambda _delay: None),
+    }
+    if "queue_maxsize" in kwargs:
+        params["queue_maxsize"] = kwargs["queue_maxsize"]
+    return telegram_notify.TelegramDispatcher(**params)
 
 
 def test_dispatcher_enqueue_is_non_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -41,10 +66,7 @@ def test_dispatcher_enqueue_is_non_blocking(monkeypatch: pytest.MonkeyPatch) -> 
         delivered.append(json.get("text", ""))
         return _FakeResponse()
 
-    dispatcher = telegram_notify.TelegramDispatcher(
-        http_post=fake_post,
-        rate_guard=fake_rate_guard,
-    )
+    dispatcher = _make_dispatcher(http_post=fake_post, rate_guard=fake_rate_guard)
 
     start = time.perf_counter()
     dispatcher.enqueue_message("one")
@@ -82,10 +104,7 @@ def test_dispatcher_respects_rate_guard(monkeypatch: pytest.MonkeyPatch) -> None
         send_times.append(time.perf_counter())
         return _FakeResponse()
 
-    dispatcher = telegram_notify.TelegramDispatcher(
-        http_post=fake_post,
-        rate_guard=fake_rate_guard,
-    )
+    dispatcher = _make_dispatcher(http_post=fake_post, rate_guard=fake_rate_guard)
 
     dispatcher.enqueue_message("first")
     dispatcher.enqueue_message("second")
@@ -119,11 +138,7 @@ def test_dispatcher_drops_oldest_when_queue_full(monkeypatch: pytest.MonkeyPatch
         sent.append(str(json.get("text", "")))
         return _FakeResponse()
 
-    dispatcher = telegram_notify.TelegramDispatcher(
-        http_post=fake_post,
-        rate_guard=lambda: None,
-        queue_maxsize=3,
-    )
+    dispatcher = _make_dispatcher(http_post=fake_post, queue_maxsize=3)
 
     dispatcher.enqueue_message("msg-0")
     assert processing_event.wait(timeout=1.0)
@@ -143,3 +158,58 @@ def test_dispatcher_drops_oldest_when_queue_full(monkeypatch: pytest.MonkeyPatch
 
     # Messages newer than the dropped ones must still be delivered without leaks.
     assert set(sent) == {"msg-0", "msg-3", "msg-4", "msg-5"}
+
+
+def test_dispatcher_retries_until_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_settings(monkeypatch)
+
+    attempts: list[str] = []
+    success_event = threading.Event()
+
+    responses = [
+        _FakeResponse(ok=False, payload={"ok": False, "description": "fail"}),
+        _FakeResponse(ok=True, payload={"ok": True}),
+    ]
+
+    def fake_post(url: str, json: dict[str, object], timeout: float) -> _FakeResponse:
+        attempts.append(json.get("text", ""))
+        response = responses.pop(0)
+        if response.ok:
+            success_event.set()
+        return response
+
+    dispatcher = _make_dispatcher(http_post=fake_post)
+
+    dispatcher.enqueue_message("retry-me")
+    assert success_event.wait(timeout=1.0)
+
+    dispatcher.shutdown(timeout=1.0)
+
+    assert attempts == ["retry-me", "retry-me"]
+    assert not responses
+
+
+def test_dispatcher_marks_failed_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_settings(monkeypatch)
+
+    recorded_logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(event: str, **payload: object) -> None:
+        recorded_logs.append((event, payload))
+
+    monkeypatch.setattr(telegram_notify, "log", fake_log)
+
+    def fake_post(url: str, json: dict[str, object], timeout: float) -> _FakeResponse:
+        return _FakeResponse(ok=False, payload={"ok": False, "description": "boom"})
+
+    dispatcher = _make_dispatcher(http_post=fake_post, max_attempts=3)
+
+    dispatcher.enqueue_message("explode")
+    dispatcher.shutdown(timeout=1.0)
+
+    failure_logs = [payload for event, payload in recorded_logs if event == "telegram.delivery_failed"]
+    assert len(failure_logs) == 1
+    failure = failure_logs[0]
+    assert failure["text"] == "explode"
+    assert failure["attempts"] == 3
+    assert failure["error"] == "boom"
