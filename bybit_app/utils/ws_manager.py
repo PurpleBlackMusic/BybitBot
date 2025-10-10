@@ -2136,8 +2136,10 @@ class WSManager:
                 continue
 
             final_payload = dict(payload)
+            success = False
             try:
                 api.place_order(**final_payload)
+                success = True
             except Exception as exc:
                 error_code = _extract_error_code(exc)
                 if error_code in _TP_LADDER_SKIP_CODES:
@@ -2162,6 +2164,20 @@ class WSManager:
                         continue
                     final_payload = retry_payload
                     price_text = str(final_payload.get("price") or price_text)
+                    try:
+                        api.place_order(**final_payload)
+                        success = True
+                    except Exception as retry_exc:
+                        log(
+                            "ws.private.tp_ladder.place.retry.error",
+                            err=str(retry_exc),
+                            symbol=symbol,
+                            rung=rung_index,
+                        )
+                        enqueue_telegram_message(
+                            f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: повторная отправка не удалась ({retry_exc})."
+                        )
+                        continue
                 else:
                     log(
                         "ws.private.tp_ladder.place.error",
@@ -2170,6 +2186,9 @@ class WSManager:
                         rung=rung_index,
                     )
                     continue
+
+            if not success:
+                continue
 
             if not cancel_invoked and on_first_success is not None:
                 try:
@@ -2271,21 +2290,6 @@ class WSManager:
         adjusted_price_text = format_to_step(capped_price, tick_size, rounding=ROUND_DOWN)
         updated_payload = dict(payload)
         updated_payload["price"] = adjusted_price_text
-
-        try:
-            api.place_order(**updated_payload)
-        except Exception as exc:
-            log(
-                "ws.private.tp_ladder.reprice.error",
-                symbol=symbol,
-                rung=rung_index,
-                err=str(exc),
-                price=adjusted_price_text,
-            )
-            enqueue_telegram_message(
-                f"⚠️ TP-рог {symbol} #{rung_index} не скорректирован: повторная отправка не удалась ({exc})."
-            )
-            return None
 
         log(
             "ws.private.tp_ladder.reprice.applied",
