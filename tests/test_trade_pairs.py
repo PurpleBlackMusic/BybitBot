@@ -1073,9 +1073,9 @@ def test_pair_trades_uses_cache_for_repeated_calls(
     original_read = trade_pairs._read_jsonl
     read_calls: list[Path] = []
 
-    def counting_read(path: Path) -> list[dict]:
+    def counting_read(path: Path, *args, **kwargs) -> list[dict]:
         read_calls.append(Path(path))
-        return original_read(path)
+        return original_read(path, *args, **kwargs)
 
     monkeypatch.setattr(trade_pairs, "_read_jsonl", counting_read)
 
@@ -1113,3 +1113,70 @@ def test_pair_trades_uses_cache_for_repeated_calls(
     third = trade_pairs.pair_trades()
     assert len(read_calls) == 4
     assert len(third) == len(first) + 1
+
+
+def test_pair_trades_reads_recent_slice_for_large_ledger(
+    pnl_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (pnl_dir / "decisions.jsonl").write_text("", encoding="utf-8")
+
+    gap = 60_000
+    total_trades = 600
+    recent_count = 5
+    ledger_rows: list[dict[str, object]] = []
+
+    for idx in range(total_trades):
+        base_ts = idx * gap
+        ledger_rows.append(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "execTime": base_ts,
+                "execPrice": 100 + idx,
+                "execQty": 1.0,
+                "execFee": 0.01,
+            }
+        )
+        ledger_rows.append(
+            {
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "execTime": base_ts + gap // 2,
+                "execPrice": 101 + idx,
+                "execQty": 1.0,
+                "execFee": 0.01,
+            }
+        )
+
+    ledger_path = pnl_dir / "executions.testnet.jsonl"
+    ledger_path.write_text(
+        "\n".join(json.dumps(row) for row in ledger_rows), encoding="utf-8"
+    )
+
+    original_read = trade_pairs._read_jsonl
+    ledger_rows_read: list[int] = []
+
+    def recording_read(path: Path, *args, **kwargs):
+        rows = original_read(path, *args, **kwargs)
+        if Path(path) == trade_pairs.LED:
+            ledger_rows_read.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(trade_pairs, "_read_jsonl", recording_read)
+
+    window_ms = 5 * gap - 1_000
+    trades = trade_pairs.pair_trades(window_ms=window_ms)
+
+    assert len(trades) == recent_count
+
+    start_recent_base = (total_trades - recent_count) * gap
+    assert min(trade["entry_ts"] for trade in trades) >= start_recent_base
+
+    latest_exec_ts = (total_trades - 1) * gap + gap // 2
+    cutoff = latest_exec_ts - window_ms
+    assert min(trade["exit_ts"] for trade in trades) >= cutoff
+
+    assert ledger_rows_read
+    assert ledger_rows_read[0] < len(ledger_rows)

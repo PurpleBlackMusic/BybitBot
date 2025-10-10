@@ -5,9 +5,10 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Iterable
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for
+from .file_io import tail_lines
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
 LED: Path | None = None
@@ -76,10 +77,89 @@ def pair_trades_cache_signature(
     ledger_path = _resolve_ledger_path(settings=settings, network=network)
     return _cache_signature(DEC, ledger_path, window)
 
-def _read_jsonl(p: Path) -> list[dict]:
-    if not p.exists(): return []
-    with p.open("r", encoding="utf-8") as f:
-        return [json.loads(x) for x in f if x.strip()]
+def _coerce_timestamp(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _extract_timestamp(record: dict[str, Any], keys: Iterable[str]) -> Optional[int]:
+    for key in keys:
+        if key in record:
+            ts = _coerce_timestamp(record.get(key))
+            if ts is not None:
+                return ts
+    return None
+
+
+def _read_jsonl(
+    p: Path,
+    *,
+    window_ms: int | None = None,
+    timestamp_fields: Tuple[str, ...] = ("ts",),
+    reference_ts: int | None = None,
+) -> list[dict]:
+    if not p.exists():
+        return []
+
+    if window_ms is None or window_ms <= 0:
+        with p.open("r", encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    window = int(window_ms)
+    limit = 256
+    selected: list[dict] = []
+
+    while True:
+        lines = tail_lines(p, limit, drop_blank=True)
+        if not lines:
+            return []
+
+        rows = [json.loads(line) for line in lines]
+        timestamps = [
+            _extract_timestamp(row, timestamp_fields)
+            for row in rows
+        ]
+
+        latest_ts = reference_ts
+        if latest_ts is None:
+            ts_candidates = [ts for ts in timestamps if ts is not None]
+            latest_ts = max(ts_candidates) if ts_candidates else None
+
+        cutoff = latest_ts - max(window, 0) if latest_ts is not None else None
+
+        selected = rows
+
+        if cutoff is None:
+            if len(lines) < limit:
+                break
+        else:
+            earliest_candidates = [ts for ts in timestamps if ts is not None]
+            earliest_ts = min(earliest_candidates) if earliest_candidates else None
+            if earliest_ts is None or earliest_ts <= cutoff or len(lines) < limit:
+                break
+
+        if len(lines) < limit:
+            break
+
+        limit *= 2
+
+    return selected
 
 def _write_jsonl(p: Path, rows: List[Dict[str, Any]]):
     with p.open("w", encoding="utf-8") as f:
@@ -107,6 +187,7 @@ def pair_trades(
     Выход: список трейдов с метриками: r_mult, bps_realized, hold_sec, fees.
     """
     window = _normalise_window(window_ms)
+    has_window = window_ms is not None
     ledger_path = _resolve_ledger_path(settings=settings, network=network)
     cache_key = _cache_key(DEC, ledger_path, window)
     signature = _cache_signature(DEC, ledger_path, window)
@@ -115,8 +196,29 @@ def pair_trades(
     if cached is not None and cached.signature == signature:
         return [deepcopy(trade) for trade in cached.trades]
 
-    decs = _read_jsonl(DEC)
-    exes = _read_jsonl(ledger_path)
+    read_window = window if has_window else None
+    exes = _read_jsonl(
+        ledger_path,
+        window_ms=read_window,
+        timestamp_fields=("execTime", "ts"),
+    )
+
+    exec_ts_values = [
+        ts
+        for ts in (
+            _extract_timestamp(exe, ("execTime", "ts"))
+            for exe in exes
+        )
+        if ts is not None
+    ]
+    latest_exec_ts = max(exec_ts_values) if exec_ts_values else None
+
+    decs = _read_jsonl(
+        DEC,
+        window_ms=read_window,
+        timestamp_fields=("ts",),
+        reference_ts=latest_exec_ts if has_window else None,
+    )
     # Сортируем по времени
     decs.sort(key=lambda d: d.get("ts", 0))
     exes.sort(key=lambda e: e.get("execTime") or e.get("ts") or 0)
@@ -174,12 +276,16 @@ def pair_trades(
     from collections import defaultdict
 
     events = defaultdict(list)
+    cutoff_ts = None
+    if has_window and latest_exec_ts is not None:
+        cutoff_ts = latest_exec_ts - max(window, 0)
+
     for e in exes:
         if (e.get("category") or "spot").lower() != "spot":
             continue
         sym = e.get("symbol")
         side = (e.get("side") or "").lower()
-        ts = int(e.get("execTime") or e.get("ts") or 0)
+        ts = _extract_timestamp(e, ("execTime", "ts")) or 0
         px = float(e.get("execPrice") or 0.0)
         qty = float(e.get("execQty") or 0.0)
         fee = float(e.get("execFee") or 0.0)
@@ -193,6 +299,19 @@ def pair_trades(
             "fee": fee,
             "link": e.get("orderLinkId") or None,
         })
+
+    required_links_per_symbol: dict[str, set[str]] = {}
+    if cutoff_ts is not None:
+        for sym, evs in events.items():
+            links = {
+                ev.get("link")
+                for ev in evs
+                if ev.get("link")
+                and ev.get("type") == "sell"
+                and (ev.get("ts") or 0) >= cutoff_ts
+            }
+            if links:
+                required_links_per_symbol[sym] = set(links)
 
     def _advance_decisions(decisions: list[dict], ts: int, last_idx: int) -> Tuple[list[dict], int]:
         nxt = last_idx
@@ -353,6 +472,25 @@ def pair_trades(
 
     for sym, evs in events.items():
         evs.sort(key=lambda ev: (ev["ts"], 0 if ev["type"] == "buy" else 1))
+        if cutoff_ts is not None:
+            required_links = required_links_per_symbol.get(sym, set())
+            filtered_events: List[dict] = []
+            for ev in evs:
+                ev_ts = ev.get("ts") or 0
+                if ev_ts < cutoff_ts:
+                    if (
+                        ev.get("type") == "buy"
+                        and ev.get("link")
+                        and ev["link"] in required_links
+                    ):
+                        filtered_events.append(ev)
+                    else:
+                        continue
+                else:
+                    filtered_events.append(ev)
+            evs = filtered_events
+            if not evs:
+                continue
         open_lots: List[dict] = []
         decs_for_sym = sorted(dec_idx.get(sym, []), key=lambda d: d.get("ts") or 0)
         dec_cursor = -1
@@ -417,7 +555,7 @@ def pair_trades(
             elif ev["type"] == "sell":
                 cutoff = None
                 if window_ms is not None:
-                    cutoff = ev["ts"] - max(window_ms, 0)
+                    cutoff = ev["ts"] - max(window, 0)
                 _prune_stale_lots(open_lots, cutoff)
                 remaining_qty = ev["qty"]
                 sell_fee_total = ev["fee"]
