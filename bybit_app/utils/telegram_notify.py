@@ -23,6 +23,11 @@ class TelegramDispatcher:
         http_post: Callable[..., object] | None = None,
         rate_guard: Callable[[], None] | None = None,
         queue_maxsize: int | None = None,
+        *,
+        max_attempts: int = 5,
+        initial_backoff: float = 1.0,
+        max_backoff: float = 30.0,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self._http_post = http_post or requests.post
         self._rate_guard = rate_guard or _rate_guard
@@ -30,12 +35,24 @@ class TelegramDispatcher:
         if maxsize <= 0:
             raise ValueError("queue_maxsize must be positive")
         self._queue_maxsize = maxsize
-        self._queue: "queue.Queue[str | None]" = queue.Queue(maxsize=maxsize)
+        self._queue: "queue.Queue[tuple[str, int] | None]" = queue.Queue(maxsize=maxsize)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._overflow_lock = threading.Lock()
         self._dropped_messages = 0
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        if initial_backoff < 0:
+            raise ValueError("initial_backoff must be non-negative")
+        if max_backoff < 0:
+            raise ValueError("max_backoff must be non-negative")
+        if initial_backoff > max_backoff and max_backoff != 0:
+            raise ValueError("initial_backoff must be <= max_backoff or max_backoff must be zero")
+        self._max_attempts = max_attempts
+        self._initial_backoff = initial_backoff
+        self._max_backoff = max_backoff
+        self._sleep = sleep or time.sleep
 
     def enqueue_message(self, text: str) -> None:
         """Schedule message for asynchronous delivery without blocking."""
@@ -44,7 +61,7 @@ class TelegramDispatcher:
             raise TypeError("text must be a string")
 
         self._ensure_thread()
-        self._put_with_overflow_handling(text)
+        self._put_with_overflow_handling((text, 0))
 
     def shutdown(self, *, timeout: float | None = None) -> None:
         """Stop dispatcher thread waiting for outstanding work."""
@@ -89,16 +106,51 @@ class TelegramDispatcher:
             except queue.Empty:
                 break
 
-    def _deliver(self, text: str) -> None:
+    def _deliver(self, item: tuple[str, int]) -> None:
+        text, attempts = item
         try:
             self._rate_guard()
-            _send_telegram_http(text, http_post=self._http_post)
+            result = _send_telegram_http(text, http_post=self._http_post)
         except Exception as exc:  # pragma: no cover - defensive catch for worker loop
             log("telegram.error", error=str(exc))
+            self._handle_delivery_failure(text, attempts, error=str(exc))
+            return
+
+        ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
+        if not ok:
+            error: str | None = None
+            if isinstance(result, dict):
+                error_value = result.get("error") or result.get("description")
+                if error_value:
+                    error = str(error_value)
+            if error is None:
+                error = "telegram_delivery_failed"
+            self._handle_delivery_failure(text, attempts, error=error)
+
+    def _handle_delivery_failure(self, text: str, attempts: int, *, error: str) -> None:
+        next_attempt = attempts + 1
+        if next_attempt >= self._max_attempts:
+            log(
+                "telegram.delivery_failed",
+                text=text,
+                attempts=next_attempt,
+                error=error,
+            )
+            return
+
+        delay = 0.0
+        if self._initial_backoff > 0:
+            delay = self._initial_backoff * (2**attempts)
+            if self._max_backoff > 0:
+                delay = min(delay, self._max_backoff)
+        if delay > 0:
+            self._sleep(delay)
+
+        self._put_with_overflow_handling((text, next_attempt))
 
     def _put_with_overflow_handling(
         self,
-        item: str | None,
+        item: tuple[str, int] | None,
         *,
         record_overflow: bool = True,
         allow_drop: bool = True,
@@ -114,7 +166,7 @@ class TelegramDispatcher:
                 if not allow_drop:
                     continue
 
-                dropped: str | None
+                dropped: tuple[str, int] | None
                 try:
                     dropped = self._queue.get_nowait()
                 except queue.Empty:  # pragma: no cover - defensive guard
@@ -128,14 +180,14 @@ class TelegramDispatcher:
                 if record_overflow:
                     self._record_overflow(dropped)
 
-    def _record_overflow(self, dropped: str) -> None:
+    def _record_overflow(self, dropped: tuple[str, int]) -> None:
         with self._overflow_lock:
             self._dropped_messages += 1
             total = self._dropped_messages
 
         log(
             "telegram.queue_overflow",
-            dropped_message=dropped,
+            dropped_message=dropped[0],
             dropped_total=total,
             queue_maxsize=self._queue_maxsize,
         )
