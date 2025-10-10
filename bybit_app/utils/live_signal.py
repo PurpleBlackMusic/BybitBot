@@ -66,25 +66,24 @@ class LiveSignalFetcher:
     ) -> None:
         self._settings: Optional[Settings] = settings
         self.data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
-        self.live_only = bool(getattr(settings, "ai_live_only", False)) if settings else False
-        base_ttl = max(float(cache_ttl), 0.0)
-        if self.live_only:
-            self.cache_ttl = 0.0
-        else:
-            self.cache_ttl = base_ttl
-        if stale_grace is None:
+        self._base_cache_ttl = max(float(cache_ttl), 0.0)
+        self._stale_grace_override = (
+            None if stale_grace is None else max(float(stale_grace), 0.0)
+        )
+        self.live_only = False
+        self.cache_ttl = self._base_cache_ttl
+        if self._stale_grace_override is None:
             # allow a wider reuse window for previously good payloads in case the
             # scanner temporarily fails — never smaller than 15 seconds to avoid
             # aggressive churn when cache_ttl is tiny.
-            if self.live_only:
-                self.stale_grace = 0.0
-            else:
-                self.stale_grace = max(self.cache_ttl * 2.0, 15.0)
+            self.stale_grace = max(self.cache_ttl * 2.0, 15.0)
         else:
-            grace = max(float(stale_grace), 0.0)
-            self.stale_grace = 0.0 if self.live_only else grace
+            self.stale_grace = self._stale_grace_override
         self._cached_status: Optional[Dict[str, object]] = None
         self._cache_timestamp: float = 0.0
+
+        if settings is not None:
+            self._apply_runtime_settings(settings)
 
     # ------------------------------------------------------------------
     # public API
@@ -95,13 +94,14 @@ class LiveSignalFetcher:
         returns an empty dict allowing callers to fallback to cached/demo data.
         """
 
+        settings = self._settings or get_settings()
+        self._apply_runtime_settings(settings)
+
         now = time.time()
 
         if self._cached_status is not None and self.cache_ttl > 0:
             if now - self._cache_timestamp <= self.cache_ttl:
                 return copy.deepcopy(self._cached_status)
-
-        settings = self._settings or get_settings()
 
         try:
             api = get_api_client()
@@ -129,6 +129,30 @@ class LiveSignalFetcher:
 
     # ------------------------------------------------------------------
     # helpers
+    def _apply_runtime_settings(self, settings: Settings) -> None:
+        """Re-evaluate cache controls against the latest settings."""
+
+        live_only = bool(getattr(settings, "ai_live_only", False))
+        previous_cache_ttl = self.cache_ttl
+
+        if live_only:
+            cache_ttl = 0.0
+            stale_grace = 0.0
+        else:
+            cache_ttl = self._base_cache_ttl
+            if self._stale_grace_override is None:
+                stale_grace = max(cache_ttl * 2.0, 15.0)
+            else:
+                stale_grace = self._stale_grace_override
+
+        self.live_only = live_only
+        self.cache_ttl = cache_ttl
+        self.stale_grace = stale_grace
+
+        if live_only or (previous_cache_ttl > 0.0 and cache_ttl <= 0.0):
+            self._cached_status = None
+            self._cache_timestamp = 0.0
+
     def _scan_market(self, settings: Settings, api) -> List[Dict[str, object]]:
         try:
             min_turnover = float(getattr(settings, "ai_min_turnover_usd", 0.0) or 0.0)
