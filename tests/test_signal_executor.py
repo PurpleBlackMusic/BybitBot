@@ -2172,6 +2172,60 @@ def test_signal_executor_blocks_after_daily_loss_limit(
     assert stub_api.orders == []
 
 
+def test_daily_loss_guard_uses_cached_pnl(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=0.5)
+    bot = StubBot(summary, settings)
+
+    stub_api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
+
+    from bybit_app.utils import pnl as pnl_module
+
+    pnl_module.invalidate_daily_pnl_cache(settings=settings)
+
+    call_count = {"value": 0}
+
+    def fake_read_ledger(n: int = 100000, **_: object) -> list[dict[str, object]]:
+        call_count["value"] += 1
+        now = time.time()
+        return [
+            {
+                "execTime": now,
+                "symbol": "ETHUSDT",
+                "side": "Sell",
+                "execPrice": 2100.0,
+                "execQty": 1.0,
+                "execFee": 0.5,
+                "category": "spot",
+            },
+            {
+                "execTime": now,
+                "symbol": "ETHUSDT",
+                "side": "Buy",
+                "execPrice": 2120.0,
+                "execQty": 1.0,
+                "execFee": 0.5,
+                "category": "spot",
+            },
+        ]
+
+    monkeypatch.setattr(pnl_module, "read_ledger", fake_read_ledger)
+
+    executor = SignalExecutor(bot)
+
+    try:
+        first = executor.execute_once()
+        second = executor.execute_once()
+
+        assert call_count["value"] == 1
+        assert first.status == "disabled"
+        assert second.status == "disabled"
+        assert first.reason is not None and "Дневной убыток" in first.reason
+    finally:
+        pnl_module.invalidate_daily_pnl_cache(settings=settings)
+
+
 def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)

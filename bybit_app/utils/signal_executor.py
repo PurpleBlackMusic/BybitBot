@@ -32,7 +32,7 @@ from .spot_market import (
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
-from .pnl import daily_pnl, read_ledger
+from .pnl import daily_pnl, invalidate_daily_pnl_cache, read_ledger
 from .spot_pnl import spot_inventory_and_pnl, _inventory_from_events, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -46,6 +46,7 @@ _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
+_DAILY_PNL_GUARD_CACHE_TTL = 30.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -2247,6 +2248,13 @@ class SignalExecutor:
         new_symbol_rows = self._extract_new_symbol_rows(
             rows_before, rows_after, symbol_upper
         )
+
+        if new_symbol_rows or len(rows_before) != len(rows_after):
+            try:
+                invalidate_daily_pnl_cache(settings=settings)
+            except Exception:  # pragma: no cover - defensive cache guard
+                pass
+
         trade_realized_pnl = self._realized_delta(
             rows_before,
             rows_after,
@@ -2845,7 +2853,15 @@ class SignalExecutor:
             return None
 
         try:
-            aggregated = daily_pnl()
+            aggregated = daily_pnl(
+                cache_ttl=_DAILY_PNL_GUARD_CACHE_TTL,
+                settings=settings,
+            )
+        except TypeError:
+            try:
+                aggregated = daily_pnl()
+            except Exception:
+                return None
         except Exception:
             return None
 

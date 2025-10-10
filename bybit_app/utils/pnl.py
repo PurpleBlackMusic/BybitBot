@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-import time
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from .envs import get_settings
 from .helpers import ensure_link_id
@@ -21,6 +22,8 @@ _RECENT_CACHE_SIZE = 2048
 _RECENT_KEYS: dict[Path, deque[str]] = {}
 _RECENT_KEY_SET: dict[Path, set[str]] = {}
 _RECENT_WARMED: set[Path] = set()
+_DAILY_PNL_CACHE_DEFAULT_TTL = 30.0
+_DAILY_PNL_CACHE: Dict[Path, Dict[str, object]] = {}
 
 
 def _normalise_network_marker(value: object | None) -> Optional[str]:
@@ -324,12 +327,82 @@ def read_ledger(
     return rows
 
 
-def daily_pnl():
+def _ledger_signature(path: Path) -> Tuple[float, int]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0.0, 0
+    return stat.st_mtime, stat.st_size
+
+
+def invalidate_daily_pnl_cache(
+    *, settings: object | None = None, network: object | None = None
+) -> None:
+    """Invalidate cached daily PnL summary.
+
+    If both ``settings`` and ``network`` are omitted, the entire cache is cleared.
+    Otherwise only the cache entry for the matching ledger is removed.
+    """
+
+    if settings is None and network is None:
+        with _LOCK:
+            _DAILY_PNL_CACHE.clear()
+        return
+
+    ledger_path = _ledger_path_for(settings, network=network)
+    with _LOCK:
+        _DAILY_PNL_CACHE.pop(ledger_path, None)
+
+
+def daily_pnl(
+    *,
+    cache_ttl: float | int | None = _DAILY_PNL_CACHE_DEFAULT_TTL,
+    force_refresh: bool = False,
+    settings: object | None = None,
+    network: object | None = None,
+):
     """Грубая агрегация PnL по группам OCO на основе fills.
     Для spot считаем: + (sell fills) - (buy fills) - fees.
     Для futures линейно не считаем (оставим на потом) — суммируем signed qty*price и fee как черновик.
     """
-    rows = read_ledger(100000)
+
+    resolved_ttl: float
+    if cache_ttl is None:
+        resolved_ttl = _DAILY_PNL_CACHE_DEFAULT_TTL
+    else:
+        try:
+            resolved_ttl = float(cache_ttl)
+        except (TypeError, ValueError):
+            resolved_ttl = _DAILY_PNL_CACHE_DEFAULT_TTL
+
+    ledger_path = _ledger_path_for(settings, network=network)
+    ledger_signature = _ledger_signature(ledger_path)
+    now = time.monotonic()
+    use_cache = not force_refresh and resolved_ttl > 0
+
+    if use_cache:
+        with _LOCK:
+            cached = _DAILY_PNL_CACHE.get(ledger_path)
+            if cached:
+                expires_at = float(cached.get("expires_at") or 0.0)
+                cached_signature = cached.get("signature")
+                if (
+                    cached_signature == ledger_signature
+                    and expires_at > now
+                ):
+                    latest_signature = _ledger_signature(ledger_path)
+                    if latest_signature == ledger_signature:
+                        cached_copy = cached.get("data")
+                        if isinstance(cached_copy, dict):
+                            return copy.deepcopy(cached_copy)
+                    else:
+                        ledger_signature = latest_signature
+
+    rows = read_ledger(
+        100000,
+        settings=settings,
+        network=network,
+    )
     by_day = {}
     for r in rows:
         raw_ts = r.get("execTime") or r.get("ts")
@@ -378,4 +451,13 @@ def daily_pnl():
             by_day[day][sym]["fees"] += abs(fee or 0.0)
     # сохранить сводку
     _SUMMARY.write_text(json.dumps(by_day, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if resolved_ttl > 0:
+        cache_payload = {
+            "data": copy.deepcopy(by_day),
+            "expires_at": time.monotonic() + resolved_ttl,
+            "signature": _ledger_signature(ledger_path),
+        }
+        with _LOCK:
+            _DAILY_PNL_CACHE[ledger_path] = cache_payload
     return by_day
