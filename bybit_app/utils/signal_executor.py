@@ -32,7 +32,12 @@ from .spot_market import (
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
-from .pnl import daily_pnl, read_ledger, invalidate_daily_pnl_cache
+from .pnl import (
+    daily_pnl,
+    execution_fee_in_quote,
+    read_ledger,
+    invalidate_daily_pnl_cache,
+)
 from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -550,7 +555,7 @@ class SignalExecutor:
 
             price = _safe_float(raw_event.get("execPrice"))
             qty = _safe_float(raw_event.get("execQty"))
-            fee = _safe_float(raw_event.get("execFee")) or 0.0
+            fee = execution_fee_in_quote(raw_event, price=price)
             side = str(raw_event.get("side") or "").lower()
             symbol_value = raw_event.get("symbol") or raw_event.get("ticker")
             symbol = str(symbol_value or "").strip().upper()
@@ -572,7 +577,7 @@ class SignalExecutor:
         for _, _, event, actual_ts in processed:
             price = _safe_float(event.get("execPrice")) or 0.0
             qty = _safe_float(event.get("execQty")) or 0.0
-            fee = _safe_float(event.get("execFee")) or 0.0
+            fee = execution_fee_in_quote(event, price=price)
             side = str(event.get("side") or "").lower()
             symbol_value = event.get("symbol") or event.get("ticker")
             symbol = str(symbol_value or "").strip().upper()

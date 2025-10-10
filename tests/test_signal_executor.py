@@ -3,6 +3,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Optional, Tuple, Union
 
+import json
 import time
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
 import bybit_app.utils.spot_pnl as spot_pnl_module
+import bybit_app.utils.spot_fifo as spot_fifo_module
 from bybit_app.utils.envs import Settings
 from bybit_app.utils.signal_executor import (
     AutomationLoop,
@@ -2506,6 +2508,90 @@ def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.Monkey
     assert result.reason is not None and "WebSocket" in result.reason
     assert api_called["value"] is False
     assert all(event != "guardian.auto.ws.autostart.error" for event, _ in logged_events)
+
+
+def test_fee_conversion_prevents_daily_loss_false_alarm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = time.time()
+    now_ms = int(now * 1000)
+    events = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execPrice": "100",
+            "execQty": "1",
+            "execFee": "0.01",
+            "feeCurrency": "BTC",
+            "category": "spot",
+            "execTime": now_ms,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "execPrice": "100",
+            "execQty": "1",
+            "execFee": "0.01",
+            "feeCurrency": "BTC",
+            "category": "spot",
+            "execTime": now_ms + 1000,
+        },
+    ]
+
+    ledger_path = tmp_path / "executions.testnet.jsonl"
+    with ledger_path.open("w", encoding="utf-8") as fh:
+        for event in events:
+            fh.write(json.dumps(event) + "\n")
+
+    fifo_books = spot_fifo_module.spot_fifo_pnl(ledger_path)
+    assert fifo_books
+    book = fifo_books.get("BTCUSDT")
+    assert book is not None
+    assert book["realized_pnl"] == pytest.approx(-2.0)
+    assert book["position_qty"] == pytest.approx(0.0)
+
+    inventory, layer_state = spot_pnl_module.spot_inventory_and_pnl(
+        events=events, return_layers=True
+    )
+    spot_state = inventory.get("BTCUSDT")
+    assert spot_state is not None
+    assert spot_state["realized_pnl"] == pytest.approx(-2.0)
+    assert spot_state["position_qty"] == pytest.approx(0.0)
+    layers_for_symbol = layer_state.get("BTCUSDT")
+    assert layers_for_symbol is not None
+    assert layers_for_symbol.get("position_qty") == pytest.approx(0.0)
+
+    summary = pnl_module._build_daily_summary(events)
+    day_key = time.strftime("%Y-%m-%d", time.gmtime(now))
+    day_bucket = summary.get(day_key, {})
+    symbol_bucket = day_bucket.get("BTCUSDT", {})
+    assert symbol_bucket.get("spot_fees") == pytest.approx(2.0)
+    assert symbol_bucket.get("spot_net") == pytest.approx(-2.0)
+
+    summary_path = tmp_path / "pnl_daily.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(pnl_module, "_SUMMARY", summary_path)
+    monkeypatch.setattr(pnl_module, "read_ledger", lambda *_, **__: events)
+    pnl_module.invalidate_daily_pnl_cache()
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        lambda self, require_success=False: (None, (100.0, 100.0)),
+    )
+
+    settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
+    bot = StubBot({"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}, settings)
+    executor = SignalExecutor(bot)
+    executor._current_time = lambda: now  # type: ignore[assignment]
+
+    guard = executor._daily_loss_guard(settings)
+    assert guard is not None
+    message, context = guard
+    assert context.get("guard") == "daily_loss_limit"
+    assert "Дневной убыток" in message
+    assert context.get("loss_value") == pytest.approx(2.0)
+    assert context.get("loss_percent") == pytest.approx(2.0)
 
 
 def test_signal_executor_blocks_after_daily_loss_limit(

@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .pnl import _ledger_path_for
+from .pnl import _ledger_path_for, execution_fee_in_quote
 
 
 def _load_events(ledger: Path) -> Iterable[dict[str, Any]]:
@@ -55,7 +55,7 @@ def spot_fifo_pnl(ledger_path: Path | None = None) -> dict[str, dict[str, Any]]:
         side = (event.get("side") or "").lower()
         price = float(event.get("execPrice") or 0.0)
         qty = float(event.get("execQty") or 0.0)
-        fee = abs(float(event.get("execFee") or 0.0))
+        fee = execution_fee_in_quote(event)
 
         if not symbol or qty <= 0.0 or price <= 0.0:
             continue
