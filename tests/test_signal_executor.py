@@ -312,6 +312,92 @@ def test_signal_executor_force_exit_skips_positive_exit_bps(
     assert metadata is None
 
 
+def test_signal_executor_force_exit_ignores_stale_summary_price(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = time.time()
+    entry_ts = now - 10.0
+
+    summary = {
+        "actionable": False,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "price": 80.0,
+        "status": {"updated_ts": entry_ts - 300.0},
+        "age_seconds": 600.0,
+    }
+
+    settings = Settings(
+        ai_enabled=True,
+        ai_max_hold_minutes=60.0,
+        ai_min_exit_bps=-10.0,
+        ai_max_slippage_bps=200,
+    )
+
+    portfolio_snapshot = {
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "qty": 2.0,
+                "avg_cost": 100.0,
+                "last_price": 100.0,
+                "updated_ts": entry_ts + 1.0,
+            }
+        ]
+    }
+
+    bot = StubBot(summary, settings)
+    bot.portfolio_overview = lambda: copy.deepcopy(portfolio_snapshot)
+
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "execQty": "2",
+            "execPrice": "100",
+            "execFee": "0",
+            "execTime": entry_ts,
+        }
+    ]
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "read_ledger",
+        lambda limit, settings=None: list(events),
+    )
+
+    def fake_inventory(*, events=None, settings=None, **_):
+        return {"BTCUSDT": {"position_qty": 2.0, "avg_cost": 100.0, "realized_pnl": 0.0}}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "spot_inventory_and_pnl",
+        fake_inventory,
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_current_time",
+        lambda self: now,
+    )
+
+    executor = SignalExecutor(bot)
+
+    positions = executor._collect_open_positions(settings, summary)
+    assert "BTCUSDT" in positions
+    btc_position = positions["BTCUSDT"]
+    assert btc_position["price_stale"] is True
+    assert btc_position["price_source"] in {"portfolio", "execution", "avg_cost"}
+    assert btc_position["price"] == pytest.approx(100.0)
+    assert btc_position["pnl_bps"] == pytest.approx(0.0)
+
+    forced_summary, metadata = executor._maybe_force_exit(summary, settings)
+
+    assert forced_summary is None
+    assert metadata is None
+
+
 def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,

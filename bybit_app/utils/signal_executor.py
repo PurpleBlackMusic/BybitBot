@@ -43,6 +43,8 @@ _PERCENT_TOLERANCE_MAX = 5.0
 
 _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
+_SUMMARY_PRICE_STALE_SECONDS = 180.0
+_SUMMARY_PRICE_ENTRY_GRACE = 2.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -516,6 +518,74 @@ class SignalExecutor:
 
         return None
 
+    def _resolve_summary_update_meta(
+        self, summary: Mapping[str, object], now: float
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if not isinstance(summary, Mapping):
+            return None, None
+
+        candidates: List[float] = []
+
+        def _append_timestamp(value: object) -> None:
+            ts = self._coerce_timestamp(value)
+            if ts is not None and math.isfinite(ts):
+                candidates.append(ts)
+
+        age_hint = _safe_float(summary.get("age_seconds"))
+        if age_hint is not None and age_hint >= 0:
+            candidates.append(now - age_hint)
+
+        for key in (
+            "updated_ts",
+            "updatedAt",
+            "updated_at",
+            "timestamp",
+            "ts",
+            "generated_at",
+            "generatedAt",
+            "last_update_ts",
+            "lastUpdateTs",
+        ):
+            _append_timestamp(summary.get(key))
+
+        nested_keys = (
+            "status",
+            "resume",
+            "guardian_status",
+            "guardian_resume",
+            "price_meta",
+            "meta",
+            "context",
+        )
+        for nested_key in nested_keys:
+            container = summary.get(nested_key)
+            if not isinstance(container, Mapping):
+                continue
+
+            nested_age = _safe_float(container.get("age_seconds"))
+            if nested_age is not None and nested_age >= 0:
+                candidates.append(now - nested_age)
+
+            for key in (
+                "updated_ts",
+                "updatedAt",
+                "updated_at",
+                "timestamp",
+                "ts",
+                "generated_at",
+                "generatedAt",
+                "last_update_ts",
+                "lastUpdateTs",
+            ):
+                _append_timestamp(container.get(key))
+
+        if not candidates:
+            return None, None
+
+        resolved_ts = max(candidates)
+        resolved_age = max(0.0, now - resolved_ts)
+        return resolved_ts, resolved_age
+
     def _collect_open_positions(
         self, settings: Settings, summary: Mapping[str, object]
     ) -> Dict[str, Dict[str, object]]:
@@ -548,6 +618,14 @@ class SignalExecutor:
                             portfolio_map[entry_symbol] = entry
 
         now = self._current_time()
+        summary_ts, summary_age = self._resolve_summary_update_meta(summary, now)
+        try:
+            raw_slippage_bps = float(getattr(settings, "ai_max_slippage_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            raw_slippage_bps = 0.0
+        slippage_percent = max(raw_slippage_bps / 100.0, 0.0)
+        slippage_percent = _normalise_slippage_percent(slippage_percent)
+        deviation_limit = (slippage_percent * 2.0) / 100.0 if slippage_percent > 0 else 0.0
         positions: Dict[str, Dict[str, object]] = {}
 
         for raw_symbol, rec in inventory.items():
@@ -584,15 +662,71 @@ class SignalExecutor:
                 hold_seconds = max(0.0, now - entry_ts)
 
             price = self._extract_market_price(summary, symbol)
-            if price is None:
-                portfolio_entry = portfolio_map.get(symbol)
+            price_source = "summary" if price is not None else None
+            price_stale = False
+
+            portfolio_entry = portfolio_map.get(symbol)
+            if price is None and isinstance(portfolio_entry, Mapping):
+                price = self._lookup_price_in_mapping(portfolio_entry, symbol)
+                if price is None:
+                    for key in ("price", "last_price", "mark_price", "close_price"):
+                        price = _safe_float(portfolio_entry.get(key))
+                        if price is not None:
+                            break
+                if price is not None:
+                    price_source = "portfolio"
+
+            if price is not None and avg_cost > 0:
+                deviation = abs(price - avg_cost) / avg_cost if avg_cost else 0.0
+                deviation_exceeds = deviation_limit > 0 and deviation > deviation_limit
+                if deviation_limit <= 0 and price != avg_cost:
+                    deviation_exceeds = True
+                summary_too_old = (
+                    summary_age is not None and summary_age > _SUMMARY_PRICE_STALE_SECONDS
+                )
+                summary_before_entry = (
+                    summary_ts is not None
+                    and entry_ts is not None
+                    and summary_ts + _SUMMARY_PRICE_ENTRY_GRACE < entry_ts
+                )
+                if deviation_exceeds or summary_too_old or summary_before_entry:
+                    price_stale = True
+
+            if price_stale:
+                fallback_price = None
+                fallback_source = None
+
                 if isinstance(portfolio_entry, Mapping):
-                    price = self._lookup_price_in_mapping(portfolio_entry, symbol)
-                    if price is None:
-                        for key in ("price", "last_price", "mark_price", "close_price"):
-                            price = _safe_float(portfolio_entry.get(key))
-                            if price is not None:
+                    fallback_price = self._lookup_price_in_mapping(portfolio_entry, symbol)
+                    if fallback_price is None:
+                        for key in (
+                            "price",
+                            "last_price",
+                            "mark_price",
+                            "close_price",
+                        ):
+                            fallback_price = _safe_float(portfolio_entry.get(key))
+                            if fallback_price is not None:
                                 break
+                    if fallback_price is not None:
+                        fallback_source = "portfolio"
+
+                if fallback_price is None and isinstance(state, Mapping):
+                    layers = state.get("layers")
+                    if isinstance(layers, list) and layers:
+                        last_layer = layers[-1]
+                        if isinstance(last_layer, Mapping):
+                            fallback_price = _safe_float(last_layer.get("price"))
+                            if fallback_price is not None:
+                                fallback_source = "execution"
+
+                if fallback_price is None:
+                    fallback_price = avg_cost
+                    if fallback_price is not None:
+                        fallback_source = "avg_cost"
+
+                price = fallback_price
+                price_source = fallback_source
 
             pnl_value = None
             pnl_bps = None
@@ -618,6 +752,8 @@ class SignalExecutor:
                 "quote_notional": float(quote_notional)
                 if quote_notional is not None
                 else None,
+                "price_source": price_source,
+                "price_stale": price_stale,
             }
 
             portfolio_entry = portfolio_map.get(symbol)
