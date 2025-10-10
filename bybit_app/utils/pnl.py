@@ -208,9 +208,24 @@ def add_execution(
     """Сохраняем fill (частичный/полный) из топика execution. Ожидаем поля: symbol, side, orderLinkId, execPrice, execQty, execFee, execTime."""
 
     ledger_path = _ledger_path_for(settings, network=network)
+    symbol_value = ev.get("symbol") or ev.get("ticker")
+    symbol = str(symbol_value or "").strip().upper()
+    base: Optional[str] = None
+    quote: Optional[str] = None
+    if symbol:
+        base, quote = symbol_resolver._split_symbol(symbol)  # type: ignore[attr-defined]
+        if isinstance(base, str):
+            base = base.strip().upper() or None
+        else:
+            base = None
+        if isinstance(quote, str):
+            quote = quote.strip().upper() or None
+        else:
+            quote = None
+
     rec = {
         "ts": int(time.time() * 1000),
-        "symbol": ev.get("symbol"),
+        "symbol": symbol_value,
         "side": ev.get("side"),
         "orderId": ev.get("orderId"),
         "orderLinkId": ensure_link_id(_normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID"))),
@@ -221,6 +236,16 @@ def add_execution(
         "category": ev.get("category") or ev.get("orderCategory") or "spot",
     }
     fee_currency = _extract_fee_currency(ev)
+    if not fee_currency and rec["execFee"] is not None:
+        inferred = _infer_fee_currency_from_size(
+            fee=rec["execFee"],
+            price=rec["execPrice"],
+            qty=rec["execQty"],
+            base=base,
+            quote=quote,
+        )
+        if inferred:
+            fee_currency = inferred
     if fee_currency:
         rec["feeCurrency"] = fee_currency
     key = _execution_key(ev)
@@ -288,6 +313,60 @@ def _extract_fee_currency(ev: Mapping[str, object] | dict) -> Optional[str]:
     return None
 
 
+def _infer_fee_currency_from_size(
+    *,
+    fee: float,
+    price: Optional[float],
+    qty: Optional[float],
+    base: Optional[str],
+    quote: Optional[str],
+) -> Optional[str]:
+    if base is None or price is None or qty is None:
+        return None
+
+    price_abs = abs(price)
+    qty_abs = abs(qty)
+    fee_abs = abs(fee)
+
+    if price_abs <= 0.0 or qty_abs <= 0.0 or fee_abs <= 0.0:
+        return None
+
+    notional = price_abs * qty_abs
+    if notional <= 0.0:
+        return None
+
+    raw_ratio = fee_abs / notional
+    converted_ratio = (fee_abs * price_abs) / notional
+
+    lower_bound = 1e-7
+    upper_bound = 5e-2
+
+    def _in_band(value: float) -> bool:
+        return lower_bound <= value <= upper_bound
+
+    raw_in_band = _in_band(raw_ratio)
+    converted_in_band = _in_band(converted_ratio)
+
+    if converted_in_band and not raw_in_band:
+        return base
+
+    if not converted_in_band:
+        return None
+
+    if not raw_in_band:
+        return base
+
+    ratio = raw_ratio
+    if ratio < 2.5e-4 or ratio > 5e-3:
+        return base
+
+    target = 1e-3
+    if abs(converted_ratio - target) < abs(raw_ratio - target):
+        return base
+
+    return None
+
+
 def execution_fee_in_quote(
     execution: Mapping[str, object] | dict,
     *,
@@ -325,10 +404,31 @@ def execution_fee_in_quote(
             quote = None
 
     fee_currency = _extract_fee_currency(execution)
+    inferred_currency: Optional[str] = None
 
     resolved_price = _f(price)
     if resolved_price is None:
         resolved_price = _f(execution.get("execPrice"))
+
+    if (
+        not fee_currency
+        and base
+        and quote
+        and resolved_price is not None
+        and fee is not None
+    ):
+        qty_value = _f(execution.get("execQty"))
+        inferred_currency = _infer_fee_currency_from_size(
+            fee=float(fee),
+            price=resolved_price,
+            qty=qty_value,
+            base=base,
+            quote=quote,
+        )
+        if inferred_currency:
+            fee_currency = inferred_currency
+            if isinstance(execution, dict) and "feeCurrency" not in execution:
+                execution["feeCurrency"] = inferred_currency
 
     if fee_currency and quote and fee_currency == quote:
         return float(fee)
