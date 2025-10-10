@@ -1397,6 +1397,29 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     assert watchlist_digest == digest
 
 
+def test_guardian_watchlist_missing_ev_remains_ready(tmp_path: Path) -> None:
+    status = {
+        "watchlist": [
+            {
+                "symbol": "ADAUSDT",
+                "trend": "buy",
+                "probability": 0.62,
+            },
+            {"symbol": "XRPUSDT", "trend": "wait"},
+        ]
+    }
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path)
+    watchlist = bot.market_watchlist()
+
+    actionable_entry = next(item for item in watchlist if item["symbol"] == "ADAUSDT")
+    assert actionable_entry["actionable"] is True
+    assert actionable_entry["ev_ready"] is True
+
+
 def test_guardian_watchlist_breakdown_cache_reuse_and_invalidation(tmp_path: Path) -> None:
     bot = _make_bot(tmp_path)
     entries = [
