@@ -6,7 +6,7 @@ import copy
 import json
 import threading
 
-from .pnl import _ledger_path_for, read_ledger
+from .pnl import _ledger_path_for, execution_fee_in_quote, read_ledger
 
 _SPOT_CACHE_VERSION = 1
 _CACHE_LOCK = threading.Lock()
@@ -212,10 +212,7 @@ def _normalise_event(
     if price <= 0 or qty <= 0:
         return None
 
-    try:
-        fee = abs(float(event.get("execFee") or 0.0))
-    except (TypeError, ValueError):
-        fee = 0.0
+    fee = execution_fee_in_quote(event)
 
     ts = _extract_timestamp(event)
     sort_key = ts if ts is not None else float(idx)

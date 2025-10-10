@@ -14,6 +14,7 @@ from .envs import get_settings
 from .helpers import ensure_link_id
 from .log import log
 from .paths import DATA_DIR
+from . import symbol_resolver
 
 _LEDGER_DIR = DATA_DIR / "pnl"
 _SUMMARY = DATA_DIR / "pnl" / "pnl_daily.json"
@@ -219,6 +220,9 @@ def add_execution(
         "execTime": ev.get("execTime") or ev.get("transactionTime") or ev.get("ts"),
         "category": ev.get("category") or ev.get("orderCategory") or "spot",
     }
+    fee_currency = _extract_fee_currency(ev)
+    if fee_currency:
+        rec["feeCurrency"] = fee_currency
     key = _execution_key(ev)
     with _LOCK:
         if key and not _remember_key(ledger_path, key):
@@ -251,6 +255,90 @@ def _f(x):
         return float(x)
     except Exception:
         return None
+
+
+def _extract_fee_currency(ev: Mapping[str, object] | dict) -> Optional[str]:
+    if not isinstance(ev, Mapping):
+        return None
+
+    for key in (
+        "feeCurrency",
+        "feeToken",
+        "execFeeCurrency",
+        "execFeeToken",
+        "feeAsset",
+        "fee_coin",
+        "fee_coin_id",
+    ):
+        value = ev.get(key)
+        if isinstance(value, str):
+            cleaned = value.strip().upper()
+            if cleaned:
+                return cleaned
+
+    value = ev.get("feeCurrency")
+    if isinstance(value, (int, float)):
+        return str(value)
+
+    value = ev.get("feeRate")
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def execution_fee_in_quote(
+    execution: Mapping[str, object] | dict,
+    *,
+    price: object | None = None,
+) -> float:
+    """Convert execution fee into quote currency units.
+
+    Keeps the original sign so rebates remain negative.
+    """
+
+    if not isinstance(execution, Mapping):
+        return 0.0
+
+    fee_raw = execution.get("execFee")
+    if fee_raw is None and "fee" in execution:
+        fee_raw = execution.get("fee")
+
+    fee = _f(fee_raw)
+    if fee is None:
+        return 0.0
+
+    symbol_value = execution.get("symbol") or execution.get("ticker")
+    symbol = str(symbol_value or "").strip().upper()
+    base: Optional[str] = None
+    quote: Optional[str] = None
+    if symbol:
+        base, quote = symbol_resolver._split_symbol(symbol)  # type: ignore[attr-defined]
+        if isinstance(base, str):
+            base = base.strip().upper() or None
+        else:
+            base = None
+        if isinstance(quote, str):
+            quote = quote.strip().upper() or None
+        else:
+            quote = None
+
+    fee_currency = _extract_fee_currency(execution)
+
+    resolved_price = _f(price)
+    if resolved_price is None:
+        resolved_price = _f(execution.get("execPrice"))
+
+    if fee_currency and quote and fee_currency == quote:
+        return float(fee)
+
+    if fee_currency and base and fee_currency == base:
+        if resolved_price is None:
+            return float(fee)
+        return float(fee * resolved_price)
+
+    return float(fee)
 
 
 def _ledger_entry_id(ev: Mapping[str, object]) -> Optional[str]:
@@ -403,9 +491,9 @@ def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str
         day = time.strftime("%Y-%m-%d", time.gmtime(ts))
         sym = r.get("symbol", "?")
         side = (r.get("side") or "").lower()
-        px = r.get("execPrice") or 0.0
-        qty = r.get("execQty") or 0.0
-        fee = r.get("execFee") or 0.0
+        px = _f(r.get("execPrice")) or 0.0
+        qty = _f(r.get("execQty")) or 0.0
+        fee = execution_fee_in_quote(r)
         cat = (r.get("category") or "spot").lower()
         if day not in by_day:
             by_day[day] = {}
@@ -432,16 +520,16 @@ def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str
             elif side == "sell":
                 payload["spot_pnl"] += px * qty
                 payload["notional_sell"] += px * qty
-            payload["spot_fees"] += abs(fee or 0.0)
-            payload["fees"] += abs(fee or 0.0)
+            payload["spot_fees"] += abs(fee)
+            payload["fees"] += abs(fee)
         else:
             # для фьючей пока просто аккумулируем нотации и комиссию (точный PnL требует позиций, оставим в v7b)
             if side == "buy":
                 payload["notional_buy"] += px * qty
             else:
                 payload["notional_sell"] += px * qty
-            payload["fees"] += abs(fee or 0.0)
-            payload["derivatives_fees"] += abs(fee or 0.0)
+            payload["fees"] += abs(fee)
+            payload["derivatives_fees"] += abs(fee)
 
     for day_payload in by_day.values():
         for sym_payload in day_payload.values():

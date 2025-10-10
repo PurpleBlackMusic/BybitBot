@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Iterable
 from .paths import DATA_DIR
-from .pnl import _ledger_path_for
+from .pnl import _ledger_path_for, execution_fee_in_quote
 from .file_io import tail_lines
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
@@ -288,7 +288,7 @@ def pair_trades(
         ts = _extract_timestamp(e, ("execTime", "ts")) or 0
         px = float(e.get("execPrice") or 0.0)
         qty = float(e.get("execQty") or 0.0)
-        fee = float(e.get("execFee") or 0.0)
+        fee = execution_fee_in_quote(e)
         if not sym or px <= 0 or qty <= 0:
             continue
         events[sym].append({
