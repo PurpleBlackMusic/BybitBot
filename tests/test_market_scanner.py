@@ -259,6 +259,7 @@ def test_build_training_dataset_handles_negative_fees(tmp_path: Path) -> None:
             "execQty": "1",
             "execPrice": "100",
             "execFee": "-0.1",
+            "feeCurrency": "BTC",
             "isMaker": True,
             "execTime": now - 120,
         },
@@ -268,11 +269,18 @@ def test_build_training_dataset_handles_negative_fees(tmp_path: Path) -> None:
             "execQty": "1",
             "execPrice": "100",
             "execFee": "-0.1",
+            "feeCurrency": "BTC",
             "isMaker": True,
             "execTime": now - 60,
         },
     ]
     _write_ledger(ledger_path, records)
+
+    executions = ai_models.load_executions(ledger_path)
+    assert executions[0].raw_fee == pytest.approx(-0.1)
+    assert executions[0].fee == pytest.approx(-10.0)
+    assert executions[1].raw_fee == pytest.approx(-0.1)
+    assert executions[1].fee == pytest.approx(-10.0)
 
     matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
 
