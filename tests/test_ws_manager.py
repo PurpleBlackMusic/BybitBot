@@ -259,6 +259,16 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     ]
     signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
 
+    fill_row = {
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "orderId": "test-order",
+        "execId": "fill-1",
+        "execQty": "0.30",
+        "execPrice": "100",
+    }
+    handshake = manager._tp_handshake_from_row(fill_row)
+
     manager.register_tp_ladder_plan(
         "BTCUSDT",
         signature=signature,
@@ -266,6 +276,7 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
         qty=Decimal("0.30"),
         status="pending",
         source="executor",
+        handshake=handshake,
     )
 
     monkeypatch.setattr(manager, "_build_tp_plan", lambda **kwargs: plan)
@@ -299,7 +310,7 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     }
 
     manager._regenerate_tp_ladder(
-        {"symbol": "BTCUSDT", "side": "Buy"},
+        fill_row,
         {"BTCUSDT": {"position_qty": Decimal("0.30"), "avg_cost": Decimal("100")}},
         config=[(Decimal("50"), Decimal("0.6"))],
         api=object(),
@@ -309,6 +320,9 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
 
     assert cancel_calls == []
     assert execute_calls == []
+
+    plan_state = manager._tp_ladder_plan.get("BTCUSDT") or {}
+    assert plan_state.get("handshake") == handshake
 
 
 @pytest.mark.parametrize(

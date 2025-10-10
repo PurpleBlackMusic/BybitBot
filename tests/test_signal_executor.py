@@ -834,6 +834,7 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
                 "signature": tuple(
                     tuple(pair) for pair in kwargs.get("signature") or ()
                 ),
+                "handshake": tuple(kwargs.get("handshake") or ()),
             }
         )
         original_register(symbol, **kwargs)
@@ -877,6 +878,7 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert [call["status"] for call in register_calls] == ["pending", "active"]
     assert all(call["symbol"] == "BTCUSDT" for call in register_calls)
     assert register_calls[0]["signature"] == register_calls[1]["signature"]
+    assert all(call["handshake"] for call in register_calls)
     assert cancel_calls == []
 
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")

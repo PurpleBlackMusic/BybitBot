@@ -1158,6 +1158,123 @@ class WSManager:
             normalised.append((price_text, qty_text))
         return tuple(normalised)
 
+    @staticmethod
+    def _normalise_tp_handshake(
+        handshake: Iterable[object] | None,
+    ) -> tuple[str, ...]:
+        if handshake is None:
+            return tuple()
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for value in handshake:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            tokens.append(text)
+        return tuple(tokens)
+
+    @staticmethod
+    def build_tp_handshake(
+        symbol: str,
+        *,
+        order_id: object | None = None,
+        order_link_id: object | None = None,
+        exec_id: object | None = None,
+    ) -> tuple[str, ...]:
+        symbol_text = str(symbol or "").strip().upper()
+        candidates: list[object] = []
+        if symbol_text:
+            candidates.append(symbol_text)
+        if order_id is not None:
+            candidates.append(order_id)
+        if order_link_id is not None:
+            candidates.append(order_link_id)
+        if exec_id is not None:
+            candidates.append(f"exec:{exec_id}")
+        return WSManager._normalise_tp_handshake(candidates)
+
+    @staticmethod
+    def _tp_handshake_from_row(row: Mapping[str, object] | None) -> tuple[str, ...]:
+        if not isinstance(row, Mapping):
+            return tuple()
+        symbol = str(row.get("symbol") or "").strip().upper()
+        order_id: object | None = None
+        for key in ("orderId", "orderID"):
+            candidate = row.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                order_id = candidate
+                break
+        order_link_id: object | None = None
+        for key in ("orderLinkId", "orderLinkID"):
+            candidate = row.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                order_link_id = candidate
+                break
+        exec_id = WSManager._ledger_entry_id(row)
+        return WSManager.build_tp_handshake(
+            symbol,
+            order_id=order_id,
+            order_link_id=order_link_id,
+            exec_id=exec_id,
+        )
+
+    def resolve_tp_handshake(
+        self,
+        symbol: str,
+        *,
+        order_id: object | None = None,
+        order_link_id: object | None = None,
+        execution_rows: Sequence[Mapping[str, object]] | None = None,
+    ) -> tuple[str, ...]:
+        symbol_text = str(symbol or "").strip().upper()
+        resolved_order_id = order_id
+        resolved_link_id = order_link_id
+        exec_marker: object | None = None
+        if execution_rows:
+            for row in execution_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                row_symbol = str(row.get("symbol") or "").strip().upper()
+                if row_symbol and symbol_text and row_symbol != symbol_text:
+                    continue
+                row_order_id = None
+                for key in ("orderId", "orderID"):
+                    candidate = row.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        row_order_id = candidate.strip()
+                        break
+                row_link_id = None
+                for key in ("orderLinkId", "orderLinkID"):
+                    candidate = row.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        row_link_id = candidate.strip()
+                        break
+                if order_id and row_order_id and row_order_id != order_id:
+                    continue
+                if order_link_id and row_link_id and row_link_id != order_link_id:
+                    continue
+                if resolved_order_id is None and row_order_id:
+                    resolved_order_id = row_order_id
+                if resolved_link_id is None and row_link_id:
+                    resolved_link_id = row_link_id
+                if exec_marker is None:
+                    exec_marker = WSManager._ledger_entry_id(row)
+                marker = WSManager._ledger_entry_id(row)
+                if marker:
+                    return WSManager.build_tp_handshake(
+                        symbol_text,
+                        order_id=resolved_order_id,
+                        order_link_id=resolved_link_id,
+                        exec_id=marker,
+                    )
+        return WSManager.build_tp_handshake(
+            symbol_text,
+            order_id=resolved_order_id,
+            order_link_id=resolved_link_id,
+            exec_id=exec_marker,
+        )
+
     def register_tp_ladder_plan(
         self,
         symbol: str,
@@ -1167,6 +1284,7 @@ class WSManager:
         qty: object = None,
         status: str = "active",
         source: str = "executor",
+        handshake: Iterable[object] | None = None,
     ) -> None:
         symbol_key = str(symbol or "").strip().upper()
         normalised_signature = self._normalise_tp_signature(signature)
@@ -1174,6 +1292,7 @@ class WSManager:
             return
         avg_cost_decimal = self._decimal_from(avg_cost)
         qty_decimal = self._decimal_from(qty)
+        handshake_tuple = self._normalise_tp_handshake(handshake)
         payload: dict[str, object] = {
             "signature": normalised_signature,
             "avg_cost": avg_cost_decimal,
@@ -1182,6 +1301,8 @@ class WSManager:
             "status": status,
             "source": source,
         }
+        if handshake_tuple:
+            payload["handshake"] = handshake_tuple
         with self._fill_lock:
             self._tp_ladder_plan[symbol_key] = payload
 
@@ -1190,10 +1311,12 @@ class WSManager:
         symbol: str,
         *,
         signature: Iterable[tuple[object, object]] | None = None,
+        handshake: Iterable[object] | None = None,
     ) -> None:
         symbol_key = str(symbol or "").strip().upper()
         if not symbol_key:
             return
+        handshake_tuple = self._normalise_tp_handshake(handshake)
         with self._fill_lock:
             if signature is not None:
                 existing = self._tp_ladder_plan.get(symbol_key)
@@ -1205,6 +1328,14 @@ class WSManager:
                     or self._normalise_tp_signature(signature) != current_signature
                 ):
                     return
+                if handshake_tuple:
+                    existing_handshake = existing.get("handshake")
+                    if (
+                        not isinstance(existing_handshake, tuple)
+                        or self._normalise_tp_handshake(existing_handshake)
+                        != handshake_tuple
+                    ):
+                        return
             self._tp_ladder_plan.pop(symbol_key, None)
 
     def _regenerate_tp_ladder(
@@ -1309,15 +1440,39 @@ class WSManager:
 
         signature = tuple((entry["price_text"], entry["qty_text"]) for entry in plan)
         previous_meta = self._tp_ladder_plan.get(symbol) or {}
+        current_handshake = self._tp_handshake_from_row(row)
         previous_signature = None
         previous_avg_cost = Decimal("0")
         previous_qty = Decimal("0")
+        previous_source = ""
+        previous_status = ""
+        previous_handshake: tuple[str, ...] = tuple()
         if isinstance(previous_meta, Mapping):
             existing_sig = previous_meta.get("signature")
             if isinstance(existing_sig, tuple):
                 previous_signature = existing_sig
             previous_avg_cost = self._decimal_from(previous_meta.get("avg_cost"))
             previous_qty = self._decimal_from(previous_meta.get("qty"))
+            previous_source = str(previous_meta.get("source") or "").strip().lower()
+            previous_status = str(previous_meta.get("status") or "").strip().lower()
+            existing_handshake = previous_meta.get("handshake")
+            if isinstance(existing_handshake, tuple):
+                previous_handshake = self._normalise_tp_handshake(existing_handshake)
+
+        normalised_handshake = self._normalise_tp_handshake(current_handshake)
+        if (
+            normalised_handshake
+            and len(normalised_handshake) > 1
+            and normalised_handshake == previous_handshake
+            and previous_source == "executor"
+            and previous_status in {"pending", "active"}
+        ):
+            log(
+                "ws.private.tp_ladder.skip",
+                symbol=symbol,
+                reason="executor_handshake",
+            )
+            return
         if previous_signature == signature:
             log("ws.private.tp_ladder.skip", symbol=symbol, reason="unchanged")
             return
@@ -1387,6 +1542,7 @@ class WSManager:
             qty=available_qty,
             status="active",
             source="ws_manager",
+            handshake=current_handshake,
         )
 
     def private_snapshot(self) -> Mapping[str, object] | None:
