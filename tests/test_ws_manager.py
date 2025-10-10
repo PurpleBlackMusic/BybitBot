@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Iterable
 
 import pytest
+import ssl
 
 from bybit_app.utils import ws_manager as ws_manager_module
 import bybit_app.utils.pnl as pnl_module
@@ -95,6 +96,52 @@ def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) ->
     status = manager.status()
     assert status["public"]["running"] is True
     assert status["private"]["running"] is True
+
+
+@pytest.mark.parametrize(
+    "verify_flag, expected_cert",
+    (
+        (True, ssl.CERT_REQUIRED),
+        (False, ssl.CERT_NONE),
+    ),
+)
+def test_ws_manager_start_public_respects_verify_ssl(
+    monkeypatch: pytest.MonkeyPatch, verify_flag: bool, expected_cert
+) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(testnet=False, verify_ssl=verify_flag)
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda *args, **kwargs: settings)
+    manager.s = settings
+
+    captured: dict[str, object] = {}
+
+    class DummyWebSocketApp:
+        def __init__(self, url: str, **kwargs):
+            captured["url"] = url
+
+        def run_forever(self, **kwargs):
+            captured["sslopt"] = kwargs.get("sslopt")
+            manager._pub_running = False
+
+    class ImmediateThread:
+        def __init__(self, target, daemon: bool = False):
+            self._target = target
+            self.daemon = daemon
+
+        def start(self):
+            self._target()
+
+        def is_alive(self):  # pragma: no cover - parity with threading.Thread
+            return False
+
+    monkeypatch.setattr(ws_manager_module.websocket, "WebSocketApp", DummyWebSocketApp)
+    monkeypatch.setattr(ws_manager_module.threading, "Thread", ImmediateThread)
+
+    assert manager.start_public(subs=("tickers.BTCUSDT",)) is True
+    sslopt = captured.get("sslopt")
+    assert isinstance(sslopt, dict)
+    assert sslopt.get("cert_reqs") == expected_cert
 
 
 def test_ws_manager_autostart_respects_settings(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,6 +4,7 @@ import json
 import sys
 from types import SimpleNamespace
 from typing import Any
+import ssl
 
 import pytest
 
@@ -311,4 +312,80 @@ def test_ws_private_v5_emits_heartbeat_on_pong(monkeypatch: pytest.MonkeyPatch) 
     assert client.start() is True
 
     assert any(payload.get("op") == "pong" for payload in captured)
+
+
+@pytest.mark.parametrize(
+    "verify_flag, expected_cert",
+    (
+        (True, ssl.CERT_REQUIRED),
+        (False, ssl.CERT_NONE),
+    ),
+)
+def test_ws_private_v5_respects_verify_ssl(
+    monkeypatch: pytest.MonkeyPatch, verify_flag: bool, expected_cert
+) -> None:
+    settings = SimpleNamespace(api_key="key", api_secret="secret", verify_ssl=verify_flag)
+    monkeypatch.setattr(ws_private_v5, "get_settings", lambda *args, **kwargs: settings)
+
+    captured: dict[str, Any] = {}
+
+    class DummyWebSocketApp:
+        def __init__(
+            self,
+            url: str,
+            on_open=None,
+            on_message=None,
+            on_error=None,
+            on_close=None,
+            on_pong=None,
+        ):
+            self._on_open = on_open
+            self._on_close = on_close
+
+        def send(self, payload: str) -> None:  # pragma: no cover - for parity
+            captured.setdefault("sent", []).append(payload)
+
+        def run_forever(self, **kwargs) -> None:
+            captured["sslopt"] = kwargs.get("sslopt")
+            if self._on_open:
+                self._on_open(self)
+            if self._on_close:
+                self._on_close(self, 1000, "normal")
+
+        def close(self) -> None:  # pragma: no cover - parity with real interface
+            captured["closed"] = True
+
+    class ImmediateThread:
+        def __init__(self, target, daemon: bool = False):
+            self._target = target
+            self.daemon = daemon
+            self._is_alive = False
+
+        def start(self) -> None:
+            name = getattr(self._target, "__name__", "")
+            if name == "_ping_loop":
+                return
+            self._is_alive = True
+            try:
+                self._target()
+            finally:
+                self._is_alive = False
+
+        def is_alive(self) -> bool:
+            return self._is_alive
+
+        def join(self, timeout: float | None = None) -> None:  # pragma: no cover - parity
+            return None
+
+    fake_websocket_module = SimpleNamespace(WebSocketApp=DummyWebSocketApp)
+    monkeypatch.setitem(sys.modules, "websocket", fake_websocket_module)
+    monkeypatch.setattr(ws_private_v5, "websocket", fake_websocket_module, raising=False)
+    monkeypatch.setattr(ws_private_v5.threading, "Thread", ImmediateThread)
+
+    client = WSPrivateV5(reconnect=False)
+    assert client.start() is True
+
+    sslopt = captured.get("sslopt")
+    assert isinstance(sslopt, dict)
+    assert sslopt.get("cert_reqs") == expected_cert
 

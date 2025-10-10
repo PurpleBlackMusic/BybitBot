@@ -223,6 +223,8 @@ class WSPrivateV5:
             log("ws.private.disabled", reason="missing credentials")
             return False
 
+        verify_ssl = bool(getattr(settings, "verify_ssl", True))
+
         try:
             import websocket  # type: ignore
         except Exception as e:
@@ -407,8 +409,10 @@ class WSPrivateV5:
                 with self._ws_lock:
                     self._ws = ws
                 try:
+                    cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
+                    sslopt = {"cert_reqs": cert_reqs}
                     ws.run_forever(
-                        sslopt={"cert_reqs": ssl.CERT_NONE},
+                        sslopt=sslopt,
                         ping_interval=0,
                         ping_timeout=None,
                     )
