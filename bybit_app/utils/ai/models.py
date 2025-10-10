@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import Deque, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +63,7 @@ class _SymbolState:
         "recent_prices",
         "recent_qtys",
         "recent_buys",
+        "price_history",
     )
 
     def __init__(self) -> None:
@@ -70,6 +72,7 @@ class _SymbolState:
         self.recent_prices: List[float] = []
         self.recent_qtys: List[float] = []
         self.recent_buys: List[Tuple[float, Optional[float]]] = []
+        self.price_history: Deque[float] = deque(maxlen=200)
 
     def register_buy(self, record: ExecutionRecord) -> None:
         total_cost = self.avg_cost * self.position_qty
@@ -140,9 +143,15 @@ class _SymbolState:
         else:
             volume_impulse = 0.0
 
+        multiframe_change_pct = change_pct
+        if self.price_history:
+            long_term_ref = sum(self.price_history) / len(self.price_history)
+            if long_term_ref > 1e-9:
+                multiframe_change_pct = (record.price - long_term_ref) / long_term_ref * 100.0
+
         vector = [
             change_pct,
-            change_pct,
+            multiframe_change_pct,
             math.log10(record.notional + 1.0),
             volatility_pct,
             volume_impulse,
@@ -170,6 +179,7 @@ class _SymbolState:
         self.recent_qtys.append(qty)
         if len(self.recent_qtys) > 50:
             self.recent_qtys.pop(0)
+        self.price_history.append(price)
 
 
 def _default_ledger_path(data_dir: Path) -> Path:
