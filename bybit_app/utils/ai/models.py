@@ -114,7 +114,11 @@ class _SymbolState:
             self._remember(record.price, abs(record.qty))
             return None
 
-        proceeds = record.price * qty_to_close - record.fee
+        fee_share = 0.0
+        total_qty = abs(record.qty)
+        if total_qty > 1e-9:
+            fee_share = record.fee * (qty_to_close / total_qty)
+        proceeds = record.price * qty_to_close - fee_share
         cost_basis = self.avg_cost * qty_to_close
         realized_pnl = proceeds - cost_basis
 

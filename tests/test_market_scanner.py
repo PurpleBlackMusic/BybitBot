@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from bybit_app.utils.market_scanner import (
 )
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
+from bybit_app.utils.trade_analytics import ExecutionRecord
 
 
 def _write_snapshot(
@@ -170,6 +172,42 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
 def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+
+def test_training_dataset_prorates_fee_for_oversized_sell(tmp_path: Path) -> None:
+    state = ai_models._SymbolState()
+    timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    buy = ExecutionRecord(
+        symbol="BTCUSDT",
+        side="buy",
+        qty=1.5,
+        price=100.0,
+        fee=0.0,
+        timestamp=timestamp,
+    )
+    state.register_buy(buy)
+
+    sell = ExecutionRecord(
+        symbol="BTCUSDT",
+        side="sell",
+        qty=2.0,
+        price=110.0,
+        fee=2.0,
+        timestamp=timestamp,
+    )
+
+    realised = state.realise_sell(sell)
+    assert realised is not None
+    _, pnl, _ = realised
+
+    qty_to_close = min(abs(sell.qty), abs(buy.qty))
+    expected_fee = sell.fee * (qty_to_close / abs(sell.qty))
+    expected_pnl = sell.price * qty_to_close - expected_fee - buy.price * qty_to_close
+
+    assert pnl == pytest.approx(expected_pnl)
+
+    assert state.position_qty == 0.0
 
 
 def test_default_ledger_path_prefers_most_recent(tmp_path: Path) -> None:
