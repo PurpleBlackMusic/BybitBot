@@ -10,6 +10,7 @@ import pytest
 
 from bybit_app.utils.ai.models import (
     MODEL_FEATURES,
+    MarketModel,
     _SymbolState,
     _ensure_scaling,
     liquidity_feature,
@@ -124,3 +125,20 @@ def test_liquidity_feature_matches_logarithm() -> None:
     value = 512.5
     expected = math.log10(value + 1.0)
     assert liquidity_feature(value) == pytest.approx(expected)
+
+
+def test_market_model_predict_proba_handles_zero_std() -> None:
+    model = MarketModel(
+        feature_names=("directional_change_pct",),
+        coefficients=(1.0,),
+        intercept=0.0,
+        feature_means=(0.0,),
+        feature_stds=(0.0,),
+        trained_at=0.0,
+        samples=1,
+    )
+
+    probability = model.predict_proba({"directional_change_pct": 1.0})
+
+    assert math.isfinite(probability)
+    assert 0.0 < probability <= 1.0
