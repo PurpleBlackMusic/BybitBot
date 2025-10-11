@@ -687,7 +687,7 @@ def test_signal_executor_skips_buy_when_usdt_unavailable(
     monkeypatch.setattr(
         signal_executor_module,
         "_wallet_available_balances",
-        lambda api_obj, account_type="UNIFIED": {
+        lambda api_obj, account_type="UNIFIED", required_asset="USDT": {
             "BTC": Decimal("0.4"),
             "USDT": Decimal("0"),
         },
