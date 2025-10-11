@@ -1962,6 +1962,130 @@ def test_signal_executor_sell_refreshes_price_for_insufficient_balance(
     assert pytest.approx(float(result.order.get("notional_quote")), rel=1e-9) == 90.0
 
 
+def test_signal_executor_sell_retries_with_wallet_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "BTCUSDT",
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=400.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    base_available = Decimal("0.1")
+    initial_snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("1000"),
+        balances={"BTC": base_available},
+        limits={"base_coin": "BTC", "min_order_amt": Decimal("5")},
+    )
+    refreshed_snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("900"),
+        balances=None,
+        limits=None,
+    )
+
+    def fake_snapshot(api_obj, symbol, **kwargs: object) -> SpotTradeSnapshot:
+        if kwargs.get("force_refresh"):
+            if kwargs.get("include_balances"):
+                return SpotTradeSnapshot(
+                    symbol="BTCUSDT",
+                    price=Decimal("900"),
+                    balances={"BTC": base_available},
+                    limits=None,
+                )
+            return refreshed_snapshot
+        return initial_snapshot
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        fake_snapshot,
+    )
+
+    def fake_compute_notional(
+        self,
+        settings_obj,
+        total_equity,
+        available_equity,
+        sizing_factor,
+        *,
+        min_notional,
+        quote_balance_cap=None,
+    ) -> Tuple[float, float, bool]:
+        return 100.0, available_equity, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute_notional,
+    )
+
+    attempts: list[float] = []
+    placed_orders: list[dict[str, object]] = []
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        qty_float = float(kwargs.get("qty", 0))
+        attempts.append(qty_float)
+        if len(attempts) == 1:
+            raise OrderValidationError(
+                "Недостаточно базового актива для продажи.",
+                code="insufficient_balance",
+                details={"best_bid": "900"},
+            )
+        placed_orders.append(dict(kwargs))
+        return {
+            "retCode": 0,
+            "result": {
+                "orderId": "sell-wallet-context",
+                "avgPrice": "900",
+                "cumExecQty": str(base_available),
+                "cumExecValue": str(Decimal("900") * base_available),
+            },
+        }
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert attempts and len(attempts) == 2
+    assert pytest.approx(attempts[0], rel=1e-9) == 100.0
+    assert pytest.approx(attempts[1], rel=1e-9) == 90.0
+    assert placed_orders and float(placed_orders[-1]["qty"]) == pytest.approx(90.0, rel=1e-9)
+
+    assert result.status == "filled"
+    assert result.context is not None
+    assert result.context.get("sell_fallback") is not None
+    adjustments = result.context.get("insufficient_balance_adjustments")
+    assert isinstance(adjustments, list) and adjustments
+    latest_adjustment = adjustments[-1]
+    assert pytest.approx(latest_adjustment.get("scaling"), rel=1e-9) == pytest.approx(
+        attempts[1] / attempts[0],
+        rel=1e-9,
+    )
+    assert result.order is not None
+    assert pytest.approx(
+        float(result.order.get("notional_quote")),
+        rel=1e-9,
+    ) == 90.0
+
 def test_signal_executor_guard_forces_sell_on_time_and_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

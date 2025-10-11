@@ -1678,6 +1678,18 @@ class SignalExecutor:
                     and combined_total > unified_total
                 ) or (spot_total is not None and spot_total > 0):
                     fallback_relevant = True
+                elif side == "Sell":
+                    balance_keys = (
+                        "wallet_available_base",
+                        "available_base",
+                        "combined_available_base",
+                        "spot_available_base",
+                        "unified_available_base",
+                    )
+                    for key in balance_keys:
+                        if key in fallback_context and fallback_context.get(key) is not None:
+                            fallback_relevant = True
+                            break
 
             if not fallback_relevant:
                 fallback_context = None
@@ -1899,17 +1911,69 @@ class SignalExecutor:
                     insufficient_retry = False
                     if (
                         side == "Sell"
-                        and isinstance(fallback_context, Mapping)
                         and exc.code == "insufficient_balance"
                         and attempts < max_attempts
                     ):
-                        fallback_available = _safe_float(
-                            fallback_context.get("wallet_available_base")
+                        fallback_source: Optional[Mapping[str, object]] = (
+                            fallback_context if isinstance(fallback_context, Mapping) else None
                         )
-                        if fallback_available is None:
+                        base_asset: Optional[str] = None
+                        if fallback_source is not None:
+                            base_candidate = fallback_source.get("base_asset")
+                            if isinstance(base_candidate, str) and base_candidate.strip():
+                                base_asset = base_candidate.strip().upper()
+                        if not base_asset and symbol:
+                            cleaned_symbol = str(symbol).strip().upper()
+                            if cleaned_symbol.endswith("USDT") and len(cleaned_symbol) > 4:
+                                base_asset = cleaned_symbol[:-4]
+
+                        fallback_available = None
+                        if fallback_source is not None:
                             fallback_available = _safe_float(
-                                fallback_context.get("available_base")
+                                fallback_source.get("wallet_available_base")
                             )
+                            if fallback_available is None:
+                                fallback_available = _safe_float(
+                                    fallback_source.get("available_base")
+                                )
+
+                        refreshed_price: Optional[float] = None
+                        if fallback_source is None and api is not None:
+                            try:
+                                refreshed_snapshot = prepare_spot_trade_snapshot(
+                                    api,
+                                    symbol,
+                                    include_limits=False,
+                                    include_price=True,
+                                    include_balances=True,
+                                    force_refresh=True,
+                                )
+                            except Exception as refresh_exc:  # pragma: no cover - defensive logging
+                                log(
+                                    "guardian.auto.order.retry_balance.refresh_error",
+                                    symbol=symbol,
+                                    err=str(refresh_exc),
+                                )
+                                refreshed_snapshot = None
+                            if refreshed_snapshot is not None:
+                                balances = refreshed_snapshot.balances or {}
+                                if base_asset:
+                                    fallback_available = _safe_float(balances.get(base_asset))
+                                refreshed_price = _safe_float(refreshed_snapshot.price)
+                                regenerated_context: Dict[str, object] = {
+                                    "source": "retry_refresh",
+                                }
+                                if base_asset:
+                                    regenerated_context["base_asset"] = base_asset
+                                if fallback_available is not None:
+                                    regenerated_context["wallet_available_base"] = fallback_available
+                                    regenerated_context["available_base"] = fallback_available
+                                if refreshed_price is not None and refreshed_price > 0:
+                                    regenerated_context["price_snapshot"] = refreshed_price
+                                fallback_context = regenerated_context
+                                fallback_source = regenerated_context
+                                order_context["sell_fallback"] = regenerated_context
+
                         available_base = (
                             _safe_float(details.get("available")) if details else None
                         )
@@ -1921,14 +1985,13 @@ class SignalExecutor:
                         best_bid = _safe_float(details.get("best_bid")) if details else None
                         fallback_price_snapshot = _safe_float(
                             fallback_context.get("price_snapshot")
-                        )
+                        ) if isinstance(fallback_context, Mapping) else None
                         price_snapshot = best_bid
                         if (price_snapshot is None or price_snapshot <= 0) and fallback_price_snapshot:
                             price_snapshot = fallback_price_snapshot
                         fallback_quote = _safe_float(
                             fallback_context.get("quote_notional")
-                        )
-                        refreshed_price: Optional[float] = None
+                        ) if isinstance(fallback_context, Mapping) else None
                         if required_base is None and api is not None:
                             try:
                                 refreshed_snapshot = prepare_spot_trade_snapshot(
