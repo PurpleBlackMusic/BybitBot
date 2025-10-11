@@ -1815,6 +1815,88 @@ class SignalExecutor:
                         details = exc.details
 
                     price_limit_hit = bool(details.get("price_limit_hit")) if details else False
+                    insufficient_retry = False
+                    if (
+                        side == "Sell"
+                        and isinstance(fallback_context, Mapping)
+                        and exc.code == "insufficient_balance"
+                        and attempts < max_attempts
+                    ):
+                        fallback_available = _safe_float(
+                            fallback_context.get("wallet_available_base")
+                        )
+                        if fallback_available is None:
+                            fallback_available = _safe_float(
+                                fallback_context.get("available_base")
+                            )
+                        available_base = (
+                            _safe_float(details.get("available")) if details else None
+                        )
+                        if available_base is None:
+                            available_base = fallback_available
+                        required_base = (
+                            _safe_float(details.get("required")) if details else None
+                        )
+                        price_snapshot = _safe_float(
+                            fallback_context.get("price_snapshot")
+                        )
+                        fallback_quote = _safe_float(
+                            fallback_context.get("quote_notional")
+                        )
+                        if required_base is None and price_snapshot and price_snapshot > 0:
+                            required_base = current_notional / price_snapshot
+                        if (
+                            required_base is None
+                            and fallback_quote is not None
+                            and fallback_available
+                            and fallback_available > 0
+                        ):
+                            implied_price = fallback_quote / fallback_available
+                            if implied_price > 0:
+                                required_base = current_notional / implied_price
+                        if (
+                            available_base is not None
+                            and required_base is not None
+                            and required_base > 0
+                            and available_base >= 0
+                        ):
+                            scaling = available_base / required_base
+                            scaling = max(min(scaling, 1.0), 0.0)
+                            if scaling > 0 and not math.isclose(
+                                scaling, 1.0, rel_tol=1e-9, abs_tol=1e-12
+                            ):
+                                clipped_notional = current_notional * scaling
+                                if clipped_notional < 0:
+                                    clipped_notional = 0.0
+                                if not math.isclose(
+                                    clipped_notional,
+                                    current_notional,
+                                    rel_tol=1e-9,
+                                    abs_tol=1e-9,
+                                ):
+                                    log(
+                                        "guardian.auto.order.retry_balance",
+                                        symbol=symbol,
+                                        available_base=available_base,
+                                        required_base=required_base,
+                                        scaling=scaling,
+                                    )
+                                    current_notional = clipped_notional
+                                    adjustment_entry = {
+                                        "attempt": attempts,
+                                        "scaling": scaling,
+                                        "available_base": available_base,
+                                        "required_base": required_base,
+                                    }
+                                    if price_snapshot and price_snapshot > 0:
+                                        adjustment_entry["price_snapshot"] = price_snapshot
+                                    order_context.setdefault(
+                                        "insufficient_balance_adjustments",
+                                        [],
+                                    ).append(adjustment_entry)
+                                    insufficient_retry = True
+                    if insufficient_retry:
+                        continue
                     if price_limit_hit and exc.code in {"insufficient_liquidity", "price_deviation"}:
                         backoff_state = self._record_price_limit_hit(
                             symbol,
@@ -3681,6 +3763,7 @@ class SignalExecutor:
         summary: Optional[Mapping[str, object]] = None,
     ) -> Tuple[Optional[float], Optional[Dict[str, object]], Optional[float]]:
         context: Dict[str, object] = {"source": "balances"}
+        context["wallet_available_base"] = None
         if symbol:
             context["symbol"] = symbol
 
@@ -3738,6 +3821,7 @@ class SignalExecutor:
         balance_account_type = "UNIFIED"
         if available_base is None or available_base <= 0:
             context["available_base"] = 0.0
+            context["wallet_available_base"] = 0.0
             context["balance_account_type"] = balance_account_type
             fallback_snapshot = None
             try:
@@ -3765,18 +3849,22 @@ class SignalExecutor:
                     available_base = fallback_available
                     balance_account_type = "SPOT"
                     context["available_base"] = float(available_base)
+                    context["wallet_available_base"] = float(available_base)
             context["balance_fallback_account_type"] = "SPOT"
             if balance_account_type == "SPOT":
                 context["balance_account_type"] = balance_account_type
         if available_base is None or available_base <= 0:
             context.setdefault("available_base", 0.0)
             context.setdefault("balance_account_type", balance_account_type)
+            if "wallet_available_base" not in context or context["wallet_available_base"] is None:
+                context["wallet_available_base"] = 0.0
             context["error"] = "no_balance"
             return None, context, float(min_order_amt) if min_order_amt > 0 else None
 
         context["balance_account_type"] = balance_account_type
 
         context["available_base"] = float(available_base)
+        context["wallet_available_base"] = float(available_base)
 
         if not isinstance(price, Decimal):
             price = self._decimal_from(price)
