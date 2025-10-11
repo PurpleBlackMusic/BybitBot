@@ -805,6 +805,73 @@ def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
     assert Decimal(audit_live.get("order_notional")) <= tolerance_cap
 
 
+def test_place_spot_market_with_tolerance_merges_spot_balances_when_required_asset_missing():
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "baseCoin": "BTC",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0.00000001",
+                    "qtyStep": "0.00000001",
+                },
+                "priceFilter": {"tickSize": "0.1"},
+            }
+        ]
+    )
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "BTC",
+                                "availableBalance": "1",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        "SPOT": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "SPOT",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableBalance": "25",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    api = DummyAPI(payload, wallet_payload=wallet_payload)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0.5,
+    )
+
+    assert response["ok"] is True
+    assert api.place_calls, "order should be placed when spot balance covers quote"
+    assert api.wallet_calls >= 2, "fallback should query spot balances"
+
+
 def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)
@@ -1718,7 +1785,7 @@ def test_place_spot_market_requires_quote_currency_balance():
     assert details.get("asset") == "USDC"
     alt_usdt = details.get("alt_usdt")
     if alt_usdt is not None:
-        assert "120" in alt_usdt
+        assert Decimal(alt_usdt) >= Decimal("120")
     assert api.place_calls == []
     assert api.place_calls == []
     assert api.wallet_calls >= 1
