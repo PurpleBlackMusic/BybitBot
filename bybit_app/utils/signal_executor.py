@@ -3557,9 +3557,12 @@ class SignalExecutor:
         except (TypeError, ValueError):
             cap_pct = 0.0
 
-        usable_after_reserve = max(
-            available_equity - total_equity * reserve_pct / 100.0, 0.0
-        )
+        reserve_base = min(total_equity, available_equity)
+        if not math.isfinite(reserve_base):
+            reserve_base = available_equity
+        reserve_base = max(reserve_base, 0.0)
+        reserve_amount = reserve_base * reserve_pct / 100.0
+        usable_after_reserve = max(available_equity - reserve_amount, 0.0)
 
         caps = []
         if usable_after_reserve > 0:

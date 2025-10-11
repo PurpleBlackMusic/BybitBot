@@ -628,7 +628,8 @@ def test_signal_executor_handles_non_usdt_wallet_balances(
 
     expected_total = 0.5 * mark_price
     expected_available = 0.4 * mark_price
-    reserve = expected_total * 0.02
+    reserve_base = min(expected_total, expected_available)
+    reserve = reserve_base * 0.02
     usable_after_reserve = expected_available - reserve
     cap_pct = getattr(settings, "spot_max_cap_per_trade_pct", 0.0) or 0.0
     cap_limit = expected_total * cap_pct / 100.0 if cap_pct > 0 else usable_after_reserve
@@ -681,6 +682,51 @@ def test_signal_executor_scales_to_min_notional_when_capital_allows(
     assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
 
 
+def test_signal_executor_reserve_respects_available_equity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.0,
+        spot_cash_reserve_pct=10.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=10_000.0, available=10.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "reserve-available"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured
+    assert captured["unit"] == "quoteCoin"
+    assert pytest.approx(float(captured["qty"]), rel=1e-9) == 9.0
+
+    assert result.context is not None
+    assert result.context["usable_after_reserve"] == pytest.approx(9.0)
+    assert result.context["available_equity"] == pytest.approx(10.0)
+    assert result.context["total_equity"] == pytest.approx(10_000.0)
+
+
 def test_signal_executor_scales_buy_notional_for_slippage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -729,7 +775,8 @@ def test_signal_executor_scales_buy_notional_for_slippage(
     assert result.status == "filled"
     assert captured
 
-    usable_after_reserve = 120.0 - 500.0 * 0.02
+    reserve_base = min(500.0, 120.0)
+    usable_after_reserve = 120.0 - reserve_base * 0.02
     multiplier, _, _, _ = signal_executor_module._resolve_slippage_tolerance(
         "Percent", settings.ai_max_slippage_bps / 100.0
     )
@@ -794,7 +841,7 @@ def test_signal_executor_sell_uses_balance_fallback(
         ai_enabled=True,
         dry_run=False,
         ai_risk_per_trade_pct=0.0,
-        spot_cash_reserve_pct=50.0,
+        spot_cash_reserve_pct=200.0,
         spot_max_cap_per_trade_pct=0.0,
     )
     bot = StubBot(summary, settings)
