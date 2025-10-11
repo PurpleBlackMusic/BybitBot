@@ -29,6 +29,7 @@ from .spot_market import (
     OrderValidationError,
     _instrument_limits,
     _resolve_slippage_tolerance,
+    parse_price_limit_error_details,
     place_spot_market_with_tolerance,
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
@@ -1726,6 +1727,65 @@ class SignalExecutor:
                 context=validation_context,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
+            error_code = _extract_bybit_error_code(exc)
+            if error_code == "170193":
+                formatted_error = _format_bybit_error(exc)
+                self._record_validation_penalty(symbol, "price_deviation")
+
+                details = parse_price_limit_error_details(str(exc))
+                if side == "Buy":
+                    details.setdefault("requested_quote", f"{adjusted_notional}")
+                else:
+                    details.setdefault("requested_base", f"{adjusted_notional}")
+                details.setdefault("price_limit_hit", True)
+                details.setdefault("side", side.lower())
+
+                validation_context = dict(order_context)
+                validation_context["validation_code"] = "price_deviation"
+                validation_context["validation_details"] = details
+
+                backoff_state = self._record_price_limit_hit(
+                    symbol,
+                    details,
+                    last_notional=adjusted_notional,
+                    last_slippage=slippage_pct,
+                )
+                quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl")) if backoff_state else None
+                if quarantine_ttl is None or quarantine_ttl <= 0:
+                    quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
+                self._quarantine_symbol(symbol, ttl=quarantine_ttl)
+                quarantine_until = self._symbol_quarantine.get(symbol)
+                if quarantine_until is not None:
+                    validation_context["quarantine_until"] = quarantine_until
+                validation_context["quarantine_ttl"] = quarantine_ttl
+                if backoff_state:
+                    validation_context["price_limit_backoff"] = backoff_state
+
+                info_parts: List[str] = []
+                price_cap = details.get("price_cap")
+                price_floor = details.get("price_floor")
+                if price_cap:
+                    info_parts.append(f"лимит цены {price_cap}")
+                elif price_floor:
+                    info_parts.append(f"лимит цены {price_floor}")
+
+                extra_text = " — " + "; ".join(info_parts) if info_parts else ""
+                message = f"{formatted_error}{extra_text}".strip()
+
+                self._maybe_notify_validation_skip(
+                    settings=settings,
+                    symbol=symbol,
+                    side=side,
+                    code="price_deviation",
+                    message=message,
+                )
+
+                return self._decision(
+                    "skipped",
+                    reason=f"Ордер пропущен (price_deviation): {message}",
+                    context=validation_context,
+                )
+
             formatted_error = _format_bybit_error(exc)
             lowered = formatted_error.lower()
             if "priceboundrate" in lowered or "price bound" in lowered:
