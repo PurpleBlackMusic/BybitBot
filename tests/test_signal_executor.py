@@ -687,7 +687,7 @@ def test_signal_executor_skips_buy_when_usdt_unavailable(
     monkeypatch.setattr(
         signal_executor_module,
         "_wallet_available_balances",
-        lambda api_obj, account_type="UNIFIED": {
+        lambda api_obj, account_type="UNIFIED", **_: {
             "BTC": Decimal("0.4"),
             "USDT": Decimal("0"),
         },
@@ -4314,18 +4314,37 @@ def test_automation_loop_retries_after_error(monkeypatch: pytest.MonkeyPatch) ->
     assert call_count["value"] == 2
 
 
-def test_automation_loop_caches_skipped_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_automation_loop_retries_transient_status_after_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     summary = {"actionable": False, "mode": "wait", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)
     bot = StubBot(summary, settings, fingerprint="sig-skip")
 
     executor = SignalExecutor(bot)
 
+    class FakeTime:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(signal_executor_module, "time", fake_time)
+
     call_count = {"value": 0}
+    statuses = [
+        ExecutionResult(status="skipped", reason="not actionable"),
+        ExecutionResult(status="dry_run"),
+    ]
 
     def fake_execute_once() -> ExecutionResult:
         call_count["value"] += 1
-        return ExecutionResult(status="skipped", reason="not actionable")
+        return statuses[min(call_count["value"] - 1, len(statuses) - 1)]
 
     executor.execute_once = fake_execute_once  # type: ignore[assignment]
 
@@ -4338,16 +4357,17 @@ def test_automation_loop_caches_skipped_signal(monkeypatch: pytest.MonkeyPatch) 
 
     first_delay = loop._tick()
     assert call_count["value"] == 1
-    assert first_delay == 1.0
+    assert first_delay == pytest.approx(1.0)
 
     second_delay = loop._tick()
     assert call_count["value"] == 1
-    assert second_delay == 3.5
+    assert second_delay == pytest.approx(1.0)
 
-    bot._fingerprint = "sig-skip-new"
+    fake_time.advance(1.0)
+
     third_delay = loop._tick()
     assert call_count["value"] == 2
-    assert third_delay == 1.0
+    assert third_delay == pytest.approx(1.0)
 
 
 def test_automation_loop_reacts_to_ai_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
