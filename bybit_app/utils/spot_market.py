@@ -1219,13 +1219,26 @@ def _load_wallet_balances(api: BybitAPI, account_type: str) -> Dict[str, Decimal
     return _parse_wallet_balances(payload)
 
 
-def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, Decimal]:
+def _wallet_available_balances(
+    api: BybitAPI,
+    account_type: str = "UNIFIED",
+    *,
+    required_asset: str | None = None,
+) -> Dict[str, Decimal]:
     account_key = (account_type or "UNIFIED").upper() or "UNIFIED"
+    required_normalised = (required_asset or "").strip().upper()
     cache_key = _balance_cache_key(api, account_key)
 
     cached = _BALANCE_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        if required_normalised:
+            cached_amount = cached.get(required_normalised, Decimal("0"))
+            if cached_amount is None or cached_amount <= 0:
+                _BALANCE_CACHE.invalidate(cache_key)
+            else:
+                return cached
+        else:
+            return cached
 
     primary_balances = _load_wallet_balances(api, account_type=account_key)
 
@@ -1240,6 +1253,10 @@ def _wallet_available_balances(api: BybitAPI, account_type: str = "UNIFIED") -> 
             needs_fallback = True
         else:
             needs_fallback = all(amount <= 0 for amount in primary_balances.values())
+            if not needs_fallback and required_normalised:
+                amount = primary_balances.get(required_normalised)
+                if amount is None or amount <= 0:
+                    needs_fallback = True
     if needs_fallback:
         spot_cache_key = _balance_cache_key(api, "SPOT")
         spot_cached = _BALANCE_CACHE.get(spot_cache_key)
@@ -1660,10 +1677,25 @@ def prepare_spot_market_order(
         if not asset_normalised or required <= 0:
             return
 
+        fetched_with_requirement = False
         if balance_map is None:
-            balance_map = _wallet_available_balances(api)
+            balance_map = _wallet_available_balances(api, required_asset=asset_normalised)
+            fetched_with_requirement = True
 
-        available = balance_map.get(asset_normalised, Decimal("0"))
+        available = Decimal("0")
+        if balance_map:
+            available = balance_map.get(asset_normalised, Decimal("0"))
+
+        if available <= 0 and not fetched_with_requirement:
+            refreshed = _wallet_available_balances(api, required_asset=asset_normalised)
+            fetched_with_requirement = True
+            if refreshed:
+                if balance_map is None:
+                    balance_map = refreshed
+                else:
+                    balance_map.update(refreshed)
+                available = balance_map.get(asset_normalised, Decimal("0"))
+
         margin = Decimal("0.00000001")
         if available + margin >= required:
             balances_checked.append((asset_normalised, required))
