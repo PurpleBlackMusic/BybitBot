@@ -29,6 +29,7 @@ from .spot_market import (
     OrderValidationError,
     _instrument_limits,
     _resolve_slippage_tolerance,
+    _wallet_available_balances,
     parse_price_limit_error_details,
     place_spot_market_with_tolerance,
     prepare_spot_trade_snapshot,
@@ -1499,7 +1500,7 @@ class SignalExecutor:
         side = "Buy" if mode == "buy" else "Sell"
 
         try:
-            api, wallet_totals = self._resolve_wallet(
+            api, wallet_totals, quote_wallet_cap = self._resolve_wallet(
                 require_success=not active_dry_run(settings)
             )
         except Exception as exc:
@@ -1513,6 +1514,17 @@ class SignalExecutor:
                 reason=reason_text,
             )
         total_equity, available_equity = wallet_totals
+        if not math.isfinite(total_equity):
+            total_equity = 0.0
+        if not math.isfinite(available_equity):
+            available_equity = 0.0
+
+        quote_wallet_cap_value = quote_wallet_cap
+        if quote_wallet_cap_value is not None:
+            if not math.isfinite(quote_wallet_cap_value):
+                quote_wallet_cap_value = None
+            elif quote_wallet_cap_value < 0.0:
+                quote_wallet_cap_value = 0.0
 
         min_notional = 5.0
         instrument_limits: Optional[Mapping[str, object]] = None
@@ -1533,12 +1545,19 @@ class SignalExecutor:
                 min_notional = max(min_notional, min_candidate)
 
         sizing_factor = self._signal_sizing_factor(summary, settings)
+        quote_balance_cap = quote_wallet_cap_value if side == "Buy" else None
+        quote_wallet_limited_available: Optional[float] = None
+        if quote_balance_cap is not None:
+            quote_wallet_limited_available = min(
+                available_equity, max(quote_balance_cap, 0.0)
+            )
         notional, usable_after_reserve = self._compute_notional(
             settings,
             total_equity,
             available_equity,
             sizing_factor,
             min_notional=min_notional,
+            quote_balance_cap=quote_balance_cap,
         )
 
         fallback_context: Optional[Dict[str, object]] = None
@@ -1698,6 +1717,10 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if quote_wallet_cap_value is not None:
+            order_context["quote_wallet_cap"] = quote_wallet_cap_value
+        if quote_wallet_limited_available is not None:
+            order_context["available_equity_quote_limited"] = quote_wallet_limited_available
         if fallback_context:
             order_context["sell_fallback"] = fallback_context
         if fallback_applied_notional is not None:
@@ -3564,7 +3587,7 @@ class SignalExecutor:
             return None
 
         try:
-            _, wallet_totals = self._resolve_wallet(require_success=False)
+            _, wallet_totals, _ = self._resolve_wallet(require_success=False)
         except Exception:
             return None
 
@@ -3671,23 +3694,43 @@ class SignalExecutor:
 
     def _resolve_wallet(
         self, *, require_success: bool
-    ) -> Tuple[Optional[object], Tuple[float, float]]:
+    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float]]:
         try:
             api = get_api_client()
         except Exception:
             if require_success:
                 raise
-            return None, (0.0, 0.0)
+            return None, (0.0, 0.0), None
 
         try:
             payload = api.wallet_balance()
         except Exception:
             if require_success:
                 raise
-            return api, (0.0, 0.0)
+            return api, (0.0, 0.0), None
 
         totals = extract_wallet_totals(payload)
-        return api, totals
+        quote_balance: Optional[float] = None
+        try:
+            balances = _wallet_available_balances(api)
+        except Exception:
+            balances = None
+        if isinstance(balances, Mapping):
+            raw_quote = balances.get("USDT")
+            if raw_quote is None:
+                raw_quote = balances.get("usdt")
+            if raw_quote is not None:
+                try:
+                    quote_balance = float(raw_quote)
+                except (TypeError, ValueError):
+                    quote_balance = None
+                else:
+                    if not math.isfinite(quote_balance):
+                        quote_balance = None
+                    elif quote_balance < 0.0:
+                        quote_balance = 0.0
+
+        return api, totals, quote_balance
 
     def _compute_notional(
         self,
@@ -3697,6 +3740,7 @@ class SignalExecutor:
         sizing_factor: float = 1.0,
         *,
         min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
     ) -> Tuple[float, float]:
         try:
             reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
@@ -3717,12 +3761,26 @@ class SignalExecutor:
         except (TypeError, ValueError):
             cap_pct = 0.0
 
-        reserve_base = min(total_equity, available_equity)
+        capped_available = available_equity
+        if quote_balance_cap is not None:
+            try:
+                quote_cap_value = float(quote_balance_cap)
+            except (TypeError, ValueError):
+                quote_cap_value = None
+            if quote_cap_value is not None and math.isfinite(quote_cap_value):
+                quote_cap_value = max(quote_cap_value, 0.0)
+                if not math.isfinite(capped_available):
+                    capped_available = quote_cap_value
+                else:
+                    capped_available = min(capped_available, quote_cap_value)
+        reserve_base = min(total_equity, capped_available)
         if not math.isfinite(reserve_base):
-            reserve_base = available_equity
+            reserve_base = capped_available
         reserve_base = max(reserve_base, 0.0)
         reserve_amount = reserve_base * reserve_pct / 100.0
-        usable_after_reserve = max(available_equity - reserve_amount, 0.0)
+        usable_after_reserve = max(capped_available - reserve_amount, 0.0)
+        if quote_balance_cap is not None and usable_after_reserve <= 0.0:
+            return 0.0, usable_after_reserve
 
         caps = []
         if usable_after_reserve > 0:
