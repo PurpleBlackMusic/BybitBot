@@ -7,6 +7,7 @@ import pytest
 from bybit_app.utils import spot_market as spot_market_module
 from bybit_app.utils import validators
 from bybit_app.utils.envs import Settings
+from bybit_app.utils.signal_executor import SignalExecutor
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     place_spot_market_with_tolerance,
@@ -995,6 +996,10 @@ def test_prepare_spot_market_rejects_quantised_price_above_instrument_cap():
     assert details.get("price_limit_hit") is True
     assert details.get("price_cap") == "100.05"
     assert details.get("limit_price") == "100.1"
+    assert details.get("requested_quote") == "10"
+    assert details.get("available_quote") == "9.995005005"
+    assert details.get("requested_base") == "0.0999001"
+    assert details.get("available_base") == "0.0999001"
 
 
 def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1024,6 +1029,10 @@ def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.M
     details = getattr(err, "details", {}) or {}
     assert details.get("price_cap") == "101.23"
     assert details.get("price_limit_hit") is True
+    assert "requested_quote" in details
+    assert "available_quote" in details
+    assert "requested_base" in details
+    assert "available_base" in details
 
 
 def test_place_spot_market_wraps_price_floor_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1056,6 +1065,57 @@ def test_place_spot_market_wraps_price_floor_runtime_error(monkeypatch: pytest.M
     details = getattr(err, "details", {}) or {}
     assert details.get("price_floor") == "98.5"
     assert details.get("price_limit_hit") is True
+    assert "requested_base" in details
+    assert "available_base" in details
+    assert "requested_quote" in details
+    assert "available_quote" in details
+
+
+def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
+    orderbook = {"result": {"a": [["100.05", "2"]], "b": [["99.5", "2"]]}}
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    limits = _basic_limits()
+    limits["max_price"] = "100.05"
+    limits["tick_size"] = "0.1"
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("10"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("0.5"),
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("1000")},
+            limits=limits,
+        )
+
+    details = getattr(excinfo.value, "details", {}) or {}
+    requested_quote = Decimal(details.get("requested_quote", "0"))
+
+    executor = SignalExecutor(object())
+    backoff_state = executor._record_price_limit_hit(
+        "BTCUSDT",
+        details,
+        last_notional=float(requested_quote),
+        last_slippage=0.5,
+    )
+    assert backoff_state.get("available_quote") is not None
+
+    adjusted_notional, adjusted_slippage, adjustments = executor._apply_price_limit_backoff(
+        "BTCUSDT",
+        "Buy",
+        float(requested_quote),
+        0.5,
+        0.0,
+    )
+
+    assert adjusted_notional < float(requested_quote)
+    assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    assert adjusted_slippage >= 0.5
 
 
 def test_parse_price_limit_error_details_handles_comparison_phrase() -> None:

@@ -1808,9 +1808,61 @@ def prepare_spot_market_order(
     elif target_base is not None:
         qty_base_raw = target_base
 
+    def _price_band_context_values() -> Dict[str, Decimal]:
+        """Resolve requested/available trade amounts for price-band errors."""
+
+        matched_quote: Optional[Decimal] = None
+        if quote_total > 0:
+            matched_quote = quote_total
+        if qty_base > 0 and worst_price > 0:
+            recalculated = qty_base * worst_price
+            if matched_quote is None:
+                matched_quote = recalculated
+            else:
+                matched_quote = min(matched_quote, recalculated)
+
+        matched_base: Optional[Decimal] = None
+        if qty_base > 0:
+            matched_base = qty_base
+        elif matched_quote is not None and worst_price > 0:
+            matched_base = matched_quote / worst_price
+
+        context: Dict[str, Decimal] = {}
+
+        if matched_quote is not None:
+            context["available_quote"] = matched_quote
+        if matched_base is not None:
+            context["available_base"] = matched_base
+
+        requested_quote_value: Optional[Decimal] = None
+        if target_quote is not None and target_quote > 0:
+            requested_quote_value = target_quote
+        elif target_base is not None and target_base > 0 and limit_price > 0:
+            requested_quote_value = target_base * limit_price
+        elif matched_quote is not None:
+            requested_quote_value = matched_quote
+        if requested_quote_value is not None:
+            context["requested_quote"] = requested_quote_value
+
+        requested_base_value: Optional[Decimal] = None
+        if target_base is not None and target_base > 0:
+            requested_base_value = target_base
+        elif matched_base is not None:
+            requested_base_value = matched_base
+        if requested_base_value is not None:
+            context["requested_base"] = requested_base_value
+
+        return context
+
     def _enforce_price_band() -> None:
         if limit_price <= 0:
             return
+
+        context_values = _price_band_context_values()
+
+        def _populate_details(details: Dict[str, object]) -> None:
+            for key, value in context_values.items():
+                details.setdefault(key, _format_decimal(value))
 
         if (
             side_normalised == "buy"
@@ -1827,6 +1879,8 @@ def prepare_spot_market_order(
             else:
                 details["price_cap"] = _format_decimal(max_price_allowed)
                 details["price_limit_hit"] = True
+
+            _populate_details(details)
 
             raise OrderValidationError(
                 "Ожидаемая цена превышает допустимый предел для инструмента.",
@@ -1849,6 +1903,8 @@ def prepare_spot_market_order(
             else:
                 details["price_floor"] = _format_decimal(min_price_allowed)
                 details["price_limit_hit"] = True
+
+            _populate_details(details)
 
             raise OrderValidationError(
                 "Ожидаемая цена ниже допустимого предела для инструмента.",
@@ -2269,6 +2325,9 @@ def prepare_spot_market_order(
         {"price": _format_decimal(price), "qty": _format_decimal(qty)} for price, qty in consumed_levels
     ]
 
+    for key, value in _price_band_context_values().items():
+        audit[f"price_band_{key}"] = _format_decimal(value)
+
     return PreparedSpotMarketOrder(payload=payload, audit=audit)
 
 
@@ -2511,6 +2570,11 @@ def place_spot_market_with_tolerance(
                 requested_base = prepared.audit.get("order_qty_base")
                 if requested_base and "requested_base" not in details:
                     details["requested_base"] = str(requested_base)
+
+            for key in ("requested_quote", "available_quote", "requested_base", "available_base"):
+                audit_value = prepared.audit.get(f"price_band_{key}")
+                if audit_value is not None and key not in details:
+                    details[key] = str(audit_value)
 
             details["price_limit_hit"] = True
             if side_normalised:
