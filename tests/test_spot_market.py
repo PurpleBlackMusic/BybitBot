@@ -747,6 +747,64 @@ def test_place_spot_market_guard_reduces_qty_on_tolerance():
     assert Decimal(audit.get("order_notional")) <= Decimal("100")
 
 
+def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
+    limits = {
+        "min_order_amt": "5",
+        "quote_step": "0.01",
+        "min_order_qty": "0",
+        "qty_step": "0.00000001",
+        "quote_coin": "USDT",
+        "base_coin": "FOO",
+        "tick_size": "0.01",
+    }
+    orderbook = {
+        "result": {
+            "a": [["1.00", "5"], ["1.01", "5"]],
+            "b": [["0.99", "5"], ["0.98", "5"]],
+        }
+    }
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="FOOUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=1,
+        max_quote=Decimal("10.2"),
+        price_snapshot=Decimal("1.05"),
+        balances={"USDT": Decimal("50")},
+        limits=limits,
+    )
+
+    audit = prepared.audit
+    assert Decimal(audit.get("effective_notional")) == Decimal("10")
+    assert Decimal(audit.get("tolerance_adjusted_notional")) == Decimal("10.1")
+    tolerance_cap = Decimal("10.1") + Decimal("0.00000001")
+    assert Decimal(audit.get("order_notional")) <= tolerance_cap
+
+    live_api = DummyAPI({}, orderbook_payload=orderbook)
+    response = place_spot_market_with_tolerance(
+        live_api,
+        symbol="FOOUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=1,
+        max_quote=Decimal("10.2"),
+        limits=limits,
+    )
+
+    assert response["ok"] is True
+    audit_live = response.get("_local", {}).get("order_audit", {})
+    assert Decimal(audit_live.get("effective_notional")) == Decimal("10")
+    assert Decimal(audit_live.get("tolerance_adjusted_notional")) == Decimal("10.1")
+    assert Decimal(audit_live.get("order_notional")) <= tolerance_cap
+
+
 def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)
