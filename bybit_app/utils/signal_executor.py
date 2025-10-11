@@ -1589,18 +1589,36 @@ class SignalExecutor:
 
         tolerance_multiplier, _, _, _ = _resolve_slippage_tolerance("Percent", slippage_pct)
 
-        adjusted_notional = notional
+        is_minimum_buy_request = False
         if (
             side == "Buy"
-            and usable_after_reserve > 0
-            and tolerance_multiplier > 0
+            and min_notional > 0
+            and math.isfinite(min_notional)
+            and math.isfinite(notional)
         ):
-            usable_decimal = Decimal(str(usable_after_reserve))
-            tolerance_decimal = Decimal(str(tolerance_multiplier))
-            planned_decimal = Decimal(str(notional))
-            affordable = usable_decimal / tolerance_decimal
-            if affordable < planned_decimal:
-                adjusted_notional = float(affordable)
+            is_minimum_buy_request = math.isclose(
+                notional,
+                min_notional,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+
+        adjusted_notional = notional
+        if side == "Buy" and tolerance_multiplier > 0:
+            equity_for_affordability = usable_after_reserve
+            if (
+                is_minimum_buy_request
+                and available_equity > equity_for_affordability
+            ):
+                equity_for_affordability = available_equity
+
+            if equity_for_affordability > 0:
+                equity_decimal = Decimal(str(equity_for_affordability))
+                tolerance_decimal = Decimal(str(tolerance_multiplier))
+                planned_decimal = Decimal(str(notional))
+                affordable = equity_decimal / tolerance_decimal
+                if affordable < planned_decimal:
+                    adjusted_notional = float(affordable)
 
         adjusted_notional = max(adjusted_notional, 0.0)
 
@@ -1692,6 +1710,17 @@ class SignalExecutor:
             )
 
         max_quote = usable_after_reserve if side == "Buy" else None
+        if side == "Buy" and is_minimum_buy_request:
+            tolerance_multiplier_float = float(tolerance_multiplier)
+            required_quote = min_notional
+            if tolerance_multiplier_float > 0:
+                required_quote *= tolerance_multiplier_float
+            if required_quote > 0:
+                allowed_quote = required_quote
+                if available_equity > 0:
+                    allowed_quote = min(required_quote, available_equity)
+                if max_quote is None or allowed_quote > max_quote:
+                    max_quote = allowed_quote
 
         ledger_before, last_exec_id = self._ledger_rows_snapshot(settings=settings)
 
