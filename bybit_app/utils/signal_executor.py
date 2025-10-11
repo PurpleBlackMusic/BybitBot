@@ -1552,7 +1552,11 @@ class SignalExecutor:
             quote_wallet_limited_available = min(
                 available_equity, max(quote_balance_cap, 0.0)
             )
-        notional, usable_after_reserve = self._compute_notional(
+        (
+            notional,
+            usable_after_reserve,
+            reserve_relaxed_for_min,
+        ) = self._compute_notional(
             settings,
             total_equity,
             available_equity,
@@ -1605,8 +1609,12 @@ class SignalExecutor:
             )
 
             if fallback_notional_valid:
-                if notional <= 0 or (
-                    min_notional > 0 and notional < min_notional
+                if (
+                    notional <= 0
+                    or (
+                        min_notional > 0 and notional < min_notional
+                    )
+                    or (side == "Sell" and reserve_relaxed_for_min)
                 ):
                     notional = fallback_notional
                     if fallback_notional > 0:
@@ -1753,6 +1761,8 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if reserve_relaxed_for_min:
+            order_context["reserve_relaxed_for_min_notional"] = True
         if quote_wallet_cap_value is not None:
             order_context["quote_wallet_cap"] = quote_wallet_cap_value
         if quote_wallet_limited_available is not None:
@@ -3787,7 +3797,7 @@ class SignalExecutor:
         *,
         min_notional: float | None = None,
         quote_balance_cap: float | None = None,
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, float, bool]:
         try:
             reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -3825,8 +3835,29 @@ class SignalExecutor:
         reserve_base = max(reserve_base, 0.0)
         reserve_amount = reserve_base * reserve_pct / 100.0
         usable_after_reserve = max(capped_available - reserve_amount, 0.0)
-        if quote_balance_cap is not None and usable_after_reserve <= 0.0:
-            return 0.0, usable_after_reserve
+        reserve_relaxed = False
+
+        min_threshold = 0.0
+        try:
+            if min_notional is not None:
+                min_threshold = max(float(min_notional), 0.0)
+        except (TypeError, ValueError):
+            min_threshold = 0.0
+
+        pre_reserve_available = capped_available
+        if not math.isfinite(pre_reserve_available):
+            pre_reserve_available = 0.0
+        pre_reserve_available = max(pre_reserve_available, 0.0)
+
+        meets_min_pre_reserve = min_threshold > 0 and pre_reserve_available >= min_threshold
+        meets_min_post_reserve = min_threshold > 0 and usable_after_reserve >= min_threshold
+
+        if (
+            quote_balance_cap is not None
+            and usable_after_reserve <= 0.0
+            and not meets_min_pre_reserve
+        ):
+            return 0.0, usable_after_reserve, reserve_relaxed
 
         caps = []
         if usable_after_reserve > 0:
@@ -3838,26 +3869,21 @@ class SignalExecutor:
         if cap_pct > 0:
             caps.append(total_equity * cap_pct / 100.0)
 
-        if not caps:
-            return 0.0, usable_after_reserve
-
-        base_notional = min(caps)
+        base_notional = min(caps) if caps else 0.0
         sizing = max(0.0, min(float(sizing_factor), 1.0))
-        notional = round(base_notional * sizing, 2)
+        notional = round(base_notional * sizing, 2) if base_notional > 0 else 0.0
         notional = max(notional, 0.0)
 
-        min_threshold = 0.0
-        try:
-            if min_notional is not None:
-                min_threshold = max(float(min_notional), 0.0)
-        except (TypeError, ValueError):
-            min_threshold = 0.0
-
-        if min_threshold > 0 and usable_after_reserve >= min_threshold:
-            if notional == 0.0 or notional < min_threshold:
+        if min_threshold > 0:
+            if meets_min_pre_reserve:
+                if notional == 0.0 or notional < min_threshold:
+                    notional = min_threshold
+                if not meets_min_post_reserve and min_threshold > 0:
+                    reserve_relaxed = True
+            elif meets_min_post_reserve and (notional == 0.0 or notional < min_threshold):
                 notional = min_threshold
 
-        return notional, usable_after_reserve
+        return notional, usable_after_reserve, reserve_relaxed
 
     def _sell_notional_from_holdings(
         self,
