@@ -1026,6 +1026,14 @@ def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.M
     assert details.get("price_limit_hit") is True
 
 
+def test_parse_price_limit_error_details_handles_comparison_phrase() -> None:
+    message = "price_cap: 0.30. Buy order price cannot be higher than 0.2824137USDT"
+
+    details = spot_market_module.parse_price_limit_error_details(message)
+
+    assert details.get("price_cap") == "0.2824137"
+
+
 def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(twap_enabled=True, twap_slices=6)
     api = DummyAPI(_universe_payload([]))
