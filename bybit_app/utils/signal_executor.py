@@ -3686,10 +3686,46 @@ class SignalExecutor:
         if not isinstance(available_base, Decimal):
             available_base = self._decimal_from(available_base)
 
+        balance_account_type = "UNIFIED"
         if available_base is None or available_base <= 0:
             context["available_base"] = 0.0
+            context["balance_account_type"] = balance_account_type
+            fallback_snapshot = None
+            try:
+                fallback_snapshot = prepare_spot_trade_snapshot(
+                    api,
+                    symbol,
+                    include_limits=False,
+                    include_price=False,
+                    include_balances=True,
+                    account_type="SPOT",
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "guardian.auto.sell_notional.spot_fallback_error",
+                    symbol=symbol,
+                    err=str(exc),
+                )
+                context["fallback_error"] = str(exc)
+            else:
+                fallback_balances = fallback_snapshot.balances or {}
+                fallback_available = fallback_balances.get(base_asset)
+                if not isinstance(fallback_available, Decimal):
+                    fallback_available = self._decimal_from(fallback_available)
+                if fallback_available is not None and fallback_available > 0:
+                    available_base = fallback_available
+                    balance_account_type = "SPOT"
+                    context["available_base"] = float(available_base)
+            context["balance_fallback_account_type"] = "SPOT"
+            if balance_account_type == "SPOT":
+                context["balance_account_type"] = balance_account_type
+        if available_base is None or available_base <= 0:
+            context.setdefault("available_base", 0.0)
+            context.setdefault("balance_account_type", balance_account_type)
             context["error"] = "no_balance"
             return None, context, float(min_order_amt) if min_order_amt > 0 else None
+
+        context["balance_account_type"] = balance_account_type
 
         context["available_base"] = float(available_base)
 
