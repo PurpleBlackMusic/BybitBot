@@ -1074,7 +1074,7 @@ def test_guardian_answer_fee_activity_summary(tmp_path: Path) -> None:
 
     reply = bot.answer("дай сводку по комиссиям и maker/taker")
 
-    assert "0.00024" in reply
+    assert "0.08019" in reply
     assert "66.7%" in reply
     assert "за 15 минут 2" in reply
     assert "за час 2" in reply

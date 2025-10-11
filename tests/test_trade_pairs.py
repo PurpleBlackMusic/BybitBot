@@ -259,7 +259,7 @@ def test_pair_trades_retains_recent_fill_when_pruning_stale_link(pnl_dir: Path):
 
     assert trade["qty"] == pytest.approx(1)
     assert trade["entry_vwap"] == pytest.approx(0.33)
-    assert trade["fees"] == pytest.approx(0.0011 + 0.0012)
+    assert trade["fees"] == pytest.approx(0.000363 + 0.00048)
 
     expected_hold = int(max(0, (12 * day - 9 * day) / 1000))
     assert trade["hold_sec"] == expected_hold

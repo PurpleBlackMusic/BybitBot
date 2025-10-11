@@ -77,6 +77,36 @@ def test_api_key_status_success() -> None:
     assert result["details"]["mode"] == "Live"
 
 
+def test_extract_wallet_totals_converts_non_usdt_assets() -> None:
+    mark_price = 27_000.0
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {
+                            "coin": "BTC",
+                            "equity": "0.5",
+                            "availableBalance": "0.4",
+                            "availableToWithdraw": "0.3",
+                            "markPrice": str(mark_price),
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    total, tradable = live_checks.extract_wallet_totals(wallet_payload)
+    full_total, full_tradable, withdrawable = live_checks._extract_wallet_totals(wallet_payload)  # type: ignore[attr-defined]
+
+    assert total == pytest.approx(0.5 * mark_price)
+    assert tradable == pytest.approx(0.4 * mark_price)
+    assert full_total == pytest.approx(total)
+    assert full_tradable == pytest.approx(tradable)
+    assert withdrawable == pytest.approx(0.3 * mark_price)
+
+
 def test_api_key_status_handles_errors() -> None:
     class FailingAPI:
         def wallet_balance(self):  # pragma: no cover - trivial proxy
