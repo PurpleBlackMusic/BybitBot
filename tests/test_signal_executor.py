@@ -2819,6 +2819,94 @@ def test_signal_executor_skips_price_limit_price_deviation(monkeypatch: pytest.M
     assert call_counter["value"] == 1
 
 
+def test_signal_executor_retries_price_limit_price_deviation_with_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    call_records: list[dict[str, object]] = []
+
+    def fake_place(*_args, **kwargs):
+        call_records.append(dict(kwargs))
+        if len(call_records) == 1:
+            raise OrderValidationError(
+                "Ожидаемая цена превышает допустимый предел для инструмента.",
+                code="price_deviation",
+                details={
+                    "side": "buy",
+                    "limit_price": "0.332757",
+                    "price_cap": "0.2883219",
+                    "price_limit_hit": True,
+                    "requested_quote": "150.0",
+                    "available_quote": "45.0",
+                },
+            )
+        return {"retCode": 0, "result": {"orderId": "stub-order"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    def fake_read_ledger(
+        limit: int | None = None,
+        *,
+        settings: object | None = None,
+        last_exec_id: str | None = None,
+        return_meta: bool = False,
+        **_: object,
+    ):
+        rows: list[dict[str, object]] = []
+        if return_meta:
+            return rows, None, {}
+        return rows
+
+    monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
+    monkeypatch.setattr(
+        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], {})
+    )
+    monkeypatch.setattr(signal_executor_module.ws_manager, "private_snapshot", lambda: {})
+
+    executor = SignalExecutor(bot)
+
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(call_records) == 2
+
+    first_qty = float(call_records[0]["qty"])
+    retry_qty = float(call_records[1]["qty"])
+    assert retry_qty < first_qty
+
+    assert result.order is not None
+    assert result.order.get("notional_quote") == pytest.approx(retry_qty)
+
+    assert result.context is not None
+    adjustments = result.context.get("price_limit_adjustments")
+    assert isinstance(adjustments, list) and adjustments
+    assert adjustments[0].get("notional_quote") == pytest.approx(retry_qty)
+
+    backoff_meta = result.context.get("price_limit_backoff")
+    assert isinstance(backoff_meta, dict)
+    assert backoff_meta.get("retries") == 1
+    assert "ETHUSDT" not in executor._symbol_quarantine
+
+
 def test_signal_executor_handles_runtime_price_limit_error(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(
