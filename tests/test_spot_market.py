@@ -1026,6 +1026,38 @@ def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.M
     assert details.get("price_limit_hit") is True
 
 
+def test_place_spot_market_wraps_price_floor_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = DummyAPI(_universe_payload([]))
+
+    limits = _basic_limits()
+    limits["min_price"] = "98.5"
+
+    def failing_place_order(**_kwargs):
+        raise RuntimeError("Bybit error 170194: lower price limit breached")
+
+    monkeypatch.setattr(api, "place_order", failing_place_order)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Sell",
+            qty=Decimal("0.2"),
+            unit="baseCoin",
+            tol_type="Percent",
+            tol_value=Decimal("2.0"),
+            price_snapshot=Decimal("99"),
+            balances={"BTC": Decimal("1")},
+            limits=limits,
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "price_deviation"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("price_floor") == "98.5"
+    assert details.get("price_limit_hit") is True
+
+
 def test_parse_price_limit_error_details_handles_comparison_phrase() -> None:
     message = "price_cap: 0.30. Buy order price cannot be higher than 0.2824137USDT"
 

@@ -1727,12 +1727,19 @@ class SignalExecutor:
                 context=validation_context,
             )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
+            error_text = str(exc)
             error_code = _extract_bybit_error_code(exc)
-            if error_code == "170193":
+            if error_code is None:
+                if "170193" in error_text:
+                    error_code = "170193"
+                elif "170194" in error_text:
+                    error_code = "170194"
+
+            if error_code in {"170193", "170194"}:
                 formatted_error = _format_bybit_error(exc)
                 self._record_validation_penalty(symbol, "price_deviation")
 
-                details = parse_price_limit_error_details(str(exc))
+                details = parse_price_limit_error_details(error_text)
                 if side == "Buy":
                     details.setdefault("requested_quote", f"{adjusted_notional}")
                 else:

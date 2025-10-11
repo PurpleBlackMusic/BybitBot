@@ -2406,11 +2406,18 @@ def place_spot_market_with_tolerance(
         try:
             response = api.place_order(**prepared.payload)
         except RuntimeError as exc:
-            error_code = _extract_bybit_error_code_from_message(str(exc))
-            if error_code != "170193":
+            error_text = str(exc)
+            error_code = _extract_bybit_error_code_from_message(error_text)
+            if error_code is None:
+                if "170193" in error_text:
+                    error_code = "170193"
+                elif "170194" in error_text:
+                    error_code = "170194"
+
+            if error_code not in {"170193", "170194"}:
                 raise
 
-            details = parse_price_limit_error_details(str(exc))
+            details = parse_price_limit_error_details(error_text)
             side_normalised = str(side or "").strip().lower()
             if "price_cap" not in details:
                 audit_cap = prepared.audit.get("price_ceiling")
