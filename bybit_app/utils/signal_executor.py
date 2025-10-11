@@ -1913,13 +1913,44 @@ class SignalExecutor:
                         required_base = (
                             _safe_float(details.get("required")) if details else None
                         )
-                        price_snapshot = _safe_float(
+                        best_bid = _safe_float(details.get("best_bid")) if details else None
+                        fallback_price_snapshot = _safe_float(
                             fallback_context.get("price_snapshot")
                         )
+                        price_snapshot = best_bid
+                        if (price_snapshot is None or price_snapshot <= 0) and fallback_price_snapshot:
+                            price_snapshot = fallback_price_snapshot
                         fallback_quote = _safe_float(
                             fallback_context.get("quote_notional")
                         )
-                        if required_base is None and price_snapshot and price_snapshot > 0:
+                        refreshed_price: Optional[float] = None
+                        if required_base is None and api is not None:
+                            try:
+                                refreshed_snapshot = prepare_spot_trade_snapshot(
+                                    api,
+                                    symbol,
+                                    include_limits=False,
+                                    include_price=True,
+                                    include_balances=False,
+                                    force_refresh=True,
+                                )
+                            except Exception as refresh_exc:  # pragma: no cover - defensive logging
+                                log(
+                                    "guardian.auto.order.retry_balance.refresh_error",
+                                    symbol=symbol,
+                                    err=str(refresh_exc),
+                                )
+                            else:
+                                if refreshed_snapshot and refreshed_snapshot.price is not None:
+                                    refreshed_price = _safe_float(refreshed_snapshot.price)
+                                    if refreshed_price and refreshed_price > 0:
+                                        price_snapshot = refreshed_price
+                                        required_base = current_notional / refreshed_price
+                        if (
+                            required_base is None
+                            and price_snapshot is not None
+                            and price_snapshot > 0
+                        ):
                             required_base = current_notional / price_snapshot
                         if (
                             required_base is None
@@ -1929,6 +1960,7 @@ class SignalExecutor:
                         ):
                             implied_price = fallback_quote / fallback_available
                             if implied_price > 0:
+                                price_snapshot = implied_price
                                 required_base = current_notional / implied_price
                         if (
                             available_base is not None
@@ -1956,6 +1988,7 @@ class SignalExecutor:
                                         available_base=available_base,
                                         required_base=required_base,
                                         scaling=scaling,
+                                        price_snapshot=price_snapshot,
                                     )
                                     current_notional = clipped_notional
                                     adjustment_entry = {
@@ -1966,6 +1999,8 @@ class SignalExecutor:
                                     }
                                     if price_snapshot and price_snapshot > 0:
                                         adjustment_entry["price_snapshot"] = price_snapshot
+                                    if refreshed_price and refreshed_price > 0:
+                                        adjustment_entry["refreshed_price"] = refreshed_price
                                     order_context.setdefault(
                                         "insufficient_balance_adjustments",
                                         [],

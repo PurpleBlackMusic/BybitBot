@@ -1787,6 +1787,125 @@ def test_signal_executor_sell_caps_notional_to_wallet_holdings(
     assert pytest.approx(float(fallback.get("requested_notional_quote")), rel=1e-9) == 100.0
 
 
+def test_signal_executor_sell_refreshes_price_for_insufficient_balance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "BTCUSDT",
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=400.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    available_base = Decimal("0.1")
+    unified_snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("1000"),
+        balances={"BTC": available_base},
+        limits={"base_coin": "BTC", "min_order_amt": Decimal("5")},
+    )
+    spot_snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=None,
+        balances={"BTC": Decimal("0")},
+        limits=None,
+    )
+    refreshed_snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("900"),
+        balances=None,
+        limits=None,
+    )
+
+    refresh_calls: list[dict[str, object]] = []
+
+    def fake_snapshot(api_obj, symbol, **kwargs: object) -> SpotTradeSnapshot:
+        if kwargs.get("force_refresh"):
+            refresh_calls.append(dict(kwargs))
+            return refreshed_snapshot
+        if kwargs.get("account_type") == "SPOT":
+            return spot_snapshot
+        return unified_snapshot
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        fake_snapshot,
+    )
+
+    attempts: list[float] = []
+
+    def fake_place(
+        api_obj,
+        symbol: str,
+        side: str,
+        qty: object,
+        unit: str,
+        tol_type: str,
+        tol_value: float,
+        max_quote: object | None,
+        settings: Settings,
+    ) -> dict[str, object]:
+        qty_float = float(qty)
+        attempts.append(qty_float)
+        if len(attempts) == 1:
+            raise OrderValidationError(
+                "Недостаточно базового актива для продажи.",
+                code="insufficient_balance",
+                details={"best_bid": "900"},
+            )
+        return {
+            "retCode": 0,
+            "result": {
+                "orderId": "sell-refresh",
+                "cumExecQty": str(available_base),
+                "cumExecValue": str(Decimal("900") * available_base),
+                "avgPrice": "900",
+            },
+        }
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert attempts and len(attempts) == 2
+    assert attempts[1] < attempts[0]
+    assert pytest.approx(attempts[0], rel=1e-9) == 100.0
+    assert pytest.approx(attempts[1], rel=1e-9) == 90.0
+    assert refresh_calls, "expected refreshed snapshot request"
+
+    assert result.status == "filled"
+    assert result.context is not None
+    adjustments = result.context.get("insufficient_balance_adjustments")
+    assert isinstance(adjustments, list) and adjustments
+    latest_adjustment = adjustments[-1]
+    assert pytest.approx(latest_adjustment.get("required_base"), rel=1e-9) == pytest.approx(
+        float(attempts[0]) / 900.0,
+        rel=1e-9,
+    )
+    assert pytest.approx(latest_adjustment.get("price_snapshot"), rel=1e-9) == 900.0
+    assert result.order is not None
+    assert pytest.approx(float(result.order.get("notional_quote")), rel=1e-9) == 90.0
+
+
 def test_signal_executor_guard_forces_sell_on_time_and_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
