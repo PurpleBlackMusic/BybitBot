@@ -1542,24 +1542,46 @@ class SignalExecutor:
         )
 
         fallback_context: Optional[Dict[str, object]] = None
+        fallback_applied_notional: Optional[float] = None
+        risk_limited_notional: Optional[float] = None
         if forced_exit_meta and side == "Sell":
             forced_notional = forced_exit_meta.get("quote_notional")
             if isinstance(forced_notional, (int, float)) and forced_notional > 0:
                 notional = float(forced_notional)
             elif isinstance(forced_exit_meta.get("qty"), (int, float)):
                 notional = 0.0
-        if side == "Sell" and notional <= 0:
-            fallback_notional, fallback_context, fallback_min_notional = (
-                self._sell_notional_from_holdings(
-                    api,
-                    symbol,
-                    summary=summary,
+        if side == "Sell":
+            risk_limited_notional = notional
+            needs_fallback = notional <= 0
+            if not needs_fallback and min_notional > 0:
+                needs_fallback = notional < min_notional
+            if needs_fallback:
+                fallback_notional, fallback_context, fallback_min_notional = (
+                    self._sell_notional_from_holdings(
+                        api,
+                        symbol,
+                        summary=summary,
+                    )
                 )
-            )
-            if fallback_min_notional is not None and fallback_min_notional > min_notional:
-                min_notional = fallback_min_notional
-            if fallback_notional is not None and fallback_notional > 0:
-                notional = fallback_notional
+                if (
+                    fallback_min_notional is not None
+                    and fallback_min_notional > min_notional
+                ):
+                    min_notional = fallback_min_notional
+                effective_min = min_notional if min_notional > 0 else 0.0
+                if (
+                    fallback_notional is not None
+                    and math.isfinite(fallback_notional)
+                    and fallback_notional >= effective_min
+                ):
+                    notional = fallback_notional
+                    fallback_applied_notional = fallback_notional
+                elif fallback_notional is not None and fallback_notional > 0:
+                    # Preserve positive fallback context even if it's below exchange minimum.
+                    fallback_applied_notional = None
+            if fallback_context is not None and fallback_applied_notional is not None:
+                fallback_context = dict(fallback_context)
+                fallback_context["applied_notional"] = fallback_applied_notional
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
@@ -1611,6 +1633,21 @@ class SignalExecutor:
         }
         if fallback_context:
             order_context["sell_fallback"] = fallback_context
+        if fallback_applied_notional is not None:
+            order_context["sell_fallback_applied"] = True
+            order_context["sell_fallback_notional_quote"] = fallback_applied_notional
+            if (
+                risk_limited_notional is not None
+                and not math.isclose(
+                    risk_limited_notional,
+                    fallback_applied_notional,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            ):
+                order_context["risk_limited_notional_quote"] = risk_limited_notional
+        elif risk_limited_notional is not None and side == "Sell":
+            order_context["risk_limited_notional_quote"] = risk_limited_notional
         if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
             order_context["requested_notional_quote"] = notional
         if symbol_meta:
