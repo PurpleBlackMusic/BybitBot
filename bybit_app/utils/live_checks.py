@@ -218,12 +218,31 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, fl
     if not isinstance(accounts, Iterable):
         return 0.0, 0.0, 0.0
 
+    account_rows = [account for account in accounts if isinstance(account, dict)]
+    if not account_rows:
+        return 0.0, 0.0, 0.0
+
+    def _normalized_account_type(account: Dict[str, object]) -> Optional[str]:
+        raw_type = account.get("accountType")
+        if isinstance(raw_type, str):
+            value = raw_type.strip().upper()
+            if value:
+                return value
+        return None
+
+    preferred_account_types = {"UNIFIED", "SPOT"}
+    preferred_accounts = [
+        account
+        for account in account_rows
+        if _normalized_account_type(account) in preferred_account_types
+    ]
+
+    accounts_to_use = preferred_accounts or account_rows
+
     total = 0.0
     tradable = 0.0
     withdrawable = 0.0
-    for account in accounts:
-        if not isinstance(account, dict):
-            continue
+    for account in accounts_to_use:
 
         coins_source = account.get("coin") or account.get("coins")
         coin_rows: Tuple[Dict[str, object], ...] = tuple()
