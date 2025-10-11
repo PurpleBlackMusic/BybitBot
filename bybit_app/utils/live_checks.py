@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings, active_api_key, active_api_secret, active_dry_run
@@ -230,14 +230,19 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, fl
                 return value
         return None
 
-    preferred_account_types = {"UNIFIED", "SPOT"}
-    preferred_accounts = [
-        account
-        for account in account_rows
-        if _normalized_account_type(account) in preferred_account_types
-    ]
+    account_type_map: Dict[str, List[Dict[str, object]]] = {}
+    for account in account_rows:
+        account_type = _normalized_account_type(account)
+        if not account_type:
+            continue
+        account_type_map.setdefault(account_type, []).append(account)
 
-    accounts_to_use = preferred_accounts or account_rows
+    accounts_to_use: Iterable[Dict[str, object]] = account_rows
+    for preferred_type in ("UNIFIED", "SPOT"):
+        preferred_accounts = account_type_map.get(preferred_type)
+        if preferred_accounts:
+            accounts_to_use = (preferred_accounts[0],)
+            break
 
     total = 0.0
     tradable = 0.0
