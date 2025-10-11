@@ -1401,11 +1401,25 @@ def _twap_price_deviation_ratio(details: Mapping[str, object] | None) -> Decimal
             ratio = limit_price / max_allowed
             return ratio if ratio > 1 else None
 
+    price_cap_value = details.get("price_cap")
+    if price_cap_value is not None:
+        price_cap = _to_decimal(price_cap_value)
+        if price_cap > 0:
+            ratio = limit_price / price_cap
+            return ratio if ratio > 1 else None
+
     min_allowed_value = details.get("min_allowed")
     if min_allowed_value is not None:
         min_allowed = _to_decimal(min_allowed_value)
         if min_allowed > 0:
             ratio = min_allowed / limit_price
+            return ratio if ratio > 1 else None
+
+    price_floor_value = details.get("price_floor")
+    if price_floor_value is not None:
+        price_floor = _to_decimal(price_floor_value)
+        if price_floor > 0:
+            ratio = price_floor / limit_price
             return ratio if ratio > 1 else None
 
     return None
@@ -2366,26 +2380,24 @@ def place_spot_market_with_tolerance(
                     "target_slices": target_slices,
                 }
                 ratio = _twap_price_deviation_ratio(getattr(exc, "details", {}) or {})
+                scaled_target = target_slices
                 if isinstance(ratio, Decimal):
                     adjustment["ratio"] = _format_decimal(ratio)
+                    scaled_target = _twap_scaled_slices(target_slices, ratio, max_slices)
                 if not twap_active:
                     twap_active = True
-                    if target_slices < max_slices:
-                        new_target = _twap_scaled_slices(target_slices, ratio, max_slices)
-                        if new_target != target_slices:
-                            target_slices = new_target
+                    if scaled_target != target_slices:
+                        target_slices = scaled_target
                     adjustment["action"] = "activate"
                     adjustment["target_slices"] = target_slices
                     twap_adjustments.append(adjustment)
                     continue
-                if target_slices < max_slices:
-                    new_target = _twap_scaled_slices(target_slices, ratio, max_slices)
-                    if new_target > target_slices:
-                        target_slices = new_target
-                        adjustment["action"] = "increase"
-                        adjustment["target_slices"] = target_slices
-                        twap_adjustments.append(adjustment)
-                        continue
+                if scaled_target > target_slices:
+                    target_slices = scaled_target
+                    adjustment["action"] = "increase"
+                    adjustment["target_slices"] = target_slices
+                    twap_adjustments.append(adjustment)
+                    continue
             raise
 
         min_order_amt_candidate = _to_decimal(prepared.audit.get("min_order_amt"))

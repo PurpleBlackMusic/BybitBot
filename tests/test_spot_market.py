@@ -1205,6 +1205,76 @@ def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
     assert adjustments[0].get("ratio") == "10"
 
 
+def test_place_spot_market_twap_uses_price_cap_ratio(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=2)
+    settings.twap_slices_max = 10
+    api = DummyAPI(_universe_payload([]))
+
+    requested: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        requested.append(qty_decimal)
+        if qty_decimal > Decimal("12"):
+            raise OrderValidationError(
+                "price cap hit",
+                code="price_deviation",
+                details={"limit_price": "120", "price_cap": "10"},
+            )
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "1",
+            "timeInForce": "GTC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+            "marketUnit": "quoteCoin",
+        }
+        audit = {"quote_step": "0.01", "qty_step": "0.00000001"}
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    place_payloads: list[dict] = []
+
+    def fake_place_order(**payload):
+        place_payloads.append(payload)
+        qty_value = Decimal(str(payload.get("qty", "0")))
+        return {
+            "result": {
+                "cumExecQty": format(qty_value, "f"),
+                "cumExecValue": format(qty_value, "f"),
+                "avgPrice": "1",
+            }
+        }
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("120"),
+        unit="quoteCoin",
+        settings=settings,
+    )
+
+    assert requested[0] == Decimal("120")
+    assert requested[1] == Decimal("12")
+    assert all(q == Decimal("12") for q in requested[1:])
+    assert len(place_payloads) == 10
+    assert all(payload.get("qty") == "12" for payload in place_payloads)
+
+    local_meta = response.get("_local", {}) if isinstance(response, dict) else {}
+    twap_meta = local_meta.get("twap", {})
+    assert twap_meta.get("active") is True
+    assert twap_meta.get("target_slices") == 10
+    adjustments = twap_meta.get("adjustments") or []
+    assert adjustments and adjustments[0].get("ratio") == "12"
+
+
 def test_place_spot_market_twap_skips_tail_below_min_notional(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
