@@ -1543,6 +1543,8 @@ class SignalExecutor:
 
         fallback_context: Optional[Dict[str, object]] = None
         fallback_applied_notional: Optional[float] = None
+        fallback_adjustment_reason: Optional[str] = None
+        fallback_relevant = False
         risk_limited_notional: Optional[float] = None
         if forced_exit_meta and side == "Sell":
             forced_notional = forced_exit_meta.get("quote_notional")
@@ -1552,36 +1554,83 @@ class SignalExecutor:
                 notional = 0.0
         if side == "Sell":
             risk_limited_notional = notional
-            needs_fallback = notional <= 0
-            if not needs_fallback and min_notional > 0:
-                needs_fallback = notional < min_notional
-            if needs_fallback:
-                fallback_notional, fallback_context, fallback_min_notional = (
-                    self._sell_notional_from_holdings(
-                        api,
-                        symbol,
-                        summary=summary,
-                    )
+            fallback_notional: Optional[float]
+            fallback_min_notional: Optional[float]
+            fallback_notional, fallback_context, fallback_min_notional = (
+                self._sell_notional_from_holdings(
+                    api,
+                    symbol,
+                    summary=summary,
                 )
-                if (
-                    fallback_min_notional is not None
-                    and fallback_min_notional > min_notional
-                ):
-                    min_notional = fallback_min_notional
-                effective_min = min_notional if min_notional > 0 else 0.0
-                if (
-                    fallback_notional is not None
-                    and math.isfinite(fallback_notional)
-                    and fallback_notional >= effective_min
+            )
+            if (
+                fallback_min_notional is not None
+                and fallback_min_notional > min_notional
+            ):
+                min_notional = fallback_min_notional
+
+            fallback_notional_valid = (
+                fallback_notional is not None
+                and math.isfinite(fallback_notional)
+                and fallback_notional >= (min_notional if min_notional > 0 else 0.0)
+            )
+
+            if fallback_notional_valid:
+                if notional <= 0 or (
+                    min_notional > 0 and notional < min_notional
                 ):
                     notional = fallback_notional
-                    fallback_applied_notional = fallback_notional
-                elif fallback_notional is not None and fallback_notional > 0:
-                    # Preserve positive fallback context even if it's below exchange minimum.
-                    fallback_applied_notional = None
+                    if fallback_notional > 0:
+                        fallback_applied_notional = fallback_notional
+                    fallback_adjustment_reason = "risk"
+                elif (
+                    fallback_notional < notional
+                    and not math.isclose(
+                        fallback_notional,
+                        notional,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                ):
+                    notional = fallback_notional
+                    if fallback_notional > 0:
+                        fallback_applied_notional = fallback_notional
+                    fallback_adjustment_reason = "wallet"
+            elif (
+                fallback_notional is not None
+                and fallback_notional > 0
+                and fallback_context is not None
+            ):
+                # Preserve positive fallback context even if it's below exchange minimum.
+                fallback_applied_notional = None
+
             if fallback_context is not None and fallback_applied_notional is not None:
                 fallback_context = dict(fallback_context)
                 fallback_context["applied_notional"] = fallback_applied_notional
+                if fallback_adjustment_reason:
+                    fallback_context["adjustment_reason"] = fallback_adjustment_reason
+                if risk_limited_notional is not None:
+                    fallback_context[
+                        "risk_limited_notional_quote"
+                    ] = risk_limited_notional
+                    if fallback_adjustment_reason == "wallet":
+                        fallback_context[
+                            "requested_notional_quote"
+                        ] = risk_limited_notional
+
+            if fallback_adjustment_reason is not None:
+                fallback_relevant = True
+            elif (
+                fallback_notional is not None
+                and fallback_notional > 0
+                and not fallback_notional_valid
+            ):
+                fallback_relevant = True
+            elif fallback_context is not None and isinstance(fallback_context, Mapping):
+                fallback_relevant = bool(fallback_context.get("error"))
+
+            if not fallback_relevant:
+                fallback_context = None
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
