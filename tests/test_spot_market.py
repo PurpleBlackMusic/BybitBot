@@ -1118,6 +1118,65 @@ def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
     assert adjusted_slippage >= 0.5
 
 
+def test_price_limit_band_violation_reports_zero_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    orderbook = {"result": {"a": [["110", "1"], ["115", "2"]], "b": [["90", "1"]]}}
+    api = DummyAPI(_universe_payload([]), orderbook_payload=orderbook)
+
+    limits = _basic_limits()
+    limits["max_price"] = "100"
+
+    def fake_plan_limit_ioc_order(**_kwargs):
+        return Decimal("110"), Decimal("0"), Decimal("0"), []
+
+    monkeypatch.setattr(spot_market_module, "_plan_limit_ioc_order", fake_plan_limit_ioc_order)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("10"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("0.5"),
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("1000")},
+            limits=limits,
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "price_deviation"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("price_cap") == "100"
+    assert details.get("price_limit_hit") is True
+    assert details.get("available_quote") == "0"
+    assert details.get("available_base") == "0"
+    assert "requested_quote" in details and "requested_base" in details
+
+    requested_quote = Decimal(details.get("requested_quote", "0"))
+
+    executor = SignalExecutor(object())
+    backoff_state = executor._record_price_limit_hit(
+        "BTCUSDT",
+        details,
+        last_notional=float(requested_quote),
+        last_slippage=0.5,
+    )
+    assert backoff_state.get("available_quote") == 0.0
+
+    adjusted_notional, adjusted_slippage, adjustments = executor._apply_price_limit_backoff(
+        "BTCUSDT",
+        "Buy",
+        float(requested_quote),
+        0.5,
+        0.0,
+    )
+
+    assert adjusted_notional < float(requested_quote)
+    assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    assert adjusted_slippage >= 0.5
+
+
 def test_parse_price_limit_error_details_handles_comparison_phrase() -> None:
     message = "price_cap: 0.30. Buy order price cannot be higher than 0.2824137USDT"
 

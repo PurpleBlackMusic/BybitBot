@@ -1829,10 +1829,20 @@ def prepare_spot_market_order(
 
         context: Dict[str, Decimal] = {}
 
-        if matched_quote is not None:
-            context["available_quote"] = matched_quote
-        if matched_base is not None:
-            context["available_base"] = matched_base
+        price_band_blocked = False
+        if side_normalised == "buy" and max_price_allowed is not None:
+            price_band_blocked = limit_price - max_price_allowed > _TOLERANCE_MARGIN
+        elif side_normalised == "sell" and min_price_allowed is not None:
+            price_band_blocked = min_price_allowed - limit_price > _TOLERANCE_MARGIN
+
+        if price_band_blocked and not consumed_levels:
+            context["available_quote"] = Decimal("0")
+            context["available_base"] = Decimal("0")
+        else:
+            if matched_quote is not None:
+                context["available_quote"] = matched_quote
+            if matched_base is not None:
+                context["available_base"] = matched_base
 
         requested_quote_value: Optional[Decimal] = None
         if target_quote is not None and target_quote > 0:
