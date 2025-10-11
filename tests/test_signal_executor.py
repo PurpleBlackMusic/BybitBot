@@ -2757,7 +2757,9 @@ def test_signal_executor_handles_runtime_price_limit_error(monkeypatch: pytest.M
 
     def failing_place(*_args, **_kwargs):
         call_counter["value"] += 1
-        raise RuntimeError("Bybit error 170193: price exceeds price_cap 101.23")
+        raise RuntimeError(
+            "Bybit error 170193: Buy order price cannot be higher than 0.2824137USDT"
+        )
 
     monkeypatch.setattr(
         signal_executor_module, "place_spot_market_with_tolerance", failing_place
@@ -2784,7 +2786,7 @@ def test_signal_executor_handles_runtime_price_limit_error(monkeypatch: pytest.M
     details = result.context.get("validation_details")
     assert isinstance(details, dict)
     assert details.get("price_limit_hit") is True
-    assert details.get("price_cap") == "101.23"
+    assert details.get("price_cap") == "0.2824137"
 
     backoff_state = executor._price_limit_backoff.get("ETHUSDT")
     assert isinstance(backoff_state, dict)

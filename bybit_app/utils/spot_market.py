@@ -33,6 +33,20 @@ _PRICE_LIMIT_FIELDS = re.compile(
     re.IGNORECASE,
 )
 
+_PRICE_LIMIT_COMPARISONS = re.compile(
+    r"""
+    (?:\b(?:buy|sell|your|the)\b\s*)?
+    (?:order\s+)?
+    price
+    \s+cannot\s+be\s+
+    (?P<comparison>higher|greater|lower|less)
+    \s+than\s+
+    (?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)
+    \s*(?P<currency>[A-Za-z]{2,10})?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _PRICE_LIMIT_KEY_ALIASES = {
     "price_cap": {"pricecap", "maxprice", "upperlimit", "upperprice", "pricelimitupper"},
     "price_floor": {"pricefloor", "minprice", "lowerlimit", "lowerprice", "pricelimitlower"},
@@ -165,9 +179,9 @@ def _normalise_price_limit_key(raw: str) -> Optional[str]:
 def parse_price_limit_error_details(message: str) -> Dict[str, str]:
     """Extract price limit hints from a Bybit error message."""
 
-    details: Dict[str, str] = {}
+    hints: Dict[str, tuple[int, str]] = {}
     if not message:
-        return details
+        return {}
 
     for match in _PRICE_LIMIT_FIELDS.finditer(message):
         raw_key = match.group("key")
@@ -175,9 +189,28 @@ def parse_price_limit_error_details(message: str) -> Dict[str, str]:
         if not raw_key or not value:
             continue
         key = _normalise_price_limit_key(raw_key)
-        if key:
-            details[key] = value
-    return details
+        if not key:
+            continue
+        hints[key] = (0, value)
+
+    for match in _PRICE_LIMIT_COMPARISONS.finditer(message):
+        comparison = match.group("comparison")
+        value = match.group("value")
+        if not comparison or not value:
+            continue
+        comparison_lower = comparison.lower()
+        if comparison_lower in ("higher", "greater"):
+            key = "price_cap"
+        elif comparison_lower in ("lower", "less"):
+            key = "price_floor"
+        else:
+            continue
+
+        previous = hints.get(key)
+        if previous is None or previous[0] < 1:
+            hints[key] = (1, value)
+
+    return {key: value for key, (_priority, value) in hints.items()}
 
 _WALLET_AVAILABLE_FIELDS = (
     "totalAvailableBalance",
