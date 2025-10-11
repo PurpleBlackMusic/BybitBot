@@ -1132,6 +1132,83 @@ def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: 
     assert adjustments and adjustments[0].get("action") == "activate"
 
 
+def test_place_spot_market_twap_handles_price_limited_liquidity(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=2)
+    setattr(settings, "twap_slices_max", 8)
+    api = DummyAPI(_universe_payload([]))
+
+    requested: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        requested.append(qty_decimal)
+        if len(requested) == 1:
+            raise OrderValidationError(
+                "insufficient depth",
+                code="insufficient_liquidity",
+                details={
+                    "requested_quote": "120",
+                    "available_quote": "30",
+                    "price_limit_hit": True,
+                    "price_cap": "1.05",
+                    "side": "buy",
+                },
+            )
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "1",
+            "timeInForce": "GTC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+            "marketUnit": "quoteCoin",
+        }
+        audit = {"quote_step": "0.01", "qty_step": "0.00000001"}
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    place_payloads: list[dict] = []
+
+    def fake_place_order(**payload):
+        place_payloads.append(payload)
+        qty_value = Decimal(str(payload.get("qty", "0")))
+        return {
+            "result": {
+                "cumExecQty": format(qty_value, "f"),
+                "cumExecValue": format(qty_value, "f"),
+                "avgPrice": "1",
+            }
+        }
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("120"),
+        unit="quoteCoin",
+        settings=settings,
+    )
+
+    assert requested[0] == Decimal("120")
+    assert all(q == Decimal("30") for q in requested[1:])
+    assert len(place_payloads) == 4
+    assert all(payload.get("qty") == "30" for payload in place_payloads)
+
+    local_meta = response.get("_local", {}) if isinstance(response, dict) else {}
+    twap_meta = local_meta.get("twap", {})
+    assert twap_meta.get("active") is True
+    assert twap_meta.get("target_slices") == 4
+    assert twap_meta.get("orders_sent") == 4
+    adjustments = twap_meta.get("adjustments") or []
+    assert adjustments and adjustments[0].get("action") == "activate"
+    assert adjustments[0].get("ratio") == "0.25"
+
+
 def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

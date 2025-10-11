@@ -1425,6 +1425,26 @@ def _twap_scaled_slices(current: int, ratio: Decimal | None, max_slices: int) ->
     return min(max_slices, candidate)
 
 
+def _twap_slices_from_fill_ratio(current: int, fill_ratio: Decimal | None, max_slices: int) -> int:
+    if not isinstance(fill_ratio, Decimal):
+        return current
+    if fill_ratio >= 1:
+        return current
+    if fill_ratio <= 0:
+        return current
+
+    try:
+        required = int((Decimal(1) / fill_ratio).to_integral_value(rounding=ROUND_UP))
+    except InvalidOperation:  # pragma: no cover - defensive
+        required = int(ceil(1.0 / float(fill_ratio)))
+
+    if required < 1:
+        required = 1
+
+    candidate = max(current, required)
+    return min(max_slices, candidate)
+
+
 def prepare_spot_trade_snapshot(
     api: BybitAPI,
     symbol: str,
@@ -2358,14 +2378,69 @@ def place_spot_market_with_tolerance(
                 settings=settings,
             )
         except OrderValidationError as exc:
-            if twap_cfg.enabled and exc.code == "price_deviation":
+            details_mapping = getattr(exc, "details", {}) or {}
+            if (
+                twap_cfg.enabled
+                and exc.code == "insufficient_liquidity"
+                and isinstance(details_mapping, Mapping)
+                and details_mapping.get("price_limit_hit")
+            ):
+                requested_key = None
+                available_key = None
+                if "requested_quote" in details_mapping and "available_quote" in details_mapping:
+                    requested_key = "requested_quote"
+                    available_key = "available_quote"
+                elif "requested_base" in details_mapping and "available_base" in details_mapping:
+                    requested_key = "requested_base"
+                    available_key = "available_base"
+
+                ratio: Decimal | None = None
+                if requested_key and available_key:
+                    requested_value = _to_decimal(details_mapping.get(requested_key))
+                    available_value = _to_decimal(details_mapping.get(available_key))
+                    if requested_value > 0 and available_value > 0:
+                        ratio = available_value / requested_value
+                        if ratio > Decimal(1):
+                            ratio = Decimal(1)
+
                 adjustment: Dict[str, object] = {
                     "code": exc.code,
                     "message": str(exc),
                     "remaining_qty": _format_decimal(remaining_qty),
                     "target_slices": target_slices,
+                    "price_limit": True,
                 }
-                ratio = _twap_price_deviation_ratio(getattr(exc, "details", {}) or {})
+                if isinstance(ratio, Decimal):
+                    adjustment["ratio"] = _format_decimal(ratio)
+
+                if not isinstance(ratio, Decimal) or ratio <= 0:
+                    adjustment["action"] = "error"
+                    twap_adjustments.append(adjustment)
+                    raise
+
+                was_active = twap_active
+                twap_active = True
+                new_target = target_slices
+                if target_slices < max_slices:
+                    new_target = _twap_slices_from_fill_ratio(target_slices, ratio, max_slices)
+
+                action = "activate" if not was_active else "maintain"
+                if new_target > target_slices:
+                    target_slices = new_target
+                    action = "increase" if was_active else "activate"
+                adjustment["action"] = action
+                adjustment["target_slices"] = target_slices
+                twap_adjustments.append(adjustment)
+                continue
+
+            if twap_cfg.enabled and exc.code == "price_deviation":
+                adjustment = {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "remaining_qty": _format_decimal(remaining_qty),
+                    "target_slices": target_slices,
+                }
+                ratio = _twap_price_deviation_ratio(details_mapping)
                 if isinstance(ratio, Decimal):
                     adjustment["ratio"] = _format_decimal(ratio)
                 if not twap_active:
