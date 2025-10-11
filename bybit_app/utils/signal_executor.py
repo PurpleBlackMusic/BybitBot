@@ -53,6 +53,7 @@ _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
+_PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -1624,116 +1625,154 @@ class SignalExecutor:
 
         ledger_before, last_exec_id = self._ledger_rows_snapshot(settings=settings)
 
+        attempts = 0
+        max_attempts = max(int(_PRICE_LIMIT_MAX_IMMEDIATE_RETRIES), 1)
+        current_notional = adjusted_notional
+        current_slippage = slippage_pct
+        response: Optional[Mapping[str, object]] = None
+
         try:
-            response = place_spot_market_with_tolerance(
-                api,
-                symbol=symbol,
-                side=side,
-                qty=adjusted_notional,
-                unit="quoteCoin",
-                tol_type="Percent",
-                tol_value=slippage_pct,
-                max_quote=max_quote,
-                settings=settings,
-            )
-        except OrderValidationError as exc:
-            self._record_validation_penalty(symbol, exc.code)
-            validation_context = dict(order_context)
-            validation_context["validation_code"] = exc.code
-            if exc.details:
-                validation_context["validation_details"] = exc.details
-            log(
-                "guardian.auto.order.validation_failed",
-                error=exc.to_dict(),
-                context=validation_context,
-            )
+            while True:
+                attempts += 1
+                order_context["notional_quote"] = current_notional
+                try:
+                    response = place_spot_market_with_tolerance(
+                        api,
+                        symbol=symbol,
+                        side=side,
+                        qty=current_notional,
+                        unit="quoteCoin",
+                        tol_type="Percent",
+                        tol_value=current_slippage,
+                        max_quote=max_quote,
+                        settings=settings,
+                    )
+                    adjusted_notional = current_notional
+                    slippage_pct = current_slippage
+                    break
+                except OrderValidationError as exc:
+                    self._record_validation_penalty(symbol, exc.code)
+                    validation_context = dict(order_context)
+                    validation_context["validation_code"] = exc.code
+                    if exc.details:
+                        validation_context["validation_details"] = exc.details
+                    log(
+                        "guardian.auto.order.validation_failed",
+                        error=exc.to_dict(),
+                        context=validation_context,
+                    )
 
-            details: Mapping[str, object] | None = None
-            if isinstance(exc.details, Mapping):
-                details = exc.details
+                    details: Mapping[str, object] | None = None
+                    if isinstance(exc.details, Mapping):
+                        details = exc.details
 
-            price_limit_hit = bool(details.get("price_limit_hit")) if details else False
-            if price_limit_hit and exc.code in {"insufficient_liquidity", "price_deviation"}:
-                backoff_state = self._record_price_limit_hit(
-                    symbol,
-                    details,
-                    last_notional=adjusted_notional,
-                    last_slippage=slippage_pct,
-                )
-                quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl"))
-                if quarantine_ttl is None or quarantine_ttl <= 0:
-                    quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
-                self._quarantine_symbol(symbol, ttl=quarantine_ttl)
-                quarantine_until = self._symbol_quarantine.get(symbol)
-                if quarantine_until is not None:
-                    validation_context["quarantine_until"] = quarantine_until
-                validation_context["quarantine_ttl"] = quarantine_ttl
-                if backoff_state:
-                    validation_context["price_limit_backoff"] = backoff_state
+                    price_limit_hit = bool(details.get("price_limit_hit")) if details else False
+                    if price_limit_hit and exc.code in {"insufficient_liquidity", "price_deviation"}:
+                        backoff_state = self._record_price_limit_hit(
+                            symbol,
+                            details,
+                            last_notional=current_notional,
+                            last_slippage=current_slippage,
+                        )
+                        if backoff_state:
+                            price_limit_meta = backoff_state
+                            order_context["price_limit_backoff"] = backoff_state
 
-                info_parts: List[str] = []
-                if details:
-                    price_cap = details.get("price_cap")
-                    price_floor = details.get("price_floor")
-                    if price_cap:
-                        info_parts.append(f"лимит цены {price_cap}")
-                    elif price_floor:
-                        info_parts.append(f"лимит цены {price_floor}")
-                    requested = details.get("requested_quote") or details.get("requested_base")
-                    available = details.get("available_quote") or details.get("available_base")
-                    if requested and available:
+                        next_notional, next_slippage, adjustments = self._apply_price_limit_backoff(
+                            symbol,
+                            side,
+                            current_notional,
+                            current_slippage,
+                            min_notional,
+                        )
+                        notional_changed = not math.isclose(
+                            next_notional, current_notional, rel_tol=1e-9, abs_tol=1e-9
+                        )
+                        if (
+                            attempts < max_attempts
+                            and notional_changed
+                            and next_notional >= min_notional
+                        ):
+                            current_notional = next_notional
+                            current_slippage = next_slippage
+                            if adjustments:
+                                order_context.setdefault("price_limit_adjustments", []).append(adjustments)
+                            continue
+
+                        quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl")) if backoff_state else None
+                        if quarantine_ttl is None or quarantine_ttl <= 0:
+                            quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
+                        self._quarantine_symbol(symbol, ttl=quarantine_ttl)
+                        quarantine_until = self._symbol_quarantine.get(symbol)
+                        if quarantine_until is not None:
+                            validation_context["quarantine_until"] = quarantine_until
+                        validation_context["quarantine_ttl"] = quarantine_ttl
+                        if backoff_state:
+                            validation_context["price_limit_backoff"] = backoff_state
+
+                        info_parts: List[str] = []
+                        if details:
+                            price_cap = details.get("price_cap")
+                            price_floor = details.get("price_floor")
+                            if price_cap:
+                                info_parts.append(f"лимит цены {price_cap}")
+                            elif price_floor:
+                                info_parts.append(f"лимит цены {price_floor}")
+                            requested = details.get("requested_quote") or details.get("requested_base")
+                            available = details.get("available_quote") or details.get("available_base")
+                            if requested and available:
+                                info_parts.append(
+                                    f"доступно {available} из {requested}"
+                                )
+
+                        quarantine_minutes = quarantine_ttl / 60.0
                         info_parts.append(
-                            f"доступно {available} из {requested}"
+                            "ждём восстановления ликвидности ≈{duration:.1f} мин".format(
+                                duration=quarantine_minutes
+                            )
                         )
 
-                quarantine_minutes = quarantine_ttl / 60.0
-                info_parts.append(
-                    "ждём восстановления ликвидности ≈{duration:.1f} мин".format(
-                        duration=quarantine_minutes
+                        extra_text = " — " + "; ".join(info_parts) if info_parts else ""
+                        reason_text = f"Ордер пропущен ({exc.code}): {exc}{extra_text}"
+
+                        self._maybe_notify_validation_skip(
+                            settings=settings,
+                            symbol=symbol,
+                            side=side,
+                            code=exc.code,
+                            message=f"{exc}{extra_text}",
+                        )
+
+                        return self._decision(
+                            "skipped",
+                            reason=reason_text,
+                            context=validation_context,
+                        )
+                    else:
+                        self._clear_price_limit_backoff(symbol)
+
+                    skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
+                    if exc.code in skip_codes:
+                        self._clear_price_limit_backoff(symbol)
+                        self._maybe_notify_validation_skip(
+                            settings=settings,
+                            symbol=symbol,
+                            side=side,
+                            code=exc.code,
+                            message=str(exc),
+                        )
+                        return self._decision(
+                            "skipped",
+                            reason=f"Ордер пропущен ({exc.code}): {exc}",
+                            context=validation_context,
+                        )
+
+                    self._clear_price_limit_backoff(symbol)
+                    return ExecutionResult(
+                        status="rejected",
+                        reason=f"Ордер отклонён биржей ({exc.code}): {exc}",
+                        context=validation_context,
                     )
-                )
-
-                extra_text = " — " + "; ".join(info_parts) if info_parts else ""
-                reason_text = f"Ордер пропущен ({exc.code}): {exc}{extra_text}"
-
-                self._maybe_notify_validation_skip(
-                    settings=settings,
-                    symbol=symbol,
-                    side=side,
-                    code=exc.code,
-                    message=f"{exc}{extra_text}",
-                )
-
-                return self._decision(
-                    "skipped",
-                    reason=reason_text,
-                    context=validation_context,
-                )
-            else:
-                self._clear_price_limit_backoff(symbol)
-
-            skip_codes = {"min_notional", "min_qty", "qty_step", "price_deviation"}
-            if exc.code in skip_codes:
-                self._clear_price_limit_backoff(symbol)
-                self._maybe_notify_validation_skip(
-                    settings=settings,
-                    symbol=symbol,
-                    side=side,
-                    code=exc.code,
-                    message=str(exc),
-                )
-                return self._decision(
-                    "skipped",
-                    reason=f"Ордер пропущен ({exc.code}): {exc}",
-                    context=validation_context,
-                )
-
-            self._clear_price_limit_backoff(symbol)
-            return ExecutionResult(
-                status="rejected",
-                reason=f"Ордер отклонён биржей ({exc.code}): {exc}",
-                context=validation_context,
-            )
         except Exception as exc:  # pragma: no cover - network/HTTP errors
             error_text = str(exc)
             error_code = _extract_bybit_error_code(exc)
@@ -1749,9 +1788,9 @@ class SignalExecutor:
 
                 details = parse_price_limit_error_details(error_text)
                 if side == "Buy":
-                    details.setdefault("requested_quote", f"{adjusted_notional}")
+                    details.setdefault("requested_quote", f"{current_notional}")
                 else:
-                    details.setdefault("requested_base", f"{adjusted_notional}")
+                    details.setdefault("requested_base", f"{current_notional}")
                 details.setdefault("price_limit_hit", True)
                 details.setdefault("side", side.lower())
 
