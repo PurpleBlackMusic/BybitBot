@@ -237,74 +237,84 @@ def _extract_wallet_totals(payload: Dict[str, object]) -> Tuple[float, float, fl
             continue
         account_type_map.setdefault(account_type, []).append(account)
 
-    accounts_to_use: Iterable[Dict[str, object]] = account_rows
+    def _aggregate_accounts(accounts_to_use: Iterable[Dict[str, object]]) -> Tuple[float, float, float]:
+        total = 0.0
+        tradable = 0.0
+        withdrawable = 0.0
+        for account in accounts_to_use:
+
+            coins_source = account.get("coin") or account.get("coins")
+            coin_rows: Tuple[Dict[str, object], ...] = tuple()
+            if isinstance(coins_source, Iterable) and not isinstance(
+                coins_source, (str, bytes)
+            ):
+                coin_rows = tuple(row for row in coins_source if isinstance(row, dict))
+
+            coin_total = 0.0
+            coin_wallet_total = 0.0
+            coin_available = 0.0
+            coin_withdrawable = 0.0
+            has_coin_total = False
+            has_coin_wallet = False
+            has_coin_available = False
+            has_coin_withdrawable = False
+            if coin_rows:
+                coin_total, has_coin_total = _sum_coin_values(
+                    coin_rows, _COIN_TOTAL_FIELDS, _COIN_TOTAL_USD_FIELDS
+                )
+                coin_wallet_total, has_coin_wallet = coin_total, has_coin_total
+                coin_available, has_coin_available = _sum_coin_values(
+                    coin_rows, _COIN_AVAILABLE_FIELDS, _COIN_AVAILABLE_USD_FIELDS
+                )
+                coin_withdrawable, has_coin_withdrawable = _sum_coin_values(
+                    coin_rows,
+                    _COIN_WITHDRAWABLE_AMOUNT_FIELDS,
+                    _COIN_WITHDRAWABLE_USD_FIELDS,
+                )
+
+            total_val = _first_numeric(account, _ACCOUNT_TOTAL_USD_FIELDS + _ACCOUNT_TOTAL_FIELDS)
+            if (total_val in (None, 0.0)) and has_coin_total:
+                total_val = coin_total
+            if total_val is not None:
+                total += total_val
+
+            available_val = _first_numeric(
+                account, _ACCOUNT_AVAILABLE_USD_FIELDS + _ACCOUNT_AVAILABLE_FIELDS
+            )
+            withdrawable_val = _first_numeric(
+                account, _ACCOUNT_WITHDRAWABLE_USD_FIELDS + _WITHDRAWABLE_FIELDS
+            )
+            if withdrawable_val is None:
+                withdrawable_val = available_val
+
+            if (available_val in (None, 0.0)) and has_coin_available:
+                available_val = coin_available
+            if (withdrawable_val in (None, 0.0)) and has_coin_withdrawable:
+                withdrawable_val = coin_withdrawable
+            if (available_val in (None, 0.0)) and has_coin_wallet:
+                available_val = coin_wallet_total
+            if (withdrawable_val in (None, 0.0)) and has_coin_available:
+                withdrawable_val = coin_available
+
+            if withdrawable_val is None:
+                withdrawable_val = 0.0
+
+            if available_val is None:
+                available_val = 0.0
+
+            tradable += available_val
+            withdrawable += withdrawable_val
+        return total, tradable, withdrawable
+
     for preferred_type in ("UNIFIED", "SPOT"):
         preferred_accounts = account_type_map.get(preferred_type)
-        if preferred_accounts:
-            accounts_to_use = (preferred_accounts[0],)
-            break
+        if not preferred_accounts:
+            continue
+        totals = _aggregate_accounts((preferred_accounts[0],))
+        if totals != (0.0, 0.0, 0.0):
+            return totals
 
-    total = 0.0
-    tradable = 0.0
-    withdrawable = 0.0
-    for account in accounts_to_use:
-
-        coins_source = account.get("coin") or account.get("coins")
-        coin_rows: Tuple[Dict[str, object], ...] = tuple()
-        if isinstance(coins_source, Iterable) and not isinstance(coins_source, (str, bytes)):
-            coin_rows = tuple(row for row in coins_source if isinstance(row, dict))
-
-        coin_total = 0.0
-        coin_wallet_total = 0.0
-        coin_available = 0.0
-        coin_withdrawable = 0.0
-        has_coin_total = False
-        has_coin_wallet = False
-        has_coin_available = False
-        has_coin_withdrawable = False
-        if coin_rows:
-            coin_total, has_coin_total = _sum_coin_values(
-                coin_rows, _COIN_TOTAL_FIELDS, _COIN_TOTAL_USD_FIELDS
-            )
-            coin_wallet_total, has_coin_wallet = coin_total, has_coin_total
-            coin_available, has_coin_available = _sum_coin_values(
-                coin_rows, _COIN_AVAILABLE_FIELDS, _COIN_AVAILABLE_USD_FIELDS
-            )
-            coin_withdrawable, has_coin_withdrawable = _sum_coin_values(
-                coin_rows, _COIN_WITHDRAWABLE_AMOUNT_FIELDS, _COIN_WITHDRAWABLE_USD_FIELDS
-            )
-
-        total_val = _first_numeric(account, _ACCOUNT_TOTAL_USD_FIELDS + _ACCOUNT_TOTAL_FIELDS)
-        if (total_val in (None, 0.0)) and has_coin_total:
-            total_val = coin_total
-        if total_val is not None:
-            total += total_val
-
-        available_val = _first_numeric(
-            account, _ACCOUNT_AVAILABLE_USD_FIELDS + _ACCOUNT_AVAILABLE_FIELDS
-        )
-        withdrawable_val = _first_numeric(account, _ACCOUNT_WITHDRAWABLE_USD_FIELDS + _WITHDRAWABLE_FIELDS)
-        if withdrawable_val is None:
-            withdrawable_val = available_val
-
-        if (available_val in (None, 0.0)) and has_coin_available:
-            available_val = coin_available
-        if (withdrawable_val in (None, 0.0)) and has_coin_withdrawable:
-            withdrawable_val = coin_withdrawable
-        if (available_val in (None, 0.0)) and has_coin_wallet:
-            available_val = coin_wallet_total
-        if (withdrawable_val in (None, 0.0)) and has_coin_available:
-            withdrawable_val = coin_available
-
-        if withdrawable_val is None:
-            withdrawable_val = 0.0
-
-        if available_val is None:
-            available_val = 0.0
-
-        tradable += available_val
-        withdrawable += withdrawable_val
-    return total, tradable, withdrawable
+    return _aggregate_accounts(account_rows)
 
 
 def _extract_wallet_withdrawable(payload: Dict[str, object]) -> Optional[float]:
