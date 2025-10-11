@@ -715,6 +715,74 @@ def test_signal_executor_skips_buy_when_usdt_unavailable(
     assert result.context.get("available_equity_quote_limited") == pytest.approx(0.0)
 
 
+def test_signal_executor_buy_uses_spot_usdt_when_unified_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=True,
+        ai_risk_per_trade_pct=5.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=1000.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    wallet_calls: list[Optional[str]] = []
+
+    def fake_wallet_balances(
+        api_obj,
+        account_type: str = "UNIFIED",
+        *,
+        required_asset: str | None = None,
+    ) -> Mapping[str, Decimal]:
+        wallet_calls.append(required_asset)
+        if required_asset:
+            return {
+                "BTC": Decimal("0.5"),
+                "USDT": Decimal("42"),
+            }
+        return {"BTC": Decimal("0.5")}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_wallet_available_balances",
+        fake_wallet_balances,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert wallet_calls and wallet_calls[0] == "USDT"
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["symbol"] == "BTCUSDT"
+    assert result.order["side"] == "Buy"
+
+    expected_quote_cap = 42.0
+    expected_notional = expected_quote_cap - (expected_quote_cap * 0.02)
+
+    assert result.context is not None
+    assert result.context.get("quote_wallet_cap") == pytest.approx(expected_quote_cap)
+    assert result.context.get("available_equity_quote_limited") == pytest.approx(
+        expected_quote_cap
+    )
+    assert result.context.get("usable_after_reserve") == pytest.approx(
+        expected_notional
+    )
+    assert result.order.get("notional_quote") == pytest.approx(
+        expected_notional, rel=1e-3
+    )
+
+
 def test_signal_executor_scales_to_min_notional_when_capital_allows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

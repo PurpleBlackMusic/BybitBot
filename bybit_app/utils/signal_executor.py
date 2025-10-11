@@ -3712,13 +3712,15 @@ class SignalExecutor:
         totals = extract_wallet_totals(payload)
         quote_balance: Optional[float] = None
         try:
-            balances = _wallet_available_balances(api)
+            balances = _wallet_available_balances(api, required_asset="USDT")
         except Exception:
             balances = None
         if isinstance(balances, Mapping):
-            raw_quote = balances.get("USDT")
-            if raw_quote is None:
-                raw_quote = balances.get("usdt")
+            raw_quote = None
+            for candidate in ("USDT", "usdt"):
+                raw_quote = balances.get(candidate)
+                if raw_quote is not None:
+                    break
             if raw_quote is not None:
                 try:
                     quote_balance = float(raw_quote)
