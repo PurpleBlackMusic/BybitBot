@@ -312,18 +312,26 @@ class SignalExecutor:
         now = self._current_time()
         self._purge_price_limit_backoff(now)
 
-        state = self._price_limit_backoff.get(symbol, {})
+        existing_state = self._price_limit_backoff.get(symbol)
+        if isinstance(existing_state, Mapping):
+            state: Dict[str, object] = dict(existing_state)
+        else:
+            state = {}
+
         try:
             retries = int(state.get("retries", 0)) + 1
         except (TypeError, ValueError):
             retries = 1
 
-        payload: Dict[str, object] = {
-            "retries": retries,
-            "last_notional": float(last_notional),
-            "last_slippage": float(last_slippage),
-            "last_updated": now,
-        }
+        payload: Dict[str, object] = dict(state)
+        payload.update(
+            {
+                "retries": retries,
+                "last_notional": float(last_notional),
+                "last_slippage": float(last_slippage),
+                "last_updated": now,
+            }
+        )
 
         if details:
             for key in (
@@ -1746,6 +1754,32 @@ class SignalExecutor:
                     details.setdefault("requested_base", f"{adjusted_notional}")
                 details.setdefault("price_limit_hit", True)
                 details.setdefault("side", side.lower())
+
+                previous_hints: List[Mapping[str, object]] = []
+                existing_backoff = self._price_limit_backoff.get(symbol)
+                if isinstance(existing_backoff, Mapping):
+                    previous_hints.append(existing_backoff)
+                context_backoff = order_context.get("price_limit_backoff")
+                if isinstance(context_backoff, Mapping):
+                    previous_hints.append(context_backoff)
+
+                if previous_hints:
+                    for hints in previous_hints:
+                        for key in (
+                            "available_quote",
+                            "available_base",
+                            "requested_quote",
+                            "requested_base",
+                            "price_cap",
+                            "price_floor",
+                        ):
+                            current_value = _safe_float(details.get(key))
+                            if current_value is not None and math.isfinite(current_value):
+                                continue
+                            seeded_value = _safe_float(hints.get(key))
+                            if seeded_value is None or not math.isfinite(seeded_value):
+                                continue
+                            details[key] = f"{seeded_value}"
 
                 validation_context = dict(order_context)
                 validation_context["validation_code"] = "price_deviation"
