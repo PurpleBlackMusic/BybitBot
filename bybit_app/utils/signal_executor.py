@@ -1498,6 +1498,7 @@ class SignalExecutor:
             )
 
         side = "Buy" if mode == "buy" else "Sell"
+        summary_price_snapshot = self._extract_market_price(summary, symbol)
 
         try:
             api, wallet_totals, quote_wallet_cap = self._resolve_wallet(
@@ -1575,11 +1576,20 @@ class SignalExecutor:
             risk_limited_notional = notional
             fallback_notional: Optional[float]
             fallback_min_notional: Optional[float]
+            expected_base_requirement: Optional[float] = None
+            if (
+                summary_price_snapshot is not None
+                and notional > 0
+                and math.isfinite(summary_price_snapshot)
+                and summary_price_snapshot > 0
+            ):
+                expected_base_requirement = notional / summary_price_snapshot
             fallback_notional, fallback_context, fallback_min_notional = (
                 self._sell_notional_from_holdings(
                     api,
                     symbol,
                     summary=summary,
+                    expected_base_requirement=expected_base_requirement,
                 )
             )
             if (
@@ -1647,6 +1657,19 @@ class SignalExecutor:
                 fallback_relevant = True
             elif fallback_context is not None and isinstance(fallback_context, Mapping):
                 fallback_relevant = bool(fallback_context.get("error"))
+                combined_total = _safe_float(
+                    fallback_context.get("combined_available_base")
+                )
+                unified_total = _safe_float(
+                    fallback_context.get("unified_available_base")
+                )
+                spot_total = _safe_float(fallback_context.get("spot_available_base"))
+                if (
+                    combined_total is not None
+                    and unified_total is not None
+                    and combined_total > unified_total
+                ) or (spot_total is not None and spot_total > 0):
+                    fallback_relevant = True
 
             if not fallback_relevant:
                 fallback_context = None
@@ -3842,6 +3865,7 @@ class SignalExecutor:
         symbol: str,
         *,
         summary: Optional[Mapping[str, object]] = None,
+        expected_base_requirement: Optional[float] = None,
     ) -> Tuple[Optional[float], Optional[Dict[str, object]], Optional[float]]:
         context: Dict[str, object] = {"source": "balances"}
         context["wallet_available_base"] = None
@@ -3891,6 +3915,19 @@ class SignalExecutor:
 
         context["min_order_amt"] = float(min_order_amt) if min_order_amt > 0 else 0.0
 
+        risk_required_base: Optional[Decimal] = None
+        if expected_base_requirement is not None:
+            try:
+                if math.isfinite(expected_base_requirement) and expected_base_requirement > 0:
+                    candidate = self._decimal_from(expected_base_requirement, Decimal("0"))
+                else:
+                    candidate = None
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and candidate > 0:
+                risk_required_base = candidate
+                context["expected_base_requirement"] = float(candidate)
+
         if not base_asset:
             context["error"] = "base_asset_unknown"
             return None, context, float(min_order_amt) if min_order_amt > 0 else None
@@ -3900,10 +3937,41 @@ class SignalExecutor:
             available_base = self._decimal_from(available_base)
 
         balance_account_type = "UNIFIED"
-        if available_base is None or available_base <= 0:
-            context["available_base"] = 0.0
-            context["wallet_available_base"] = 0.0
-            context["balance_account_type"] = balance_account_type
+        unified_available = available_base if available_base > 0 else Decimal("0")
+        context["unified_available_base"] = (
+            float(unified_available) if unified_available > 0 else 0.0
+        )
+        spot_available: Optional[Decimal] = None
+
+        if not isinstance(price, Decimal):
+            price = self._decimal_from(price)
+
+        min_order_base_requirement: Optional[Decimal] = None
+        if price is not None and price > 0 and min_order_amt > 0:
+            try:
+                min_order_base_requirement = min_order_amt / price
+            except InvalidOperation:  # pragma: no cover - defensive guard
+                min_order_base_requirement = None
+
+        required_base_threshold: Optional[Decimal] = risk_required_base
+        if min_order_base_requirement is not None and min_order_base_requirement > 0:
+            required_base_threshold = (
+                min_order_base_requirement
+                if required_base_threshold is None
+                else max(required_base_threshold, min_order_base_requirement)
+            )
+        if required_base_threshold is not None and required_base_threshold > 0:
+            context["required_base_threshold"] = float(required_base_threshold)
+
+        need_spot_top_up = available_base <= 0
+        if (
+            not need_spot_top_up
+            and required_base_threshold is not None
+            and required_base_threshold > 0
+        ):
+            need_spot_top_up = available_base < required_base_threshold
+
+        if need_spot_top_up:
             fallback_snapshot = None
             try:
                 fallback_snapshot = prepare_spot_trade_snapshot(
@@ -3927,13 +3995,22 @@ class SignalExecutor:
                 if not isinstance(fallback_available, Decimal):
                     fallback_available = self._decimal_from(fallback_available)
                 if fallback_available is not None and fallback_available > 0:
-                    available_base = fallback_available
-                    balance_account_type = "SPOT"
-                    context["available_base"] = float(available_base)
-                    context["wallet_available_base"] = float(available_base)
+                    spot_available = fallback_available
+                    if unified_available <= 0:
+                        balance_account_type = "SPOT"
             context["balance_fallback_account_type"] = "SPOT"
-            if balance_account_type == "SPOT":
-                context["balance_account_type"] = balance_account_type
+
+        combined_available = unified_available
+        if spot_available is not None and spot_available > 0:
+            combined_available += spot_available
+            context["spot_available_base"] = float(spot_available)
+
+        if combined_available is not None and combined_available > 0:
+            context["combined_available_base"] = float(combined_available)
+            available_base = combined_available
+        else:
+            context["combined_available_base"] = 0.0
+
         if available_base is None or available_base <= 0:
             context.setdefault("available_base", 0.0)
             context.setdefault("balance_account_type", balance_account_type)
@@ -3946,9 +4023,6 @@ class SignalExecutor:
 
         context["available_base"] = float(available_base)
         context["wallet_available_base"] = float(available_base)
-
-        if not isinstance(price, Decimal):
-            price = self._decimal_from(price)
 
         if price is None or price <= 0:
             context["error"] = "price_unavailable"
