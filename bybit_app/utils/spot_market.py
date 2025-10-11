@@ -1801,6 +1801,30 @@ def prepare_spot_market_order(
     qty_base = _round_down(qty_base, qty_step) if qty_step > 0 else qty_base
     limit_notional = qty_base * limit_price
 
+    planned_quote_reference: Optional[Decimal] = None
+    quote_total_positive = quote_total if quote_total > 0 else None
+    target_quote_positive = target_quote if target_quote is not None and target_quote > 0 else None
+    if quote_total_positive is not None and target_quote_positive is not None:
+        planned_quote_reference = quote_total_positive
+        if planned_quote_reference > target_quote_positive:
+            planned_quote_reference = target_quote_positive
+    elif quote_total_positive is not None:
+        planned_quote_reference = quote_total_positive
+    elif target_quote_positive is not None:
+        planned_quote_reference = target_quote_positive
+
+    effective_notional: Decimal = limit_notional
+    if planned_quote_reference is not None:
+        effective_notional = planned_quote_reference
+
+    def _recalculate_effective_notional() -> None:
+        nonlocal effective_notional
+
+        if planned_quote_reference is not None:
+            effective_notional = planned_quote_reference
+        else:
+            effective_notional = limit_notional
+
     price_used = limit_price
     qty_base_raw = qty_base
     if target_quote is not None and price_used > 0:
@@ -1942,6 +1966,8 @@ def prepare_spot_market_order(
         qty_base = qty_candidate
         limit_notional = result.notional
 
+        _recalculate_effective_notional()
+
         _enforce_price_band()
 
     validated = validators.validate_spot_rules(
@@ -2022,12 +2048,13 @@ def prepare_spot_market_order(
             else:
                 qty_base = affordable_qty
                 limit_notional = qty_base * limit_price
+                _recalculate_effective_notional()
 
     tolerance_margin = _TOLERANCE_MARGIN
     tolerance_guard_reduction: Decimal | None = None
 
     def _shrink_order_to_ceiling(max_quote_allowed: Decimal) -> bool:
-        nonlocal qty_base, limit_notional, tolerance_guard_reduction
+        nonlocal qty_base, limit_notional, tolerance_guard_reduction, planned_quote_reference, effective_notional
 
         if limit_price <= 0 or max_quote_allowed <= 0:
             return False
@@ -2086,6 +2113,17 @@ def prepare_spot_market_order(
                 tolerance_guard_reduction = reduction if reduction > 0 else None
                 qty_base = candidate_qty
                 limit_notional = candidate_notional
+                if planned_quote_reference is not None and candidate_notional > 0:
+                    if candidate_notional < planned_quote_reference:
+                        planned_quote_reference = candidate_notional
+                elif (
+                    planned_quote_reference is None
+                    and target_quote is not None
+                    and target_quote > 0
+                    and candidate_notional > 0
+                ):
+                    planned_quote_reference = min(target_quote, candidate_notional)
+                _recalculate_effective_notional()
                 return True
 
             overshoot = candidate_notional - max_quote_allowed
@@ -2124,7 +2162,7 @@ def prepare_spot_market_order(
                     code="tolerance_exceeded",
                     details={
                         "requested_quote": _format_decimal(target_quote),
-                        "effective_notional": _format_decimal(limit_notional),
+                        "effective_notional": _format_decimal(effective_notional),
                         "tolerance_ceiling": _format_decimal(tolerance_target),
                         "tolerance_multiplier": _format_decimal(tolerance_multiplier),
                         "tolerance_type": tolerance_type,
@@ -2132,9 +2170,7 @@ def prepare_spot_market_order(
                     },
                 )
 
-    effective_notional = limit_notional
-
-    tolerance_margin = _TOLERANCE_MARGIN
+    _recalculate_effective_notional()
     tolerance_adjusted = effective_notional * tolerance_multiplier
 
     quote_ceiling: Decimal | None = None
@@ -2167,7 +2203,7 @@ def prepare_spot_market_order(
                     },
                 )
 
-            effective_notional = limit_notional
+            _recalculate_effective_notional()
             if market_unit != "quoteCoin":
                 effective_quote = limit_notional
             else:
@@ -2208,13 +2244,13 @@ def prepare_spot_market_order(
 
     _enforce_price_band()
 
-    if min_amount > 0 and effective_notional < min_amount:
+    if min_amount > 0 and limit_notional < min_amount:
         raise OrderValidationError(
             "Минимальный объём ордера не достигнут.",
             code="min_notional",
             details={
                 "requested": _format_decimal(target_quote or requested_qty),
-                "rounded": _format_decimal(effective_notional),
+                "rounded": _format_decimal(limit_notional),
                 "min_notional": _format_decimal(min_amount),
                 "unit": "quote",
             },
