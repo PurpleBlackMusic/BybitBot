@@ -1673,12 +1673,25 @@ class SignalExecutor:
 
         adjusted_notional = notional
         if side == "Buy" and tolerance_multiplier > 0:
+            quote_cap_limit: Optional[float] = None
+            if quote_wallet_cap_value is not None and math.isfinite(quote_wallet_cap_value):
+                quote_cap_limit = max(quote_wallet_cap_value, 0.0)
+
             equity_for_affordability = usable_after_reserve
-            if (
-                is_minimum_buy_request
-                and available_equity > equity_for_affordability
-            ):
-                equity_for_affordability = available_equity
+            if quote_cap_limit is not None and quote_cap_limit < equity_for_affordability:
+                equity_for_affordability = quote_cap_limit
+
+            if is_minimum_buy_request:
+                bypass_cap = available_equity
+                if quote_cap_limit is not None:
+                    if bypass_cap <= 0 or not math.isfinite(bypass_cap):
+                        bypass_cap = 0.0
+                    bypass_cap = min(bypass_cap, quote_cap_limit)
+                elif not math.isfinite(bypass_cap) or bypass_cap < 0:
+                    bypass_cap = 0.0
+
+                if bypass_cap > equity_for_affordability:
+                    equity_for_affordability = bypass_cap
 
             if equity_for_affordability > 0:
                 equity_decimal = Decimal(str(equity_for_affordability))
@@ -1791,6 +1804,13 @@ class SignalExecutor:
                 allowed_quote = required_quote
                 if available_equity > 0:
                     allowed_quote = min(required_quote, available_equity)
+                cap_for_min_buy = usable_after_reserve
+                if (
+                    quote_wallet_cap_value is not None
+                    and math.isfinite(quote_wallet_cap_value)
+                ):
+                    cap_for_min_buy = max(quote_wallet_cap_value, 0.0)
+                    allowed_quote = min(allowed_quote, cap_for_min_buy)
                 if max_quote is None or allowed_quote > max_quote:
                     max_quote = allowed_quote
 

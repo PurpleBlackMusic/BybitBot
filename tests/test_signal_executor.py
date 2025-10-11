@@ -871,6 +871,79 @@ def test_signal_executor_scales_to_min_notional_when_capital_allows(
     assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
 
 
+def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=500,
+    )
+    bot = StubBot(summary, settings)
+
+    total_equity = 1_000.0
+    available_equity = 250.0
+    quote_cap = 5.0
+
+    api = StubAPI(total=total_equity, available=available_equity)
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {"min_order_amt": "5"},
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        lambda self, require_success: (api, (total_equity, available_equity), quote_cap),
+    )
+
+    def fake_compute(
+        self,
+        settings: Settings,
+        total_equity_value: float,
+        available_equity_value: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> tuple[float, float]:
+        return 5.0, 4.5
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute,
+    )
+
+    def fail_place(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("place_spot_market_with_tolerance should not be called")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fail_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert "Недостаточно свободного капитала" in result.reason
+    assert result.context is not None
+    assert result.context.get("min_notional") == pytest.approx(5.0)
+    assert result.context.get("quote_wallet_cap") == pytest.approx(quote_cap)
+
+
 def test_signal_executor_reserve_respects_available_equity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
