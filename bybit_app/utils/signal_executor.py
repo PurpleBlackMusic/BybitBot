@@ -1514,13 +1514,34 @@ class SignalExecutor:
             )
         total_equity, available_equity = wallet_totals
 
+        min_notional = 5.0
+        instrument_limits: Optional[Mapping[str, object]] = None
+        if api is not None:
+            try:
+                instrument_limits = _instrument_limits(api, symbol)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "guardian.auto.instrument_limits.error",
+                    symbol=symbol,
+                    err=str(exc),
+                )
+                instrument_limits = None
+
+        if instrument_limits:
+            min_candidate = _safe_float(instrument_limits.get("min_order_amt"))
+            if min_candidate is not None and min_candidate > 0:
+                min_notional = max(min_notional, min_candidate)
+
         sizing_factor = self._signal_sizing_factor(summary, settings)
         notional, usable_after_reserve = self._compute_notional(
-            settings, total_equity, available_equity, sizing_factor
+            settings,
+            total_equity,
+            available_equity,
+            sizing_factor,
+            min_notional=min_notional,
         )
 
         fallback_context: Optional[Dict[str, object]] = None
-        min_notional = 5.0
         if forced_exit_meta and side == "Sell":
             forced_notional = forced_exit_meta.get("quote_notional")
             if isinstance(forced_notional, (int, float)) and forced_notional > 0:
@@ -1561,9 +1582,21 @@ class SignalExecutor:
 
         adjusted_notional = max(adjusted_notional, 0.0)
 
+        min_notional_for_backoff = min_notional
+        if min_notional_for_backoff > 0:
+            if side == "Buy":
+                tolerance_multiplier_float = float(tolerance_multiplier)
+                required_quote = min_notional_for_backoff
+                if tolerance_multiplier_float > 0:
+                    required_quote = min_notional_for_backoff * tolerance_multiplier_float
+                if usable_after_reserve < required_quote:
+                    min_notional_for_backoff = 0.0
+            elif adjusted_notional < min_notional_for_backoff:
+                min_notional_for_backoff = 0.0
+
         price_limit_meta: Optional[Dict[str, object]] = None
         adjusted_notional, slippage_pct, backoff_meta = self._apply_price_limit_backoff(
-            symbol, side, adjusted_notional, slippage_pct, min_notional
+            symbol, side, adjusted_notional, slippage_pct, min_notional_for_backoff
         )
         if backoff_meta:
             price_limit_meta = backoff_meta
@@ -1678,20 +1711,49 @@ class SignalExecutor:
                             price_limit_meta = backoff_state
                             order_context["price_limit_backoff"] = backoff_state
 
+                        retry_min_notional = min_notional
+                        if retry_min_notional > 0:
+                            if side == "Buy":
+                                tolerance_multiplier_float = float(tolerance_multiplier)
+                                required_quote = retry_min_notional
+                                if tolerance_multiplier_float > 0:
+                                    required_quote = (
+                                        retry_min_notional * tolerance_multiplier_float
+                                    )
+                                if usable_after_reserve < required_quote:
+                                    retry_min_notional = 0.0
+                            elif current_notional <= retry_min_notional:
+                                retry_min_notional = 0.0
+
                         next_notional, next_slippage, adjustments = self._apply_price_limit_backoff(
                             symbol,
                             side,
                             current_notional,
                             current_slippage,
-                            min_notional,
+                            retry_min_notional,
                         )
                         notional_changed = not math.isclose(
                             next_notional, current_notional, rel_tol=1e-9, abs_tol=1e-9
                         )
+                        allow_retry_at_min = exc.code != "insufficient_liquidity"
+                        can_retry_notional = next_notional > retry_min_notional
+                        if (
+                            allow_retry_at_min
+                            and retry_min_notional > 0
+                            and not can_retry_notional
+                            and math.isclose(
+                                next_notional,
+                                retry_min_notional,
+                                rel_tol=1e-9,
+                                abs_tol=1e-9,
+                            )
+                        ):
+                            can_retry_notional = True
+
                         if (
                             attempts < max_attempts
                             and notional_changed
-                            and next_notional >= min_notional
+                            and can_retry_notional
                         ):
                             current_notional = next_notional
                             current_slippage = next_slippage
@@ -3436,6 +3498,8 @@ class SignalExecutor:
         total_equity: float,
         available_equity: float,
         sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
     ) -> Tuple[float, float]:
         try:
             reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
@@ -3476,7 +3540,20 @@ class SignalExecutor:
         base_notional = min(caps)
         sizing = max(0.0, min(float(sizing_factor), 1.0))
         notional = round(base_notional * sizing, 2)
-        return max(notional, 0.0), usable_after_reserve
+        notional = max(notional, 0.0)
+
+        min_threshold = 0.0
+        try:
+            if min_notional is not None:
+                min_threshold = max(float(min_notional), 0.0)
+        except (TypeError, ValueError):
+            min_threshold = 0.0
+
+        if min_threshold > 0 and usable_after_reserve >= min_threshold:
+            if notional == 0.0 or notional < min_threshold:
+                notional = min_threshold
+
+        return notional, usable_after_reserve
 
     def _sell_notional_from_holdings(
         self,

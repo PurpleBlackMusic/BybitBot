@@ -565,6 +565,45 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_scales_to_min_notional_when_capital_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.1,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=100.0, available=100.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "min-size"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured
+    assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
+
+
 def test_signal_executor_scales_buy_notional_for_slippage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
