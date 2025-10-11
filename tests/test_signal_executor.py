@@ -565,6 +565,83 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_handles_non_usdt_wallet_balances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mark_price = 27_000.0
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=0.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {
+                            "coin": "BTC",
+                            "equity": "0.5",
+                            "availableBalance": "0.4",
+                            "availableToWithdraw": "0.3",
+                            "markPrice": str(mark_price),
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    api = StubAPI(total=0.0, available=0.0)
+    monkeypatch.setattr(api, "wallet_balance", lambda: wallet_payload)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"status": "ok", "result": {"orderId": "test"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert not result.reason or "min_notional" not in result.reason
+    assert captured["symbol"] == "BTCUSDT"
+    assert captured["side"] == "Buy"
+    assert captured["unit"] == "quoteCoin"
+
+    expected_total = 0.5 * mark_price
+    expected_available = 0.4 * mark_price
+    reserve = expected_total * 0.02
+    usable_after_reserve = expected_available - reserve
+    cap_pct = getattr(settings, "spot_max_cap_per_trade_pct", 0.0) or 0.0
+    cap_limit = expected_total * cap_pct / 100.0 if cap_pct > 0 else usable_after_reserve
+    expected_notional = min(usable_after_reserve, cap_limit)
+
+    assert result.context is not None
+    assert result.context["total_equity"] == pytest.approx(expected_total)
+    assert result.context["available_equity"] == pytest.approx(expected_available)
+    assert result.context["usable_after_reserve"] == pytest.approx(usable_after_reserve)
+    assert captured["max_quote"] == pytest.approx(usable_after_reserve)
+    assert captured["qty"] == pytest.approx(expected_notional)
+
+
 def test_signal_executor_scales_to_min_notional_when_capital_allows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
