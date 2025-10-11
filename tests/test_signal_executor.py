@@ -4967,6 +4967,62 @@ def test_automation_loop_retries_transient_status_after_cooldown(
     assert third_delay == pytest.approx(1.0)
 
 
+def test_automation_loop_retries_disabled_status_after_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=True)
+    bot = StubBot(summary, settings, fingerprint="sig-disabled")
+
+    executor = SignalExecutor(bot)
+
+    class FakeTime:
+        def __init__(self) -> None:
+            self.value = 0.0
+
+        def monotonic(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+    fake_time = FakeTime()
+    monkeypatch.setattr(signal_executor_module, "time", fake_time)
+
+    call_count = {"value": 0}
+    statuses = [
+        ExecutionResult(status="disabled", reason="guard tripped"),
+        ExecutionResult(status="dry_run"),
+    ]
+
+    def fake_execute_once() -> ExecutionResult:
+        call_count["value"] += 1
+        return statuses[min(call_count["value"] - 1, len(statuses) - 1)]
+
+    executor.execute_once = fake_execute_once  # type: ignore[assignment]
+
+    loop = AutomationLoop(
+        executor,
+        poll_interval=5.0,
+        success_cooldown=3.0,
+        error_backoff=0.0,
+    )
+
+    first_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert first_delay == pytest.approx(3.0)
+
+    second_delay = loop._tick()
+    assert call_count["value"] == 1
+    assert second_delay == pytest.approx(3.0)
+
+    fake_time.advance(3.0)
+
+    third_delay = loop._tick()
+    assert call_count["value"] == 2
+    assert third_delay == pytest.approx(3.0)
+
+
 def test_automation_loop_reacts_to_ai_toggle(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=False, dry_run=True)
@@ -4997,7 +5053,7 @@ def test_automation_loop_reacts_to_ai_toggle(monkeypatch: pytest.MonkeyPatch) ->
 
     second_delay = loop._tick()
     assert call_count["value"] == 1
-    assert second_delay == 2.0
+    assert second_delay == pytest.approx(1.5, rel=1e-3)
 
     bot.settings.ai_enabled = True
     third_delay = loop._tick()

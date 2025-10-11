@@ -4534,7 +4534,7 @@ class SignalExecutor:
 class AutomationLoop:
     """Keep executing trading signals until stopped explicitly."""
 
-    _SUCCESSFUL_STATUSES = {"filled", "dry_run", "disabled"}
+    _SUCCESSFUL_STATUSES = {"filled", "dry_run"}
 
     def __init__(
         self,
