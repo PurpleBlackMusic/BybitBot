@@ -729,6 +729,122 @@ def test_signal_executor_sell_uses_balance_fallback(
     assert pytest.approx(fallback.get("min_order_amt"), rel=1e-9) == 5.0
 
 
+def test_signal_executor_sell_fallback_allows_minimum_notional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "BTCUSDT",
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.2,
+        spot_cash_reserve_pct=2.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=500.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("1.0"),
+        balances={"BTC": Decimal("5")},
+        limits={"min_order_amt": Decimal("5"), "base_coin": "BTC"},
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        lambda api_obj, symbol, **_: snapshot,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "sell-min"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
+    assert result.context is not None
+    assert result.context.get("holdings_notional_quote") == pytest.approx(5.0)
+    assert result.context.get("requested_notional_quote") == pytest.approx(1.0)
+    assert "min_notional" not in result.context
+
+
+def test_signal_executor_sell_fallback_records_holdings_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "BTCUSDT",
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.5,
+        spot_cash_reserve_pct=2.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=500.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    snapshot = SpotTradeSnapshot(
+        symbol="BTCUSDT",
+        price=Decimal("2.5"),
+        balances={"BTC": Decimal("3")},
+        limits={"min_order_amt": Decimal("5"), "base_coin": "BTC"},
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        lambda api_obj, symbol, **_: snapshot,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "sell-holdings"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured
+    assert pytest.approx(float(captured["qty"]), rel=1e-9) == pytest.approx(7.5)
+    assert result.context is not None
+    assert result.context.get("holdings_notional_quote") == pytest.approx(7.5)
+    assert result.context.get("requested_notional_quote") == pytest.approx(2.5)
+
+
 def test_signal_executor_guard_forces_sell_on_time_and_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

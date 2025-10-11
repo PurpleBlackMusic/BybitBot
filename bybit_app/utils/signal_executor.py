@@ -1520,14 +1520,18 @@ class SignalExecutor:
         )
 
         fallback_context: Optional[Dict[str, object]] = None
+        fallback_applied_notional: Optional[float] = None
+        fallback_requested_notional: Optional[float] = None
         min_notional = 5.0
+        risk_budget_notional = notional
         if forced_exit_meta and side == "Sell":
             forced_notional = forced_exit_meta.get("quote_notional")
             if isinstance(forced_notional, (int, float)) and forced_notional > 0:
                 notional = float(forced_notional)
+                risk_budget_notional = notional
             elif isinstance(forced_exit_meta.get("qty"), (int, float)):
                 notional = 0.0
-        if side == "Sell" and notional <= 0:
+        if side == "Sell" and notional < min_notional:
             fallback_notional, fallback_context, fallback_min_notional = (
                 self._sell_notional_from_holdings(
                     api,
@@ -1538,7 +1542,20 @@ class SignalExecutor:
             if fallback_min_notional is not None and fallback_min_notional > min_notional:
                 min_notional = fallback_min_notional
             if fallback_notional is not None and fallback_notional > 0:
-                notional = fallback_notional
+                notional = float(fallback_notional)
+                if (
+                    not math.isclose(
+                        risk_budget_notional,
+                        notional,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and risk_budget_notional > 0
+                ):
+                    fallback_requested_notional = risk_budget_notional
+                if notional >= min_notional:
+                    fallback_applied_notional = notional
+
 
         raw_slippage_bps = getattr(settings, "ai_max_slippage_bps", 500)
         slippage_pct = max(float(raw_slippage_bps or 0.0) / 100.0, 0.0)
@@ -1578,7 +1595,11 @@ class SignalExecutor:
         }
         if fallback_context:
             order_context["sell_fallback"] = fallback_context
-        if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
+        if fallback_applied_notional is not None:
+            order_context["holdings_notional_quote"] = fallback_applied_notional
+        if fallback_requested_notional is not None:
+            order_context["requested_notional_quote"] = fallback_requested_notional
+        elif not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
             order_context["requested_notional_quote"] = notional
         if symbol_meta:
             order_context["symbol_meta"] = symbol_meta
