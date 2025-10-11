@@ -1501,7 +1501,7 @@ class SignalExecutor:
         summary_price_snapshot = self._extract_market_price(summary, symbol)
 
         try:
-            api, wallet_totals, quote_wallet_cap = self._resolve_wallet(
+            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
                 require_success=not active_dry_run(settings)
             )
         except Exception as exc:
@@ -1761,6 +1761,11 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if wallet_meta:
+            order_context["wallet_meta"] = copy.deepcopy(wallet_meta)
+            error_code = wallet_meta.get("quote_wallet_cap_error")
+            if isinstance(error_code, str) and error_code:
+                order_context["quote_wallet_cap_error"] = error_code
         if reserve_relaxed_for_min:
             order_context["reserve_relaxed_for_min_notional"] = True
         if quote_wallet_cap_value is not None:
@@ -3675,7 +3680,7 @@ class SignalExecutor:
             return None
 
         try:
-            _, wallet_totals, _ = self._resolve_wallet(require_success=False)
+            _, wallet_totals, _, _ = self._resolve_wallet(require_success=False)
         except Exception:
             return None
 
@@ -3782,27 +3787,34 @@ class SignalExecutor:
 
     def _resolve_wallet(
         self, *, require_success: bool
-    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float]]:
+    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float], Dict[str, object]]:
+        metadata: Dict[str, object] = {}
         try:
             api = get_api_client()
         except Exception:
             if require_success:
                 raise
-            return None, (0.0, 0.0), None
+            return None, (0.0, 0.0), None, metadata
 
         try:
             payload = api.wallet_balance()
         except Exception:
             if require_success:
                 raise
-            return api, (0.0, 0.0), None
+            return api, (0.0, 0.0), None, metadata
 
         totals = extract_wallet_totals(payload)
         quote_balance: Optional[float] = None
         try:
             balances = _wallet_available_balances(api, required_asset="USDT")
-        except Exception:
+        except Exception as exc:
             balances = None
+            quote_balance = 0.0
+            metadata["quote_wallet_cap_error"] = "wallet_balance_unavailable"
+            log(
+                "guardian.auto.wallet.available.error",
+                err=str(exc),
+            )
         if isinstance(balances, Mapping):
             quote_balance = 0.0
             raw_quote = None
@@ -3821,7 +3833,7 @@ class SignalExecutor:
                 if quote_value is not None:
                     quote_balance = quote_value
 
-        return api, totals, quote_balance
+        return api, totals, quote_balance, metadata
 
     def _compute_notional(
         self,
