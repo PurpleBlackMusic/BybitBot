@@ -536,15 +536,48 @@ def _normalise_orderbook_levels(
     return normalised
 
 
-def _apply_tick(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
+def _apply_tick(
+    price: Decimal,
+    tick_size: Decimal,
+    side: str,
+    *,
+    max_price_allowed: Decimal | None = None,
+    min_price_allowed: Decimal | None = None,
+) -> Decimal:
     if tick_size <= 0:
-        return price
-    side_normalised = (side or "").lower()
-    rounding = ROUND_UP if side_normalised == "buy" else ROUND_DOWN
-    multiplier = (price / tick_size).to_integral_value(rounding=rounding)
-    adjusted = multiplier * tick_size
-    if adjusted <= 0:
-        adjusted = tick_size
+        adjusted = price
+    else:
+        side_normalised = (side or "").lower()
+        rounding = ROUND_UP if side_normalised == "buy" else ROUND_DOWN
+        multiplier = (price / tick_size).to_integral_value(rounding=rounding)
+        adjusted = multiplier * tick_size
+        if adjusted <= 0:
+            adjusted = tick_size
+
+    if max_price_allowed is not None:
+        if adjusted > max_price_allowed:
+            if tick_size > 0:
+                multiplier = (max_price_allowed / tick_size).to_integral_value(rounding=ROUND_DOWN)
+                adjusted = multiplier * tick_size
+                if adjusted <= 0:
+                    adjusted = tick_size
+            else:
+                adjusted = max_price_allowed
+        if adjusted > max_price_allowed:
+            adjusted = max_price_allowed
+
+    if min_price_allowed is not None:
+        if adjusted < min_price_allowed:
+            if tick_size > 0:
+                multiplier = (min_price_allowed / tick_size).to_integral_value(rounding=ROUND_UP)
+                adjusted = multiplier * tick_size
+                if adjusted <= 0:
+                    adjusted = tick_size
+            else:
+                adjusted = min_price_allowed
+        if adjusted < min_price_allowed:
+            adjusted = min_price_allowed
+
     return adjusted
 
 
@@ -1829,7 +1862,18 @@ def prepare_spot_market_order(
 
 
     limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
-    limit_price = _apply_tick(worst_price, limit_map_tick, side_normalised)
+    limit_price = _apply_tick(
+        worst_price,
+        limit_map_tick,
+        side_normalised,
+        max_price_allowed=max_price_allowed,
+        min_price_allowed=min_price_allowed,
+    )
+
+    if max_price_allowed is not None and limit_price - max_price_allowed > _TOLERANCE_MARGIN:
+        limit_price = max_price_allowed
+    if min_price_allowed is not None and min_price_allowed - limit_price > _TOLERANCE_MARGIN:
+        limit_price = min_price_allowed
     qty_base = _round_down(qty_base, qty_step) if qty_step > 0 else qty_base
     limit_notional = qty_base * limit_price
 

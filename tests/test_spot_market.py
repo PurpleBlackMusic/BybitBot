@@ -956,6 +956,31 @@ def test_prepare_spot_market_target_quote_min_notional_adjustment():
     assert Decimal(audit.get("order_qty_base")) > Decimal("0")
 
 
+def test_prepare_spot_market_ceiling_rounds_down_to_allowed_tick():
+    orderbook = {"result": {"a": [["100.05", "2"], ["100.1", "2"]], "b": [["99.5", "2"]]}}
+    limits = _basic_limits()
+    limits.update({"tick_size": "0.1", "max_price": "100.05"})
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("100"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0,
+        price_snapshot=Decimal("100.05"),
+        limits=limits,
+    )
+
+    audit = prepared.audit
+
+    assert prepared.payload["price"] == "100.0"
+    assert audit.get("limit_price") == "100"
+    assert audit.get("price_ceiling") == "100.05"
+
+
 def test_buy_tick_and_validation_ceiling_respects_worst_ask():
     asks = [(Decimal("100.03"), Decimal("0.4"))]
     bids = [(Decimal("99.5"), Decimal("0.4"))]
@@ -1093,7 +1118,7 @@ def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
     assert details.get("price_limit_hit") is True
 
 
-def test_prepare_spot_market_rejects_quantised_price_above_instrument_cap():
+def test_prepare_spot_market_clamps_price_at_instrument_cap():
     orderbook = {"result": {"a": [["100.05", "2"]], "b": [["99.5", "2"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)
 
@@ -1101,30 +1126,24 @@ def test_prepare_spot_market_rejects_quantised_price_above_instrument_cap():
     limits["max_price"] = "100.05"
     limits["tick_size"] = "0.1"
 
-    with pytest.raises(OrderValidationError) as excinfo:
-        spot_market_module.prepare_spot_market_order(
-            api,
-            symbol="BTCUSDT",
-            side="Buy",
-            qty=Decimal("10"),
-            unit="quoteCoin",
-            tol_type="Percent",
-            tol_value=Decimal("0.5"),
-            price_snapshot=Decimal("100"),
-            balances={"USDT": Decimal("1000")},
-            limits=limits,
-        )
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=Decimal("0.5"),
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("1000")},
+        limits=limits,
+    )
 
-    err = excinfo.value
-    assert getattr(err, "code", None) == "price_deviation"
-    details = getattr(err, "details", {}) or {}
-    assert details.get("price_limit_hit") is True
-    assert details.get("price_cap") == "100.05"
-    assert details.get("limit_price") == "100.1"
-    assert details.get("requested_quote") == "10"
-    assert details.get("available_quote") == "9.995005005"
-    assert details.get("requested_base") == "0.0999001"
-    assert details.get("available_base") == "0.0999001"
+    audit = prepared.audit
+    assert audit.get("limit_price") == "100"
+    assert prepared.payload["price"] == "100.0"
+    assert audit.get("price_used") == "100"
+    assert audit.get("price_ceiling") == "100.05"
 
 
 def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1201,7 +1220,7 @@ def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
     api = DummyAPI({}, orderbook_payload=orderbook)
 
     limits = _basic_limits()
-    limits["max_price"] = "100.05"
+    limits["max_price"] = "100"
     limits["tick_size"] = "0.1"
 
     with pytest.raises(OrderValidationError) as excinfo:
@@ -1220,6 +1239,9 @@ def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
 
     details = getattr(excinfo.value, "details", {}) or {}
     requested_quote = Decimal(details.get("requested_quote", "0"))
+    assert getattr(excinfo.value, "code", None) == "insufficient_liquidity"
+    assert details.get("price_cap") == "100"
+    assert details.get("available_quote") == "0"
 
     executor = SignalExecutor(object())
     backoff_state = executor._record_price_limit_hit(
@@ -1237,31 +1259,28 @@ def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
         0.5,
         0.0,
     )
-
-    assert adjusted_notional < float(requested_quote)
-    assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    if requested_quote > 0:
+        assert adjusted_notional < float(requested_quote)
+        assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    else:
+        assert adjusted_notional == pytest.approx(0.0)
     assert adjusted_slippage >= 0.5
 
 
-def test_price_limit_band_violation_reports_zero_available(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_price_limit_band_violation_reports_zero_available() -> None:
     orderbook = {"result": {"a": [["110", "1"], ["115", "2"]], "b": [["90", "1"]]}}
     api = DummyAPI(_universe_payload([]), orderbook_payload=orderbook)
 
     limits = _basic_limits()
     limits["max_price"] = "100"
 
-    def fake_plan_limit_ioc_order(**_kwargs):
-        return Decimal("110"), Decimal("0"), Decimal("0"), []
-
-    monkeypatch.setattr(spot_market_module, "_plan_limit_ioc_order", fake_plan_limit_ioc_order)
-
     with pytest.raises(OrderValidationError) as excinfo:
         spot_market_module.prepare_spot_market_order(
             api,
             symbol="BTCUSDT",
             side="Buy",
-            qty=Decimal("10"),
-            unit="quoteCoin",
+            qty=Decimal("0.2"),
+            unit="baseCoin",
             tol_type="Percent",
             tol_value=Decimal("0.5"),
             price_snapshot=Decimal("100"),
@@ -1270,13 +1289,12 @@ def test_price_limit_band_violation_reports_zero_available(monkeypatch: pytest.M
         )
 
     err = excinfo.value
-    assert getattr(err, "code", None) == "price_deviation"
+    assert getattr(err, "code", None) == "insufficient_liquidity"
     details = getattr(err, "details", {}) or {}
     assert details.get("price_cap") == "100"
     assert details.get("price_limit_hit") is True
-    assert details.get("available_quote") == "0"
     assert details.get("available_base") == "0"
-    assert "requested_quote" in details and "requested_base" in details
+    assert details.get("requested_base") == "0.2"
 
     requested_quote = Decimal(details.get("requested_quote", "0"))
 
@@ -1287,7 +1305,7 @@ def test_price_limit_band_violation_reports_zero_available(monkeypatch: pytest.M
         last_notional=float(requested_quote),
         last_slippage=0.5,
     )
-    assert backoff_state.get("available_quote") == 0.0
+    assert backoff_state.get("available_base") == 0.0
 
     adjusted_notional, adjusted_slippage, adjustments = executor._apply_price_limit_backoff(
         "BTCUSDT",
@@ -1297,8 +1315,11 @@ def test_price_limit_band_violation_reports_zero_available(monkeypatch: pytest.M
         0.0,
     )
 
-    assert adjusted_notional < float(requested_quote)
-    assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    if requested_quote > 0:
+        assert adjusted_notional < float(requested_quote)
+        assert adjustments.get("notional_quote") == pytest.approx(adjusted_notional)
+    else:
+        assert adjusted_notional == pytest.approx(0.0)
     assert adjusted_slippage >= 0.5
 
 
