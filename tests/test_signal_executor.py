@@ -25,6 +25,7 @@ from bybit_app.utils.spot_market import (
     _BALANCE_CACHE,
 )
 from bybit_app.utils.ws_manager import WSManager
+from tests.test_spot_market import DummyAPI as SpotDummyAPI, _universe_payload
 
 
 @pytest.fixture(autouse=True)
@@ -582,6 +583,97 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert captured["side"] == "Buy"
     assert captured["unit"] == "quoteCoin"
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
+
+
+def test_signal_executor_uses_spot_fallback_when_unified_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "ETHUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "baseCoin": "ETH",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0.00000001",
+                    "qtyStep": "0.00000001",
+                },
+                "priceFilter": {"tickSize": "0.1"},
+            }
+        ]
+    )
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "UNIFIED",
+                        "totalEquity": "100",
+                        "availableBalance": "100",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "equity": "100",
+                                "availableBalance": "3",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        "SPOT": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "SPOT",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "equity": "150",
+                                "availableBalance": "150",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    api = SpotDummyAPI(payload, wallet_payload=wallet_payload)
+
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_resolve_wallet(self, *, require_success: bool):
+        return api, (100.0, 100.0), 100.0, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status != "rejected"
+    assert api.place_calls, "executor should submit order when spot funds are available"
+    assert api.wallet_calls >= 2, "spot fallback should refresh balances for affordability guard"
 
 
 def test_signal_executor_handles_non_usdt_wallet_balances(
