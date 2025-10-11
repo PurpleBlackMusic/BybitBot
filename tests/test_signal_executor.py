@@ -1,7 +1,7 @@
 import copy
 from decimal import Decimal
 from pathlib import Path
-from typing import Mapping, Optional, Tuple, Union
+from typing import Dict, Mapping, Optional, Tuple, Union
 
 import json
 import time
@@ -954,7 +954,12 @@ def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_wallet",
-        lambda self, require_success: (api, (total_equity, available_equity), quote_cap),
+        lambda self, require_success: (
+            api,
+            (total_equity, available_equity),
+            quote_cap,
+            {},
+        ),
     )
 
     def fake_compute(
@@ -991,6 +996,57 @@ def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
     assert result.context is not None
     assert result.context.get("min_notional") == pytest.approx(5.0)
     assert result.context.get("quote_wallet_cap") == pytest.approx(quote_cap)
+
+
+def test_signal_executor_skips_buy_when_wallet_balance_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=False)
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=250.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fail_place(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AssertionError("place_spot_market_with_tolerance should not be called")
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        fail_place,
+    )
+
+    def raise_balances(*args: object, **kwargs: object) -> Mapping[str, object]:
+        raise RuntimeError("balance unavailable")
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_wallet_available_balances",
+        raise_balances,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.order is None
+    assert result.reason is not None
+    assert "Недостаточно свободного капитала" in result.reason
+    assert result.context is not None
+    assert result.context.get("quote_wallet_cap") == pytest.approx(0.0)
+    assert (
+        result.context.get("quote_wallet_cap_error")
+        == "wallet_balance_unavailable"
+    )
+    wallet_meta = result.context.get("wallet_meta")
+    assert isinstance(wallet_meta, Mapping)
+    assert wallet_meta.get("quote_wallet_cap_error") == "wallet_balance_unavailable"
 
 
 def test_signal_executor_reserve_respects_available_equity(
@@ -4364,7 +4420,7 @@ def test_fee_conversion_prevents_daily_loss_false_alarm(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_wallet",
-        lambda self, require_success=False: (None, (100.0, 100.0), None),
+        lambda self, require_success=False: (None, (100.0, 100.0), None, {}),
     )
 
     settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
@@ -4436,7 +4492,7 @@ def test_daily_loss_guard_handles_missing_fee_currency(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_wallet",
-        lambda self, require_success=False: (None, (30.0, 30.0), None),
+        lambda self, require_success=False: (None, (30.0, 30.0), None, {}),
     )
 
     settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
@@ -4634,8 +4690,8 @@ def test_daily_loss_guard_uses_cached_summary(
 
     def fake_resolve_wallet(
         self, *, require_success: bool
-    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float]]:
-        return None, (1000.0, 1000.0), None
+    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float], Dict[str, object]]:
+        return None, (1000.0, 1000.0), None, {}
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
