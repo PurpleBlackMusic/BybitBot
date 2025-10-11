@@ -2794,6 +2794,71 @@ def test_signal_executor_handles_runtime_price_limit_error(monkeypatch: pytest.M
     assert executor._symbol_quarantine.get("ETHUSDT") is not None
 
 
+def test_signal_executor_handles_runtime_price_floor_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    call_counter = {"value": 0}
+
+    def failing_place(*_args, **_kwargs):
+        call_counter["value"] += 1
+        raise RuntimeError(
+            "Bybit error 170194: Sell order price cannot be lower than 99.5USDT"
+        )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", failing_place
+    )
+
+    base_time = 1700000000.0
+    time_state = {"value": base_time}
+
+    def fake_now(self):
+        current = time_state["value"]
+        time_state["value"] += 30.0
+        return current
+
+    monkeypatch.setattr(SignalExecutor, "_current_time", fake_now)
+
+    executor = SignalExecutor(bot)
+
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert call_counter["value"] == 1
+    assert result.context is not None
+    assert result.context.get("validation_code") == "price_deviation"
+    details = result.context.get("validation_details")
+    assert isinstance(details, dict)
+    assert details.get("price_limit_hit") is True
+    assert details.get("price_floor") == "99.5"
+
+    backoff_state = result.context.get("price_limit_backoff")
+    assert isinstance(backoff_state, dict)
+    assert backoff_state.get("retries") == 1
+    assert backoff_state.get("price_floor") == pytest.approx(99.5)
+
+    executor_state = executor._price_limit_backoff.get("ETHUSDT")
+    assert isinstance(executor_state, dict)
+    assert executor_state.get("price_floor") == pytest.approx(99.5)
+    assert executor._symbol_quarantine.get("ETHUSDT") is not None
+
+
 def test_signal_executor_scales_position_with_signal_strength(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
