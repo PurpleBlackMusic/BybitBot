@@ -997,6 +997,35 @@ def test_prepare_spot_market_rejects_quantised_price_above_instrument_cap():
     assert details.get("limit_price") == "100.1"
 
 
+def test_place_spot_market_wraps_price_limit_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = DummyAPI(_universe_payload([]))
+
+    def failing_place_order(**_kwargs):
+        raise RuntimeError("Bybit error 170193: price exceeds price_cap 101.23")
+
+    monkeypatch.setattr(api, "place_order", failing_place_order)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("10"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("2.0"),
+            price_snapshot=Decimal("101"),
+            balances={"USDT": Decimal("1000")},
+            limits=_basic_limits(),
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "price_deviation"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("price_cap") == "101.23"
+    assert details.get("price_limit_hit") is True
+
+
 def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(twap_enabled=True, twap_slices=6)
     api = DummyAPI(_universe_payload([]))

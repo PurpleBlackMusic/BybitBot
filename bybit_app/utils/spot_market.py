@@ -6,6 +6,7 @@ from math import ceil
 import time
 from threading import RLock
 from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Tuple, TypeVar
+import re
 
 from .bybit_api import BybitAPI
 from .log import log
@@ -23,6 +24,19 @@ _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
 _TWAP_DEFAULT_MAX_SLICES = 10
 _TOLERANCE_MARGIN = Decimal("0.00000001")
+
+_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
+_PRICE_LIMIT_FIELDS = re.compile(
+    r"(?P<key>price[\s_-]?(?:cap|floor)|max[\s_-]?price|min[\s_-]?price|"
+    r"upper[\s_-]?(?:limit|price)|lower[\s_-]?(?:limit|price)|priceLimit(?:Upper|Lower)?)"
+    r"\s*(?:[:=]|is|<=|>=)?\s*\(?\s*(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
+    re.IGNORECASE,
+)
+
+_PRICE_LIMIT_KEY_ALIASES = {
+    "price_cap": {"pricecap", "maxprice", "upperlimit", "upperprice", "pricelimitupper"},
+    "price_floor": {"pricefloor", "minprice", "lowerlimit", "lowerprice", "pricelimitlower"},
+}
 
 
 T = TypeVar("T")
@@ -125,6 +139,45 @@ class OrderValidationError(RuntimeError):
         if self.details:
             payload["details"] = self.details
         return payload
+
+
+def _extract_bybit_error_code_from_message(message: str) -> Optional[str]:
+    match = _BYBIT_ERROR.search(message)
+    if match:
+        return match.group("code")
+    return None
+
+
+def _normalise_price_limit_key(raw: str) -> Optional[str]:
+    cleaned = re.sub(r"[^a-z]", "", raw.lower())
+    if not cleaned:
+        return None
+    for target, aliases in _PRICE_LIMIT_KEY_ALIASES.items():
+        if cleaned in aliases:
+            return target
+    if cleaned in ("pricecap", "pricelimit"):
+        return "price_cap"
+    if cleaned == "pricefloor":
+        return "price_floor"
+    return None
+
+
+def parse_price_limit_error_details(message: str) -> Dict[str, str]:
+    """Extract price limit hints from a Bybit error message."""
+
+    details: Dict[str, str] = {}
+    if not message:
+        return details
+
+    for match in _PRICE_LIMIT_FIELDS.finditer(message):
+        raw_key = match.group("key")
+        value = match.group("value")
+        if not raw_key or not value:
+            continue
+        key = _normalise_price_limit_key(raw_key)
+        if key:
+            details[key] = value
+    return details
 
 _WALLET_AVAILABLE_FIELDS = (
     "totalAvailableBalance",
@@ -2317,7 +2370,55 @@ def place_spot_market_with_tolerance(
             prepared.audit["twap_target_slices"] = target_slices
             prepared.audit["twap_order_index"] = twap_orders_sent
 
-        response = api.place_order(**prepared.payload)
+        try:
+            response = api.place_order(**prepared.payload)
+        except RuntimeError as exc:
+            error_code = _extract_bybit_error_code_from_message(str(exc))
+            if error_code != "170193":
+                raise
+
+            details = parse_price_limit_error_details(str(exc))
+            side_normalised = str(side or "").strip().lower()
+            if "price_cap" not in details:
+                audit_cap = prepared.audit.get("price_ceiling")
+                if audit_cap:
+                    details["price_cap"] = str(audit_cap)
+            if "price_floor" not in details:
+                audit_floor = prepared.audit.get("price_floor")
+                if audit_floor:
+                    details["price_floor"] = str(audit_floor)
+
+            limit_price = prepared.audit.get("limit_price")
+            if limit_price and "limit_price" not in details:
+                details["limit_price"] = str(limit_price)
+
+            if side_normalised == "buy":
+                requested_quote = (
+                    prepared.audit.get("requested_quote_notional")
+                    or prepared.audit.get("limit_notional")
+                )
+                if requested_quote and "requested_quote" not in details:
+                    details["requested_quote"] = str(requested_quote)
+            else:
+                requested_base = prepared.audit.get("order_qty_base")
+                if requested_base and "requested_base" not in details:
+                    details["requested_base"] = str(requested_base)
+
+            details["price_limit_hit"] = True
+            if side_normalised:
+                details.setdefault("side", side_normalised)
+
+            message = "Ожидаемая цена выходит за пределы допустимого значения."
+            if "price_cap" in details and details["price_cap"]:
+                message = "Ожидаемая цена превышает допустимый предел для инструмента."
+            elif "price_floor" in details and details["price_floor"]:
+                message = "Ожидаемая цена ниже допустимого предела для инструмента."
+
+            raise OrderValidationError(
+                message,
+                code="price_deviation",
+                details=details,
+            ) from exc
         last_response_raw = response
 
         ret_code = None
