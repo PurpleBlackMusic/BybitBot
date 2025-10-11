@@ -2398,6 +2398,62 @@ def place_spot_market_with_tolerance(
                     adjustment["target_slices"] = target_slices
                     twap_adjustments.append(adjustment)
                     continue
+            if twap_cfg.enabled and exc.code == "insufficient_liquidity":
+                details = getattr(exc, "details", {}) or {}
+                price_limit_hit = bool(details.get("price_limit_hit"))
+                if price_limit_hit:
+                    adjustment = {
+                        "code": exc.code,
+                        "message": str(exc),
+                        "remaining_qty": _format_decimal(remaining_qty),
+                        "target_slices": target_slices,
+                    }
+                    requested_value = details.get("requested_quote") or details.get("requested_base")
+                    available_value = details.get("available_quote") or details.get("available_base")
+                    requested_amount = _to_decimal(requested_value) if requested_value is not None else None
+                    available_amount = _to_decimal(available_value) if available_value is not None else None
+                    ratio: Decimal | None = None
+                    if isinstance(requested_amount, Decimal) and requested_amount > 0 and isinstance(
+                        available_amount, Decimal
+                    ):
+                        ratio = max(Decimal("0"), available_amount / requested_amount)
+                    scaled_target = target_slices
+                    if isinstance(ratio, Decimal):
+                        adjustment["ratio"] = _format_decimal(ratio)
+                        if ratio > 0:
+                            try:
+                                desired = (Decimal("1") / ratio).to_integral_value(rounding=ROUND_UP)
+                            except (InvalidOperation, ZeroDivisionError):  # pragma: no cover - defensive
+                                desired = Decimal(max_slices)
+                            try:
+                                desired_int = int(desired)
+                            except (TypeError, ValueError):  # pragma: no cover - defensive
+                                desired_int = max_slices
+                            if desired_int <= 0:
+                                desired_int = 1
+                            scaled_target = min(max_slices, max(target_slices, desired_int))
+                        else:
+                            scaled_target = max_slices
+                    else:
+                        scaled_target = max_slices
+                    if not twap_active:
+                        twap_active = True
+                        if scaled_target != target_slices:
+                            target_slices = scaled_target
+                        adjustment["action"] = "activate"
+                        adjustment["target_slices"] = target_slices
+                        twap_adjustments.append(adjustment)
+                        continue
+                    if scaled_target > target_slices:
+                        target_slices = scaled_target
+                        adjustment["action"] = "increase"
+                        adjustment["target_slices"] = target_slices
+                        twap_adjustments.append(adjustment)
+                        continue
+                    adjustment["action"] = "retry"
+                    adjustment["target_slices"] = target_slices
+                    twap_adjustments.append(adjustment)
+                    continue
             raise
 
         min_order_amt_candidate = _to_decimal(prepared.audit.get("min_order_amt"))
