@@ -62,7 +62,7 @@ class StubAPI:
         self._available = available
         self.orders: list[dict[str, object]] = []
 
-    def wallet_balance(self) -> dict:
+    def wallet_balance(self, *args: object, **kwargs: object) -> dict:
         return {
             "result": {
                 "list": [
@@ -643,6 +643,78 @@ def test_signal_executor_handles_non_usdt_wallet_balances(
     assert captured["qty"] == pytest.approx(expected_notional)
 
 
+def test_signal_executor_skips_buy_when_usdt_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mark_price = 25_000.0
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=5.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {
+                            "coin": "BTC",
+                            "equity": "0.4",
+                            "availableBalance": "0.4",
+                            "availableToWithdraw": "0.4",
+                            "markPrice": str(mark_price),
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    api = StubAPI(total=0.0, available=0.0)
+    monkeypatch.setattr(api, "wallet_balance", lambda *args, **kwargs: wallet_payload)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_wallet_available_balances",
+        lambda api_obj, account_type="UNIFIED": {
+            "BTC": Decimal("0.4"),
+            "USDT": Decimal("0"),
+        },
+    )
+
+    place_called = {"value": False}
+
+    def fail_place(*args: object, **kwargs: object) -> dict[str, object]:
+        place_called["value"] = True
+        raise AssertionError("place_spot_market_with_tolerance should not be called")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fail_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert "Недостаточно свободного капитала" in result.reason
+    assert place_called["value"] is False
+    assert result.context is not None
+    assert result.context.get("quote_wallet_cap") == pytest.approx(0.0)
+    assert result.context.get("available_equity_quote_limited") == pytest.approx(0.0)
+
+
 def test_signal_executor_scales_to_min_notional_when_capital_allows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1131,6 +1203,7 @@ def test_signal_executor_sell_reads_spot_balance_when_unified_empty(
         sizing_factor,
         *,
         min_notional,
+        quote_balance_cap=None,
     ) -> Tuple[float, float]:
         return 0.0, available_equity
 
@@ -1213,6 +1286,7 @@ def test_signal_executor_sell_uses_fallback_notional_when_below_min(
         sizing_factor,
         *,
         min_notional,
+        quote_balance_cap=None,
     ) -> Tuple[float, float]:
         return 1.0, available_equity
 
@@ -1297,6 +1371,7 @@ def test_signal_executor_sell_caps_notional_to_wallet_holdings(
         sizing_factor,
         *,
         min_notional,
+        quote_balance_cap=None,
     ) -> Tuple[float, float]:
         return 100.0, available_equity
 
@@ -3804,7 +3879,7 @@ def test_fee_conversion_prevents_daily_loss_false_alarm(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_wallet",
-        lambda self, require_success=False: (None, (100.0, 100.0)),
+        lambda self, require_success=False: (None, (100.0, 100.0), None),
     )
 
     settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
@@ -3876,7 +3951,7 @@ def test_daily_loss_guard_handles_missing_fee_currency(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_resolve_wallet",
-        lambda self, require_success=False: (None, (30.0, 30.0)),
+        lambda self, require_success=False: (None, (30.0, 30.0), None),
     )
 
     settings = Settings(ai_enabled=True, ai_daily_loss_limit_pct=1.0)
@@ -4074,8 +4149,8 @@ def test_daily_loss_guard_uses_cached_summary(
 
     def fake_resolve_wallet(
         self, *, require_success: bool
-    ) -> Tuple[Optional[object], Tuple[float, float]]:
-        return None, (1000.0, 1000.0)
+    ) -> Tuple[Optional[object], Tuple[float, float], Optional[float]]:
+        return None, (1000.0, 1000.0), None
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
