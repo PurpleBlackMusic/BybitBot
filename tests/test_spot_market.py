@@ -872,6 +872,73 @@ def test_place_spot_market_with_tolerance_merges_spot_balances_when_required_ass
     assert api.wallet_calls >= 2, "fallback should query spot balances"
 
 
+def test_place_spot_market_with_tolerance_refreshes_when_unified_balance_insufficient():
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "ETHUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "baseCoin": "ETH",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0.00000001",
+                    "qtyStep": "0.00000001",
+                },
+                "priceFilter": {"tickSize": "0.1"},
+            }
+        ]
+    )
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableBalance": "3",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        "SPOT": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "SPOT",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "availableBalance": "25",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+    }
+
+    api = DummyAPI(payload, wallet_payload=wallet_payload)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="ETHUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0.5,
+    )
+
+    assert response["ok"] is True
+    assert api.place_calls, "order should be placed when spot funds top up unified wallet"
+    assert api.wallet_calls >= 2, "insufficient unified balance should trigger refresh"
+
+
 def test_prepare_spot_market_allows_price_within_mark_tolerance_bps():
     orderbook = {"result": {"a": [["104", "5"]], "b": [["99", "5"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)

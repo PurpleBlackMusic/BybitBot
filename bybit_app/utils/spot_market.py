@@ -1706,6 +1706,7 @@ def prepare_spot_market_order(
 
     def _ensure_balance(asset: str, required: Decimal) -> None:
         nonlocal balance_map
+
         asset_normalised = asset.strip().upper()
         if not asset_normalised or required <= 0:
             return
@@ -1715,24 +1716,45 @@ def prepare_spot_market_order(
             balance_map = _wallet_available_balances(api, required_asset=asset_normalised)
             fetched_with_requirement = True
 
-        available = Decimal("0")
-        if balance_map:
-            available = balance_map.get(asset_normalised, Decimal("0"))
+        def _current_available() -> Decimal:
+            if balance_map:
+                return balance_map.get(asset_normalised, Decimal("0"))
+            return Decimal("0")
 
-        if available <= 0 and not fetched_with_requirement:
-            refreshed = _wallet_available_balances(api, required_asset=asset_normalised)
-            fetched_with_requirement = True
-            if refreshed:
-                if balance_map is None:
-                    balance_map = refreshed
-                else:
-                    balance_map.update(refreshed)
-                available = balance_map.get(asset_normalised, Decimal("0"))
+        available = _current_available()
 
-        margin = Decimal("0.00000001")
+        margin = _TOLERANCE_MARGIN
         if available + margin >= required:
             balances_checked.append((asset_normalised, required))
             return
+
+        if available + margin < required and not fetched_with_requirement:
+            refreshed = _wallet_available_balances(api, required_asset=asset_normalised)
+            fetched_with_requirement = True
+            merged: Dict[str, Decimal] = dict(balance_map or {})
+            if refreshed:
+                merged.update(refreshed)
+            balance_map = merged if merged else balance_map
+            available = _current_available()
+            if available + margin >= required:
+                balances_checked.append((asset_normalised, required))
+                return
+
+        if available + margin < required:
+            spot_refreshed = _wallet_available_balances(
+                api,
+                account_type="SPOT",
+                required_asset=asset_normalised,
+            )
+            merged: Dict[str, Decimal] = dict(balance_map or {})
+            if spot_refreshed:
+                merged.update(spot_refreshed)
+            if merged:
+                balance_map = merged
+                available = _current_available()
+                if available + margin >= required:
+                    balances_checked.append((asset_normalised, required))
+                    return
 
         details: Dict[str, object] = {
             "asset": asset_normalised,
