@@ -2673,6 +2673,91 @@ def test_signal_executor_skips_price_limit_liquidity(monkeypatch: pytest.MonkeyP
     assert followup_backoff.get("retries") == 2
 
 
+def test_price_limit_backoff_preserves_price_cap_without_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    attempt = {"value": 0}
+
+    def failing_place(*_args, **_kwargs):
+        attempt["value"] += 1
+        base_details = {
+            "requested_quote": "100.0",
+            "available_quote": "42.0",
+            "side": "buy",
+            "price_limit_hit": True,
+        }
+        if attempt["value"] == 1:
+            details = dict(base_details)
+            details["price_cap"] = "123.45"
+        else:
+            details = dict(base_details)
+        raise OrderValidationError(
+            "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
+            code="insufficient_liquidity",
+            details=details,
+        )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", failing_place
+    )
+
+    base_time = 1700000000.0
+    time_state = {"value": base_time}
+
+    def fake_now(self):
+        current = time_state["value"]
+        time_state["value"] += 30.0
+        return current
+
+    monkeypatch.setattr(SignalExecutor, "_current_time", fake_now)
+
+    executor = SignalExecutor(bot)
+
+    first_result = executor.execute_once()
+    executor._symbol_quarantine.pop("ETHUSDT", None)
+    time_state["value"] = base_time + signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL + 10.0
+    second_result = executor.execute_once()
+
+    assert first_result.status == "skipped"
+    assert second_result.status == "skipped"
+    assert attempt["value"] == 2
+
+    backoff_state = executor._price_limit_backoff.get("ETHUSDT")
+    assert isinstance(backoff_state, dict)
+    assert backoff_state.get("price_cap") == pytest.approx(123.45)
+
+    adjusted_notional, adjusted_slippage, adjustments = executor._apply_price_limit_backoff(
+        "ETHUSDT",
+        "Buy",
+        notional_quote=100.0,
+        slippage_pct=0.5,
+        min_notional=5.0,
+    )
+
+    assert adjusted_notional <= 100.0
+    assert adjusted_slippage >= 0.5
+    assert isinstance(adjustments, dict)
+    assert adjustments.get("price_cap") == pytest.approx(123.45)
+
+
 def test_signal_executor_skips_price_limit_price_deviation(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(
