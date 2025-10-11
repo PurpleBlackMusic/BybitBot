@@ -1556,6 +1556,7 @@ class SignalExecutor:
             notional,
             usable_after_reserve,
             reserve_relaxed_for_min,
+            quote_cap_substituted,
         ) = self._compute_notional(
             settings,
             total_equity,
@@ -1784,6 +1785,8 @@ class SignalExecutor:
             order_context["quote_wallet_cap"] = quote_wallet_cap_value
         if quote_wallet_limited_available is not None:
             order_context["available_equity_quote_limited"] = quote_wallet_limited_available
+        if quote_cap_substituted:
+            order_context["quote_wallet_cap_substituted"] = True
         if fallback_context:
             order_context["sell_fallback"] = fallback_context
         if fallback_applied_notional is not None:
@@ -3907,7 +3910,7 @@ class SignalExecutor:
         *,
         min_notional: float | None = None,
         quote_balance_cap: float | None = None,
-    ) -> Tuple[float, float, bool]:
+    ) -> Tuple[float, float, bool, bool]:
         try:
             reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -3928,6 +3931,7 @@ class SignalExecutor:
             cap_pct = 0.0
 
         capped_available = available_equity
+        quote_cap_substituted = False
         if quote_balance_cap is not None:
             try:
                 quote_cap_value = float(quote_balance_cap)
@@ -3935,8 +3939,13 @@ class SignalExecutor:
                 quote_cap_value = None
             if quote_cap_value is not None and math.isfinite(quote_cap_value):
                 quote_cap_value = max(quote_cap_value, 0.0)
-                if not math.isfinite(capped_available):
-                    capped_available = quote_cap_value
+                available_invalid = not math.isfinite(capped_available)
+                if available_invalid or capped_available <= 0.0:
+                    if quote_cap_value > 0.0:
+                        capped_available = quote_cap_value
+                        quote_cap_substituted = True
+                    elif available_invalid:
+                        capped_available = quote_cap_value
                 else:
                     capped_available = min(capped_available, quote_cap_value)
         reserve_base = min(total_equity, capped_available)
@@ -3967,7 +3976,7 @@ class SignalExecutor:
             and usable_after_reserve <= 0.0
             and not meets_min_pre_reserve
         ):
-            return 0.0, usable_after_reserve, reserve_relaxed
+            return 0.0, usable_after_reserve, reserve_relaxed, quote_cap_substituted
 
         caps = []
         if usable_after_reserve > 0:
@@ -3993,7 +4002,7 @@ class SignalExecutor:
             elif meets_min_post_reserve and (notional == 0.0 or notional < min_threshold):
                 notional = min_threshold
 
-        return notional, usable_after_reserve, reserve_relaxed
+        return notional, usable_after_reserve, reserve_relaxed, quote_cap_substituted
 
     def _sell_notional_from_holdings(
         self,
