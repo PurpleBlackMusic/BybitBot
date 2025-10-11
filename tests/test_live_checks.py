@@ -137,6 +137,42 @@ def test_extract_wallet_totals_prefers_spot_accounts() -> None:
     assert withdrawable == pytest.approx(70.0)
 
 
+def test_extract_wallet_totals_deduplicates_spot_capable_accounts() -> None:
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "totalEquity": "200.0",
+                    "availableBalance": "150.0",
+                    "availableToWithdraw": "140.0",
+                },
+                {
+                    "accountType": "SPOT",
+                    "totalEquity": "200.0",
+                    "availableBalance": "150.0",
+                    "availableToWithdraw": "140.0",
+                },
+                {
+                    "accountType": "CONTRACT",
+                    "totalEquity": "1000.0",
+                    "availableBalance": "900.0",
+                    "availableToWithdraw": "800.0",
+                },
+            ]
+        }
+    }
+
+    total, tradable = live_checks.extract_wallet_totals(wallet_payload)
+    full_total, full_tradable, withdrawable = live_checks._extract_wallet_totals(wallet_payload)  # type: ignore[attr-defined]
+
+    assert total == pytest.approx(200.0)
+    assert tradable == pytest.approx(150.0)
+    assert full_total == pytest.approx(200.0)
+    assert full_tradable == pytest.approx(150.0)
+    assert withdrawable == pytest.approx(140.0)
+
+
 def test_api_key_status_handles_errors() -> None:
     class FailingAPI:
         def wallet_balance(self):  # pragma: no cover - trivial proxy
