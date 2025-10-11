@@ -3716,6 +3716,7 @@ class SignalExecutor:
         except Exception:
             balances = None
         if isinstance(balances, Mapping):
+            quote_balance = 0.0
             raw_quote = None
             for candidate in ("USDT", "usdt"):
                 raw_quote = balances.get(candidate)
@@ -3723,14 +3724,14 @@ class SignalExecutor:
                     break
             if raw_quote is not None:
                 try:
-                    quote_balance = float(raw_quote)
+                    quote_value = float(raw_quote)
                 except (TypeError, ValueError):
-                    quote_balance = None
+                    quote_value = None
                 else:
-                    if not math.isfinite(quote_balance):
-                        quote_balance = None
-                    elif quote_balance < 0.0:
-                        quote_balance = 0.0
+                    if not math.isfinite(quote_value) or quote_value < 0.0:
+                        quote_value = 0.0
+                if quote_value is not None:
+                    quote_balance = quote_value
 
         return api, totals, quote_balance
 

@@ -19,7 +19,11 @@ from bybit_app.utils.signal_executor import (
     ExecutionResult,
     SignalExecutor,
 )
-from bybit_app.utils.spot_market import OrderValidationError, SpotTradeSnapshot
+from bybit_app.utils.spot_market import (
+    OrderValidationError,
+    SpotTradeSnapshot,
+    _BALANCE_CACHE,
+)
 from bybit_app.utils.ws_manager import WSManager
 
 
@@ -30,6 +34,13 @@ def _stub_ws_autostart(monkeypatch: pytest.MonkeyPatch) -> None:
         "autostart",
         lambda include_private=True: (False, False),
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_wallet_cache() -> None:
+    _BALANCE_CACHE.clear()
+    yield
+    _BALANCE_CACHE.clear()
 
 
 class StubBot:
@@ -69,6 +80,14 @@ class StubAPI:
                     {
                         "totalEquity": str(self._total),
                         "availableBalance": str(self._available),
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "equity": str(self._available),
+                                "availableToWithdraw": str(self._available),
+                                "availableBalance": str(self._available),
+                            }
+                        ],
                     }
                 ]
             }
@@ -580,6 +599,8 @@ def test_signal_executor_handles_non_usdt_wallet_balances(
     )
     bot = StubBot(summary, settings)
 
+    _BALANCE_CACHE.clear()
+
     wallet_payload = {
         "result": {
             "list": [
@@ -599,7 +620,7 @@ def test_signal_executor_handles_non_usdt_wallet_balances(
     }
 
     api = StubAPI(total=0.0, available=0.0)
-    monkeypatch.setattr(api, "wallet_balance", lambda: wallet_payload)
+    monkeypatch.setattr(api, "wallet_balance", lambda *args, **kwargs: wallet_payload)
     monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
     monkeypatch.setattr(
         signal_executor_module,
@@ -607,40 +628,14 @@ def test_signal_executor_handles_non_usdt_wallet_balances(
         lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
     )
 
-    captured: dict[str, object] = {}
-
-    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
-        captured.update(kwargs)
-        return {"status": "ok", "result": {"orderId": "test"}}
-
-    monkeypatch.setattr(
-        signal_executor_module, "place_spot_market_with_tolerance", fake_place
-    )
-
     executor = SignalExecutor(bot)
     result = executor.execute_once()
 
-    assert result.status == "filled"
-    assert not result.reason or "min_notional" not in result.reason
-    assert captured["symbol"] == "BTCUSDT"
-    assert captured["side"] == "Buy"
-    assert captured["unit"] == "quoteCoin"
-
-    expected_total = 0.5 * mark_price
-    expected_available = 0.4 * mark_price
-    reserve_base = min(expected_total, expected_available)
-    reserve = reserve_base * 0.02
-    usable_after_reserve = expected_available - reserve
-    cap_pct = getattr(settings, "spot_max_cap_per_trade_pct", 0.0) or 0.0
-    cap_limit = expected_total * cap_pct / 100.0 if cap_pct > 0 else usable_after_reserve
-    expected_notional = min(usable_after_reserve, cap_limit)
-
     assert result.context is not None
-    assert result.context["total_equity"] == pytest.approx(expected_total)
-    assert result.context["available_equity"] == pytest.approx(expected_available)
-    assert result.context["usable_after_reserve"] == pytest.approx(usable_after_reserve)
-    assert captured["max_quote"] == pytest.approx(usable_after_reserve)
-    assert captured["qty"] == pytest.approx(expected_notional)
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert "Недостаточно свободного капитала" in result.reason
+    assert result.context.get("quote_wallet_cap") == pytest.approx(0.0)
 
 
 def test_signal_executor_skips_buy_when_usdt_unavailable(
@@ -713,6 +708,60 @@ def test_signal_executor_skips_buy_when_usdt_unavailable(
     assert result.context is not None
     assert result.context.get("quote_wallet_cap") == pytest.approx(0.0)
     assert result.context.get("available_equity_quote_limited") == pytest.approx(0.0)
+
+
+def test_signal_executor_skips_buy_when_usdt_wallet_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        dry_run_mainnet=False,
+        dry_run_testnet=False,
+        ai_risk_per_trade_pct=5.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=500.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {"min_order_amt": "5"},
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_wallet_available_balances",
+        lambda api_obj, account_type="UNIFIED", **_: {"BTC": Decimal("0.4")},
+    )
+
+    place_called = {"value": False}
+
+    def fail_place(*args: object, **kwargs: object) -> dict[str, object]:
+        place_called["value"] = True
+        raise AssertionError("place_spot_market_with_tolerance should not be called")
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fail_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert "Недостаточно свободного капитала" in result.reason
+    assert place_called["value"] is False
+    assert result.context is not None
+    assert result.context.get("quote_wallet_cap") == pytest.approx(0.0)
 
 
 def test_signal_executor_buy_uses_spot_usdt_when_unified_missing(
