@@ -871,6 +871,55 @@ def test_signal_executor_scales_to_min_notional_when_capital_allows(
     assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
 
 
+def test_signal_executor_relaxes_reserve_for_minimum_buy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=0.0,
+        spot_cash_reserve_pct=10.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=5.0, available=5.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {"min_order_amt": "5"},
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_place(api_obj, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"retCode": 0, "result": {"orderId": "reserve-min"}}
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", fake_place
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert captured
+    assert pytest.approx(float(captured["qty"]), rel=1e-9) == 5.0
+    assert result.context is not None
+    assert result.context.get("reserve_relaxed_for_min_notional") is True
+    assert result.context.get("usable_after_reserve") == pytest.approx(4.5)
+    assert result.order is not None
+    assert result.order.get("notional_quote") == pytest.approx(5.0)
+
+
 def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -917,8 +966,8 @@ def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
         *,
         min_notional: float | None = None,
         quote_balance_cap: float | None = None,
-    ) -> tuple[float, float]:
-        return 5.0, 4.5
+    ) -> tuple[float, float, bool]:
+        return 5.0, 4.5, False
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
@@ -1394,8 +1443,8 @@ def test_signal_executor_sell_reads_spot_balance_when_unified_empty(
         *,
         min_notional,
         quote_balance_cap=None,
-    ) -> Tuple[float, float]:
-        return 0.0, available_equity
+    ) -> Tuple[float, float, bool]:
+        return 0.0, available_equity, False
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
@@ -1494,8 +1543,8 @@ def test_signal_executor_sell_combines_unified_and_spot_balances(
         *,
         min_notional,
         quote_balance_cap=None,
-    ) -> Tuple[float, float]:
-        return 50.0, available_equity
+    ) -> Tuple[float, float, bool]:
+        return 50.0, available_equity, False
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
@@ -1604,8 +1653,8 @@ def test_signal_executor_sell_uses_fallback_notional_when_below_min(
         *,
         min_notional,
         quote_balance_cap=None,
-    ) -> Tuple[float, float]:
-        return 1.0, available_equity
+    ) -> Tuple[float, float, bool]:
+        return 1.0, available_equity, False
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
@@ -1689,8 +1738,8 @@ def test_signal_executor_sell_caps_notional_to_wallet_holdings(
         *,
         min_notional,
         quote_balance_cap=None,
-    ) -> Tuple[float, float]:
-        return 100.0, available_equity
+    ) -> Tuple[float, float, bool]:
+        return 100.0, available_equity, False
 
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
