@@ -2424,14 +2424,23 @@ def place_spot_market_with_tolerance(
                 if target_slices < max_slices:
                     new_target = _twap_slices_from_fill_ratio(target_slices, ratio, max_slices)
 
-                action = "activate" if not was_active else "maintain"
+                if not was_active:
+                    target_slices = new_target
+                    adjustment["action"] = "activate"
+                    adjustment["target_slices"] = target_slices
+                    twap_adjustments.append(adjustment)
+                    continue
+
                 if new_target > target_slices:
                     target_slices = new_target
-                    action = "increase" if was_active else "activate"
-                adjustment["action"] = action
-                adjustment["target_slices"] = target_slices
+                    adjustment["action"] = "increase"
+                    adjustment["target_slices"] = target_slices
+                    twap_adjustments.append(adjustment)
+                    continue
+
+                adjustment["action"] = "error"
                 twap_adjustments.append(adjustment)
-                continue
+                raise
 
             if twap_cfg.enabled and exc.code == "price_deviation":
                 adjustment = {
