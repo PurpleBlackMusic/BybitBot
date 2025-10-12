@@ -1748,7 +1748,8 @@ def prepare_spot_market_order(
             )
             merged: Dict[str, Decimal] = dict(balance_map or {})
             if spot_refreshed:
-                merged.update(spot_refreshed)
+                for spot_asset, spot_available in spot_refreshed.items():
+                    merged[spot_asset] = merged.get(spot_asset, Decimal("0")) + spot_available
             if merged:
                 balance_map = merged
                 available = _current_available()
