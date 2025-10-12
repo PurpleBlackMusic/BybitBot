@@ -1267,7 +1267,10 @@ def _wallet_available_balances(
         if required_normalised:
             cached_amount = cached.get(required_normalised, Decimal("0"))
             if cached_amount is None or cached_amount <= 0:
-                _BALANCE_CACHE.invalidate(cache_key)
+                if cached:
+                    _BALANCE_CACHE.invalidate(cache_key)
+                else:
+                    return cached
             else:
                 return cached
         else:
@@ -2519,7 +2522,43 @@ def place_spot_market_with_tolerance(
     twap_adjustments: list[Dict[str, object]] = []
 
     max_attempts = max(3, max_slices * 5 if twap_cfg.enabled else 3)
+    if isinstance(settings, Settings):
+        override_raw = getattr(settings, "twap_adjustment_max_attempts", None)
+        try:
+            override_value = int(override_raw) if override_raw is not None else 0
+        except Exception:  # pragma: no cover - defensive
+            override_value = 0
+        if override_value > 0:
+            max_attempts = max(1, min(max_attempts, override_value))
     attempt = 0
+    adjustment_attempts = 0
+
+    def _register_adjustment_retry(reason: str, error: OrderValidationError) -> None:
+        nonlocal attempt, adjustment_attempts
+        attempt += 1
+        adjustment_attempts += 1
+        if attempt >= max_attempts:
+            details = {
+                "reason": reason,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "adjustment_attempts": adjustment_attempts,
+                "twap_active": twap_active,
+                "twap_target_slices": target_slices,
+                "twap_adjustments": list(twap_adjustments),
+                "last_error": getattr(error, "details", {}) or {},
+            }
+            log(
+                "spot.market.twap_adjustment_exhausted",
+                symbol=symbol,
+                side=side,
+                **{k: v for k, v in details.items() if k != "twap_adjustments"},
+            )
+            raise OrderValidationError(
+                "Не удалось выполнить ордер в пределах допустимого количества попыток.",
+                code="twap_adjustment_exhausted",
+                details=details,
+            ) from error
 
     while attempt < max_attempts:
         if remaining_qty <= 0:
@@ -2594,12 +2633,14 @@ def place_spot_market_with_tolerance(
                     adjustment["action"] = "activate"
                     adjustment["target_slices"] = target_slices
                     twap_adjustments.append(adjustment)
+                    _register_adjustment_retry(exc.code or "price_deviation", exc)
                     continue
                 if scaled_target > target_slices:
                     target_slices = scaled_target
                     adjustment["action"] = "increase"
                     adjustment["target_slices"] = target_slices
                     twap_adjustments.append(adjustment)
+                    _register_adjustment_retry(exc.code or "price_deviation", exc)
                     continue
             if twap_cfg.enabled and exc.code == "insufficient_liquidity":
                 details = getattr(exc, "details", {}) or {}
@@ -2646,16 +2687,19 @@ def place_spot_market_with_tolerance(
                         adjustment["action"] = "activate"
                         adjustment["target_slices"] = target_slices
                         twap_adjustments.append(adjustment)
+                        _register_adjustment_retry(exc.code or "insufficient_liquidity", exc)
                         continue
                     if scaled_target > target_slices:
                         target_slices = scaled_target
                         adjustment["action"] = "increase"
                         adjustment["target_slices"] = target_slices
                         twap_adjustments.append(adjustment)
+                        _register_adjustment_retry(exc.code or "insufficient_liquidity", exc)
                         continue
                     adjustment["action"] = "retry"
                     adjustment["target_slices"] = target_slices
                     twap_adjustments.append(adjustment)
+                    _register_adjustment_retry(exc.code or "insufficient_liquidity", exc)
                     continue
             raise
 

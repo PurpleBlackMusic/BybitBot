@@ -1464,6 +1464,51 @@ def test_place_spot_market_twap_splits_quantity_on_price_deviation(monkeypatch: 
     assert adjustments and adjustments[0].get("action") == "activate"
 
 
+def test_place_spot_market_with_tolerance_limits_price_deviation_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(twap_enabled=True, twap_slices=1)
+    settings.twap_slices_max = 64
+    settings.twap_adjustment_max_attempts = 3
+    api = DummyAPI(_universe_payload([]))
+
+    calls = 0
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise OrderValidationError(
+            "too wide",
+            code="price_deviation",
+            details={"limit_price": "10", "max_allowed": "1"},
+        )
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+    monkeypatch.setattr(
+        spot_market_module,
+        "_twap_scaled_slices",
+        lambda current, ratio, max_slices: current + 1,
+    )
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        place_spot_market_with_tolerance(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("120"),
+            unit="quoteCoin",
+            settings=settings,
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "twap_adjustment_exhausted"
+    details = getattr(err, "details", {}) or {}
+    assert details.get("reason") == "price_deviation"
+    assert details.get("adjustment_attempts") == settings.twap_adjustment_max_attempts
+    assert details.get("twap_adjustments")
+    assert calls == settings.twap_adjustment_max_attempts
+
+
 def test_place_spot_market_twap_scales_slices_from_price_deviation_details(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
