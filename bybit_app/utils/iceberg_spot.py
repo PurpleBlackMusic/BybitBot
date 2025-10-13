@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import math
 import time
+from decimal import Decimal, ROUND_UP
 
 from .bybit_api import BybitAPI
 from .helpers import ensure_link_id
 from .log import log
+from .spot_rules import (
+    SpotInstrumentNotFound,
+    format_decimal,
+    load_spot_instrument,
+    quantize_spot_order,
+)
 
 
 def iceberg_spot(
@@ -32,16 +38,39 @@ def iceberg_spot(
     if child_qty and splits:
         raise ValueError("Либо child_qty, либо splits")
 
-    batch_count = splits or max(1, int(math.ceil(total_qty / float(child_qty))))
-    remaining_qty = float(total_qty)
+    total_qty_dec = Decimal(str(total_qty))
+    if total_qty_dec <= 0:
+        raise ValueError("total_qty must be positive")
 
-    def _best_price() -> float | None:
+    child_qty_dec = Decimal(str(child_qty)) if child_qty is not None else None
+    if child_qty_dec is not None and child_qty_dec <= 0:
+        raise ValueError("child_qty must be positive")
+
+    if splits is not None and splits <= 0:
+        raise ValueError("splits must be positive")
+
+    if splits is not None:
+        batch_count = int(splits)
+    else:
+        assert child_qty_dec is not None
+        ratio = (total_qty_dec / child_qty_dec).to_integral_value(rounding=ROUND_UP)
+        batch_count = max(1, int(ratio))
+
+    remaining_qty = total_qty_dec
+    price_limit_dec = Decimal(str(price_limit)) if price_limit is not None else None
+
+    try:
+        instrument = load_spot_instrument(api, symbol)
+    except SpotInstrumentNotFound as exc:
+        raise ValueError(str(exc)) from exc
+
+    def _best_price() -> Decimal | None:
         orderbook = api.orderbook(category="spot", symbol=symbol, limit=1)
         result = (orderbook.get("result") or {})
         ask_rows = result.get("a") or []
         bid_rows = result.get("b") or []
-        best_ask = float(ask_rows[0][0]) if ask_rows else None
-        best_bid = float(bid_rows[0][0]) if bid_rows else None
+        best_ask = Decimal(str(ask_rows[0][0])) if ask_rows else None
+        best_bid = Decimal(str(bid_rows[0][0])) if bid_rows else None
 
         if mode == "fast":
             return best_ask if normalised_side == "Buy" else best_bid
@@ -49,41 +78,64 @@ def iceberg_spot(
             base_price = best_ask if normalised_side == "Buy" else best_bid
             if base_price is None:
                 return None
-            adjustment = offset_bps / 10_000.0
+            adjustment = Decimal(str(offset_bps)) / Decimal("10000")
             if normalised_side == "Buy":
-                return base_price * (1 + adjustment)
-            return base_price * (1 - adjustment)
+                return base_price * (Decimal("1") + adjustment)
+            return base_price * (Decimal("1") - adjustment)
         if mode == "fixed":
-            return price_limit
+            return price_limit_dec
         return None
 
     responses: list[dict[str, object]] = []
     slices_executed = 0
 
-    while remaining_qty > 1e-12 and slices_executed < batch_count:
+    while remaining_qty > Decimal("0") and slices_executed < batch_count:
         per_slice_qty = (
-            child_qty if child_qty is not None else total_qty / batch_count
+            child_qty_dec if child_qty_dec is not None else total_qty_dec / Decimal(batch_count)
         )
         current_qty = min(remaining_qty, per_slice_qty)
+        if current_qty <= 0:
+            break
+
         price = _best_price()
-        if price is None:
+        if price is None or price <= 0:
             log("iceberg.skip.no_price", symbol=symbol)
             break
-        if price_limit is not None:
-            if normalised_side == "Buy" and price > price_limit:
+
+        validated = quantize_spot_order(
+            instrument=instrument,
+            price=price,
+            qty=current_qty,
+            side=normalised_side,
+        )
+        if not validated.ok or validated.qty <= 0 or validated.price <= 0:
+            log(
+                "iceberg.skip.invalid_qty",
+                symbol=symbol,
+                reasons=list(validated.reasons),
+                qty=str(validated.qty),
+                price=str(validated.price),
+            )
+            break
+
+        price_quant = validated.price
+        qty_quant = validated.qty
+
+        if price_limit_dec is not None:
+            if normalised_side == "Buy" and price_quant > price_limit_dec:
                 log(
                     "iceberg.stop.limit",
                     reason="price above limit",
-                    px=price,
-                    limit=price_limit,
+                    px=price_quant,
+                    limit=price_limit_dec,
                 )
                 break
-            if normalised_side == "Sell" and price < price_limit:
+            if normalised_side == "Sell" and price_quant < price_limit_dec:
                 log(
                     "iceberg.stop.limit",
                     reason="price below limit",
-                    px=price,
-                    limit=price_limit,
+                    px=price_quant,
+                    limit=price_limit_dec,
                 )
                 break
 
@@ -95,8 +147,8 @@ def iceberg_spot(
             "symbol": symbol,
             "side": normalised_side,
             "orderType": "Limit",
-            "qty": f"{current_qty:.10f}",
-            "price": f"{price:.10f}",
+            "qty": format_decimal(qty_quant),
+            "price": format_decimal(price_quant),
             "timeInForce": tif,
             "orderLinkId": link_id,
         }
@@ -106,7 +158,7 @@ def iceberg_spot(
         log("iceberg.child", index=slices_executed, body=payload, resp=response)
 
         slices_executed += 1
-        remaining_qty -= current_qty
+        remaining_qty -= qty_quant
         time.sleep(sleep_ms / 1000.0)
 
     return {"children": slices_executed, "responses": responses}
