@@ -1,5 +1,5 @@
 {
-  "ts": 1760422004576,
+  "ts": 1760422317344,
   "symbols": [
     "BTCUSDT",
     "ETHUSDT",
@@ -7,11 +7,23 @@
     "XRPUSDT",
     "BNBUSDT",
     "DOGEUSDT",
+    "TONUSDT",
     "ADAUSDT",
     "TRXUSDT",
-    "MATICUSDT",
+    "SHIBUSDT",
+    "LINKUSDT",
+    "PEPEUSDT",
+    "BCHUSDT",
     "LTCUSDT",
+    "DOTUSDT",
     "AVAXUSDT",
-    "LINKUSDT"
+    "MATICUSDT",
+    "NEARUSDT",
+    "SUIUSDT",
+    "APTUSDT",
+    "ARBUSDT",
+    "OPUSDT",
+    "SEIUSDT",
+    "IMXUSDT"
   ]
 }

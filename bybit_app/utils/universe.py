@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Iterable
@@ -147,6 +148,7 @@ def build_universe(
     size: int = 8,
     min_turnover: float | None = None,
     max_spread_bps: float | None = None,
+    persist: bool | None = None,
 ) -> list[str]:
     min_turnover, max_spread_bps = _resolve_liquidity_filters(min_turnover, max_spread_bps)
     response = api._safe_req("GET", "/v5/market/tickers", params={"category": "spot"})
@@ -176,12 +178,16 @@ def build_universe(
     filtered_symbols = filter_available_spot_pairs(ordered_symbols)
     top = filtered_symbols[: int(size)] if size else filtered_symbols
 
-    payload = {"ts": int(time.time() * 1000), "symbols": top}
-    UNIVERSE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    UNIVERSE_FILE.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    if persist is None:
+        persist = os.environ.get("PYTEST_CURRENT_TEST") is None
+
+    if persist:
+        payload = {"ts": int(time.time() * 1000), "symbols": top}
+        UNIVERSE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        UNIVERSE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     return top
 
 def load_universe() -> list[str]:
