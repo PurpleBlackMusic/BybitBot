@@ -8,6 +8,7 @@ from typing import Iterable, List, Tuple
 from .bybit_api import BybitAPI
 from .helpers import ensure_link_id
 from .log import log
+from .spot_rules import format_decimal
 
 _TEN_DECIMALS = Decimal("0.0000000001")
 _BPS_DIVISOR = Decimal("10000")
@@ -97,13 +98,16 @@ def twap_spot_batch(
     side_cased = _normalise_side(side)
 
     timestamp_ms = int(time.time() * 1000)
+    price_text = format_decimal(px)
+    qty_texts = [format_decimal(qty) for qty in qtys]
+
     orders = [
         {
             "symbol": symbol,
             "side": side_cased,
             "orderType": "Limit",
-            "qty": str(qtys[i]),
-            "price": str(px),
+            "qty": qty_texts[i],
+            "price": price_text,
             "timeInForce": "IOC",
             "orderLinkId": ensure_link_id(f"TWAPB-{timestamp_ms}-{i}"),
         }

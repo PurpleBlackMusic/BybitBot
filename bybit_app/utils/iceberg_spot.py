@@ -8,9 +8,9 @@ from .helpers import ensure_link_id
 from .log import log
 from .spot_rules import (
     SpotInstrumentNotFound,
-    format_decimal,
     load_spot_instrument,
     quantize_spot_order,
+    render_spot_order_texts,
 )
 
 
@@ -120,6 +120,7 @@ def iceberg_spot(
 
         price_quant = validated.price
         qty_quant = validated.qty
+        price_text, qty_text = render_spot_order_texts(validated)
 
         if price_limit_dec is not None:
             if normalised_side == "Buy" and price_quant > price_limit_dec:
@@ -147,8 +148,8 @@ def iceberg_spot(
             "symbol": symbol,
             "side": normalised_side,
             "orderType": "Limit",
-            "qty": format_decimal(qty_quant),
-            "price": format_decimal(price_quant),
+            "qty": qty_text,
+            "price": price_text,
             "timeInForce": tif,
             "orderLinkId": link_id,
         }

@@ -8,9 +8,9 @@ from .helpers import ensure_link_id
 from .log import log
 from .spot_rules import (
     SpotInstrumentNotFound,
-    format_decimal,
     load_spot_instrument,
     quantize_spot_order,
+    render_spot_order_texts,
 )
 
 
@@ -89,8 +89,7 @@ def twap_spot(
             )
             break
 
-        price_text = format_decimal(validated.price)
-        qty_text = format_decimal(validated.qty)
+        price_text, qty_text = render_spot_order_texts(validated)
 
         try:
             response = api.place_order(
