@@ -160,3 +160,25 @@ def quantize_price_only(
     if rounding == ROUND_UP:
         return _round_up_to_step(decimal_value, tick_size)
     return quantize_to_step(decimal_value, tick_size, rounding=rounding)
+
+
+def render_spot_order_texts(
+    validated: validators.SpotValidationResult,
+) -> tuple[str, str]:
+    """Return formatted price/quantity strings for a validated spot order."""
+
+    return format_decimal(validated.price), format_decimal(validated.qty)
+
+
+def format_optional_spot_price(
+    value: DecimalLike | None,
+    *,
+    tick_size: Decimal,
+    rounding=ROUND_DOWN,
+) -> str | None:
+    """Format an optional TP/SL value respecting tick size and rounding."""
+
+    if value is None:
+        return None
+    quantized = quantize_price_only(value, tick_size=tick_size, rounding=rounding)
+    return format_decimal(quantized)

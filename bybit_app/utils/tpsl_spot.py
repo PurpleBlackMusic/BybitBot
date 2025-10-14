@@ -8,10 +8,10 @@ from .bybit_api import BybitAPI
 from .log import log
 from .spot_rules import (
     SpotInstrumentNotFound,
-    format_decimal,
+    format_optional_spot_price,
     load_spot_instrument,
-    quantize_price_only,
     quantize_spot_order,
+    render_spot_order_texts,
 )
 
 def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float, price: float, tp: float | None, sl: float | None, tp_order_type: str = "Market", sl_order_type: str = "Market", tp_limit: float | None = None, sl_limit: float | None = None, link_id: str | None = None, tif: str = "PostOnly"):
@@ -39,19 +39,12 @@ def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float
     if validated.price <= 0 or validated.qty <= 0:
         raise ValueError("Количество или цена после квантизации невалидны")
 
-    qty_text = format_decimal(validated.qty)
-    price_text = format_decimal(validated.price)
+    price_text, qty_text = render_spot_order_texts(validated)
 
     entry_side = side.capitalize()
     exit_side = "Sell" if entry_side == "Buy" else "Buy"
     tick_size: Decimal = validated.tick_size
     exit_rounding = ROUND_UP if exit_side == "Buy" else ROUND_DOWN
-
-    def _quantize_optional(value: float | None) -> str | None:
-        if value is None:
-            return None
-        quantized = quantize_price_only(value, tick_size=tick_size, rounding=exit_rounding)
-        return format_decimal(quantized)
 
     body = {
         "category": "spot",
@@ -65,26 +58,34 @@ def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float
     if link_id:
         body["orderLinkId"] = ensure_link_id(link_id)
     if tp is not None:
-        tp_text = _quantize_optional(tp)
+        tp_text = format_optional_spot_price(
+            tp, tick_size=tick_size, rounding=exit_rounding
+        )
         if tp_text is None:
             raise ValueError("Некорректное значение takeProfit")
         body["takeProfit"] = tp_text
         body["tpOrderType"] = tp_order_type
         if tp_order_type == "Limit":
             assert tp_limit is not None, "tp_limit required for Limit tp"
-            tp_limit_text = _quantize_optional(tp_limit)
+            tp_limit_text = format_optional_spot_price(
+                tp_limit, tick_size=tick_size, rounding=exit_rounding
+            )
             if tp_limit_text is None:
                 raise ValueError("Некорректное значение tp_limit")
             body["tpLimitPrice"] = tp_limit_text
     if sl is not None:
-        sl_text = _quantize_optional(sl)
+        sl_text = format_optional_spot_price(
+            sl, tick_size=tick_size, rounding=exit_rounding
+        )
         if sl_text is None:
             raise ValueError("Некорректное значение stopLoss")
         body["stopLoss"] = sl_text
         body["slOrderType"] = sl_order_type
         if sl_order_type == "Limit":
             assert sl_limit is not None, "sl_limit required for Limit sl"
-            sl_limit_text = _quantize_optional(sl_limit)
+            sl_limit_text = format_optional_spot_price(
+                sl_limit, tick_size=tick_size, rounding=exit_rounding
+            )
             if sl_limit_text is None:
                 raise ValueError("Некорректное значение sl_limit")
             body["slLimitPrice"] = sl_limit_text

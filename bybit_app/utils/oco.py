@@ -10,10 +10,10 @@ from .log import log
 from .oco_guard import register_group
 from .spot_rules import (
     SpotInstrumentNotFound,
-    format_decimal,
+    format_optional_spot_price,
     load_spot_instrument,
-    quantize_price_only,
     quantize_spot_order,
+    render_spot_order_texts,
 )
 from .telegram_notify import enqueue_telegram_message
 
@@ -54,17 +54,17 @@ def place_spot_oco(
             list(validated.reasons),
         )
 
-    qty_text = format_decimal(validated.qty)
-    price_text = format_decimal(validated.price)
+    price_text, qty_text = render_spot_order_texts(validated)
 
     exit_side = "Sell" if side_normalised == "Buy" else "Buy"
     exit_rounding = ROUND_UP if exit_side == "Buy" else ROUND_DOWN
 
-    tp_price = quantize_price_only(take_profit, tick_size=validated.tick_size, rounding=exit_rounding)
-    sl_price = quantize_price_only(stop_loss, tick_size=validated.tick_size, rounding=exit_rounding)
-
-    tp_text = format_decimal(tp_price)
-    sl_text = format_decimal(sl_price)
+    tp_text = format_optional_spot_price(
+        take_profit, tick_size=validated.tick_size, rounding=exit_rounding
+    )
+    sl_text = format_optional_spot_price(
+        stop_loss, tick_size=validated.tick_size, rounding=exit_rounding
+    )
 
     primary = api.place_order(
         category="spot",
