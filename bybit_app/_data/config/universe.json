@@ -1,7 +1,17 @@
 {
-  "ts": 1760017267256,
+  "ts": 1760422004576,
   "symbols": [
+    "BTCUSDT",
     "ETHUSDT",
-    "SOLUSDT"
+    "SOLUSDT",
+    "XRPUSDT",
+    "BNBUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "TRXUSDT",
+    "MATICUSDT",
+    "LTCUSDT",
+    "AVAXUSDT",
+    "LINKUSDT"
   ]
 }
