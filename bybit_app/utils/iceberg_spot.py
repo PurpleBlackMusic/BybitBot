@@ -121,6 +121,15 @@ def iceberg_spot(
         price_quant = validated.price
         qty_quant = validated.qty
 
+        if qty_quant > remaining_qty:
+            log(
+                "iceberg.stop.overshoot",
+                reason="quantized qty exceeds remaining",
+                remaining=str(remaining_qty),
+                quantized=str(qty_quant),
+            )
+            break
+
         if price_limit_dec is not None:
             if normalised_side == "Buy" and price_quant > price_limit_dec:
                 log(
