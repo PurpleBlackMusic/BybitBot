@@ -82,6 +82,45 @@ def test_filter_available_spot_pairs_excludes_blacklisted_tokens(
     assert result == ["BTCUSDT", "SOLUSDT"]
 
 
+def test_filter_available_spot_pairs_supports_multiple_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        universe_module,
+        "filter_listed_spot_symbols",
+        lambda symbols, **kwargs: list(symbols),
+    )
+
+    result = universe_module.filter_available_spot_pairs(
+        [
+            "ETHUSDT",
+            "BTCUSDC",
+            "SOLUSDT",
+            "XRPUSDC",
+            "DOGEUSD",
+        ],
+        quote_assets=["USDT", "USDC"],
+    )
+
+    assert result == ["ETHUSDT", "BTCUSDC", "SOLUSDT", "XRPUSDC"]
+
+
+def test_filter_available_spot_pairs_defaults_to_usdt_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        universe_module,
+        "filter_listed_spot_symbols",
+        lambda symbols, **kwargs: list(symbols),
+    )
+
+    result = universe_module.filter_available_spot_pairs(
+        ["BTCUSDT", "ETHUSDT", "SOLUSDC"],
+    )
+
+    assert result == ["BTCUSDT", "ETHUSDT"]
+
+
 def test_filter_blacklisted_symbols_ignores_non_strings() -> None:
     assert universe_module.filter_blacklisted_symbols([
         "ETHUSDT",
