@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .bybit_api import BybitAPI
 from .envs import get_settings, update_settings
@@ -51,8 +51,20 @@ def _safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _dedupe_preserve_order(symbols: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for symbol in symbols:
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            deduped.append(symbol)
+    return deduped
+
+
 def filter_usdt_pairs(symbols: Iterable[str]) -> list[str]:
-    return [sym for sym in (_normalize_symbol(raw) for raw in symbols) if sym.endswith("USDT")]
+    normalized = (_normalize_symbol(raw) for raw in symbols)
+    usdt_only = (sym for sym in normalized if sym.endswith("USDT"))
+    return _dedupe_preserve_order(usdt_only)
 
 
 def is_symbol_blacklisted(symbol: str) -> bool:
@@ -78,10 +90,12 @@ def is_symbol_blacklisted(symbol: str) -> bool:
 
 def filter_blacklisted_symbols(symbols: Iterable[str]) -> list[str]:
     filtered: list[str] = []
+    seen: set[str] = set()
     for raw in symbols:
         symbol = _normalize_symbol(raw)
-        if not symbol:
+        if not symbol or symbol in seen:
             continue
+        seen.add(symbol)
         if symbol in DEBUG_WHITELIST or not is_symbol_blacklisted(symbol):
             filtered.append(symbol)
     return filtered
@@ -128,15 +142,10 @@ def filter_available_spot_pairs(symbols: Iterable[str]) -> list[str]:
     settings = get_settings()
     is_testnet = getattr(settings, "testnet", True)
 
-    listed = [
-        sym
-        for sym in (
-            _normalize_symbol(symbol)
-            for symbol in filter_listed_spot_symbols(usdt_only, testnet=is_testnet)
-        )
-        if sym
-    ]
-
+    listed = (
+        _normalize_symbol(symbol)
+        for symbol in filter_listed_spot_symbols(usdt_only, testnet=is_testnet)
+    )
     filtered_listed = filter_blacklisted_symbols(listed)
     if filtered_listed:
         return filtered_listed
@@ -151,30 +160,15 @@ def build_universe(
     persist: bool | None = None,
 ) -> list[str]:
     min_turnover, max_spread_bps = _resolve_liquidity_filters(min_turnover, max_spread_bps)
-    response = api._safe_req("GET", "/v5/market/tickers", params={"category": "spot"})
-    rows = (response.get("result") or {}).get("list") or []
+    scored = build_universe_scored(
+        api,
+        size=0,
+        min_turnover=min_turnover,
+        max_spread_bps=max_spread_bps,
+        score_fn=lambda turnover, _spread: turnover,
+    )
 
-    scored: list[tuple[float, str]] = []
-    for item in rows:
-        sym = _normalize_symbol(item.get("symbol"))
-        if not sym.endswith("USDT"):
-            continue
-        if is_symbol_blacklisted(sym):
-            continue
-
-        turnover = _safe_float(item.get("turnover24h"))
-        bid = _safe_float(item.get("bestBidPrice"))
-        ask = _safe_float(item.get("bestAskPrice"))
-        if ask <= 0:
-            continue
-
-        spread_bps = ((ask - bid) / ask) * 10_000.0
-        if turnover >= float(min_turnover) and spread_bps <= float(max_spread_bps):
-            scored.append((turnover, sym))
-
-    scored.sort(key=lambda entry: entry[0], reverse=True)
-
-    ordered_symbols = [symbol for _, symbol in scored]
+    ordered_symbols = [symbol for symbol, _ in scored]
     filtered_symbols = filter_available_spot_pairs(ordered_symbols)
     top = filtered_symbols[: int(size)] if size else filtered_symbols
 
@@ -214,20 +208,29 @@ def build_universe_scored(
     max_spread_bps: float | None = None,
     whitelist: list[str] | None = None,
     blacklist: list[str] | None = None,
+    score_fn: Callable[[float, float], float] | None = None,
 ) -> list[tuple[str, float]]:
     min_turnover, max_spread_bps = _resolve_liquidity_filters(min_turnover, max_spread_bps)
     response = api._safe_req("GET", "/v5/market/tickers", params={"category": "spot"})
     rows = (response.get("result") or {}).get("list") or []
     scored: list[tuple[str, float]] = []
-    whitelist_set = set(filter_usdt_pairs(whitelist or []))
+    score_fn = score_fn or liquidity_score
+
+    whitelist_clean = filter_blacklisted_symbols(filter_usdt_pairs(whitelist or []))
+    whitelist_set = set(whitelist_clean)
     blacklist_set = {
         symbol
         for symbol in (_normalize_symbol(item) for item in (blacklist or []))
         if symbol
     }
 
+    seen: set[str] = set()
     for item in rows:
         sym = _normalize_symbol(item.get("symbol"))
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+
         if not sym.endswith("USDT"):
             continue
         if sym in blacklist_set:
@@ -243,7 +246,7 @@ def build_universe_scored(
 
         spread_bps = ((ask - bid) / ask) * 10_000.0
         if turnover >= float(min_turnover) and spread_bps <= float(max_spread_bps):
-            score = liquidity_score(turnover, spread_bps)
+            score = score_fn(turnover, spread_bps)
             scored.append((sym, score))
 
     existing_symbols = {symbol for symbol, _ in scored}
