@@ -89,6 +89,16 @@ def twap_spot(
             )
             break
 
+        if validated.qty > remaining_qty:
+            log(
+                "twap.stop.overshoot",
+                i=i,
+                reason="quantized qty exceeds remaining",
+                remaining=str(remaining_qty),
+                quantized=str(validated.qty),
+            )
+            break
+
         price_text = format_decimal(validated.price)
         qty_text = format_decimal(validated.qty)
 
