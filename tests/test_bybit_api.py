@@ -10,6 +10,7 @@ import pytest
 
 import bybit_app.utils.bybit_api as bybit_api_module
 from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
+from bybit_app.utils.time_sync import SyncedTimestamp
 from bybit_app.utils.helpers import ensure_link_id
 
 
@@ -58,8 +59,12 @@ def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(
         bybit_api_module,
-        "synced_timestamp_ms",
-        lambda *args, **kwargs: 1_700_000_000_000,
+        "synced_timestamp",
+        lambda *args, **kwargs: SyncedTimestamp(
+            value_ms=1_700_000_000_000,
+            offset_ms=123.0,
+            latency_ms=12.0,
+        ),
     )
 
     api.fee_rate(category="spot", symbol="BTCUSDT", baseCoin="USDT")
@@ -82,6 +87,8 @@ def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch
     expected_payload = f"{ts}key12315000{expected_query}".encode()
     expected_sign = hmac.new(b"secret456", expected_payload, hashlib.sha256).hexdigest()
     assert headers["X-BAPI-SIGN"] == expected_sign
+    assert api.clock_offset_ms == pytest.approx(123.0)
+    assert api.clock_latency_ms == pytest.approx(12.0)
 
 
 def test_batch_cancel_accepts_requests_payload() -> None:

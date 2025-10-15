@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional
 
 import threading
@@ -26,6 +27,20 @@ _SERVER_TIME_KEYS: tuple[str, ...] = (
 
 _CLOCKS: dict[tuple[str, bool], "_SyncedClock"] = {}
 _CLOCK_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class SyncedTimestamp:
+    """Snapshot of the current exchange-adjusted time."""
+
+    value_ms: int
+    offset_ms: float
+    latency_ms: float
+
+    def as_int(self) -> int:
+        """Return the timestamp as an ``int`` for backwards compatibility."""
+
+        return int(self.value_ms)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -105,10 +120,11 @@ class _SyncedClock:
 
     def __init__(self) -> None:
         self._offset_ms: float = 0.0
+        self._latency_ms: float = 0.0
         self._expiry: float = 0.0
         self._lock = threading.Lock()
 
-    def timestamp_ms(
+    def snapshot(
         self,
         base_url: str,
         *,
@@ -116,7 +132,7 @@ class _SyncedClock:
         timeout: float = 5.0,
         verify: bool = True,
         force_refresh: bool = False,
-    ) -> int:
+    ) -> SyncedTimestamp:
         now = time.time()
         if force_refresh or now >= self._expiry:
             self._refresh(
@@ -125,7 +141,8 @@ class _SyncedClock:
                 timeout=timeout,
                 verify=verify,
             )
-        return int(time.time() * 1000 + self._offset_ms)
+        value = int(time.time() * 1000 + self._offset_ms)
+        return SyncedTimestamp(value_ms=value, offset_ms=self._offset_ms, latency_ms=self._latency_ms)
 
     def _refresh(
         self,
@@ -177,12 +194,35 @@ class _SyncedClock:
             latency = max((end - start) / 2.0, 0.0)
             local_epoch = end - latency
             self._offset_ms = server_epoch * 1000.0 - local_epoch * 1000.0
+            self._latency_ms = latency * 1000.0
             # Refresh at most once per minute unless explicitly forced.
             self._expiry = time.time() + 60.0
 
 
 def _clock_key(base_url: str, verify: bool) -> tuple[str, bool]:
     return (base_url.rstrip("/"), bool(verify))
+
+
+def synced_timestamp(
+    base_url: str,
+    *,
+    session: requests.Session | None = None,
+    timeout: float = 5.0,
+    verify: bool = True,
+    force_refresh: bool = False,
+) -> SyncedTimestamp:
+    """Return a snapshot of the exchange-synchronised clock."""
+
+    key = _clock_key(base_url, verify)
+    with _CLOCK_LOCK:
+        clock = _CLOCKS.setdefault(key, _SyncedClock())
+    return clock.snapshot(
+        base_url,
+        session=session,
+        timeout=timeout,
+        verify=verify,
+        force_refresh=force_refresh,
+    )
 
 
 def synced_timestamp_ms(
@@ -195,16 +235,14 @@ def synced_timestamp_ms(
 ) -> int:
     """Return a drift-adjusted unix timestamp in milliseconds."""
 
-    key = _clock_key(base_url, verify)
-    with _CLOCK_LOCK:
-        clock = _CLOCKS.setdefault(key, _SyncedClock())
-    return clock.timestamp_ms(
+    snapshot = synced_timestamp(
         base_url,
         session=session,
         timeout=timeout,
         verify=verify,
         force_refresh=force_refresh,
     )
+    return snapshot.as_int()
 
 
 def invalidate_synced_clock(base_url: str | None = None, *, verify: bool | None = None) -> None:
@@ -226,9 +264,11 @@ def invalidate_synced_clock(base_url: str | None = None, *, verify: bool | None 
 _extract_server_epoch = extract_server_epoch
 
 __all__ = [
+    "SyncedTimestamp",
     "extract_server_epoch",
     "extract_server_datetime",
     "check_time_drift_seconds",
+    "synced_timestamp",
     "synced_timestamp_ms",
     "invalidate_synced_clock",
 ]
