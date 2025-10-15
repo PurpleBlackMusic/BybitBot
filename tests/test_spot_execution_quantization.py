@@ -58,8 +58,16 @@ class _IcebergAPI(_BaseAPI):
 
 
 class _OcoAPI(_BaseAPI):
-    def orderbook(self, *args, **kwargs):  # pragma: no cover - not used in OCO
-        raise RuntimeError("orderbook should not be called for OCO")
+    def orderbook(self, *, category: str, symbol: str, limit: int) -> dict[str, object]:
+        assert category == "spot"
+        assert symbol == "TESTUSDT"
+        assert limit >= 1
+        return {
+            "result": {
+                "b": [["99.9", "1"]],
+                "a": [["100.1", "1"]],
+            }
+        }
 
 
 def test_twap_spot_quantizes_child_orders(monkeypatch) -> None:
@@ -125,5 +133,8 @@ def test_oco_quantizes_all_orders(monkeypatch) -> None:
     assert primary["price"] == "100.1"
     assert tp["price"] == "105"
     assert tp["qty"] == "0.02"
+    assert sl["orderType"] == "Limit"
     assert sl["triggerPrice"] == "95"
+    assert sl["price"] == "94.7"
+    assert sl["timeInForce"] == "GTC"
     assert sl["qty"] == "0.02"
