@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import timezone
+
 from bybit_app.utils import time_sync
 
 
@@ -19,6 +21,16 @@ def test_extract_server_epoch_parses_common_formats(payload, expected) -> None:
 
 def test_extract_server_epoch_returns_none_for_invalid() -> None:
     assert time_sync.extract_server_epoch({"result": {"foo": "bar"}}) is None
+
+
+def test_extract_server_datetime_returns_aware_dt() -> None:
+    payload = {"serverTime": 1_680_000_000.0}
+    result = time_sync.extract_server_datetime(payload)
+
+    assert result is not None
+    assert result.tzinfo is not None
+    assert result.tzinfo.utcoffset(result) == timezone.utc.utcoffset(result)
+    assert result.timestamp() == pytest.approx(1_680_000_000.0)
 
 
 class _DummyAPI:
