@@ -33,6 +33,27 @@ class _RetryableTelegramError(RuntimeError):
 _REQUEST_SEMAPHORE = threading.BoundedSemaphore(value=1)
 
 
+def _now() -> float:
+    return time.time()
+
+
+_LAST_ACTIVITY_LOCK = threading.Lock()
+_LAST_ACTIVITY_TS = _now()
+
+
+def _record_activity(ts: float | None = None) -> None:
+    """Record the timestamp of the latest successful Telegram delivery."""
+
+    with _LAST_ACTIVITY_LOCK:
+        global _LAST_ACTIVITY_TS
+        _LAST_ACTIVITY_TS = float(ts) if ts is not None else _now()
+
+
+def _last_activity() -> float:
+    with _LAST_ACTIVITY_LOCK:
+        return _LAST_ACTIVITY_TS
+
+
 def _acquire_request_slot() -> threading.Semaphore:
     _REQUEST_SEMAPHORE.acquire()
     return _REQUEST_SEMAPHORE
@@ -160,6 +181,7 @@ class TelegramDispatcher:
 
             ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
             if ok:
+                _record_activity()
                 return result  # type: ignore[return-value]
 
             error: str | None = None
@@ -236,8 +258,178 @@ class TelegramDispatcher:
         )
 
 
+class TelegramHeartbeat:
+    """Background monitor that emits periodic heartbeats and silence alerts."""
+
+    def __init__(
+        self,
+        *,
+        send: Callable[[str], None],
+        get_settings_func: Callable[[], object] = get_settings,
+        log_func: Callable[..., None] = log,
+        time_func: Callable[[], float] = _now,
+        silence_threshold: float = 60.0,
+        min_poll_interval: float = 5.0,
+    ) -> None:
+        if silence_threshold <= 0:
+            raise ValueError("silence_threshold must be positive")
+        if min_poll_interval <= 0:
+            raise ValueError("min_poll_interval must be positive")
+
+        self._send = send
+        self._get_settings = get_settings_func
+        self._log = log_func
+        self._time = time_func
+        self._silence_threshold = float(silence_threshold)
+        self._min_poll_interval = float(min_poll_interval)
+
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._last_sent: Optional[float] = None
+        self._alerted = False
+        self._last_activity_seen: Optional[float] = None
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            thread = self._thread
+            if thread and thread.is_alive():
+                return
+            self._stop_event.clear()
+            thread = threading.Thread(target=self._run, name="telegram-heartbeat", daemon=True)
+            self._thread = thread
+            thread.start()
+
+    def stop(self, *, timeout: float | None = None) -> None:
+        thread = self._thread
+        if not thread:
+            return
+        self._stop_event.set()
+        thread.join(timeout=timeout)
+
+    def run_cycle(self) -> float:
+        settings = self._safe_settings()
+        if not settings or not bool(getattr(settings, "heartbeat_enabled", False)):
+            self._alerted = False
+            self._last_sent = None
+            self._last_activity_seen = None
+            return self._min_poll_interval
+
+        interval_seconds = self._resolve_interval_seconds(settings)
+        now = self._time()
+
+        if self._should_emit_heartbeat(settings, now, interval_seconds):
+            message = self._format_message(now)
+            self._safe_send(message, interval_seconds, event="telegram.heartbeat.sent")
+
+        self._check_silence(now)
+
+        return self._next_sleep(interval_seconds)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            sleep_for = self.run_cycle()
+            if sleep_for <= 0:
+                sleep_for = self._min_poll_interval
+            self._stop_event.wait(timeout=sleep_for)
+
+    def _safe_settings(self) -> object | None:
+        try:
+            return self._get_settings()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._log("telegram.heartbeat.settings_error", err=str(exc))
+            return None
+
+    def _resolve_interval_seconds(self, settings: object) -> float:
+        candidates = (
+            ("seconds", getattr(settings, "heartbeat_seconds", None)),
+            ("seconds", getattr(settings, "heartbeat_interval_seconds", None)),
+            ("minutes", getattr(settings, "heartbeat_interval_min", None)),
+            ("minutes", getattr(settings, "heartbeat_minutes", None)),
+        )
+        for kind, raw in candidates:
+            try:
+                if raw is None:
+                    continue
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value <= 0:
+                continue
+            seconds = value if kind == "seconds" else value * 60.0
+            return max(seconds, self._min_poll_interval)
+
+        return max(60.0, self._min_poll_interval)
+
+    def _should_emit_heartbeat(
+        self, settings: object, now: float, interval_seconds: float
+    ) -> bool:
+        token = getattr(settings, "telegram_token", "")
+        chat_id = getattr(settings, "telegram_chat_id", "")
+        if not token or not chat_id:
+            return False
+        if self._last_sent is None:
+            return True
+        return now - self._last_sent >= interval_seconds
+
+    def _format_message(self, now: float) -> str:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
+        return f"🤖 Heartbeat · alive @ {timestamp} UTC"
+
+    def _safe_send(self, text: str, interval_seconds: float, *, event: str, mark_last: bool = True) -> None:
+        try:
+            self._send(text)
+        except Exception as exc:  # pragma: no cover - network/runtime guard
+            self._log("telegram.heartbeat.error", err=str(exc), text=text)
+            return
+
+        if mark_last:
+            self._last_sent = self._time()
+
+        self._log(event, interval=interval_seconds, text=text)
+
+    def _check_silence(self, now: float) -> None:
+        last = _last_activity()
+        if last < 0:
+            return
+        previous_seen = self._last_activity_seen
+        if previous_seen is None or last > previous_seen:
+            self._alerted = False
+        self._last_activity_seen = last
+
+        silence = now - last
+        if silence > self._silence_threshold:
+            if not self._alerted:
+                self._alerted = True
+                self._handle_silence(silence)
+        else:
+            if self._alerted:
+                self._log(
+                    "telegram.heartbeat.recovered",
+                    silence=silence,
+                    threshold=self._silence_threshold,
+                )
+            self._alerted = False
+
+    def _handle_silence(self, silence: float) -> None:
+        payload = {"silence": round(silence, 3), "threshold": self._silence_threshold}
+        self._log("telegram.heartbeat.silence", **payload)
+        alert_text = (
+            "⚠️ Telegram heartbeat silence "
+            f"> {self._silence_threshold:.0f}s (actual {silence:.0f}s)."
+        )
+        self._safe_send(alert_text, self._silence_threshold, event="telegram.heartbeat.alert", mark_last=False)
+
+    def _next_sleep(self, interval_seconds: float) -> float:
+        candidate = interval_seconds / 4.0
+        candidate = max(candidate, self._min_poll_interval)
+        candidate = min(candidate, max(self._silence_threshold / 2.0, self._min_poll_interval))
+        return candidate
+
 def send_telegram(text: str):
     """Send Telegram message synchronously respecting rate limits."""
+
+    heartbeat.ensure_started()
 
     def _attempt() -> dict[str, object]:
         semaphore = _acquire_request_slot()
@@ -269,6 +461,7 @@ def send_telegram(text: str):
         last_result = result if isinstance(result, dict) else None
         ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
         if ok:
+            _record_activity()
             return result
 
         error: str | None = None
@@ -382,14 +575,30 @@ def _send_telegram_http(text: str, http_post: Callable[..., object] | None = Non
 
 
 dispatcher = TelegramDispatcher()
+heartbeat = TelegramHeartbeat(send=dispatcher.enqueue_message)
 
 
 def enqueue_telegram_message(text: str) -> None:
+    heartbeat.ensure_started()
     dispatcher.enqueue_message(text)
 
 
 def shutdown_telegram_dispatcher(*, timeout: float | None = None) -> None:
+    heartbeat.stop(timeout=timeout)
     dispatcher.shutdown(timeout=timeout)
 
 
-atexit.register(dispatcher.shutdown)
+def _auto_start_heartbeat() -> None:
+    try:
+        settings = get_settings()
+    except Exception:  # pragma: no cover - defensive guard
+        return
+
+    if getattr(settings, "heartbeat_enabled", False):
+        heartbeat.ensure_started()
+
+
+_auto_start_heartbeat()
+
+
+atexit.register(shutdown_telegram_dispatcher)
