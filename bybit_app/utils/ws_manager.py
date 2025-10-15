@@ -28,6 +28,7 @@ from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
 from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
+from .tp_targets import resolve_fee_guard_fraction, target_multiplier
 from .ws_events import fetch_events as _fetch_ws_events
 from .ws_events import event_queue_stats as _ws_event_stats
 from .ws_events import publish_event as _publish_ws_event
@@ -1742,6 +1743,8 @@ class WSManager:
         if available_qty <= 0:
             return
 
+        fee_guard_fraction = resolve_fee_guard_fraction(settings_obj)
+
         if not plan:
             plan = self._build_tp_plan(
                 total_qty=available_qty,
@@ -1753,6 +1756,7 @@ class WSManager:
                 min_notional=min_notional,
                 min_price=price_band_min,
                 max_price=price_band_max,
+                fee_guard_fraction=fee_guard_fraction,
             )
             if not plan:
                 return
@@ -2037,6 +2041,7 @@ class WSManager:
         min_notional: Decimal,
         min_price: Decimal,
         max_price: Decimal,
+        fee_guard_fraction: Decimal = Decimal("0"),
     ) -> list[dict[str, object]]:
         total_qty = max(total_qty, Decimal("0"))
         if total_qty <= 0 or not config:
@@ -2079,7 +2084,9 @@ class WSManager:
 
         aggregated: list[dict[str, object]] = []
         for profit_bps, qty in allocations:
-            price_raw = avg_cost * (Decimal("1") + profit_bps / Decimal("10000"))
+            profit_fraction = profit_bps / Decimal("10000") if profit_bps > 0 else Decimal("0")
+            multiplier = target_multiplier(profit_fraction, fee_guard_fraction)
+            price_raw = avg_cost * multiplier
             price = quantize_to_step(price_raw, price_step, rounding=ROUND_UP)
             price = self._apply_price_band(
                 price,
