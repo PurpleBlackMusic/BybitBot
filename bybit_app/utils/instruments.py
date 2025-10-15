@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Iterable, List, Set
 
 import requests
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from .file_io import ensure_directory, tail_lines
 from .log import log
@@ -22,6 +29,10 @@ _LOCK = threading.Lock()
 _IN_FLIGHT: dict[str, threading.Event] = {}
 
 _HISTORY_DIR = DATA_DIR / "cache" / "instrument_history"
+
+
+class _RetryableInstrumentFetchError(RuntimeError):
+    """Internal marker for retryable catalogue fetch failures."""
 
 
 def _history_path(testnet: bool) -> Path:
@@ -144,14 +155,71 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
         seen_cursors: Set[str] = set()
         symbols: Set[str] = set()
 
-        while True:
-            params = {"category": "spot"}
-            if cursor:
-                params["cursor"] = cursor
+        wait_strategy = wait_random_exponential(multiplier=0.5, max=5.0)
+        max_attempts = 3
 
-            response = requests.get(url, params=params, timeout=timeout)
-            response.raise_for_status()
-            payload = response.json()
+        def _log_retry(retry_state: RetryCallState) -> None:
+            if retry_state.outcome is None or not retry_state.outcome.failed:
+                return
+            exc = retry_state.outcome.exception()
+            cursor_arg = retry_state.args[0] if retry_state.args else None
+            log(
+                "instruments.fetch.retry",
+                scope="spot",
+                testnet=testnet,
+                cursor=cursor_arg or None,
+                attempt=retry_state.attempt_number,
+                maxAttempts=max_attempts,
+                err=str(exc),
+            )
+
+        @retry(
+            reraise=True,
+            stop=stop_after_attempt(max_attempts),
+            wait=wait_strategy,
+            retry=retry_if_exception_type(_RetryableInstrumentFetchError),
+            after=_log_retry,
+        )
+        def _request_page(current_cursor: str | None) -> dict[str, object]:
+            params = {"category": "spot"}
+            if current_cursor:
+                params["cursor"] = current_cursor
+
+            try:
+                response = requests.get(url, params=params, timeout=timeout)
+                response.raise_for_status()
+            except requests.exceptions.RequestException as exc:
+                raise _RetryableInstrumentFetchError(str(exc)) from exc
+
+            try:
+                payload = response.json()
+            except ValueError as exc:  # pragma: no cover - defensive guard
+                raise _RetryableInstrumentFetchError("invalid JSON response") from exc
+
+            ret_code = payload.get("retCode")
+            if ret_code not in (None, 0, "0"):
+                ret_msg_raw = (
+                    payload.get("retMsg")
+                    or payload.get("ret_message")
+                    or payload.get("message")
+                )
+                ret_msg = str(ret_msg_raw).strip() if ret_msg_raw else None
+                log(
+                    "instruments.fetch.retcode_error",
+                    scope="spot",
+                    testnet=testnet,
+                    cursor=current_cursor or None,
+                    retCode=ret_code,
+                    retMsg=ret_msg,
+                )
+                raise _RetryableInstrumentFetchError(
+                    f"retCode {ret_code}: {ret_msg or 'unknown error'}"
+                )
+
+            return payload
+
+        while True:
+            payload = _request_page(cursor)
             result = payload.get("result") or {}
             rows = result.get("list") or []
             for item in rows:
@@ -178,7 +246,7 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
 
     try:
         return _fetch(url)
-    except requests.exceptions.RequestException as exc:
+    except (requests.exceptions.RequestException, _RetryableInstrumentFetchError) as exc:
         if not testnet:
             raise
 

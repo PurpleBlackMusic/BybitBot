@@ -9,6 +9,13 @@ import time
 
 import requests
 from datetime import datetime, timezone
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from .envs import get_api_client
 from .http_client import configure_http_session
@@ -27,6 +34,10 @@ _SERVER_TIME_KEYS: tuple[str, ...] = (
 
 _CLOCKS: dict[tuple[str, bool], "_SyncedClock"] = {}
 _CLOCK_LOCK = threading.Lock()
+
+
+class _RetryableTimeSyncError(RuntimeError):
+    """Internal marker for retryable time synchronisation failures."""
 
 
 @dataclass(frozen=True)
@@ -165,11 +176,69 @@ class _SyncedClock:
                 close_http = True
             else:
                 http = session
-            start = time.time()
+
+            wait_strategy = wait_random_exponential(multiplier=0.5, max=3.0)
+            max_attempts = 3
+
+            def _log_retry(retry_state: RetryCallState) -> None:
+                if retry_state.outcome is None or not retry_state.outcome.failed:
+                    return
+                exc = retry_state.outcome.exception()
+                log(
+                    "time.sync.retry",
+                    base=url,
+                    attempt=retry_state.attempt_number,
+                    maxAttempts=max_attempts,
+                    err=str(exc),
+                )
+
+            @retry(
+                reraise=True,
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_strategy,
+                retry=retry_if_exception_type(_RetryableTimeSyncError),
+                after=_log_retry,
+            )
+            def _fetch_payload() -> tuple[dict[str, object], float, float]:
+                start = time.time()
+                try:
+                    response = http.get(url, timeout=timeout, verify=verify)
+                    response.raise_for_status()
+                except requests.exceptions.RequestException as exc:
+                    raise _RetryableTimeSyncError(str(exc)) from exc
+
+                try:
+                    payload = response.json()
+                except ValueError as exc:  # pragma: no cover - defensive guard
+                    raise _RetryableTimeSyncError("invalid JSON response") from exc
+
+                ret_code = payload.get("retCode")
+                if ret_code not in (None, 0, "0"):
+                    ret_msg_raw = (
+                        payload.get("retMsg")
+                        or payload.get("ret_message")
+                        or payload.get("message")
+                    )
+                    ret_msg = str(ret_msg_raw).strip() if ret_msg_raw else None
+                    log(
+                        "time.sync.retcode_error",
+                        base=url,
+                        retCode=ret_code,
+                        retMsg=ret_msg,
+                    )
+                    raise _RetryableTimeSyncError(
+                        f"retCode {ret_code}: {ret_msg or 'unknown error'}"
+                    )
+
+                end = time.time()
+                return payload, start, end
+
             try:
-                response = http.get(url, timeout=timeout, verify=verify)
-                response.raise_for_status()
-                payload = response.json()
+                payload, start, end = _fetch_payload()
+            except _RetryableTimeSyncError as exc:  # pragma: no cover - defensive guard
+                log("time.sync.error", err=str(exc), base=url)
+                self._expiry = time.time() + 5.0
+                return
             except Exception as exc:  # pragma: no cover - defensive guard
                 log("time.sync.error", err=str(exc), base=url)
                 self._expiry = time.time() + 5.0
