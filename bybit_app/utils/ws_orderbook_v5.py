@@ -72,20 +72,20 @@ class WSOrderbookV5:
 
         def run():
             import websocket, ssl
-            try:
-                settings = get_settings()
-            except Exception:
-                settings = None
-            verify_ssl = True
-            if settings is not None:
-                verify_ssl = bool(getattr(settings, "verify_ssl", True))
-            cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
-            sslopt = {"cert_reqs": cert_reqs}
             attempt = 0
             backoff = 1.0
             max_backoff = 60.0
             while not self._stop:
                 attempt += 1
+                try:
+                    settings = get_settings()
+                except Exception:
+                    settings = None
+                verify_ssl = True
+                if settings is not None:
+                    verify_ssl = bool(getattr(settings, "verify_ssl", True))
+                cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
+                sslopt = {"cert_reqs": cert_reqs}
                 try:
                     ws = websocket.WebSocketApp(
                         self.url,
