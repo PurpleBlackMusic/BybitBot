@@ -38,6 +38,10 @@ if "sklearn" not in sys.modules:  # pragma: no cover - test shim for optional de
         return estimator
 
     base_module.clone = _clone
+    def _clone_estimator(estimator):
+        return estimator
+
+    base_module.clone = _clone_estimator
 
     linear_module = types.ModuleType("sklearn.linear_model")
 
@@ -129,6 +133,55 @@ def _write_snapshot(
     path = tmp_path / "ai" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+
+def _sample_row(symbol: str, *, change_24h: float = 0.5, extra: dict[str, object] | None = None) -> dict[str, object]:
+    base = {
+        "symbol": symbol,
+        "turnover24h": "2000000",
+        "price24hPcnt": str(change_24h),
+        "price1hPcnt": "0.2",
+        "price4hPcnt": "0.4",
+        "price7dPcnt": "1.5",
+        "price5mPcnt": "0.02",
+        "price15mPcnt": "0.05",
+        "bestBidPrice": "10",
+        "bestAskPrice": "10.02",
+        "volume24h": "5000",
+        "volume1h": "200",
+        "prevVolume1h": "180",
+        "volume4h": "800",
+        "prevVolume4h": "750",
+        "prevVolume24h": "4500",
+        "prevVolume7d": "3000",
+        "bid1Size": "150",
+        "ask1Size": "140",
+        "buyTurnover24h": "600000",
+        "sellTurnover24h": "580000",
+        "buyVolume24h": "2500",
+        "sellVolume24h": "2400",
+        "buyVolume4h": "400",
+        "sellVolume4h": "380",
+        "buyVolume1h": "120",
+        "sellVolume1h": "110",
+        "corr_btc": "0.5",
+        "corr_market": "0.4",
+        "highPrice24h": "10.5",
+        "lowPrice24h": "9.5",
+        "lastPrice": "10.1",
+        "highPrice1h": "10.3",
+        "lowPrice1h": "9.9",
+        "closePrice1h": "10.1",
+        "highPrice4h": "10.4",
+        "lowPrice4h": "9.6",
+        "closePrice4h": "10.0",
+        "highPrice7d": "11.0",
+        "lowPrice7d": "9.0",
+        "closePrice7d": "10.0",
+    }
+    if extra:
+        base.update(extra)
+    return base
 
 
 def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
@@ -1206,4 +1259,115 @@ def test_candle_cache_filters_unclosed_payload() -> None:
     assert starts == [closed_start, almost_closed_start]
     assert all(start + interval_ms <= base_ms for start in starts)
     assert api.calls == [("BTCUSDT", interval)]
+
+
+def test_scan_market_opportunities_filters_percent_outliers(tmp_path):
+    rows: list[dict[str, object]] = []
+    base_changes = [0.12, 0.18, 0.2, 0.22, 0.19]
+    for idx, change in enumerate(base_changes):
+        symbol = f"NORM{idx}USDT"
+        rows.append(
+            _sample_row(
+                symbol,
+                change_24h=change,
+                extra={
+                    "price5mPcnt": "0.03",
+                    "price15mPcnt": "0.04",
+                    "price1hPcnt": "0.05",
+                    "price4hPcnt": "0.06",
+                    "price7dPcnt": "0.5",
+                },
+            )
+        )
+
+    rows.append(
+        _sample_row(
+            "SPIKEUSDT",
+            change_24h=0.95,
+            extra={
+                "price5mPcnt": "0.9",
+                "price15mPcnt": "0.92",
+                "price1hPcnt": "0.85",
+                "price4hPcnt": "0.9",
+                "price7dPcnt": "0.95",
+            },
+        )
+    )
+
+    _write_snapshot(tmp_path, rows)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=10,
+        min_turnover=0.0,
+        min_change_pct=0.1,
+        max_spread_bps=200.0,
+    )
+
+    returned = {entry["symbol"] for entry in opportunities}
+    assert "SPIKEUSDT" not in returned
+    assert any(symbol.startswith("NORM") for symbol in returned)
+
+
+def test_scan_market_opportunities_respects_maintenance_stoplist(tmp_path):
+    snapshot = {
+        "ts": time.time(),
+        "rows": [
+            _sample_row("GOODUSDT", change_24h=0.2),
+            _sample_row("HALTUSDT", change_24h=0.25),
+            _sample_row("PAUSEUSDT", change_24h=0.3, extra={"status": "Trading halt"}),
+        ],
+        "maintenance": {"symbols": ["HALTUSDT"]},
+    }
+    path = tmp_path / "ai" / "market_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=0.0,
+        min_change_pct=0.1,
+        max_spread_bps=200.0,
+    )
+
+    symbols = {entry["symbol"] for entry in opportunities}
+    assert symbols == {"GOODUSDT"}
+
+
+def test_scan_market_opportunities_detects_delist_candidates(tmp_path):
+    future_delist_ms = int((time.time() + 1800) * 1000)
+    snapshot = {
+        "ts": time.time(),
+        "rows": [
+            _sample_row("ACTIVEUSDT", change_24h=0.18),
+            _sample_row("SNAPSHOTUSDT", change_24h=0.22),
+            _sample_row(
+                "SOONUSDT",
+                change_24h=0.3,
+                extra={
+                    "status": "Delisting",
+                    "delistingTime": str(future_delist_ms),
+                },
+            ),
+        ],
+        "delistingSymbols": ["SNAPSHOTUSDT"],
+    }
+    path = tmp_path / "ai" / "market_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=0.0,
+        min_change_pct=0.1,
+        max_spread_bps=200.0,
+    )
+
+    symbols = {entry["symbol"] for entry in opportunities}
+    assert symbols == {"ACTIVEUSDT"}
 
