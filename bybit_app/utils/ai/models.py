@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
-import json
 import math
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Tuple
 
+import joblib
 import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from ..paths import DATA_DIR
 from ..trade_analytics import ExecutionRecord, load_executions
 from ..log import log
 
-MODEL_FILENAME = "model.json"
+MODEL_FILENAME = "model.joblib"
 MODEL_FEATURES: Tuple[str, ...] = (
     "directional_change_pct",
     "multiframe_change_pct",
@@ -58,26 +62,25 @@ def feature_vector_from_map(features: Mapping[str, float]) -> List[float]:
 
 @dataclass
 class MarketModel:
-    """Persisted parameters for the logistic regression classifier."""
+    """Persisted pipeline wrapper used for inference in the market scanner."""
 
     feature_names: Tuple[str, ...]
-    coefficients: Tuple[float, ...]
-    intercept: float
-    feature_means: Tuple[float, ...]
-    feature_stds: Tuple[float, ...]
+    pipeline: Pipeline
     trained_at: float
     samples: int
 
     def predict_proba(self, features: Mapping[str, float]) -> float:
         """Predict the probability for the provided feature mapping."""
 
-        vector = np.array([float(features.get(name, 0.0)) for name in self.feature_names])
-        means = np.array(self.feature_means)
-        stds = np.array(self.feature_stds)
-        safe_stds = np.where(np.abs(stds) < 1e-8, 1e-8, stds)
-        normalized = (vector - means) / safe_stds
-        logit = float(self.intercept + np.dot(self.coefficients, normalized))
-        return 1.0 / (1.0 + math.exp(-logit))
+        vector = np.array(
+            [[float(features.get(name, 0.0)) for name in self.feature_names]],
+            dtype=float,
+        )
+        probabilities = self.pipeline.predict_proba(vector)
+        classifier = _extract_classifier(self.pipeline)
+        classes = getattr(classifier, "classes_", np.array([0, 1]))
+        positive_index = _positive_index(self.pipeline)
+        return float(probabilities[0, positive_index])
 
 
 class _SymbolState:
@@ -282,34 +285,69 @@ def build_training_dataset(
     return matrix, labels, recency_weights
 
 
-def _ensure_scaling(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    means = matrix.mean(axis=0)
-    stds = matrix.std(axis=0)
-    stds[stds < 1e-6] = 1.0
-    normalized = (matrix - means) / stds
-    return normalized, means, stds
+class _WeightedLogisticRegression(BaseEstimator, ClassifierMixin):
+    """Logistic regression with graceful handling of single-class datasets."""
+
+    def __init__(self, *, max_iter: int = 500, l2: float = 1e-2) -> None:
+        self.max_iter = int(max_iter)
+        self.l2 = float(l2)
+        self._model: Optional[LogisticRegression] = None
+        self._constant_prob: Optional[float] = None
+
+    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None):
+        unique = np.unique(y)
+        if len(unique) >= 2:
+            c_value = float("inf") if self.l2 <= 0 else 1.0 / self.l2
+            logistic = LogisticRegression(
+                penalty="l2",
+                C=c_value,
+                solver="lbfgs",
+                max_iter=self.max_iter,
+            )
+            logistic.fit(X, y, sample_weight=sample_weight)
+            self._model = logistic
+            self._constant_prob = None
+            self.classes_ = np.array(logistic.classes_, dtype=int)
+            return self
+
+        probability = float(np.mean(y)) if len(y) else 0.5
+        logit = _logit(probability)
+        self._model = None
+        self._constant_prob = 1.0 / (1.0 + math.exp(-logit))
+        self.classes_ = np.array([0, 1], dtype=int)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self._model is not None:
+            return self._model.predict_proba(X)
+        prob = float(self._constant_prob if self._constant_prob is not None else 0.5)
+        n = X.shape[0]
+        negatives = np.full(n, 1.0 - prob, dtype=float)
+        positives = np.full(n, prob, dtype=float)
+        return np.column_stack((negatives, positives))
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        probabilities = self.predict_proba(X)
+        positive_idx = 1 if probabilities.shape[1] > 1 else 0
+        return (probabilities[:, positive_idx] >= 0.5).astype(int)
 
 
-def _serialize_model(
-    *,
-    coefficients: Sequence[float],
-    intercept: float,
-    means: Sequence[float],
-    stds: Sequence[float],
-    samples: int,
-    feature_names: Sequence[str] = MODEL_FEATURES,
-    trained_at: Optional[float] = None,
-) -> dict:
-    payload = {
-        "feature_names": list(feature_names),
-        "coefficients": list(coefficients),
-        "intercept": float(intercept),
-        "feature_means": list(means),
-        "feature_stds": list(stds),
-        "trained_at": float(trained_at if trained_at is not None else time.time()),
-        "samples": int(samples),
-    }
-    return payload
+def _extract_classifier(pipeline: Pipeline) -> ClassifierMixin:
+    try:
+        return pipeline.named_steps["classifier"]
+    except (AttributeError, KeyError):  # pragma: no cover - defensive fallback
+        return pipeline.steps[-1][1]
+
+
+def _positive_index(pipeline: Pipeline) -> int:
+    classifier = _extract_classifier(pipeline)
+    classes = getattr(classifier, "classes_", np.array([0, 1]))
+    if len(classes) == 1:
+        return 0
+    matches = np.where(classes == 1)[0]
+    if len(matches):
+        return int(matches[0])
+    return len(classes) - 1
 
 
 def _logit(probability: float) -> float:
@@ -330,25 +368,6 @@ def _balanced_sample_weights(labels: np.ndarray) -> np.ndarray:
     pos_weight = total / (2.0 * positives)
     neg_weight = total / (2.0 * negatives)
     return np.where(labels > 0, pos_weight, neg_weight)
-
-
-def _logistic_loss(
-    weights: np.ndarray,
-    intercept: float,
-    features: np.ndarray,
-    labels: np.ndarray,
-    sample_weights: np.ndarray,
-    l2: float,
-) -> float:
-    linear = intercept + features.dot(weights)
-    # Guard against floating point overflow when exponentiating
-    preds = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
-    preds = np.clip(preds, 1e-8, 1.0 - 1e-8)
-    losses = -(
-        labels * np.log(preds) + (1.0 - labels) * np.log(1.0 - preds)
-    )
-    weighted_loss = (sample_weights * losses).mean()
-    return float(weighted_loss + 0.5 * l2 * float(np.dot(weights, weights)))
 
 
 def _normalise_sample_weights(sample_weights: np.ndarray) -> np.ndarray:
@@ -380,100 +399,6 @@ def _weighted_accuracy(labels: np.ndarray, predictions: np.ndarray, weights: np.
     return _weighted_average(correct, weights)
 
 
-def _evaluate_training_metrics(
-    coefficients: np.ndarray,
-    intercept: float,
-    features: np.ndarray,
-    labels: np.ndarray,
-    sample_weights: np.ndarray,
-) -> Tuple[float, float]:
-    if len(labels) == 0:
-        return 0.0, 0.0
-
-    linear = intercept + features.dot(coefficients)
-    probabilities = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
-    weights = _normalise_sample_weights(sample_weights)
-    predictions = (probabilities >= 0.5).astype(int)
-    accuracy = _weighted_accuracy(labels, predictions, weights)
-    log_loss_value = _weighted_log_loss(labels, probabilities, weights)
-    return float(accuracy), float(log_loss_value)
-
-
-def _train_logistic_regression(
-    features: np.ndarray,
-    labels: np.ndarray,
-    *,
-    sample_weights: Optional[np.ndarray] = None,
-    max_iter: int = 500,
-    initial_step: float = 0.2,
-    l2: float = 1e-2,
-    tolerance: float = 1e-6,
-) -> Tuple[np.ndarray, float]:
-    """Train a logistic regression classifier using gradient descent.
-
-    The implementation is intentionally lightweight to avoid heavy SciPy
-    dependencies while remaining numerically stable for small datasets.
-    """
-
-    if features.size == 0:
-        return np.zeros(features.shape[1], dtype=float), 0.0
-
-    weights = np.zeros(features.shape[1], dtype=float)
-    intercept = 0.0
-    if sample_weights is None:
-        sample_weights = np.ones(len(labels), dtype=float)
-    elif len(sample_weights) != len(labels):
-        raise ValueError("Sample weights must align with labels")
-    else:
-        sample_weights = _normalise_sample_weights(sample_weights)
-
-    step = float(initial_step)
-    prev_loss = _logistic_loss(weights, intercept, features, labels, sample_weights, l2)
-
-    for _ in range(max_iter):
-        linear = intercept + features.dot(weights)
-        probs = 1.0 / (1.0 + np.exp(-np.clip(linear, -40.0, 40.0)))
-        errors = (probs - labels) * sample_weights
-        grad_weights = features.T.dot(errors) / len(labels) + l2 * weights
-        grad_intercept = float(errors.mean())
-
-        # Backtracking line search for stability
-        current_step = step
-        updated = False
-        while current_step > 1e-4:
-            candidate_weights = weights - current_step * grad_weights
-            candidate_intercept = intercept - current_step * grad_intercept
-            candidate_loss = _logistic_loss(
-                candidate_weights,
-                candidate_intercept,
-                features,
-                labels,
-                sample_weights,
-                l2,
-            )
-            if candidate_loss <= prev_loss:
-                weights = candidate_weights
-                intercept = candidate_intercept
-                step = current_step * 1.05  # slowly increase when successful
-                prev_loss = candidate_loss
-                updated = True
-                break
-            current_step *= 0.5
-
-        if not updated:
-            # Could not improve further; assume convergence
-            break
-
-        max_delta = max(
-            np.max(np.abs(current_step * grad_weights)),
-            abs(current_step * grad_intercept),
-        )
-        if max_delta < tolerance:
-            break
-
-    return weights, float(intercept)
-
-
 def train_market_model(
     *,
     data_dir: Path = DATA_DIR,
@@ -491,29 +416,31 @@ def train_market_model(
         return None
 
     unique = set(int(label) for label in labels)
-    normalized, means, stds = _ensure_scaling(matrix)
-
     if len(recency_weights) == 0:
         recency_weights = np.ones(len(labels), dtype=float)
 
+    classifier = _WeightedLogisticRegression(max_iter=600, l2=1e-2)
+    pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            ("classifier", classifier),
+        ]
+    )
+
     metrics_weights: np.ndarray
     if len(unique) < 2:
-        probability = float(labels.mean()) if len(labels) else 0.5
-        intercept = _logit(probability)
-        feature_count = matrix.shape[1]
-        coefficients = np.zeros(feature_count, dtype=float)
         metrics_weights = _normalise_sample_weights(recency_weights)
+        pipeline.fit(matrix, labels)
     else:
         class_weights = _balanced_sample_weights(labels)
         combined_weights = class_weights * recency_weights
-        coefficients, intercept = _train_logistic_regression(
-            normalized, labels, sample_weights=combined_weights
-        )
+        pipeline.fit(matrix, labels, classifier__sample_weight=combined_weights)
         metrics_weights = _normalise_sample_weights(combined_weights)
 
-    accuracy, log_loss_value = _evaluate_training_metrics(
-        coefficients, intercept, normalized, labels, metrics_weights
-    )
+    probabilities = pipeline.predict_proba(matrix)[:, _positive_index(pipeline)]
+    predictions = (probabilities >= 0.5).astype(int)
+    accuracy = _weighted_accuracy(labels, predictions, metrics_weights)
+    log_loss_value = _weighted_log_loss(labels, probabilities, metrics_weights)
 
     log(
         "market_model.training_metrics",
@@ -523,17 +450,16 @@ def train_market_model(
         positive_rate=float(labels.mean() if len(labels) else 0.0),
     )
 
-    payload = _serialize_model(
-        coefficients=coefficients,
-        intercept=intercept,
-        means=means,
-        stds=stds,
-        samples=len(labels),
-    )
+    payload = {
+        "feature_names": list(MODEL_FEATURES),
+        "trained_at": float(time.time()),
+        "samples": int(len(labels)),
+        "pipeline": pipeline,
+    }
 
     path = Path(model_path) if model_path is not None else Path(data_dir) / "ai" / MODEL_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    joblib.dump(payload, path)
     return load_model(path)
 
 
@@ -544,30 +470,24 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
     if not model_path.exists():
         return None
     try:
-        payload = json.loads(model_path.read_text(encoding="utf-8"))
+        payload = joblib.load(model_path)
     except Exception:
         return None
 
     try:
         feature_names = tuple(str(name) for name in payload["feature_names"])
-        coefficients = tuple(float(value) for value in payload["coefficients"])
-        intercept = float(payload["intercept"])
-        means = tuple(float(value) for value in payload["feature_means"])
-        stds = tuple(max(float(value), 1e-6) for value in payload["feature_stds"])
+        pipeline = payload["pipeline"]
         trained_at = float(payload.get("trained_at", time.time()))
         samples = int(payload.get("samples", 0))
     except (KeyError, TypeError, ValueError):
         return None
 
-    if len(feature_names) != len(coefficients) or len(feature_names) != len(means) or len(means) != len(stds):
+    if not isinstance(pipeline, Pipeline):
         return None
 
     return MarketModel(
         feature_names=feature_names,
-        coefficients=coefficients,
-        intercept=intercept,
-        feature_means=means,
-        feature_stds=stds,
+        pipeline=pipeline,
         trained_at=trained_at,
         samples=samples,
     )
@@ -619,8 +539,7 @@ def describe_model(model: MarketModel) -> Mapping[str, object]:
 
     return {
         "feature_names": list(model.feature_names),
-        "coefficients": list(model.coefficients),
-        "intercept": model.intercept,
+        "classifier": type(_extract_classifier(model.pipeline)).__name__,
         "samples": model.samples,
         "trained_at": datetime.fromtimestamp(model.trained_at).isoformat(),
     }

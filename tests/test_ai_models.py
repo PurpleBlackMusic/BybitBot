@@ -8,11 +8,14 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
 from bybit_app.utils.ai.models import (
     MODEL_FEATURES,
     MarketModel,
     _SymbolState,
-    _ensure_scaling,
+    _WeightedLogisticRegression,
     liquidity_feature,
 )
 from bybit_app.utils.trade_analytics import ExecutionRecord
@@ -118,13 +121,28 @@ def test_multiframe_change_differs_from_directional() -> None:
     assert abs(multiframe - directional) > 1.0
 
 
-def test_scaling_output_matches_feature_count() -> None:
-    matrix = np.ones((4, len(MODEL_FEATURES)), dtype=float)
-    normalized, means, stds = _ensure_scaling(matrix)
+def test_weighted_logistic_handles_single_class() -> None:
+    classifier = _WeightedLogisticRegression()
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", classifier),
+    ])
 
-    assert normalized.shape[1] == len(MODEL_FEATURES)
-    assert means.shape[0] == len(MODEL_FEATURES)
-    assert stds.shape[0] == len(MODEL_FEATURES)
+    matrix = np.ones((5, len(MODEL_FEATURES)), dtype=float)
+    labels = np.zeros(5, dtype=int)
+    pipeline.fit(matrix, labels)
+
+    model = MarketModel(
+        feature_names=MODEL_FEATURES,
+        pipeline=pipeline,
+        trained_at=0.0,
+        samples=len(labels),
+    )
+
+    probability = model.predict_proba({name: 0.0 for name in MODEL_FEATURES})
+
+    assert math.isfinite(probability)
+    assert 0.0 <= probability <= 1.0
 
 
 def test_liquidity_feature_matches_logarithm() -> None:
@@ -137,14 +155,21 @@ def test_liquidity_feature_matches_logarithm() -> None:
 
 
 def test_market_model_predict_proba_handles_zero_std() -> None:
+    classifier = _WeightedLogisticRegression()
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", classifier),
+    ])
+
+    features = np.zeros((2, 1), dtype=float)
+    labels = np.array([0, 1], dtype=int)
+    pipeline.fit(features, labels)
+
     model = MarketModel(
         feature_names=("directional_change_pct",),
-        coefficients=(1.0,),
-        intercept=0.0,
-        feature_means=(0.0,),
-        feature_stds=(0.0,),
+        pipeline=pipeline,
         trained_at=0.0,
-        samples=1,
+        samples=len(labels),
     )
 
     probability = model.predict_proba({"directional_change_pct": 1.0})

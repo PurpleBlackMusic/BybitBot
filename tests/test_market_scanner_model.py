@@ -5,7 +5,12 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+import joblib
+import numpy as np
 import pytest
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from bybit_app.utils.ai.models import MODEL_FEATURES, liquidity_feature
 from bybit_app.utils.market_scanner import (
@@ -17,6 +22,43 @@ from bybit_app.utils.market_scanner import (
 FEATURE_NAMES = list(MODEL_FEATURES)
 
 
+def _build_pipeline(
+    *,
+    weight: float,
+    intercept: float,
+    means: Optional[Sequence[float]],
+    stds: Optional[Sequence[float]],
+    weights: Optional[Sequence[float]],
+) -> Pipeline:
+    feature_count = len(FEATURE_NAMES)
+    mean_vector = np.array(means or ([0.0] * feature_count), dtype=float)
+    scale_vector = np.array(stds or ([1.0] * feature_count), dtype=float)
+    scale_vector = np.where(np.abs(scale_vector) < 1e-6, 1.0, scale_vector)
+
+    scaler = StandardScaler()
+    scaler.mean_ = mean_vector
+    scaler.scale_ = scale_vector
+    scaler.var_ = scaler.scale_ ** 2
+    scaler.n_features_in_ = feature_count
+    scaler.n_samples_seen_ = 1
+    # Align with production where numpy arrays without named columns are used.
+
+    classifier = LogisticRegression()
+    classifier.classes_ = np.array([0, 1], dtype=int)
+    if weights is not None:
+        coefficients = np.array(list(weights), dtype=float)
+    else:
+        coefficients = np.array([weight] + [0.0] * (feature_count - 1), dtype=float)
+    classifier.coef_ = coefficients.reshape(1, -1)
+    classifier.intercept_ = np.array([intercept], dtype=float)
+    classifier.n_iter_ = np.array([1], dtype=int)
+
+    return Pipeline([
+        ("scaler", scaler),
+        ("classifier", classifier),
+    ])
+
+
 def _write_model(
     path: Path,
     *,
@@ -26,21 +68,21 @@ def _write_model(
     stds: Optional[Sequence[float]] = None,
     weights: Optional[Sequence[float]] = None,
 ) -> None:
-    if weights is not None:
-        coefficients = list(weights)
-    else:
-        coefficients = [weight] + [0.0] * (len(FEATURE_NAMES) - 1)
+    pipeline = _build_pipeline(
+        weight=weight,
+        intercept=intercept,
+        means=means,
+        stds=stds,
+        weights=weights,
+    )
 
     payload = {
         "feature_names": FEATURE_NAMES,
-        "coefficients": coefficients,
-        "intercept": intercept,
-        "feature_means": list(means or ([0.0] * len(FEATURE_NAMES))),
-        "feature_stds": list(stds or ([1.0] * len(FEATURE_NAMES))),
         "trained_at": time.time(),
         "samples": 100,
+        "pipeline": pipeline,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    joblib.dump(payload, path)
 
 
 def _write_snapshot(path: Path) -> None:
@@ -72,7 +114,7 @@ def test_model_weights_affect_ranking(tmp_path: Path) -> None:
     snapshot_path = ai_dir / "market_snapshot.json"
     _write_snapshot(snapshot_path)
 
-    model_path = ai_dir / "model.json"
+    model_path = ai_dir / "model.joblib"
 
     _write_model(model_path, weight=2.0)
     first = scan_market_opportunities(
@@ -128,7 +170,7 @@ def test_turnover_feature_consistency(tmp_path: Path) -> None:
     weights = [0.0] * len(FEATURE_NAMES)
     weights[2] = 2.0
     _write_model(
-        ai_dir / "model.json",
+        ai_dir / "model.joblib",
         weight=0.0,
         intercept=-1.0,
         means=means,
