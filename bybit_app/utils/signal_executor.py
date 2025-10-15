@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from .envs import (
     Settings,
@@ -58,6 +58,8 @@ _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
+_PARTIAL_FILL_MAX_FOLLOWUPS = 3
+_PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -2703,6 +2705,40 @@ class SignalExecutor:
                 audit = local.get("order_audit")
         if audit:
             order["order_audit"] = audit
+
+        requested_quote_decimal = self._decimal_from(order_context.get("notional_quote"))
+        partial_meta: Optional[Dict[str, object]] = None
+        executed_base_total = Decimal("0")
+        executed_quote_total = Decimal("0")
+        if isinstance(response, Mapping):
+            response, executed_base_total, executed_quote_total, partial_meta = self._chase_partial_fill(
+                api=api,
+                settings=settings,
+                symbol=symbol,
+                side=side,
+                slippage_pct=slippage_pct,
+                requested_quote=requested_quote_decimal,
+                response=response,
+                audit=audit if isinstance(audit, Mapping) else None,
+                order_context=order_context,
+            )
+        if partial_meta:
+            order_context["partial_fill"] = copy.deepcopy(partial_meta)
+            order["partial_fill"] = copy.deepcopy(partial_meta)
+            if partial_meta.get("status") == "incomplete":
+                reason_text = partial_meta.get("reason")
+                if not reason_text:
+                    reason_text = (
+                        "Ордер частично исполнен, остаток будет отправлен повторно на следующем цикле."
+                    )
+                return ExecutionResult(
+                    status="partial",
+                    reason=str(reason_text),
+                    order=order,
+                    response=response if isinstance(response, Mapping) else None,
+                    context=order_context,
+                )
+
         private_snapshot = ws_manager.private_snapshot()
         ledger_rows_after, _ = self._ledger_rows_snapshot(
             settings=settings, last_exec_id=last_exec_id
@@ -4005,6 +4041,226 @@ class SignalExecutor:
                     executed_quote = max(executed_quote, quote_total)
 
         return executed_base, executed_quote
+
+    @staticmethod
+    def _format_decimal_for_meta(value: Decimal) -> str:
+        quantised = value
+        if value == value.to_integral():
+            quantised = value
+        else:
+            quantised = value.normalize()
+        return format(quantised, "f")
+
+    @staticmethod
+    def _partial_attempts(response: Mapping[str, object] | None) -> list[dict[str, object]]:
+        if not isinstance(response, Mapping):
+            return []
+        local = response.get("_local") if isinstance(response, Mapping) else None
+        attempts = None
+        if isinstance(local, Mapping):
+            attempts = local.get("attempts")
+        if not isinstance(attempts, Sequence):
+            return []
+        extracted: list[dict[str, object]] = []
+        for entry in attempts:
+            if isinstance(entry, Mapping):
+                extracted.append(dict(entry))
+        return extracted
+
+    @staticmethod
+    def _store_partial_attempts(response: Mapping[str, object] | None, attempts: Sequence[Mapping[str, object]]) -> None:
+        if not isinstance(response, MutableMapping):  # type: ignore[arg-type]
+            return
+        local = response.get("_local") if isinstance(response.get("_local"), Mapping) else None
+        if not isinstance(local, MutableMapping):  # type: ignore[arg-type]
+            local = {}
+            response["_local"] = local
+        local["attempts"] = list(attempts)
+
+    def _partial_fill_threshold(
+        self,
+        audit: Mapping[str, object] | None,
+        requested_quote: Decimal,
+    ) -> Decimal:
+        quote_step = self._decimal_from((audit or {}).get("quote_step"), _PARTIAL_FILL_MIN_THRESHOLD)
+        threshold = max(_PARTIAL_FILL_MIN_THRESHOLD, quote_step)
+        if requested_quote > 0:
+            fractional = requested_quote * Decimal("0.000001")
+            if fractional > threshold:
+                threshold = fractional
+        return threshold
+
+    def _remaining_quote_cap(
+        self,
+        order_context: Mapping[str, object],
+        executed_quote: Decimal,
+    ) -> Optional[float]:
+        usable_after_reserve = _safe_float(order_context.get("usable_after_reserve"))
+        if usable_after_reserve is None:
+            return None
+        executed_float = float(executed_quote)
+        remaining = usable_after_reserve - executed_float
+        if remaining <= 0:
+            return 0.0
+        return remaining
+
+    def _chase_partial_fill(
+        self,
+        *,
+        api: object,
+        settings: Settings,
+        symbol: str,
+        side: str,
+        slippage_pct: float,
+        requested_quote: Decimal,
+        response: Mapping[str, object] | None,
+        audit: Mapping[str, object] | None,
+        order_context: MutableMapping[str, object],
+    ) -> tuple[Mapping[str, object] | None, Decimal, Decimal, Optional[Dict[str, object]]]:
+        executed_base, executed_quote = self._extract_execution_totals(response)
+        if requested_quote <= 0:
+            return response, executed_base, executed_quote, None
+
+        attempts_seed = self._partial_attempts(response)
+        if executed_quote <= 0 and not attempts_seed:
+            return response, executed_base, executed_quote, None
+
+        threshold = self._partial_fill_threshold(audit, requested_quote)
+        remaining = requested_quote - executed_quote
+        if remaining <= threshold:
+            meta = {
+                "status": "complete",
+                "requested_quote": self._format_decimal_for_meta(requested_quote),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+            }
+            return response, executed_base, executed_quote, meta
+
+        min_notional = self._decimal_from((audit or {}).get("min_order_amt"))
+        if min_notional > 0 and remaining < min_notional:
+            meta = {
+                "status": "complete_below_minimum",
+                "requested_quote": self._format_decimal_for_meta(requested_quote),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                "min_order_amt": self._format_decimal_for_meta(min_notional),
+            }
+            return response, executed_base, executed_quote, meta
+
+        if api is None or not hasattr(api, "place_order"):
+            meta = {
+                "status": "incomplete",
+                "reason": "api_unavailable",
+                "requested_quote": self._format_decimal_for_meta(requested_quote),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+            }
+            return response, executed_base, executed_quote, meta
+
+        aggregated_attempts = list(attempts_seed)
+        followups: list[dict[str, object]] = []
+        remaining_cap = self._remaining_quote_cap(order_context, executed_quote)
+
+        for attempt in range(_PARTIAL_FILL_MAX_FOLLOWUPS):
+            if remaining <= threshold:
+                break
+            float_remaining = float(remaining)
+            if float_remaining <= 0:
+                break
+            max_quote = remaining_cap if remaining_cap is not None else None
+            try:
+                follow_response = place_spot_market_with_tolerance(
+                    api,
+                    symbol=symbol,
+                    side=side,
+                    qty=float_remaining,
+                    unit="quoteCoin",
+                    tol_type="Percent",
+                    tol_value=slippage_pct,
+                    max_quote=max_quote,
+                    settings=settings,
+                )
+            except OrderValidationError as exc:
+                followups.append(
+                    {
+                        "status": "error",
+                        "code": exc.code,
+                        "message": str(exc),
+                        "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                    }
+                )
+                log(
+                    "guardian.auto.partial_fill.retry_error",
+                    symbol=symbol,
+                    side=side,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                    code=exc.code,
+                )
+                break
+            except Exception as exc:  # pragma: no cover - defensive
+                followups.append(
+                    {
+                        "status": "error",
+                        "code": "runtime",
+                        "message": str(exc),
+                        "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                    }
+                )
+                log(
+                    "guardian.auto.partial_fill.retry_runtime",
+                    symbol=symbol,
+                    side=side,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                break
+
+            add_base, add_quote = self._extract_execution_totals(follow_response)
+            aggregated_attempts.extend(self._partial_attempts(follow_response))
+            executed_base += add_base
+            executed_quote += add_quote
+            remaining = requested_quote - executed_quote
+            if remaining < 0:
+                remaining = Decimal("0")
+
+            follow_entry: dict[str, object] = {
+                "status": "filled" if add_quote > 0 else "empty",
+                "executed_base": self._format_decimal_for_meta(max(add_base, Decimal("0"))),
+                "executed_quote": self._format_decimal_for_meta(max(add_quote, Decimal("0"))),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+            }
+            followups.append(follow_entry)
+            log(
+                "guardian.auto.partial_fill.retry_success",
+                symbol=symbol,
+                side=side,
+                attempt=attempt + 1,
+                executed_quote=follow_entry["executed_quote"],
+                remaining_quote=follow_entry["remaining_quote"],
+            )
+
+            remaining_cap = self._remaining_quote_cap(order_context, executed_quote)
+
+        if aggregated_attempts:
+            self._store_partial_attempts(response, aggregated_attempts)
+
+        meta: Dict[str, object] = {
+            "status": "complete" if remaining <= threshold else "incomplete",
+            "requested_quote": self._format_decimal_for_meta(requested_quote),
+            "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
+            "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+            "followups": followups,
+        }
+
+        if isinstance(response, MutableMapping):  # type: ignore[arg-type]
+            local = response.get("_local") if isinstance(response.get("_local"), MutableMapping) else None
+            if not isinstance(local, MutableMapping):  # type: ignore[arg-type]
+                local = {}
+                response["_local"] = local
+            local["partial_fill"] = meta
+
+        return response, executed_base, executed_quote, meta
 
     def current_signature(self) -> Optional[str]:
         """Return a stable identifier for the currently cached signal."""
