@@ -197,6 +197,42 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert ada["model_metrics"]["correlation"] >= -0.5
 
 
+def test_normalise_candles_filters_outliers() -> None:
+    base_start = 1_700_000_000_000
+    normal_candle = {
+        "start": base_start,
+        "open": "100",
+        "high": "101",
+        "low": "99",
+        "close": "100.5",
+        "volume": "2500",
+    }
+
+    rows: list[dict[str, object]] = []
+    for idx in range(6):
+        candle = dict(normal_candle)
+        candle["start"] = base_start + idx * 60_000
+        rows.append(candle)
+
+    spike = {
+        "start": base_start + 6 * 60_000,
+        "open": "100",
+        "high": "450",
+        "low": "20",
+        "close": "300",
+        "volume": "5000000",
+    }
+    rows.append(spike)
+
+    payload = {"result": {"list": rows}}
+    candles = market_scanner_module._normalise_candles(payload)
+
+    starts = [candle["start"] for candle in candles]
+    assert spike["start"] not in starts
+    assert len(candles) == 6
+    assert all(candle["close"] > 0 for candle in candles)
+
+
 def test_market_scanner_enforces_top_liquidity_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

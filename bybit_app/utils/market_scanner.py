@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import random
+import statistics
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -27,6 +28,7 @@ from .ai.models import (
     initialise_feature_map,
     liquidity_feature,
 )
+from .listing_guard import get_listing_status_snapshot
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -685,6 +687,22 @@ def scan_market_opportunities(
     fee_round_trip_bps = float(cost_profile.get("round_trip_fee_bps", 0.0) or 0.0)
     slippage_cost_bps = float(cost_profile.get("slippage_bps", 0.0) or 0.0)
 
+    maintenance_stoplist: Set[str] = set()
+    delisted_stoplist: Set[str] = set()
+    status_lookup: Dict[str, str] = {}
+    if api is not None:
+        try:
+            listing_snapshot = get_listing_status_snapshot(api, category="spot")
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log("market_scanner.listing_status.error", err=str(exc))
+        else:
+            maintenance_stoplist = listing_snapshot.maintenance_symbols()
+            delisted_stoplist = listing_snapshot.delisted_symbols()
+            status_lookup = dict(listing_snapshot.statuses)
+
+    reported_maintenance: Set[str] = set()
+    reported_delisted: Set[str] = set()
+
     for raw in rows:
         if not isinstance(raw, dict):
             continue
@@ -694,6 +712,18 @@ def scan_market_opportunities(
             continue
         upper_source = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else None
         if bset and symbol in bset:
+            continue
+
+        reason = status_lookup.get(symbol) or status_lookup.get(upper_source or "")
+        if symbol in delisted_stoplist:
+            if symbol not in reported_delisted:
+                log("market_scanner.skip.delisted", symbol=symbol, reason=reason)
+                reported_delisted.add(symbol)
+            continue
+        if symbol in maintenance_stoplist:
+            if symbol not in reported_maintenance:
+                log("market_scanner.skip.maintenance", symbol=symbol, reason=reason)
+                reported_maintenance.add(symbol)
             continue
 
         turnover = _safe_float(raw.get("turnover24h"))
@@ -1040,23 +1070,182 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
             # Explicitly flagged by the API as "not yet closed" – skip.
             continue
 
+        if high is not None and low is not None and high < low:
+            continue
+
         record: Dict[str, object] = {"start": start}
-        if open_ is not None:
-            record["open"] = open_
-        if high is not None:
+
+        def _store_positive(target: Dict[str, object], key: str, value: Optional[float]) -> None:
+            if value is None:
+                return
+            if isinstance(value, (int, float)) and value <= 0:
+                return
+            target[key] = value
+
+        _store_positive(record, "open", open_)
+        if high is not None and high > 0:
             record["high"] = high
-        if low is not None:
+        if low is not None and low > 0:
             record["low"] = low
-        if close is not None:
-            record["close"] = close
-        if volume is not None:
+        _store_positive(record, "close", close)
+        if isinstance(volume, (int, float)) and volume > 0:
             record["volume"] = volume
-        if turnover is not None:
+        if isinstance(turnover, (int, float)) and turnover > 0:
             record["turnover"] = turnover
         candles.append(record)
 
     candles.sort(key=lambda row: row.get("start") or 0)
-    return candles
+    return _remove_outlier_candles(candles)
+
+
+def _remove_outlier_candles(candles: Sequence[Mapping[str, object]]) -> List[Dict[str, object]]:
+    """Filter candles exhibiting extreme spikes in price range or volume."""
+
+    if len(candles) < 5:
+        return [dict(candle) for candle in candles]
+
+    def _typical_price(candle: Mapping[str, object]) -> Optional[float]:
+        open_ = _safe_float(candle.get("open"))
+        close = _safe_float(candle.get("close"))
+        high = _safe_float(candle.get("high"))
+        low = _safe_float(candle.get("low"))
+
+        values: List[float] = []
+        if open_ is not None and open_ > 0:
+            values.append(open_)
+        if close is not None and close > 0:
+            values.append(close)
+        if high is not None and low is not None and high > 0 and low > 0:
+            values.append((high + low) / 2.0)
+        if not values:
+            return None
+        return statistics.fmean(values)
+
+    def _range_ratio(candle: Mapping[str, object]) -> Optional[float]:
+        high = _safe_float(candle.get("high"))
+        low = _safe_float(candle.get("low"))
+        if high is None or low is None or high <= 0 or low <= 0:
+            return None
+        base = _typical_price(candle)
+        if base is None or base <= 0:
+            base = max(high, low)
+        if base <= 0:
+            return None
+        return (high - low) / base
+
+    def _volume_value(candle: Mapping[str, object]) -> Optional[float]:
+        volume = _safe_float(candle.get("volume"))
+        if volume is not None and volume > 0:
+            return volume
+        turnover = _safe_float(candle.get("turnover"))
+        if turnover is not None and turnover > 0:
+            return turnover
+        return None
+
+    price_series = [_typical_price(candle) for candle in candles]
+    range_series = [_range_ratio(candle) for candle in candles]
+    volume_series = [_volume_value(candle) for candle in candles]
+
+    price_outliers = _robust_outlier_indices(
+        price_series,
+        iqr_multiplier=4.0,
+        z_threshold=3.0,
+        relative_multiplier=1.6,
+    )
+    range_outliers = _robust_outlier_indices(
+        range_series,
+        iqr_multiplier=5.0,
+        z_threshold=3.5,
+        relative_multiplier=3.0,
+    )
+    volume_outliers = _robust_outlier_indices(
+        volume_series,
+        iqr_multiplier=6.0,
+        z_threshold=3.5,
+        relative_multiplier=5.0,
+    )
+
+    rejected = price_outliers | range_outliers | volume_outliers
+    if not rejected:
+        return [dict(candle) for candle in candles]
+
+    filtered: List[Dict[str, object]] = []
+    for idx, candle in enumerate(candles):
+        if idx in rejected:
+            continue
+        filtered.append(dict(candle))
+    return filtered
+
+
+def _robust_outlier_indices(
+    series: Sequence[Optional[float]],
+    *,
+    iqr_multiplier: float,
+    z_threshold: float,
+    relative_multiplier: Optional[float] = None,
+) -> Set[int]:
+    """Return indices of values that look like statistical outliers."""
+
+    samples: List[Tuple[int, float]] = []
+    for idx, value in enumerate(series):
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            continue
+        samples.append((idx, numeric))
+
+    if len(samples) < 5:
+        return set()
+
+    values = [value for _, value in samples]
+    try:
+        quartiles = statistics.quantiles(values, n=4, method="inclusive")
+        q1, q3 = quartiles[0], quartiles[2]
+        iqr = q3 - q1
+    except statistics.StatisticsError:
+        iqr = 0.0
+
+    median_value = statistics.median(values)
+    lower_bound = median_value - iqr_multiplier * iqr if iqr > 0 else None
+    upper_bound = median_value + iqr_multiplier * iqr if iqr > 0 else None
+
+    avg = statistics.fmean(values)
+    variance = sum((value - avg) ** 2 for value in values) / len(values)
+    std_dev = math.sqrt(variance)
+
+    upper_relative: Optional[float] = None
+    lower_relative: Optional[float] = None
+    if relative_multiplier is not None and relative_multiplier > 1.0 and median_value != 0:
+        upper_relative = median_value * relative_multiplier
+        if median_value > 0:
+            lower_relative = median_value / relative_multiplier
+        else:
+            lower_relative = median_value * relative_multiplier
+
+    rejected: Set[int] = set()
+    for idx, value in samples:
+        if lower_bound is not None and value < lower_bound:
+            rejected.add(idx)
+            continue
+        if upper_bound is not None and value > upper_bound:
+            rejected.add(idx)
+            continue
+        if upper_relative is not None:
+            if value > upper_relative:
+                rejected.add(idx)
+                continue
+            if lower_relative is not None and value < lower_relative:
+                rejected.add(idx)
+                continue
+        if std_dev > 0:
+            z_score = abs((value - avg) / std_dev)
+            if z_score > z_threshold:
+                rejected.add(idx)
+
+    return rejected
 
 
 def _select_closed_candles(
