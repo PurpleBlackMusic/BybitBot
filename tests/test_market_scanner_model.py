@@ -8,11 +8,14 @@ from typing import Optional, Sequence
 import joblib
 import numpy as np
 import pytest
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
-from bybit_app.utils.ai.models import MODEL_FEATURES, liquidity_feature
+from bybit_app.utils.ai.models import (
+    MODEL_FEATURES,
+    Pipeline,
+    StandardScaler,
+    _WeightedLogisticRegression,
+    liquidity_feature,
+)
 from bybit_app.utils.market_scanner import (
     TURNOVER_AVG_TRADES_PER_DAY,
     scan_market_opportunities,
@@ -43,7 +46,7 @@ def _build_pipeline(
     scaler.n_samples_seen_ = 1
     # Align with production where numpy arrays without named columns are used.
 
-    classifier = LogisticRegression()
+    classifier = _WeightedLogisticRegression()
     classifier.classes_ = np.array([0, 1], dtype=int)
     if weights is not None:
         coefficients = np.array(list(weights), dtype=float)
@@ -51,7 +54,7 @@ def _build_pipeline(
         coefficients = np.array([weight] + [0.0] * (feature_count - 1), dtype=float)
     classifier.coef_ = coefficients.reshape(1, -1)
     classifier.intercept_ = np.array([intercept], dtype=float)
-    classifier.n_iter_ = np.array([1], dtype=int)
+    classifier._constant_prob = None
 
     return Pipeline([
         ("scaler", scaler),

@@ -10,12 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import copy
 import joblib
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from ..paths import DATA_DIR
 from ..trade_analytics import ExecutionRecord, load_executions
@@ -32,6 +29,179 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "spread_bps",
     "correlation_strength",
 )
+
+
+class StandardScaler:
+    """Lightweight replacement for ``sklearn.preprocessing.StandardScaler``."""
+
+    def __init__(
+        self,
+        *,
+        with_mean: bool = True,
+        with_std: bool = True,
+        epsilon: float = 1e-9,
+    ) -> None:
+        self.with_mean = bool(with_mean)
+        self.with_std = bool(with_std)
+        self.epsilon = float(epsilon)
+
+    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None):
+        data = np.asarray(X, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        self.n_features_in_ = data.shape[1]
+        self.n_samples_seen_ = data.shape[0]
+        if self.with_mean:
+            self.mean_ = data.mean(axis=0)
+        else:
+            self.mean_ = np.zeros(self.n_features_in_, dtype=float)
+        if self.with_std:
+            variance = data.var(axis=0)
+            self.scale_ = np.sqrt(variance)
+            self.scale_ = np.where(
+                np.abs(self.scale_) < self.epsilon, 1.0, self.scale_
+            )
+            self.var_ = self.scale_**2
+        else:
+            self.scale_ = np.ones(self.n_features_in_, dtype=float)
+            self.var_ = np.ones(self.n_features_in_, dtype=float)
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        data = np.asarray(X, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        result = np.array(data, dtype=float, copy=True)
+        if self.with_mean:
+            result = result - self.mean_
+        if self.with_std:
+            result = result / self.scale_
+        return result
+
+    def fit_transform(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> np.ndarray:
+        self.fit(X, y)
+        return self.transform(X)
+
+    def inverse_transform(self, X: np.ndarray) -> np.ndarray:
+        data = np.asarray(X, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        result = np.array(data, dtype=float, copy=True)
+        if self.with_std:
+            result = result * self.scale_
+        if self.with_mean:
+            result = result + self.mean_
+        return result
+
+    def get_params(self) -> Dict[str, object]:
+        return {
+            "with_mean": self.with_mean,
+            "with_std": self.with_std,
+            "epsilon": self.epsilon,
+        }
+
+    def set_params(self, **params):
+        for key, value in params.items():
+            setattr(self, key, value)
+        return self
+
+    def clone(self) -> "StandardScaler":
+        return StandardScaler(
+            with_mean=self.with_mean, with_std=self.with_std, epsilon=self.epsilon
+        )
+
+
+class Pipeline:
+    """Minimal pipeline implementation supporting fit/predict workflows."""
+
+    def __init__(self, steps: Sequence[Tuple[str, object]]):
+        if not steps:
+            self.steps = []
+            self.named_steps: Dict[str, object] = {}
+            return
+        self.steps = [(str(name), step) for name, step in steps]
+        self.named_steps = {name: step for name, step in self.steps}
+
+    def _step_params(self, name: str, fit_params: Dict[str, object]) -> Dict[str, object]:
+        prefix = f"{name}__"
+        extracted: Dict[str, object] = {}
+        for key in list(fit_params.keys()):
+            if key.startswith(prefix):
+                extracted[key[len(prefix) :]] = fit_params.pop(key)
+        return extracted
+
+    def fit(self, X: np.ndarray, y: np.ndarray, **fit_params):
+        if not self.steps:
+            raise ValueError("Pipeline has no steps to fit")
+        data = np.asarray(X, dtype=float)
+        params = dict(fit_params)
+        for name, step in self.steps[:-1]:
+            step_params = self._step_params(name, params)
+            if hasattr(step, "fit_transform"):
+                data = step.fit_transform(data, y, **step_params)
+            else:
+                step.fit(data, y, **step_params)
+                data = step.transform(data)
+        last_name, last_step = self.steps[-1]
+        last_params = self._step_params(last_name, params)
+        if last_params:
+            last_step.fit(data, y, **last_params)
+        else:
+            last_step.fit(data, y)
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if not self.steps:
+            raise ValueError("Pipeline has no steps to transform")
+        data = np.asarray(X, dtype=float)
+        for name, step in self.steps[:-1]:
+            data = step.transform(data)
+        classifier = self.steps[-1][1]
+        if not hasattr(classifier, "predict_proba"):
+            raise AttributeError("Final pipeline step must implement predict_proba")
+        return classifier.predict_proba(data)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self.steps:
+            raise ValueError("Pipeline has no steps to transform")
+        data = np.asarray(X, dtype=float)
+        for name, step in self.steps[:-1]:
+            data = step.transform(data)
+        classifier = self.steps[-1][1]
+        if hasattr(classifier, "predict"):
+            return classifier.predict(data)
+        probabilities = self.predict_proba(data)
+        positive_index = 1 if probabilities.shape[1] > 1 else 0
+        return (probabilities[:, positive_index] >= 0.5).astype(int)
+
+    def clone(self) -> "Pipeline":
+        return Pipeline([(name, _clone_step(step)) for name, step in self.steps])
+
+
+def _clone_step(step: object) -> object:
+    if hasattr(step, "clone"):
+        return step.clone()
+    if hasattr(step, "get_params"):
+        try:
+            params = step.get_params()
+        except TypeError:
+            return copy.deepcopy(step)
+        constructor_args = {
+            key: value
+            for key, value in params.items()
+            if not key.endswith("_")
+        }
+        try:
+            return step.__class__(**constructor_args)
+        except Exception:
+            return copy.deepcopy(step)
+    return copy.deepcopy(step)
+
+
+def clone_pipeline(pipeline: Pipeline) -> Pipeline:
+    """Return a fresh copy of the provided pipeline."""
+
+    return pipeline.clone()
 
 
 def liquidity_feature(value: float) -> float:
@@ -393,7 +563,7 @@ def _rolling_out_of_sample_metrics(
             start += max(test_size // 2, 1)
             continue
 
-        estimator = clone(template_pipeline)
+        estimator = clone_pipeline(template_pipeline)
         train_weights = base_weights[train_indices]
         estimator.fit(
             matrix[train_indices],
@@ -444,46 +614,124 @@ def _rolling_out_of_sample_metrics(
     }
 
 
-class _WeightedLogisticRegression(BaseEstimator, ClassifierMixin):
+class _WeightedLogisticRegression:
     """Logistic regression with graceful handling of single-class datasets."""
 
-    def __init__(self, *, max_iter: int = 500, l2: float = 1e-2) -> None:
+    def __init__(
+        self,
+        *,
+        max_iter: int = 500,
+        l2: float = 1e-2,
+        learning_rate: float = 0.1,
+        tol: float = 1e-6,
+    ) -> None:
         self.max_iter = int(max_iter)
         self.l2 = float(l2)
-        self._model: Optional[LogisticRegression] = None
+        self.learning_rate = float(learning_rate)
+        self.tol = float(tol)
         self._constant_prob: Optional[float] = None
+        self.coef_: Optional[np.ndarray] = None
+        self.intercept_: Optional[np.ndarray] = None
+        self.classes_ = np.array([0, 1], dtype=int)
 
-    def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None):
-        unique = np.unique(y)
+    def get_params(self) -> Dict[str, object]:  # pragma: no cover - helper for cloning
+        return {
+            "max_iter": self.max_iter,
+            "l2": self.l2,
+            "learning_rate": self.learning_rate,
+            "tol": self.tol,
+        }
+
+    def set_params(self, **params):  # pragma: no cover - helper for cloning
+        for key, value in params.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+        return self
+
+    def clone(self) -> "_WeightedLogisticRegression":
+        return _WeightedLogisticRegression(
+            max_iter=self.max_iter,
+            l2=self.l2,
+            learning_rate=self.learning_rate,
+            tol=self.tol,
+        )
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> "_WeightedLogisticRegression":
+        features = np.asarray(X, dtype=float)
+        if features.ndim == 1:
+            features = features.reshape(-1, 1)
+        targets = np.asarray(y, dtype=float).reshape(-1)
+        unique = np.unique(targets)
         if len(unique) >= 2:
-            c_value = float("inf") if self.l2 <= 0 else 1.0 / self.l2
-            logistic = LogisticRegression(
-                penalty="l2",
-                C=c_value,
-                solver="lbfgs",
-                max_iter=self.max_iter,
+            weights = (
+                np.asarray(sample_weight, dtype=float)
+                if sample_weight is not None
+                else np.ones_like(targets, dtype=float)
             )
-            logistic.fit(X, y, sample_weight=sample_weight)
-            self._model = logistic
+            weights = np.where(weights > 0, weights, 0.0)
+            mean_weight = float(weights.mean()) if weights.size else 1.0
+            if not math.isfinite(mean_weight) or mean_weight <= 0:
+                weights = np.ones_like(targets, dtype=float)
+            else:
+                weights = weights / mean_weight
+
+            coef = np.zeros(features.shape[1], dtype=float)
+            intercept = 0.0
+            for _ in range(max(self.max_iter, 1)):
+                logits = features.dot(coef) + intercept
+                logits = np.clip(logits, -50.0, 50.0)
+                predictions = 1.0 / (1.0 + np.exp(-logits))
+                errors = (predictions - targets) * weights
+                grad_w = features.T.dot(errors) / max(len(targets), 1)
+                if self.l2 > 0:
+                    grad_w += self.l2 * coef
+                grad_b = float(errors.mean())
+                step = self.learning_rate
+                coef -= step * grad_w
+                intercept -= step * grad_b
+                if np.linalg.norm(np.append(grad_w, grad_b)) <= self.tol:
+                    break
+
+            self.coef_ = coef.reshape(1, -1)
+            self.intercept_ = np.array([intercept], dtype=float)
             self._constant_prob = None
-            self.classes_ = np.array(logistic.classes_, dtype=int)
+            self.classes_ = np.array([0, 1], dtype=int)
             return self
 
-        probability = float(np.mean(y)) if len(y) else 0.5
-        logit = _logit(probability)
-        self._model = None
-        self._constant_prob = 1.0 / (1.0 + math.exp(-logit))
+        probability = float(np.mean(targets)) if len(targets) else 0.5
+        probability = min(max(probability, 1e-6), 1.0 - 1e-6)
+        self._constant_prob = probability
+        feature_count = features.shape[1] if features.ndim > 1 else 1
+        self.coef_ = np.zeros((1, feature_count), dtype=float)
+        self.intercept_ = np.array([_logit(probability)], dtype=float)
         self.classes_ = np.array([0, 1], dtype=int)
         return self
 
+    def _sigmoid(self, logits: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-logits))
+
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        if self._model is not None:
-            return self._model.predict_proba(X)
-        prob = float(self._constant_prob if self._constant_prob is not None else 0.5)
-        n = X.shape[0]
-        negatives = np.full(n, 1.0 - prob, dtype=float)
-        positives = np.full(n, prob, dtype=float)
-        return np.column_stack((negatives, positives))
+        data = np.asarray(X, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        if self._constant_prob is not None:
+            prob = float(self._constant_prob)
+            n = data.shape[0]
+            negatives = np.full(n, 1.0 - prob, dtype=float)
+            positives = np.full(n, prob, dtype=float)
+            return np.column_stack((negatives, positives))
+        if self.coef_ is None or self.intercept_ is None:
+            raise ValueError("Classifier has not been fitted")
+        logits = data.dot(self.coef_.reshape(-1)) + float(self.intercept_[0])
+        logits = np.clip(logits, -50.0, 50.0)
+        probs = self._sigmoid(logits)
+        negatives = 1.0 - probs
+        return np.column_stack((negatives, probs))
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         probabilities = self.predict_proba(X)
@@ -491,7 +739,7 @@ class _WeightedLogisticRegression(BaseEstimator, ClassifierMixin):
         return (probabilities[:, positive_idx] >= 0.5).astype(int)
 
 
-def _extract_classifier(pipeline: Pipeline) -> ClassifierMixin:
+def _extract_classifier(pipeline: Pipeline) -> object:
     try:
         return pipeline.named_steps["classifier"]
     except (AttributeError, KeyError):  # pragma: no cover - defensive fallback

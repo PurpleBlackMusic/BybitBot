@@ -8,12 +8,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pytest
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-
 from bybit_app.utils.ai.models import (
     MODEL_FEATURES,
     MarketModel,
+    Pipeline,
+    StandardScaler,
     _SymbolState,
     _WeightedLogisticRegression,
     _cross_sectional_weights,
