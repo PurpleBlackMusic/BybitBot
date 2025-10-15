@@ -27,6 +27,7 @@ from .ai.models import (
     liquidity_feature,
 )
 from .log import log
+from .maintenance import MaintenanceStoplist, load_maintenance_stoplist
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
 from .symbols import ensure_usdt_symbol
@@ -39,6 +40,28 @@ if TYPE_CHECKING:  # pragma: no cover - for type checking only
 
 SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
+
+DELIST_STATUS_DENYLIST: Tuple[str, ...] = (
+    "delist",
+    "delisted",
+    "delisting",
+    "delistsoon",
+    "suspend",
+    "suspended",
+    "halt",
+    "maintenance",
+    "stopped",
+)
+DELIST_TIME_FIELDS: Tuple[str, ...] = (
+    "delistingTime",
+    "delistTime",
+    "expireTime",
+    "expiryTime",
+    "maintenanceEndTime",
+    "maintainEndTime",
+    "suspendTime",
+)
+UPCOMING_DELIST_GRACE = 24 * 3600.0
 
 
 class MarketScannerError(RuntimeError):
@@ -86,6 +109,141 @@ def _safe_float(value: object) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def _normalise_epoch(value: object) -> Optional[float]:
+    ts = _safe_float(value)
+    if ts is None or ts <= 0:
+        return None
+    if ts > 1e12:
+        ts /= 1000.0
+    elif ts > 1e10:
+        ts /= 1000.0
+    return ts
+
+
+def _normalise_status(value: str) -> str:
+    cleaned = value.strip().lower()
+    if not cleaned:
+        return ""
+    return "".join(ch for ch in cleaned if ch.isalpha())
+
+
+def _status_tokens(row: Mapping[str, object]) -> Tuple[str, ...]:
+    tokens: list[str] = []
+    for field in ("status", "symbolStatus", "listStatus", "state", "tradingStatus"):
+        raw = row.get(field)
+        if isinstance(raw, str):
+            token = _normalise_status(raw)
+            if token:
+                tokens.append(token)
+    return tuple(tokens)
+
+
+def _is_delisted(row: Mapping[str, object], now: float) -> bool:
+    for token in _status_tokens(row):
+        if token in DELIST_STATUS_DENYLIST:
+            return True
+        for deny in DELIST_STATUS_DENYLIST:
+            if token.startswith(deny):
+                return True
+
+    for field in DELIST_TIME_FIELDS:
+        ts = _normalise_epoch(row.get(field))
+        if ts is None:
+            continue
+        if now >= ts:
+            return True
+        if ts - now <= UPCOMING_DELIST_GRACE:
+            return True
+    return False
+
+
+def _percentile(sorted_values: Sequence[float], fraction: float) -> float:
+    if not sorted_values:
+        raise ValueError("empty sequence")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    fraction = min(max(fraction, 0.0), 1.0)
+    position = fraction * (len(sorted_values) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return sorted_values[lower]
+    weight = position - lower
+    return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+
+
+def _typical_price(record: Mapping[str, object]) -> Optional[float]:
+    prices: list[float] = []
+    for field in ("close", "open", "high", "low"):
+        value = record.get(field)
+        if isinstance(value, (int, float)):
+            prices.append(float(value))
+    if not prices:
+        return None
+    prices.sort()
+    mid = len(prices) // 2
+    if len(prices) % 2:
+        return prices[mid]
+    return (prices[mid - 1] + prices[mid]) / 2.0
+
+
+def _filter_candle_outliers(candles: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    if len(candles) < 5:
+        return candles
+
+    price_lookup: Dict[int, float] = {}
+    prices: list[float] = []
+    for idx, record in enumerate(candles):
+        price = _typical_price(record)
+        if price is None:
+            continue
+        price_lookup[idx] = price
+        prices.append(price)
+
+    if len(prices) < 5:
+        return candles
+
+    sorted_prices = sorted(prices)
+    q1 = _percentile(sorted_prices, 0.25)
+    q3 = _percentile(sorted_prices, 0.75)
+    iqr = q3 - q1
+    iqr_bounds: Optional[Tuple[float, float]] = None
+    if iqr > 0:
+        scale = 3.0
+        iqr_bounds = (q1 - scale * iqr, q3 + scale * iqr)
+
+    mean = sum(prices) / len(prices)
+    variance = sum((price - mean) ** 2 for price in prices) / len(prices)
+    std = math.sqrt(variance)
+    z_bounds: Optional[Tuple[float, float]] = None
+    if std > 1e-9:
+        threshold = 6.0
+        z_bounds = (mean - threshold * std, mean + threshold * std)
+
+    filtered: List[Dict[str, object]] = []
+    removed = 0
+    for idx, record in enumerate(candles):
+        price = price_lookup.get(idx)
+        if price is None:
+            filtered.append(record)
+            continue
+
+        drop = False
+        if iqr_bounds is not None and (price < iqr_bounds[0] or price > iqr_bounds[1]):
+            drop = True
+        if not drop and z_bounds is not None and (price < z_bounds[0] or price > z_bounds[1]):
+            drop = True
+
+        if drop:
+            removed += 1
+            continue
+        filtered.append(record)
+
+    if removed and not filtered:
+        return candles
+    return filtered if removed else candles
 
 
 def _normalise_percent(value: object) -> Optional[float]:
@@ -422,6 +580,8 @@ def scan_market_opportunities(
             ttl_value = DEFAULT_CACHE_TTL
     cache_ttl = max(ttl_value, 0.0)
 
+    maintenance_stoplist: MaintenanceStoplist = load_maintenance_stoplist(data_dir)
+
     snapshot = load_market_snapshot(data_dir, settings=settings, testnet=testnet)
     now = time.time()
     if snapshot is not None and cache_ttl >= 0:
@@ -482,6 +642,15 @@ def scan_market_opportunities(
             continue
         upper_source = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else None
         if bset and symbol in bset:
+            continue
+
+        blocked, reason = maintenance_stoplist.check(symbol, now=now)
+        if blocked:
+            log("market_scanner.skip.maintenance", symbol=symbol, reason=reason)
+            continue
+
+        if _is_delisted(raw, now):
+            log("market_scanner.skip.delisted", symbol=symbol)
             continue
 
         turnover = _safe_float(raw.get("turnover24h"))
@@ -732,7 +901,11 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
         candles.append(record)
 
     candles.sort(key=lambda row: row.get("start") or 0)
-    return candles
+    filtered = _filter_candle_outliers(candles)
+    if filtered is candles:
+        return candles
+    filtered.sort(key=lambda row: row.get("start") or 0)
+    return filtered
 
 
 class _CandleCache:

@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 import numpy as np
 
+import bybit_app.utils.market_scanner as market_scanner_module
+
 from bybit_app.utils.ai import models as ai_models
 from bybit_app.utils.market_scanner import (
     MarketScanner,
@@ -26,6 +28,32 @@ def _write_snapshot(
     path = tmp_path / "ai" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+
+def _write_maintenance_stoplist(tmp_path: Path, payload: dict[str, object]) -> None:
+    path = tmp_path / "config" / "maintenance.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_normalise_candles_filters_outliers() -> None:
+    payload = {
+        "result": {
+            "list": [
+                [1, "100", "101", "99", "100", "10"],
+                [2, "100", "500", "50", "450", "20"],
+                [3, "101", "102", "100", "101", "15"],
+                [4, "102", "103", "101", "102", "15"],
+                [5, "103", "104", "102", "103", "15"],
+                [6, "104", "105", "103", "104", "15"],
+            ]
+        }
+    }
+
+    candles = market_scanner_module._normalise_candles(payload)
+    starts = [row["start"] for row in candles]
+    assert len(candles) == 5
+    assert 2 not in starts
 
 
 def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
@@ -167,6 +195,89 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert ada["probability"] < opportunities[1]["probability"]
     assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
     assert ada["model_metrics"]["correlation"] >= -0.5
+
+
+def test_market_scanner_respects_maintenance_stoplist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = 1_700_000_000.0
+    monkeypatch.setattr(time, "time", lambda: now)
+    _write_maintenance_stoplist(
+        tmp_path,
+        {"stoplist": {"MAINTUSDT": {"until": now + 600, "reason": "maintenance"}}},
+    )
+
+    rows = [
+        {
+            "symbol": "MAINTUSDT",
+            "turnover24h": "3000000",
+            "price24hPcnt": "3.0",
+            "bestBidPrice": "10",
+            "bestAskPrice": "10.01",
+            "volume24h": "100000",
+        },
+        {
+            "symbol": "OKUSDT",
+            "turnover24h": "4000000",
+            "price24hPcnt": "2.5",
+            "bestBidPrice": "20",
+            "bestAskPrice": "20.05",
+            "volume24h": "80000",
+        },
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=1_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=50.0,
+    )
+
+    symbols = [entry["symbol"] for entry in opportunities]
+    assert "MAINTUSDT" not in symbols
+    assert "OKUSDT" in symbols
+
+
+def test_market_scanner_skips_delisted_rows(tmp_path: Path) -> None:
+    rows = [
+        {
+            "symbol": "DELISTUSDT",
+            "turnover24h": "3500000",
+            "price24hPcnt": "1.5",
+            "bestBidPrice": "15",
+            "bestAskPrice": "15.05",
+            "volume24h": "50000",
+            "status": "Delisting",
+        },
+        {
+            "symbol": "LIVEUSDT",
+            "turnover24h": "3600000",
+            "price24hPcnt": "1.6",
+            "bestBidPrice": "16",
+            "bestAskPrice": "16.04",
+            "volume24h": "52000",
+            "status": "Trading",
+        },
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=1_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=50.0,
+    )
+
+    symbols = [entry["symbol"] for entry in opportunities]
+    assert "DELISTUSDT" not in symbols
+    assert "LIVEUSDT" in symbols
 
 
 def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
