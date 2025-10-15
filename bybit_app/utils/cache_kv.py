@@ -98,3 +98,14 @@ class TTLKV:
             self._ensure_fresh()
             self._data[key] = {"ts": time.time(), "val": val}
             self._flush()
+
+    def clear(self) -> None:
+        """Remove all cached entries and delete the backing file."""
+
+        with self._lock:
+            self._data = {}
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            self._mtime = None

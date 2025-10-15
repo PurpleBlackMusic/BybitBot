@@ -9,9 +9,11 @@ from typing import Any, Dict, Generic, List, Mapping, Optional, Sequence, Tuple,
 import re
 
 from .bybit_api import BybitAPI
+from .cache_kv import TTLKV
 from .log import log
 from . import validators
 from .envs import Settings
+from .paths import CACHE_DIR
 from .precision import ceil_qty_to_min_notional, format_to_step
 
 _MIN_QUOTE = Decimal("5")
@@ -19,6 +21,7 @@ _PRICE_CACHE_TTL = 5.0
 _BALANCE_CACHE_TTL = 5.0
 _INSTRUMENT_CACHE_TTL = 600.0
 _INSTRUMENT_DYNAMIC_TTL = 30.0
+_INSTRUMENT_PERSIST_TTL = 6 * 3600.0
 _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
@@ -50,6 +53,17 @@ _PRICE_LIMIT_COMPARISONS = re.compile(
 _PRICE_LIMIT_KEY_ALIASES = {
     "price_cap": {"pricecap", "maxprice", "upperlimit", "upperprice", "pricelimitupper"},
     "price_floor": {"pricefloor", "minprice", "lowerlimit", "lowerprice", "pricelimitlower"},
+}
+
+
+_DECIMAL_LIMIT_FIELDS = {
+    "min_order_amt",
+    "quote_step",
+    "min_order_qty",
+    "qty_step",
+    "tick_size",
+    "min_price",
+    "max_price",
 }
 
 
@@ -95,6 +109,110 @@ _INSTRUMENT_CACHE: TTLCache[Dict[str, object]] = TTLCache(_INSTRUMENT_CACHE_TTL)
 _PRICE_CACHE: TTLCache[Decimal] = TTLCache(_PRICE_CACHE_TTL)
 _BALANCE_CACHE: TTLCache[Dict[str, Decimal]] = TTLCache(_BALANCE_CACHE_TTL)
 _SYMBOL_CACHE: TTLCache[Dict[str, object]] = TTLCache(_SYMBOL_CACHE_TTL)
+_INSTRUMENT_KV: TTLKV = TTLKV(CACHE_DIR / "instrument_limits.json")
+
+
+def _decimal_to_text(value: Decimal) -> str:
+    try:
+        normalised = value.normalize()
+    except InvalidOperation:
+        normalised = value
+    text = format(normalised, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _store_instrument_limits(cache_key: str, limits: Mapping[str, object]) -> None:
+    payload: Dict[str, object] = {}
+    for key, value in limits.items():
+        if key in _DECIMAL_LIMIT_FIELDS and isinstance(value, Decimal):
+            payload[key] = _decimal_to_text(value)
+        elif key == "_dynamic_ts":
+            try:
+                payload[key] = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+        else:
+            payload[key] = value
+    _INSTRUMENT_KV.set(cache_key, payload)
+
+
+def _load_instrument_limits(cache_key: str) -> Optional[Dict[str, object]]:
+    record = _INSTRUMENT_KV.get(cache_key, ttl_sec=int(_INSTRUMENT_PERSIST_TTL))
+    if not isinstance(record, Mapping):
+        return None
+
+    hydrated: Dict[str, object] = {}
+    for key, value in record.items():
+        if key in _DECIMAL_LIMIT_FIELDS:
+            hydrated[key] = _to_decimal(value)
+        else:
+            hydrated[key] = value
+    return hydrated
+
+
+def _merge_with_fallback(
+    limits: Dict[str, object],
+    fallback: Optional[Mapping[str, object]],
+) -> Dict[str, object]:
+    if not fallback:
+        return limits
+
+    merged = dict(limits)
+    placeholders: Dict[str, Decimal] = {
+        "tick_size": Decimal("0.00000001"),
+        "qty_step": Decimal("0.00000001"),
+        "min_order_amt": Decimal("0"),
+        "min_order_qty": Decimal("0"),
+        "quote_step": Decimal("0.01"),
+    }
+    for key in _DECIMAL_LIMIT_FIELDS:
+        value = merged.get(key)
+        placeholder_threshold = placeholders.get(key)
+        if isinstance(value, Decimal):
+            if value > 0 and (
+                placeholder_threshold is None or value > placeholder_threshold
+            ):
+                continue
+        fallback_value = fallback.get(key)
+        if isinstance(fallback_value, Decimal) and fallback_value > 0:
+            if not isinstance(value, Decimal) or value <= 0:
+                merged[key] = fallback_value
+            elif (
+                placeholder_threshold is not None
+                and value <= placeholder_threshold
+                and fallback_value > value
+            ):
+                merged[key] = fallback_value
+    if "_instrument" not in merged and isinstance(fallback.get("_instrument"), Mapping):
+        merged["_instrument"] = fallback["_instrument"]
+    return merged
+
+
+def _validate_required_limit_fields(symbol: str, limits: Mapping[str, object]) -> None:
+    required = {
+        "tick_size": "tickSize",
+        "qty_step": "stepSize",
+        "min_order_amt": "minNotional",
+    }
+
+    missing: list[str] = []
+    for key, alias in required.items():
+        value = limits.get(key)
+        if not isinstance(value, Decimal):
+            value = _to_decimal(value)
+            if isinstance(limits, dict):
+                limits[key] = value
+        if value <= 0:
+            missing.append(alias)
+
+    if missing:
+        raise OrderValidationError(
+            f"Правила торговли для {symbol} не содержат обязательные параметры: {', '.join(missing)}.",
+            code="instrument_rules_missing",
+            details={"missing": missing, "symbol": symbol},
+        )
 
 
 def _network_label(api: BybitAPI) -> str:
@@ -829,8 +947,8 @@ def _execution_stats(
 def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     key = symbol.upper()
     cache_key = _instrument_cache_key(api, key)
-    cached = _INSTRUMENT_CACHE.get(cache_key)
     now = time.time()
+    cached = _INSTRUMENT_CACHE.get(cache_key)
     if cached is not None:
         dynamic_ts = cached.get("_dynamic_ts") if isinstance(cached, dict) else None
         try:
@@ -840,9 +958,16 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
         if ts_value is not None and now - ts_value < _INSTRUMENT_DYNAMIC_TTL:
             return cached
 
+    fallback_limits = _load_instrument_limits(cache_key)
+
     try:
         response = api.instruments_info(category="spot", symbol=key)
     except Exception as exc:  # pragma: no cover - network/runtime errors
+        if fallback_limits is not None:
+            fallback_copy = dict(fallback_limits)
+            fallback_copy["_dynamic_ts"] = now
+            _INSTRUMENT_CACHE.set(cache_key, fallback_copy)
+            return fallback_copy
         raise RuntimeError(f"Не удалось получить правила для {key}: {exc}") from exc
 
     result = (response or {}).get("result") if isinstance(response, dict) else None
@@ -863,6 +988,11 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
         instrument = entries[0]
 
     if instrument is None:
+        if fallback_limits is not None:
+            fallback_copy = dict(fallback_limits)
+            fallback_copy["_dynamic_ts"] = now
+            _INSTRUMENT_CACHE.set(cache_key, fallback_copy)
+            return fallback_copy
         raise OrderValidationError(
             f"Не найдены данные об инструменте {key}",
             code="instrument_missing",
@@ -871,6 +1001,11 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
 
     status = str(instrument.get("status") or "").strip().lower()
     if status and status != "trading":
+        if fallback_limits is not None:
+            fallback_copy = dict(fallback_limits)
+            fallback_copy["_dynamic_ts"] = now
+            _INSTRUMENT_CACHE.set(cache_key, fallback_copy)
+            return fallback_copy
         raise OrderValidationError(
             f"Инструмент {key} недоступен для торговли (status={status}).",
             code="instrument_inactive",
@@ -923,7 +1058,7 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     price_filter = instrument.get("priceFilter") or {}
     tick_size = _to_decimal(price_filter.get("tickSize") or price_filter.get("tick_size") or "0")
     if tick_size <= 0:
-        tick_size = Decimal("0")
+        tick_size = Decimal("0.00000001")
     min_price = _to_decimal(price_filter.get("minPrice") or price_filter.get("min_price") or "0")
     max_price = _to_decimal(price_filter.get("maxPrice") or price_filter.get("max_price") or "0")
 
@@ -941,7 +1076,12 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
     }
     limits["_instrument"] = instrument
     limits["_dynamic_ts"] = now
+
+    limits = _merge_with_fallback(limits, fallback_limits)
+    _validate_required_limit_fields(key, limits)
+
     _INSTRUMENT_CACHE.set(cache_key, limits)
+    _store_instrument_limits(cache_key, limits)
     return limits
 
 
