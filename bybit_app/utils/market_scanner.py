@@ -384,11 +384,34 @@ def scan_market_opportunities(
         a refresh on every call.
     """
 
+    if testnet is None and settings is not None:
+        try:
+            testnet = bool(getattr(settings, "testnet"))
+        except Exception:
+            testnet = None
+
+    testnet_active = bool(testnet)
+
+    limit_value = int(limit) if isinstance(limit, (int, float)) else 0
+    if limit_value <= 0:
+        limit_value = 25
+    if testnet_active:
+        limit_value = max(limit_value, 50)
+    limit = limit_value
+
     min_turnover = max(0.0, float(min_turnover))
+    if testnet_active and min_turnover > 50_000.0:
+        min_turnover = 50_000.0
+
     effective_change = float(min_change_pct) if min_change_pct is not None else 0.5
     if effective_change < 0.05:
         effective_change = 0.05
     max_spread_bps = float(max_spread_bps)
+    if testnet_active:
+        if max_spread_bps <= 0:
+            max_spread_bps = 120.0
+        else:
+            max_spread_bps = max(max_spread_bps, 120.0)
 
     if cache_ttl is None:
         ttl_value = DEFAULT_CACHE_TTL
