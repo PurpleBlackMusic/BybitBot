@@ -189,6 +189,8 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
                 response = requests.get(url, params=params, timeout=timeout)
                 response.raise_for_status()
             except requests.exceptions.RequestException as exc:
+                if isinstance(exc, requests.exceptions.HTTPError):
+                    raise
                 raise _RetryableInstrumentFetchError(str(exc)) from exc
 
             try:
@@ -250,8 +252,12 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
         if not testnet:
             raise
 
-        if isinstance(exc, requests.exceptions.HTTPError):
-            log("instruments.fetch.testnet_http_error", scope="spot", err=str(exc))
+        root_exc = exc
+        if isinstance(exc, _RetryableInstrumentFetchError) and getattr(exc, "__cause__", None):
+            root_exc = exc.__cause__  # pragma: no cover - depends on network error shape
+
+        if isinstance(root_exc, requests.exceptions.HTTPError):
+            log("instruments.fetch.testnet_http_error", scope="spot", err=str(root_exc))
             try:
                 fallback_symbols = _fetch(_MAINNET_URL)
             except requests.exceptions.RequestException as fallback_exc:
@@ -276,7 +282,7 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
                 "instruments.fetch.testnet_mainnet_fallback",
                 scope="spot",
                 count=len(fallback_symbols),
-                err=str(exc),
+                err=str(root_exc),
             )
             return fallback_symbols
 

@@ -258,7 +258,6 @@ class _SyncedClock:
                 self._expiry = time.time() + 5.0
                 return
 
-            end = time.time()
             # Estimate mid-point between request/response to compensate latency.
             latency = max((end - start) / 2.0, 0.0)
             local_epoch = end - latency
