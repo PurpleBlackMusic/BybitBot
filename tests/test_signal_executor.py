@@ -585,6 +585,32 @@ def test_signal_executor_places_market_order(monkeypatch: pytest.MonkeyPatch) ->
     assert pytest.approx(captured["qty"], rel=1e-3) == 15.0
 
 
+def test_signal_executor_runs_tp_sweeper_even_when_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": False, "mode": "wait"}
+    settings = Settings(ai_enabled=True, dry_run=False)
+    bot = StubBot(summary, settings)
+
+    sweeps: list[dict[str, object]] = []
+
+    monkeypatch.setattr(signal_executor_module, "creds_ok", lambda _settings: True)
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "sweep_tp_ladder_orders",
+        lambda **kwargs: (sweeps.append(kwargs) or {"cancelled": 0}),
+    )
+    monkeypatch.setattr(signal_executor_module.time, "monotonic", lambda: 1_000.0)
+
+    executor = SignalExecutor(bot)
+    executor._tp_sweeper_last_run = 0.0
+
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert sweeps, "sweeper should run even when summary is skipped"
+    sweep_payload = sweeps[0]
+    assert sweep_payload.get("older_than") == pytest.approx(900.0)
+
+
 def test_signal_executor_uses_spot_fallback_when_unified_short(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = _universe_payload(
         [

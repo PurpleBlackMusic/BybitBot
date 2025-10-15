@@ -667,6 +667,89 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
         assert ladder_payload[0][1] == "0.20"
 
 
+def test_tp_sweeper_cancels_stale_orders_and_replans(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    now = 1_700_000_000.0
+    monkeypatch.setattr(ws_manager_module.time, "time", lambda: now)
+
+    stale_created = int((now - 1200) * 1000)
+    fresh_created = int((now - 60) * 1000)
+
+    class DummyAPI:
+        def __init__(self) -> None:
+            self.cancelled: list[dict[str, object]] = []
+
+        def open_orders(self, **_kwargs):
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "old-order",
+                            "orderLinkId": "AI-TP-BTC-OLD",
+                            "timeInForce": "GTC",
+                            "createdTime": str(stale_created),
+                        },
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "fresh-order",
+                            "orderLinkId": "AI-TP-BTC-NEW",
+                            "timeInForce": "GTC",
+                            "createdTime": str(fresh_created),
+                        },
+                        {
+                            "symbol": "ETHUSDT",
+                            "orderId": "unrelated",
+                            "orderLinkId": "NOT-TP",
+                            "createdTime": str(stale_created),
+                        },
+                    ]
+                }
+            }
+
+        def cancel_batch(self, **kwargs):
+            self.cancelled.append(kwargs)
+            return {"result": {}}
+
+    api = DummyAPI()
+
+    monkeypatch.setattr(
+        manager,
+        "_resolve_tp_config",
+        lambda settings: [(Decimal("50"), Decimal("0.5"))],
+    )
+
+    monkeypatch.setattr(
+        ws_manager_module,
+        "spot_inventory_and_pnl",
+        lambda **kwargs: {"BTCUSDT": {"position_qty": 0.3, "avg_cost": 100.0}},
+    )
+
+    regen_calls: list[tuple[dict[str, object], dict[str, dict[str, object]]]] = []
+
+    def fake_regenerate(row: dict, inventory: dict, **kwargs: object) -> None:
+        regen_calls.append((row, inventory))
+
+    monkeypatch.setattr(manager, "_regenerate_tp_ladder", fake_regenerate)
+
+    result = manager.sweep_tp_ladder_orders(
+        api=api,
+        settings=SimpleNamespace(testnet=False),
+        older_than=600.0,
+    )
+
+    assert api.cancelled, "sweeper should cancel stale TP orders"
+    payload = api.cancelled[0]
+    assert payload["request"][0]["orderId"] == "old-order"
+    assert regen_calls, "sweeper should attempt to regenerate ladder"
+    assert result["cancelled"] == 1
+    assert result["stale"] == 1
+    assert result["checked"] == 2
+    assert result["symbols"] == ["BTCUSDT"]
+    assert "BTCUSDT" in result["replanned"]
+
+
 @pytest.mark.parametrize(
     "verify_flag, expected_cert",
     (

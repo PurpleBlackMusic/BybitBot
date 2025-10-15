@@ -58,6 +58,8 @@ _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
+_TP_SWEEPER_DEFAULT_INTERVAL = 120.0
+_TP_SWEEPER_MAX_AGE = 900.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -135,6 +137,7 @@ class SignalExecutor:
         self._spot_inventory_snapshot: Optional[
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
+        self._tp_sweeper_last_run: float = 0.0
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -143,6 +146,7 @@ class SignalExecutor:
             "validation_penalties": copy.deepcopy(self._validation_penalties),
             "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
             "price_limit_backoff": copy.deepcopy(self._price_limit_backoff),
+            "tp_sweeper": {"last_run": self._tp_sweeper_last_run},
         }
 
     def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
@@ -228,6 +232,20 @@ class SignalExecutor:
                     restored_backoff[symbol] = cleaned
             if restored_backoff:
                 self._price_limit_backoff = restored_backoff
+
+        sweeper_state = (
+            state.get("tp_sweeper")
+            if isinstance(state, Mapping)
+            else None
+        )
+        if isinstance(sweeper_state, Mapping):
+            last_run = sweeper_state.get("last_run")
+            try:
+                last_run_value = float(last_run) if last_run is not None else 0.0
+            except (TypeError, ValueError):
+                last_run_value = 0.0
+            if math.isfinite(last_run_value) and last_run_value >= 0:
+                self._tp_sweeper_last_run = last_run_value
 
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
@@ -1596,6 +1614,7 @@ class SignalExecutor:
         self._spot_inventory_snapshot = None
         summary = self._fetch_summary()
         settings = self._resolve_settings()
+        self._maybe_sweep_take_profit_orders(settings)
         now = self._current_time()
         summary_meta = self._resolve_summary_update_meta(summary, now)
         price_meta = self._resolve_price_update_meta(summary, now)
@@ -2531,6 +2550,66 @@ class SignalExecutor:
         self._clear_symbol_penalties(symbol)
         self._mark_daily_pnl_stale()
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
+
+    # ------------------------------------------------------------------
+    # take-profit maintenance
+    def _tp_sweeper_interval(self, settings: Settings | None) -> float:
+        interval_raw = getattr(settings, "spot_tp_sweeper_interval_sec", None) if settings else None
+        try:
+            interval = float(interval_raw) if interval_raw is not None else _TP_SWEEPER_DEFAULT_INTERVAL
+        except (TypeError, ValueError):
+            interval = _TP_SWEEPER_DEFAULT_INTERVAL
+        return max(interval, 0.0)
+
+    def _tp_sweeper_age_threshold(self, settings: Settings | None) -> float:
+        age_minutes_raw = getattr(settings, "spot_tp_sweeper_max_age_min", None) if settings else None
+        if age_minutes_raw is None:
+            return _TP_SWEEPER_MAX_AGE
+        try:
+            minutes = float(age_minutes_raw)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        return max(minutes * 60.0, 0.0)
+
+    def _maybe_sweep_take_profit_orders(self, settings: Settings | None) -> None:
+        if settings is None:
+            return
+        if not creds_ok(settings):
+            return
+
+        interval = self._tp_sweeper_interval(settings)
+        if interval <= 0.0:
+            return
+
+        now = time.monotonic()
+        if self._tp_sweeper_last_run and now - self._tp_sweeper_last_run < interval:
+            return
+
+        age_threshold = self._tp_sweeper_age_threshold(settings)
+        if age_threshold <= 0.0:
+            self._tp_sweeper_last_run = now
+            return
+
+        try:
+            result = ws_manager.sweep_tp_ladder_orders(settings=settings, older_than=age_threshold)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("guardian.auto.tp_sweeper.error", err=str(exc))
+            self._tp_sweeper_last_run = now
+            return
+
+        cancelled = 0
+        if isinstance(result, Mapping):
+            try:
+                cancelled = int(result.get("cancelled", 0) or 0)
+            except Exception:
+                cancelled = 0
+        log(
+            "guardian.auto.tp_sweeper",
+            cancelled=cancelled,
+            threshold=age_threshold,
+            interval=interval,
+        )
+        self._tp_sweeper_last_run = now
 
     # ------------------------------------------------------------------
     # helpers

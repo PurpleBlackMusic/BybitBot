@@ -2005,6 +2005,260 @@ class WSManager:
                     count=len(chunk),
                 )
 
+    @staticmethod
+    def _extract_order_timestamp_ms(order: Mapping[str, object]) -> Optional[int]:
+        """Best-effort extraction of the order creation/update timestamp in ms."""
+
+        if not isinstance(order, Mapping):
+            return None
+
+        candidates = (
+            "updatedTime",
+            "updateTime",
+            "updated_at",
+            "createdTime",
+            "createTime",
+            "created_at",
+            "transactTime",
+            "ts",
+        )
+
+        for key in candidates:
+            value = order.get(key)
+            if value is None:
+                continue
+            try:
+                timestamp = float(value)
+            except (TypeError, ValueError):
+                continue
+
+            if timestamp <= 0:
+                continue
+            if timestamp > 1e18:  # nanoseconds
+                timestamp /= 1e6
+            elif timestamp > 1e15:  # microseconds
+                timestamp /= 1e3
+            elif timestamp > 1e12:  # milliseconds (default)
+                pass
+            elif timestamp > 1e10:  # seconds precision
+                timestamp *= 1000
+            else:  # likely already seconds or less
+                timestamp *= 1000
+
+            try:
+                return int(timestamp)
+            except (TypeError, ValueError):
+                continue
+
+        return None
+
+    def _tp_replan_after_sweep(
+        self,
+        symbols: Iterable[str],
+        *,
+        api=None,
+        settings=None,
+    ) -> dict[str, object]:
+        """Attempt to restore TP ladders for symbols after a stale sweep."""
+
+        unique_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if symbol})
+        if not unique_symbols:
+            return {"replanned": []}
+
+        settings_obj = settings
+        if settings_obj is None:
+            try:
+                settings_obj = get_settings()
+            except Exception as exc:  # pragma: no cover - defensive
+                log("ws.private.tp_ladder.sweep.settings.error", err=str(exc))
+                return {"replanned": [], "errors": [str(exc)]}
+
+        config = self._resolve_tp_config(settings_obj)
+        if not config:
+            return {"replanned": []}
+
+        try:
+            inventory_snapshot = spot_inventory_and_pnl(settings=settings_obj)
+        except Exception as exc:  # pragma: no cover - defensive
+            log("ws.private.tp_ladder.sweep.inventory.error", err=str(exc))
+            return {"replanned": [], "errors": [str(exc)]}
+
+        if not isinstance(inventory_snapshot, Mapping):
+            return {"replanned": []}
+
+        limits_cache: dict[str, dict[str, object]] = {}
+        replanned: list[str] = []
+        errors: list[str] = []
+
+        for symbol in unique_symbols:
+            entry = inventory_snapshot.get(symbol)
+            if not isinstance(entry, Mapping):
+                entry = inventory_snapshot.get(symbol.lower()) if isinstance(symbol, str) else None
+            if not isinstance(entry, Mapping):
+                continue
+
+            qty = self._decimal_from(entry.get("position_qty"))
+            avg_cost = self._decimal_from(entry.get("avg_cost"))
+            if qty <= 0 or avg_cost <= 0:
+                continue
+
+            inventory_payload = {symbol: {"position_qty": qty, "avg_cost": avg_cost}}
+            row = {"symbol": symbol, "side": "Buy"}
+            try:
+                self._regenerate_tp_ladder(
+                    row,
+                    inventory_payload,
+                    config=config,
+                    api=api,
+                    limits_cache=limits_cache,
+                    settings=settings_obj,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log(
+                    "ws.private.tp_ladder.sweep.replan.error",
+                    symbol=symbol,
+                    err=str(exc),
+                )
+                errors.append(str(exc))
+                continue
+            replanned.append(symbol)
+
+        result: dict[str, object] = {"replanned": replanned}
+        if errors:
+            result["errors"] = errors
+        return result
+
+    def sweep_tp_ladder_orders(
+        self,
+        *,
+        api=None,
+        settings=None,
+        older_than: float = 900.0,
+        batch_size: int = 10,
+    ) -> dict[str, object]:
+        """Cancel stale AI TP orders and regenerate ladders when needed."""
+
+        if older_than <= 0:
+            return {"checked": 0, "stale": 0, "cancelled": 0, "symbols": [], "replanned": []}
+
+        api_client = api
+        if api_client is None:
+            try:
+                api_client = get_api_client()
+            except Exception as exc:  # pragma: no cover - defensive
+                log("ws.private.tp_ladder.sweep.api.error", err=str(exc))
+                return {
+                    "checked": 0,
+                    "stale": 0,
+                    "cancelled": 0,
+                    "symbols": [],
+                    "replanned": [],
+                    "error": str(exc),
+                }
+
+        try:
+            response = api_client.open_orders(category="spot", openOnly=1)
+        except Exception as exc:  # pragma: no cover - defensive
+            log("ws.private.tp_ladder.sweep.open_orders.error", err=str(exc))
+            return {
+                "checked": 0,
+                "stale": 0,
+                "cancelled": 0,
+                "symbols": [],
+                "replanned": [],
+                "error": str(exc),
+            }
+
+        rows = ((response.get("result") or {}).get("list") or []) if isinstance(response, dict) else []
+        if not rows:
+            return {"checked": 0, "stale": 0, "cancelled": 0, "symbols": [], "replanned": []}
+
+        now_ms = int(time.time() * 1000)
+        stale_by_symbol: dict[str, list[dict[str, object]]] = {}
+        checked = 0
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            link = str(item.get("orderLinkId") or item.get("orderLinkID") or "").strip()
+            if not link.upper().startswith("AI-TP-"):
+                continue
+            checked += 1
+            tif = str(
+                item.get("timeInForce")
+                or item.get("timeInForceValue")
+                or item.get("tif")
+                or item.get("time_in_force")
+                or ""
+            ).strip().upper()
+            if tif and tif not in {"GTC", "GOODTILLCANCEL", "GOOD_TIL_CANCEL"}:
+                continue
+            created_ms = self._extract_order_timestamp_ms(item)
+            if created_ms is None:
+                continue
+            age_sec = (now_ms - created_ms) / 1000.0
+            if age_sec < older_than:
+                continue
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            payload = {
+                "symbol": item.get("symbol") or symbol,
+                "orderId": item.get("orderId"),
+                "orderLinkId": ensure_link_id(link),
+            }
+            if payload["orderId"] is None and payload["orderLinkId"] is None:
+                continue
+            stale_by_symbol.setdefault(symbol, []).append(payload)
+
+        stale_total = sum(len(entries) for entries in stale_by_symbol.values())
+        if not stale_total:
+            return {"checked": checked, "stale": 0, "cancelled": 0, "symbols": [], "replanned": []}
+
+        cancelled_total = 0
+        processed_symbols: list[str] = []
+        errors: list[str] = []
+
+        for symbol, requests in stale_by_symbol.items():
+            if not requests:
+                continue
+            for idx in range(0, len(requests), max(int(batch_size), 1)):
+                chunk = requests[idx : idx + max(int(batch_size), 1)]
+                try:
+                    api_client.cancel_batch(category="spot", request=chunk)
+                except Exception as exc:  # pragma: no cover - defensive
+                    log(
+                        "ws.private.tp_ladder.sweep.cancel.error",
+                        symbol=symbol,
+                        count=len(chunk),
+                        err=str(exc),
+                    )
+                    errors.append(str(exc))
+                    continue
+                cancelled_total += len(chunk)
+                processed_symbols.append(symbol)
+                log(
+                    "ws.private.tp_ladder.sweep.cancelled",
+                    symbol=symbol,
+                    count=len(chunk),
+                )
+
+        replan_result = self._tp_replan_after_sweep(processed_symbols, api=api_client, settings=settings)
+        replanned = replan_result.get("replanned", []) if isinstance(replan_result, Mapping) else []
+        replan_errors = replan_result.get("errors") if isinstance(replan_result, Mapping) else None
+        if isinstance(replan_errors, Sequence) and replan_errors:
+            errors.extend(str(err) for err in replan_errors)
+
+        result: dict[str, object] = {
+            "checked": checked,
+            "stale": stale_total,
+            "cancelled": cancelled_total,
+            "symbols": sorted(set(processed_symbols)),
+            "replanned": list(replanned) if isinstance(replanned, Sequence) else [],
+        }
+        if errors:
+            result["errors"] = list(dict.fromkeys(errors))
+        return result
+
     def _apply_price_band(
         self,
         price: Decimal,
