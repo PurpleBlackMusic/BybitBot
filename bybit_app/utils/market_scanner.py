@@ -31,6 +31,7 @@ from .paths import DATA_DIR
 from .market_features import build_feature_bundle
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
+from .tp_targets import resolve_fee_guard_bps
 
 if TYPE_CHECKING:  # pragma: no cover - for type checking only
     from .portfolio_manager import PortfolioManager
@@ -464,6 +465,7 @@ def scan_market_opportunities(
         return normalised
 
     entries: List[Dict[str, object]] = []
+    fee_guard_cache: Dict[str, float] = {}
     wset = _normalise_symbol_set(whitelist or ())
     bset = _normalise_symbol_set(blacklist or ())
 
@@ -579,7 +581,26 @@ def scan_market_opportunities(
         elif trend == "sell":
             direction = -1
 
-        ev_bps = change_pct * 100.0 if change_pct is not None else None
+        ev_bps_raw = change_pct * 100.0 if change_pct is not None else None
+
+        fee_guard_bps = 0.0
+        guard_key = symbol if symbol else ""
+        if guard_key:
+            cached_guard = fee_guard_cache.get(guard_key)
+            if cached_guard is None:
+                guard_decimal = resolve_fee_guard_bps(
+                    settings,
+                    symbol=guard_key,
+                    api=api,
+                )
+                try:
+                    cached_guard = float(guard_decimal)
+                except (TypeError, ValueError):
+                    cached_guard = 0.0
+                fee_guard_cache[guard_key] = cached_guard
+            fee_guard_bps = max(cached_guard, 0.0)
+
+        ev_bps = ev_bps_raw - fee_guard_bps if ev_bps_raw is not None else None
 
         note_parts: List[str] = []
         if change_pct is not None:

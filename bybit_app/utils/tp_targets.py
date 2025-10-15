@@ -2,36 +2,55 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
+
+from .fees import resolve_fee_guard_bps as _resolve_fee_guard_bps
 
 _DEFAULT_FEE_GUARD_BPS = Decimal("20")
 _BPS_FACTOR = Decimal("10000")
 _ONE = Decimal("1")
 
 
-def _to_decimal(value: Any, *, default: Decimal) -> Decimal:
-    if isinstance(value, Decimal):
-        return value
-    if value is None:
-        return default
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return default
+def resolve_fee_guard_bps(
+    settings: Any,
+    *,
+    symbol: str | None = None,
+    api: Any | None = None,
+    default_bps: Decimal = _DEFAULT_FEE_GUARD_BPS,
+) -> Decimal:
+    """Return the TP fee guard expressed in basis points."""
+
+    guard = _resolve_fee_guard_bps(
+        settings,
+        symbol,
+        category="spot",
+        api=api,
+        default_bps=default_bps,
+    )
+    if guard < 0:
+        return Decimal("0")
+    return guard
 
 
-def resolve_fee_guard_fraction(settings: Any, default_bps: Decimal = _DEFAULT_FEE_GUARD_BPS) -> Decimal:
+def resolve_fee_guard_fraction(
+    settings: Any,
+    *,
+    symbol: str | None = None,
+    api: Any | None = None,
+    default_bps: Decimal = _DEFAULT_FEE_GUARD_BPS,
+) -> Decimal:
     """Return the TP fee guard as a Decimal fraction."""
 
-    raw_bps = default_bps
-    if settings is not None:
-        candidate = getattr(settings, "spot_tp_fee_guard_bps", None)
-        if candidate is not None:
-            raw_bps = _to_decimal(candidate, default=default_bps)
-    if raw_bps < 0:
-        raw_bps = Decimal("0")
-    return raw_bps / _BPS_FACTOR
+    guard_bps = resolve_fee_guard_bps(
+        settings,
+        symbol=symbol,
+        api=api,
+        default_bps=default_bps,
+    )
+    if guard_bps < 0:
+        guard_bps = Decimal("0")
+    return guard_bps / _BPS_FACTOR
 
 
 def target_multiplier(profit_fraction: Decimal, fee_guard_fraction: Decimal) -> Decimal:

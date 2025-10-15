@@ -3012,7 +3012,11 @@ class SignalExecutor:
             mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
             time_in_force = mapping.get(tif_upper, tif_upper)
 
-        fee_guard_fraction = resolve_fee_guard_fraction(settings)
+        fee_guard_fraction = resolve_fee_guard_fraction(
+            settings,
+            symbol=symbol,
+            api=api,
+        )
         aggregated: list[Dict[str, object]] = []
         for step_cfg, qty in allocations:
             multiplier = target_multiplier(step_cfg.profit_fraction, fee_guard_fraction)

@@ -1743,7 +1743,11 @@ class WSManager:
         if available_qty <= 0:
             return
 
-        fee_guard_fraction = resolve_fee_guard_fraction(settings_obj)
+        fee_guard_fraction = resolve_fee_guard_fraction(
+            settings_obj,
+            symbol=symbol,
+            api=api,
+        )
 
         if not plan:
             plan = self._build_tp_plan(
