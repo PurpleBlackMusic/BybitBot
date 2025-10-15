@@ -148,3 +148,35 @@ def test_synced_clock_refresh_keeps_external_session(monkeypatch: pytest.MonkeyP
     clock._refresh("https://example.com", session=external_session, timeout=5.0, verify=False)
 
     assert external_session.closed is False
+
+
+def test_synced_timestamp_returns_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {"time": 1_700_000_100_000}
+    response = _DummyResponse(payload)
+    dummy_session = _DummySession(response)
+
+    monkeypatch.setattr(time_sync.requests, "Session", lambda: dummy_session)
+
+    timeline = iter([1000.0, 1000.0, 1000.0, 1000.2, 1000.2, 1000.2])
+    monkeypatch.setattr(time_sync.time, "time", lambda: next(timeline))
+
+    snapshot = time_sync.synced_timestamp(
+        "https://example.com",
+        session=None,
+        timeout=1.0,
+        verify=True,
+        force_refresh=True,
+    )
+
+    server_epoch = payload["time"] / 1000.0
+    start = 1000.0
+    end = 1000.2
+    latency = (end - start) / 2.0
+    local_epoch = end - latency
+    expected_offset = (server_epoch - local_epoch) * 1000.0
+    expected_latency = latency * 1000.0
+    expected_timestamp = int((1000.2 * 1000.0) + expected_offset)
+
+    assert snapshot.value_ms == expected_timestamp
+    assert snapshot.offset_ms == pytest.approx(expected_offset)
+    assert snapshot.latency_ms == pytest.approx(expected_latency)

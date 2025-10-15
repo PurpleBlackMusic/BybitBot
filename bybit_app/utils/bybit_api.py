@@ -36,7 +36,7 @@ from .bybit_errors import (
     resolve_error_policy,
 )
 from .log import log
-from .time_sync import invalidate_synced_clock, synced_timestamp_ms
+from .time_sync import SyncedTimestamp, invalidate_synced_clock, synced_timestamp
 
 
 class _RetryableRequestError(RuntimeError):
@@ -104,6 +104,8 @@ class BybitAPI:
         self.verify_ssl = bool(verify_ssl)
         self._http_local: threading.local = threading.local()
         self._order_registry = _LocalOrderRegistry()
+        self._clock_offset_ms: float = 0.0
+        self._clock_latency_ms: float = 0.0
 
     def _thread_local_session(self) -> requests.Session:
         session = getattr(self._http_local, "session", None)
@@ -130,6 +132,18 @@ class BybitAPI:
     def base(self) -> str:
         return API_TEST if self.creds.testnet else API_MAIN
 
+    @property
+    def clock_offset_ms(self) -> float:
+        """Return the most recent server/local clock offset in milliseconds."""
+
+        return self._clock_offset_ms
+
+    @property
+    def clock_latency_ms(self) -> float:
+        """Return the last measured half round-trip latency in milliseconds."""
+
+        return self._clock_latency_ms
+
     # --- signing helpers ---
     def _headers(self, ts: str, sign: str):
         return {
@@ -147,13 +161,16 @@ class BybitAPI:
 
     def _timestamp_ms(self, *, force_refresh: bool = False) -> int:
         timeout_seconds = max(self.timeout / 1000.0, 1.0)
-        return synced_timestamp_ms(
+        snapshot: SyncedTimestamp = synced_timestamp(
             self.base,
             session=self.session,
             timeout=timeout_seconds,
             verify=self.verify_ssl,
             force_refresh=force_refresh,
         )
+        self._clock_offset_ms = snapshot.offset_ms
+        self._clock_latency_ms = snapshot.latency_ms
+        return snapshot.as_int()
 
     def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None, signed: bool = False):
         url = self.base + path
