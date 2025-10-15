@@ -44,6 +44,33 @@ def _clear_wallet_cache() -> None:
     _BALANCE_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def _preflight_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(signal_executor_module, "check_time_drift_seconds", lambda: 0.0)
+
+    def _status_stub() -> dict[str, object]:
+        return {
+            "public": {
+                "running": True,
+                "subscriptions": ["tickers.BTCUSDT"],
+                "age_seconds": 0.0,
+            },
+            "private": {
+                "running": True,
+                "connected": True,
+                "age_seconds": 0.0,
+            },
+        }
+
+    monkeypatch.setattr(signal_executor_module.ws_manager, "status", _status_stub)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api, symbol: {"min_order_amt": 5.0},
+    )
+    monkeypatch.setattr(signal_executor_module, "creds_ok", lambda *_args, **_kwargs: True)
+
+
 class StubBot:
     def __init__(
         self,
@@ -163,6 +190,113 @@ class StubAPI:
                 ]
             },
         }
+
+
+def _live_settings(**overrides: object) -> Settings:
+    defaults = dict(
+        ai_enabled=True,
+        api_key="key",
+        api_secret="secret",
+        dry_run=False,
+        dry_run_mainnet=False,
+        dry_run_testnet=False,
+    )
+    defaults.update(overrides)
+    return Settings(**defaults)
+
+
+def test_preflight_blocks_when_time_drift_exceeds_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = _live_settings()
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot, settings=settings)
+
+    monkeypatch.setattr(signal_executor_module, "check_time_drift_seconds", lambda: 12.0)
+
+    called = {"count": 0}
+
+    def fake_resolve_wallet(self, require_success: bool):
+        called["count"] += 1
+        return StubAPI(total=100.0, available=80.0), (100.0, 80.0), 80.0, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+
+    result = executor._preflight_healthcheck(summary, settings, current_time=time.time())
+    assert isinstance(result, ExecutionResult)
+    assert result.status == "disabled"
+    assert called["count"] == 0
+
+
+def test_preflight_caches_wallet_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = _live_settings()
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot, settings=settings)
+
+    calls = {"count": 0}
+    limit_calls: list[str] = []
+
+    def fake_resolve_wallet(self, require_success: bool):
+        calls["count"] += 1
+        api = StubAPI(total=150.0, available=120.0)
+        api.rate_limit_snapshot = lambda: {"remaining": 5.0, "limit": 50.0}
+        return api, (150.0, 120.0), 120.0, {}
+
+    def fake_instrument_limits(api: object, symbol: str) -> dict[str, object]:
+        limit_calls.append(symbol)
+        return {"min_order_amt": 5.0, "symbol": symbol}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        fake_instrument_limits,
+    )
+
+    result = executor._preflight_healthcheck(summary, settings, current_time=time.time())
+    assert result is None
+    assert calls["count"] == 1
+    assert limit_calls == ["BTCUSDT"]
+
+    cached = executor._consume_preflight_wallet()
+    assert cached is not None
+    assert calls["count"] == 1
+    assert executor._consume_preflight_wallet() is None
+
+    instrument_cached = executor._consume_preflight_instrument_limits("BTCUSDT")
+    assert instrument_cached == {"min_order_amt": 5.0, "symbol": "BTCUSDT"}
+    assert executor._consume_preflight_instrument_limits("BTCUSDT") is None
+
+
+def test_preflight_blocks_when_api_quota_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = _live_settings()
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot, settings=settings)
+
+    def fake_resolve_wallet(self, require_success: bool):
+        api = StubAPI(total=200.0, available=150.0)
+        api.rate_limit_snapshot = lambda: {"remaining": 0.0, "limit": 50.0}
+        return api, (200.0, 150.0), 150.0, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+
+    result = executor._preflight_healthcheck(summary, settings, current_time=time.time())
+    assert isinstance(result, ExecutionResult)
+    assert result.status == "disabled"
+    assert "квот" in (result.reason or "").lower()
 
 
 def patch_tp_sources(

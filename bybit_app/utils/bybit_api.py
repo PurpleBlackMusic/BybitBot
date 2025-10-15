@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hmac, hashlib, json, time, uuid
+import math
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
@@ -104,6 +105,7 @@ class BybitAPI:
         self.verify_ssl = bool(verify_ssl)
         self._http_local: threading.local = threading.local()
         self._order_registry = _LocalOrderRegistry()
+        self._last_rate_limit: dict[str, float] | None = None
 
     def _thread_local_session(self) -> requests.Session:
         session = getattr(self._http_local, "session", None)
@@ -155,6 +157,63 @@ class BybitAPI:
             force_refresh=force_refresh,
         )
 
+    @staticmethod
+    def _parse_rate_limit_value(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                return None
+            if math.isfinite(candidate):
+                return candidate
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            candidate = float(text)
+        except (TypeError, ValueError):
+            return None
+        return candidate if math.isfinite(candidate) else None
+
+    def _record_rate_limit(self, headers: Mapping[str, Any] | None) -> None:
+        if not headers:
+            return
+
+        try:
+            items = {str(key).lower(): value for key, value in headers.items()}
+        except Exception:
+            return
+
+        aliases = {
+            "limit": ("x-bapi-ratelimit-limit", "x-ratelimit-limit"),
+            "remaining": (
+                "x-bapi-ratelimit-remaining",
+                "x-ratelimit-remaining",
+            ),
+            "reset": ("x-bapi-ratelimit-reset", "x-ratelimit-reset"),
+            "used": ("x-bapi-ratelimit-used", "x-ratelimit-used"),
+        }
+
+        snapshot: dict[str, float] = {}
+        for key, candidates in aliases.items():
+            value: Any = None
+            for candidate in candidates:
+                if candidate in items:
+                    value = items[candidate]
+                    break
+            parsed = self._parse_rate_limit_value(value)
+            if parsed is not None:
+                snapshot[key] = parsed
+
+        if not snapshot:
+            return
+
+        snapshot["timestamp"] = time.time()
+        self._last_rate_limit = snapshot
+
     def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None, signed: bool = False):
         url = self.base + path
         if not signed:
@@ -176,6 +235,7 @@ class BybitAPI:
                     headers={"Content-Type": "application/json"},
                 )
             r.raise_for_status()
+            self._record_rate_limit(getattr(r, "headers", None))
             return r.json()
 
         # signed
@@ -199,6 +259,7 @@ class BybitAPI:
             r = self.session.request(method.upper(), url, params=None, data=q, headers=headers,
                                      timeout=self.timeout, verify=self.verify_ssl)
         r.raise_for_status()
+        self._record_rate_limit(getattr(r, "headers", None))
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
@@ -367,6 +428,14 @@ class BybitAPI:
         if isinstance(value, Mapping):
             return {str(key): BybitAPI._json_safe(val) for key, val in value.items()}
         return value
+
+    def rate_limit_snapshot(self) -> dict[str, float] | None:
+        """Return the latest rate limit headers observed for this client."""
+
+        snapshot = self._last_rate_limit
+        if not snapshot:
+            return None
+        return dict(snapshot)
 
     @staticmethod
     def _order_log_meta(data: Mapping[str, Any]) -> dict[str, Any]:

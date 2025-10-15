@@ -24,6 +24,7 @@ from .settings_loader import call_get_settings
 from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
+from .time_sync import check_time_drift_seconds
 from .log import log
 from .bybit_errors import parse_bybit_error_message
 from .spot_market import (
@@ -61,6 +62,9 @@ _SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 _PARTIAL_FILL_MAX_FOLLOWUPS = 3
 _PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
+
+_PREFLIGHT_SUCCESS_TTL = 60.0
+_PREFLIGHT_FAILURE_RETRY = 15.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -139,6 +143,12 @@ class SignalExecutor:
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
         self._tp_sweeper_last_run: float = 0.0
+        self._preflight_state: Dict[str, object] | None = None
+        self._preflight_next_check: float = 0.0
+        self._preflight_temp_wallet: Optional[
+            Tuple[Optional[object], Tuple[float, float], Optional[float], Dict[str, object]]
+        ] = None
+        self._preflight_temp_instrument_limits: Optional[Dict[str, Dict[str, object]]] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -166,6 +176,10 @@ class SignalExecutor:
         self._validation_penalties = {}
         self._symbol_quarantine = {}
         self._price_limit_backoff = {}
+        self._preflight_state = None
+        self._preflight_next_check = 0.0
+        self._preflight_temp_wallet = None
+        self._preflight_temp_instrument_limits = None
         if not state:
             return
 
@@ -1851,6 +1865,16 @@ class SignalExecutor:
         if guard_result is not None:
             return guard_result
 
+        preflight_result = self._preflight_healthcheck(
+            summary,
+            settings,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
+        if preflight_result is not None:
+            return preflight_result
+
         mode = str(summary.get("mode") or "").lower()
         if mode not in {"buy", "sell"}:
             return self._decision(
@@ -1887,10 +1911,14 @@ class SignalExecutor:
             ):
                 summary_price_snapshot = None
 
+        preflight_wallet = self._consume_preflight_wallet()
         try:
-            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
-                require_success=not active_dry_run(settings)
-            )
+            if preflight_wallet is not None:
+                api, wallet_totals, quote_wallet_cap, wallet_meta = preflight_wallet
+            else:
+                api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
+                    require_success=not active_dry_run(settings)
+                )
         except Exception as exc:
             reason_text = f"Не удалось получить баланс: {exc}"
             if not creds_ok(settings) and not active_dry_run(settings):
@@ -1916,7 +1944,10 @@ class SignalExecutor:
 
         min_notional = 5.0
         instrument_limits: Optional[Mapping[str, object]] = None
-        if api is not None:
+        preflight_instrument_limits = self._consume_preflight_instrument_limits(symbol)
+        if preflight_instrument_limits is not None:
+            instrument_limits = preflight_instrument_limits
+        elif api is not None:
             try:
                 instrument_limits = _instrument_limits(api, symbol)
             except Exception as exc:  # pragma: no cover - defensive logging
@@ -4529,6 +4560,343 @@ class SignalExecutor:
             return f"{minutes:.1f} мин"
         hours = minutes / 60.0
         return f"{hours:.1f} ч"
+
+    def _consume_preflight_wallet(
+        self,
+    ) -> Optional[Tuple[Optional[object], Tuple[float, float], Optional[float], Dict[str, object]]]:
+        snapshot = self._preflight_temp_wallet
+        if snapshot is None:
+            return None
+        self._preflight_temp_wallet = None
+        return snapshot
+
+    def _consume_preflight_instrument_limits(
+        self, symbol: str | None
+    ) -> Optional[Dict[str, object]]:
+        if not symbol:
+            return None
+        snapshot = self._preflight_temp_instrument_limits
+        if not snapshot:
+            return None
+        key = str(symbol)
+        limits = snapshot.pop(key, None)
+        if snapshot:
+            self._preflight_temp_instrument_limits = snapshot
+        else:
+            self._preflight_temp_instrument_limits = None
+        if limits is None:
+            return None
+        return copy.deepcopy(limits)
+
+    def _preflight_healthcheck(
+        self,
+        summary: Mapping[str, object],
+        settings: Settings,
+        *,
+        current_time: float | None = None,
+        summary_meta: Tuple[Optional[float], Optional[float]] | None = None,
+        price_meta: Tuple[Optional[float], Optional[float]] | None = None,
+    ) -> Optional[ExecutionResult]:
+        now_monotonic = time.monotonic()
+        state = self._preflight_state
+        if state is not None and now_monotonic < self._preflight_next_check:
+            if not state.get("ok", True):
+                cached = state.get("result")
+                if isinstance(cached, ExecutionResult):
+                    return cached
+                message = str(state.get("message") or "Pre-flight check failed.")
+                context_payload = state.get("context")
+                context_copy = (
+                    copy.deepcopy(context_payload)
+                    if isinstance(context_payload, Mapping)
+                    else None
+                )
+                cached = ExecutionResult(
+                    status="disabled",
+                    reason=message,
+                    context=context_copy,
+                )
+                state["result"] = cached
+                return cached
+            return None
+
+        self._preflight_temp_wallet = None
+
+        context: Dict[str, object] = {}
+
+        dry_run = bool(active_dry_run(settings))
+        has_creds = bool(creds_ok(settings))
+        context["dry_run"] = dry_run
+        context["has_credentials"] = has_creds
+
+        if current_time is None:
+            current_time = time.time()
+
+        def _store_failure(
+            status: str,
+            message: str,
+            *,
+            retry: float = _PREFLIGHT_FAILURE_RETRY,
+        ) -> ExecutionResult:
+            payload = copy.deepcopy(context)
+            result = self._decision(status, reason=message, context=payload)
+            self._preflight_state = {
+                "ok": False,
+                "message": message,
+                "context": payload,
+                "result": result,
+            }
+            self._preflight_next_check = now_monotonic + max(retry, 1.0)
+            self._preflight_temp_wallet = None
+            self._preflight_temp_instrument_limits = None
+            return result
+
+        if not dry_run and not has_creds:
+            context["guard"] = "missing_api_keys"
+            return _store_failure(
+                "disabled",
+                "API ключи не настроены — автоматизация не может стартовать.",
+            )
+
+        drift_limit_raw = getattr(settings, "server_time_max_drift_sec", 5.0)
+        try:
+            drift_limit = float(drift_limit_raw or 0.0)
+        except (TypeError, ValueError):
+            drift_limit = 0.0
+        if drift_limit < 0:
+            drift_limit = 0.0
+
+        try:
+            drift_value = abs(check_time_drift_seconds())
+        except Exception as exc:  # pragma: no cover - defensive guard
+            context["time_check_error"] = str(exc)
+            drift_value = None
+        else:
+            context["time_drift_sec"] = drift_value
+            context["time_drift_limit_sec"] = drift_limit
+        if (
+            not dry_run
+            and drift_value is not None
+            and drift_limit > 0
+            and drift_value > drift_limit
+        ):
+            context["guard"] = "time_drift"
+            message = (
+                "Серверное время Bybit расходится на {drift:.2f} сек — превышен лимит {limit:.2f} сек."
+            ).format(drift=drift_value, limit=drift_limit)
+            return _store_failure("disabled", message)
+
+        require_success = not dry_run
+        try:
+            wallet_snapshot = self._resolve_wallet(require_success=require_success)
+        except Exception as exc:
+            context["wallet_error"] = str(exc)
+            if require_success:
+                context["guard"] = "wallet_unavailable"
+                return _store_failure(
+                    "error",
+                    f"Не удалось получить баланс перед запуском: {exc}",
+                )
+            wallet_snapshot = (None, (0.0, 0.0), None, {})
+
+        api_client, wallet_totals, quote_cap, wallet_meta = wallet_snapshot
+        total_equity = _safe_float(wallet_totals[0]) or 0.0
+        available_equity = _safe_float(wallet_totals[1]) or 0.0
+
+        context["balance_total"] = round(total_equity, 4)
+        context["balance_available"] = round(available_equity, 4)
+        if quote_cap is not None:
+            try:
+                quote_cap_value = float(quote_cap)
+            except (TypeError, ValueError):
+                quote_cap_value = None
+            if quote_cap_value is not None and math.isfinite(quote_cap_value):
+                context["quote_wallet_cap"] = quote_cap_value
+
+        if total_equity <= 0.0 or available_equity <= 0.0:
+            context["balance_non_positive"] = True
+
+        self._preflight_temp_wallet = (
+            api_client,
+            (float(total_equity), float(available_equity)),
+            quote_cap,
+            copy.deepcopy(wallet_meta),
+        )
+
+        expect_private_ws = has_creds and not dry_run
+        ws_status: Mapping[str, object] | None
+        try:
+            ws_status = ws_manager.status()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            context["ws_status_error"] = str(exc)
+            ws_status = None
+
+        ws_public_ok = True
+        ws_private_ok = True
+        ws_subscriptions: Sequence[str] | None = None
+        if isinstance(ws_status, Mapping):
+            public_info = ws_status.get("public")
+            if isinstance(public_info, Mapping):
+                ws_public_ok = bool(public_info.get("running"))
+                subs = public_info.get("subscriptions")
+                if isinstance(subs, Sequence) and not isinstance(subs, (str, bytes)):
+                    ws_subscriptions = [str(item) for item in subs if isinstance(item, str)]
+                age = _safe_float(public_info.get("age_seconds"))
+                if age is not None:
+                    context["ws_public_age_seconds"] = age
+            else:
+                ws_public_ok = False
+            private_info = ws_status.get("private")
+            if isinstance(private_info, Mapping):
+                ws_private_ok = bool(private_info.get("running"))
+                connected = bool(private_info.get("connected"))
+                if expect_private_ws:
+                    context["ws_private_connected"] = connected
+                age = _safe_float(private_info.get("age_seconds"))
+                if age is not None:
+                    context["ws_private_age_seconds"] = age
+            elif expect_private_ws:
+                ws_private_ok = False
+        else:
+            ws_public_ok = False
+            if expect_private_ws:
+                ws_private_ok = False
+
+        if ws_subscriptions is not None:
+            context["ws_public_subscriptions"] = ws_subscriptions
+        elif ws_public_ok:
+            context["ws_public_subscriptions"] = []
+
+        if not ws_public_ok or (expect_private_ws and not ws_private_ok):
+            context["guard"] = "ws_inactive"
+            if not ws_public_ok and expect_private_ws and not ws_private_ok:
+                message = "WS подключение не активно — публичный и приватный каналы остановлены."
+            elif not ws_public_ok:
+                message = "Публичный WebSocket не запущен — подпишитесь на маркет-данные."
+            else:
+                message = "Приватный WebSocket не запущен — нет подтверждения сделок."
+            return _store_failure("disabled", message)
+
+        candidate_symbols: List[str] = []
+        try:
+            for symbol, _ in self._candidate_symbol_stream(summary):
+                if symbol:
+                    candidate_symbols.append(symbol)
+        except Exception:  # pragma: no cover - defensive guard
+            candidate_symbols = []
+
+        symbol_hint = _safe_symbol(summary.get("symbol"))
+        if symbol_hint and symbol_hint not in candidate_symbols:
+            candidate_symbols.append(symbol_hint)
+        if not candidate_symbols:
+            candidate_symbols.append("BTCUSDT")
+
+        context["candidate_symbols"] = candidate_symbols[:5]
+
+        instrument_ok = False
+        instrument_details: Dict[str, object] | None = None
+        instrument_errors: List[Dict[str, object]] = []
+        prefetched_instrument_limits: Dict[str, Dict[str, object]] = {}
+
+        instrument_api = api_client
+        if instrument_api is None and has_creds:
+            try:
+                instrument_api = get_api_client()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                instrument_errors.append({"symbol": None, "error": str(exc)})
+
+        if instrument_api is not None:
+            for symbol in candidate_symbols:
+                try:
+                    limits = _instrument_limits(instrument_api, symbol)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    instrument_errors.append({"symbol": symbol, "error": str(exc)})
+                    continue
+                if limits:
+                    try:
+                        materialized = dict(limits)
+                    except Exception:  # pragma: no cover - defensive guard
+                        materialized = {"raw": limits}
+                    else:
+                        materialized = copy.deepcopy(materialized)
+                    prefetched_instrument_limits[str(symbol)] = materialized
+                    instrument_ok = True
+                    instrument_details = {
+                        "symbol": symbol,
+                        "limits": copy.deepcopy(materialized),
+                    }
+                    break
+
+        if instrument_details is not None:
+            context["instrument_limits"] = instrument_details
+        elif instrument_errors:
+            context["instrument_limit_errors"] = instrument_errors
+
+        if not instrument_ok and not dry_run and has_creds:
+            context["guard"] = "instrument_limits"
+            return _store_failure(
+                "disabled",
+                "Не удалось получить торговые лимиты для выбранных инструментов.",
+            )
+
+        if summary_meta is None:
+            summary_meta = self._resolve_summary_update_meta(summary, current_time)
+        if price_meta is None:
+            price_meta = self._resolve_price_update_meta(summary, current_time)
+
+        if summary_meta is not None:
+            _, summary_age = summary_meta
+            if summary_age is not None:
+                context["summary_age_seconds"] = summary_age
+        if price_meta is not None:
+            _, price_age = price_meta
+            if price_age is not None:
+                context["price_age_seconds"] = price_age
+
+        rate_limit_snapshot = None
+        quota_error: Optional[str] = None
+        quota_remaining: Optional[float] = None
+        if instrument_api is not None:
+            snapshot_func = getattr(instrument_api, "rate_limit_snapshot", None)
+            if callable(snapshot_func):
+                try:
+                    rate_limit_snapshot = snapshot_func()
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    quota_error = str(exc)
+            if isinstance(rate_limit_snapshot, Mapping):
+                rate_limit_copy = {str(k): v for k, v in rate_limit_snapshot.items()}
+                context["api_quota"] = rate_limit_copy
+                quota_remaining = _safe_float(rate_limit_copy.get("remaining"))
+            elif quota_error:
+                context["api_quota_error"] = quota_error
+
+        if (
+            quota_remaining is not None
+            and not dry_run
+            and quota_remaining <= 0.0
+        ):
+            context["guard"] = "api_quota"
+            return _store_failure(
+                "disabled",
+                "Квота API исчерпана — дождитесь восстановления лимита перед запуском.",
+            )
+
+        if prefetched_instrument_limits:
+            self._preflight_temp_instrument_limits = {
+                symbol: copy.deepcopy(limits)
+                for symbol, limits in prefetched_instrument_limits.items()
+            }
+        else:
+            self._preflight_temp_instrument_limits = None
+
+        payload = copy.deepcopy(context)
+        self._preflight_state = {
+            "ok": True,
+            "context": payload,
+            "timestamp": current_time,
+        }
+        self._preflight_next_check = now_monotonic + _PREFLIGHT_SUCCESS_TTL
+        return None
 
     def _resolve_wallet(
         self, *, require_success: bool

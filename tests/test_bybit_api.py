@@ -14,8 +14,9 @@ from bybit_app.utils.helpers import ensure_link_id
 
 
 class _DummyResponse:
-    def __init__(self, payload: dict[str, Any]):
+    def __init__(self, payload: dict[str, Any], headers: dict[str, Any] | None = None):
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> dict[str, Any]:
         return self._payload
@@ -27,6 +28,7 @@ class _DummyResponse:
 class _RecordingSession:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.response_headers: dict[str, Any] = {}
 
     def get(self, url: str, *, params=None, headers=None, timeout=None, verify=None):
         self.calls.append(
@@ -41,7 +43,7 @@ class _RecordingSession:
                 },
             )
         )
-        return _DummyResponse({"retCode": 0, "result": {}})
+        return _DummyResponse({"retCode": 0, "result": {}}, headers=dict(self.response_headers))
 
     def request(self, *_, **__):  # pragma: no cover - not exercised in this test
         raise AssertionError("Unexpected request() call")
@@ -82,6 +84,31 @@ def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch
     expected_payload = f"{ts}key12315000{expected_query}".encode()
     expected_sign = hmac.new(b"secret456", expected_payload, hashlib.sha256).hexdigest()
     assert headers["X-BAPI-SIGN"] == expected_sign
+
+
+def test_rate_limit_snapshot_records_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _RecordingSession()
+    session.response_headers = {
+        "X-Bapi-Ratelimit-Remaining": "42",
+        "X-Bapi-Ratelimit-Limit": "120",
+        "X-Bapi-Ratelimit-Reset": "1690000000",
+    }
+    api = BybitAPI(BybitCreds(key="key123", secret="secret456", testnet=True))
+    api.session = session
+
+    monkeypatch.setattr(
+        bybit_api_module,
+        "synced_timestamp_ms",
+        lambda *args, **kwargs: 1_700_000_000_000,
+    )
+
+    api.server_time()
+
+    snapshot = api.rate_limit_snapshot()
+    assert snapshot is not None
+    assert snapshot.get("remaining") == 42.0
+    assert snapshot.get("limit") == 120.0
+    assert "timestamp" in snapshot
 
 
 def test_batch_cancel_accepts_requests_payload() -> None:
