@@ -19,6 +19,7 @@ from bybit_app.utils.signal_executor import (
     ExecutionResult,
     SignalExecutor,
 )
+from bybit_app.utils.helpers import ensure_link_id
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     SpotTradeSnapshot,
@@ -210,6 +211,94 @@ def test_signal_executor_dry_run_preview(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result.order is not None
     assert result.order["symbol"] == "ETHUSDT"
     assert result.order["side"] == "Buy"
+
+
+def test_signal_executor_skips_duplicate_orders(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+        dry_run=False,
+    )
+    bot = StubBot(summary, settings, fingerprint="dup-signal")
+
+    api = StubAPI(total=1000.0, available=800.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api, symbol: {
+            "min_order_amt": "5",
+            "qty_step": "0.0001",
+            "tick_size": "0.0001",
+            "quote_coin": "USDT",
+        },
+    )
+
+    placed_link_ids: list[str | None] = []
+
+    def fake_place(
+        api_obj,
+        symbol: str,
+        side: str,
+        qty: object,
+        unit: str = "quoteCoin",
+        tol_type: str = "Percent",
+        tol_value: float = 0.5,
+        max_quote: object | None = None,
+        *,
+        price_snapshot: object | None = None,
+        balances: Mapping[str, object] | None = None,
+        limits: Mapping[str, object] | None = None,
+        settings: Settings | None = None,
+        order_link_id_seed: str | None = None,
+    ) -> dict[str, object]:
+        placed_link_ids.append(order_link_id_seed)
+        link = ensure_link_id(f"{order_link_id_seed}-A{len(placed_link_ids)}")
+        return {
+            "retCode": 0,
+            "result": {"orderId": f"order-{len(placed_link_ids)}", "orderLinkId": link},
+            "_local": {
+                "order_payload": {"orderLinkId": link},
+                "order_audit": {},
+            },
+        }
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        fake_place,
+    )
+
+    executor = SignalExecutor(bot)
+
+    first = executor.execute_once()
+    assert first.status == "filled"
+    assert len(placed_link_ids) == 1
+    assert placed_link_ids[0] is not None
+
+    second = executor.execute_once()
+    assert second.status == "filled"
+    assert len(placed_link_ids) == 1
+    assert second.context is not None
+    assert second.context.get("duplicate_request") is True
+
+    state = executor.export_state()
+    restored = SignalExecutor(bot)
+    restored.restore_state(state)
+
+    third = restored.execute_once()
+    assert third.status == "filled"
+    assert len(placed_link_ids) == 1
+    assert third.context is not None
+    assert third.context.get("duplicate_request") is True
 
 
 def test_signal_executor_maps_usdc_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1501,6 +1590,7 @@ def test_signal_executor_sell_scales_on_insufficient_balance(
         tol_value: float,
         max_quote: object | None,
         settings: Settings,
+        order_link_id_seed: str | None = None,
     ) -> dict[str, object]:
         qty_float = float(qty)
         attempts.append(qty_float)
@@ -2057,6 +2147,7 @@ def test_signal_executor_sell_refreshes_price_for_insufficient_balance(
         tol_value: float,
         max_quote: object | None,
         settings: Settings,
+        order_link_id_seed: str | None = None,
     ) -> dict[str, object]:
         qty_float = float(qty)
         attempts.append(qty_float)

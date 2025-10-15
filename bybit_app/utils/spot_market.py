@@ -13,6 +13,7 @@ from .log import log
 from . import validators
 from .envs import Settings
 from .precision import ceil_qty_to_min_notional, format_to_step
+from .helpers import ensure_link_id
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -2614,6 +2615,7 @@ def place_spot_market_with_tolerance(
     balances: Mapping[str, object] | None = None,
     limits: Mapping[str, object] | None = None,
     settings: Settings | None = None,
+    order_link_id_seed: str | None = None,
 ):
     """Создать маркет-ордер со строгой валидацией объёма и балансов."""
     unit_normalised = (unit or "quoteCoin").strip().lower()
@@ -2839,6 +2841,15 @@ def place_spot_market_with_tolerance(
             prepared.audit["twap_active"] = True
             prepared.audit["twap_target_slices"] = target_slices
             prepared.audit["twap_order_index"] = twap_orders_sent
+
+        link_id: Optional[str] = None
+        if order_link_id_seed:
+            suffix = "" if attempt <= 1 else f"-{attempt}"
+            candidate = f"{order_link_id_seed}{suffix}"
+            link_id = ensure_link_id(candidate)
+            if link_id:
+                prepared.payload["orderLinkId"] = link_id
+                prepared.audit["order_link_id"] = link_id
 
         try:
             response = api.place_order(**prepared.payload)

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 import re
 import time
@@ -56,6 +58,9 @@ _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price 
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
+_ORDER_REGISTRY_TTL = 1800.0  # keep duplicate guard entries for 30 minutes
+_ORDER_REGISTRY_MAX = 64
+_ORDER_REGISTRY_SUCCESS_STATUSES = {"filled", "dry_run"}
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -134,20 +139,28 @@ class SignalExecutor:
         self._spot_inventory_snapshot: Optional[
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
+        self._order_registry: Dict[str, Dict[str, object]] = {}
+        self._order_registry_lock = threading.Lock()
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
-        return {
+        state: Dict[str, Any] = {
             "validation_penalties": copy.deepcopy(self._validation_penalties),
             "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
             "price_limit_backoff": copy.deepcopy(self._price_limit_backoff),
         }
+        with self._order_registry_lock:
+            self._purge_order_registry()
+            if self._order_registry:
+                state["order_registry"] = copy.deepcopy(self._order_registry)
+        return state
 
     def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
         self._validation_penalties = {}
         self._symbol_quarantine = {}
         self._price_limit_backoff = {}
+        self._order_registry = {}
         if not state:
             return
 
@@ -225,11 +238,37 @@ class SignalExecutor:
                         cleaned[key] = value
                 if cleaned:
                     restored_backoff[symbol] = cleaned
-            if restored_backoff:
-                self._price_limit_backoff = restored_backoff
+        if restored_backoff:
+            self._price_limit_backoff = restored_backoff
 
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
+
+        registry_state = state.get("order_registry") if isinstance(state, Mapping) else None
+        if isinstance(registry_state, Mapping):
+            restored_registry: Dict[str, Dict[str, object]] = {}
+            for key, payload in registry_state.items():
+                if not isinstance(key, str) or not isinstance(payload, Mapping):
+                    continue
+                entry: Dict[str, object] = {}
+                status = payload.get("status")
+                if status is not None:
+                    entry["status"] = str(status)
+                for field in ("reason", "order", "response", "context", "order_link_id"):
+                    if field in payload:
+                        entry[field] = copy.deepcopy(payload[field])
+                registered_at = self._coerce_timestamp(payload.get("registered_at"))
+                if registered_at is None:
+                    registered_at = self._current_time()
+                expires_at = self._coerce_timestamp(payload.get("expires_at"))
+                if expires_at is None:
+                    expires_at = registered_at + _ORDER_REGISTRY_TTL
+                entry["registered_at"] = registered_at
+                entry["expires_at"] = expires_at
+                restored_registry[key] = entry
+            with self._order_registry_lock:
+                self._order_registry = restored_registry
+                self._purge_order_registry()
 
     # ------------------------------------------------------------------
     # state helpers
@@ -275,6 +314,177 @@ class SignalExecutor:
             if expiry_value is not None and expiry_value > timestamp:
                 continue
             self._price_limit_backoff.pop(symbol, None)
+
+    def _purge_order_registry(self, now: Optional[float] = None) -> None:
+        if not self._order_registry:
+            return
+        timestamp = self._current_time() if now is None else now
+        for key, entry in list(self._order_registry.items()):
+            expires_at = self._coerce_timestamp(entry.get("expires_at"))
+            if expires_at is not None and expires_at <= timestamp:
+                self._order_registry.pop(key, None)
+        if len(self._order_registry) <= _ORDER_REGISTRY_MAX:
+            return
+        ordered = sorted(
+            self._order_registry.items(),
+            key=lambda item: self._coerce_timestamp(item[1].get("registered_at")) or 0.0,
+        )
+        for key, _ in ordered[:-_ORDER_REGISTRY_MAX]:
+            self._order_registry.pop(key, None)
+
+    def _lookup_order_registry_entry(
+        self, key: Optional[str], now: Optional[float] = None
+    ) -> Optional[Dict[str, object]]:
+        if not key:
+            return None
+        timestamp = self._current_time() if now is None else now
+        with self._order_registry_lock:
+            entry = self._order_registry.get(key)
+            if not entry:
+                return None
+            expires_at = self._coerce_timestamp(entry.get("expires_at"))
+            if expires_at is not None and expires_at <= timestamp:
+                self._order_registry.pop(key, None)
+                return None
+            entry_copy = copy.deepcopy(entry)
+            entry["expires_at"] = timestamp + _ORDER_REGISTRY_TTL
+            return entry_copy
+
+    def _register_order_registry_entry(
+        self,
+        key: Optional[str],
+        payload: Mapping[str, object],
+        now: Optional[float] = None,
+    ) -> None:
+        if not key:
+            return
+        timestamp = self._current_time() if now is None else now
+        entry: Dict[str, object] = copy.deepcopy(dict(payload))
+        entry["registered_at"] = timestamp
+        entry["expires_at"] = timestamp + _ORDER_REGISTRY_TTL
+        with self._order_registry_lock:
+            self._order_registry[key] = entry
+            self._purge_order_registry(timestamp)
+
+    def _record_registry_result(
+        self,
+        registry_key: Optional[str],
+        result: ExecutionResult,
+        *,
+        order_link_id: Optional[str] = None,
+    ) -> None:
+        if not registry_key or result.status not in _ORDER_REGISTRY_SUCCESS_STATUSES:
+            return
+        payload: Dict[str, object] = {"status": result.status}
+        if result.reason is not None:
+            payload["reason"] = result.reason
+        if result.order is not None:
+            payload["order"] = copy.deepcopy(result.order)
+        if result.response is not None:
+            payload["response"] = copy.deepcopy(result.response)
+        if result.context is not None:
+            payload["context"] = copy.deepcopy(result.context)
+        if order_link_id:
+            payload["order_link_id"] = order_link_id
+        self._register_order_registry_entry(registry_key, payload)
+
+    @staticmethod
+    def _order_registry_key(
+        signature: Optional[str], symbol: Optional[str], side: str
+    ) -> Optional[str]:
+        if not symbol or not side:
+            return None
+        base = f"{side.upper()}:{str(symbol).upper()}"
+        if signature:
+            return f"{signature}:{base}"
+        return base
+
+    @staticmethod
+    def _build_order_link_seed(symbol: str, side: str, signature: str) -> str:
+        safe_symbol = str(symbol).upper()
+        safe_side = str(side).upper()
+        digest = hashlib.blake2s(signature.encode("utf-8"), digest_size=6).hexdigest()
+        return f"AI-{safe_symbol}-{safe_side}-{digest}"
+
+    @staticmethod
+    def _json_default(value: object) -> str:
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
+
+    @staticmethod
+    def _canonical_summary_payload(summary: Mapping[str, object]) -> str:
+        try:
+            return json.dumps(
+                summary,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=SignalExecutor._json_default,
+            )
+        except Exception:
+            return repr(summary)
+
+    def _compute_execution_signature(self, summary: Mapping[str, object]) -> str:
+        fingerprint = self.current_signature()
+        if fingerprint:
+            return str(fingerprint)
+        canonical = self._canonical_summary_payload(summary)
+        digest = hashlib.blake2s(canonical.encode("utf-8"), digest_size=8).hexdigest()
+        return f"summary:{digest}"
+
+    def _reuse_previous_execution(
+        self,
+        registry_key: Optional[str],
+        *,
+        symbol: str,
+        side: str,
+        signature: str,
+    ) -> Optional[ExecutionResult]:
+        entry = self._lookup_order_registry_entry(registry_key)
+        if entry is None:
+            return None
+        status = str(entry.get("status") or "")
+        if status not in _ORDER_REGISTRY_SUCCESS_STATUSES:
+            return None
+        context_payload = entry.get("context")
+        if isinstance(context_payload, Mapping):
+            context = copy.deepcopy(dict(context_payload))
+        elif context_payload is None:
+            context = {}
+        else:
+            context = {"original_context": copy.deepcopy(context_payload)}
+        context["duplicate_request"] = True
+        log(
+            "guardian.auto.duplicate.skip",
+            symbol=symbol,
+            side=side,
+            signature=signature,
+            order_link_id=entry.get("order_link_id"),
+        )
+        reason = entry.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            reason = str(reason)
+        order_payload = entry.get("order")
+        response_payload = entry.get("response")
+        order_copy = (
+            copy.deepcopy(order_payload)
+            if isinstance(order_payload, Mapping)
+            else order_payload
+        )
+        response_copy = (
+            copy.deepcopy(response_payload)
+            if isinstance(response_payload, Mapping)
+            else response_payload
+        )
+        return ExecutionResult(
+            status=status or "filled",
+            reason=reason,
+            order=order_copy,  # type: ignore[arg-type]
+            response=response_copy,  # type: ignore[arg-type]
+            context=context,
+        )
 
     def _mark_daily_pnl_stale(self) -> None:
         self._daily_pnl_force_refresh = True
@@ -1460,6 +1670,8 @@ class SignalExecutor:
                 reason="Signal is not actionable according to current thresholds.",
             )
 
+        execution_signature = self._compute_execution_signature(summary)
+
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
         self._ensure_ws_activity(settings)
@@ -1499,6 +1711,18 @@ class SignalExecutor:
             )
 
         side = "Buy" if mode == "buy" else "Sell"
+        registry_key = self._order_registry_key(execution_signature, symbol, side)
+        duplicate_result = self._reuse_previous_execution(
+            registry_key,
+            symbol=symbol,
+            side=side,
+            signature=execution_signature,
+        )
+        if duplicate_result is not None:
+            return duplicate_result
+
+        order_link_seed = self._build_order_link_seed(symbol, side, execution_signature)
+
         summary_price_snapshot = self._extract_market_price(summary, symbol)
 
         try:
@@ -1821,9 +2045,11 @@ class SignalExecutor:
                 order["slippage_percent"] = slippage_pct
                 order["note"] = "preview"
                 log("guardian.auto.preview", order=order)
-                return ExecutionResult(
+                result = ExecutionResult(
                     status="dry_run", order=order, context=order_context
                 )
+                self._record_registry_result(registry_key, result)
+                return result
             return self._decision(
                 "skipped",
                 reason="Недостаточно свободного капитала для безопасной сделки.",
@@ -1834,12 +2060,14 @@ class SignalExecutor:
             order = copy.deepcopy(order_context)
             order["slippage_percent"] = slippage_pct
             log("guardian.auto.preview", order=order)
-            return self._decision(
+            result = self._decision(
                 "dry_run",
                 reason="Режим dry-run активен — ордер не отправлен.",
                 context=order_context,
                 order=order,
             )
+            self._record_registry_result(registry_key, result)
+            return result
 
         if api is None:
             return self._decision(
@@ -1891,6 +2119,7 @@ class SignalExecutor:
                         tol_value=current_slippage,
                         max_quote=max_quote,
                         settings=settings,
+                        order_link_id_seed=order_link_seed,
                     )
                     adjusted_notional = current_notional
                     slippage_pct = current_slippage
@@ -2322,6 +2551,11 @@ class SignalExecutor:
                 context=order_context,
             )
 
+        _, response_order_link_id = self._extract_order_identifiers(response)
+        primary_order_link = response_order_link_id
+        if primary_order_link is None and order_link_seed:
+            primary_order_link = ensure_link_id(order_link_seed)
+
         order = copy.deepcopy(order_context)
         order["slippage_percent"] = slippage_pct
         log("guardian.auto.execute", order=order, response=response)
@@ -2365,7 +2599,11 @@ class SignalExecutor:
         )
         self._clear_symbol_penalties(symbol)
         self._mark_daily_pnl_stale()
-        return ExecutionResult(status="filled", order=order, response=response, context=order_context)
+        result = ExecutionResult(
+            status="filled", order=order, response=response, context=order_context
+        )
+        self._record_registry_result(registry_key, result, order_link_id=primary_order_link)
+        return result
 
     # ------------------------------------------------------------------
     # helpers
