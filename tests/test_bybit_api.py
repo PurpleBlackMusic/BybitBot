@@ -598,6 +598,113 @@ def test_place_order_sanitises_order_link_id(monkeypatch) -> None:
     assert first["body"]["orderLinkId"] == ensure_link_id(long_link)
 
 
+def test_place_order_idempotent_returns_cached_response(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    create_calls: list[dict[str, Any]] = []
+    ancillary_calls: list[dict[str, Any]] = []
+    response_payload = {"retCode": 0, "result": {"orderId": "1", "orderLinkId": "dup"}}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        call = {"method": method, "path": path, "body": body, "params": params, "signed": signed}
+        if path == "/v5/order/create":
+            create_calls.append(call)
+            return response_payload
+        ancillary_calls.append(call)
+        return {"retCode": 0, "result": {"list": []}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "orderType": "Limit",
+        "qty": Decimal("1.5"),
+        "price": Decimal("25000"),
+        "orderLinkId": "duplicate-test",
+    }
+
+    first = api.place_order(**payload)
+    create_after_first = len(create_calls)
+    second = api.place_order(**payload)
+
+    assert first == response_payload
+    assert second == response_payload
+    assert len(create_calls) == create_after_first, "Duplicate call must not send another create request"
+
+
+def test_place_order_conflicting_duplicate_raises(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        if path == "/v5/order/create":
+            return {"retCode": 0, "result": {}}
+        return {"retCode": 0, "result": {"list": []}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "ETHUSDT",
+        "side": "sell",
+        "orderType": "Limit",
+        "qty": Decimal("0.5"),
+        "price": Decimal("1800"),
+        "orderLinkId": "conflict-test",
+    }
+
+    api.place_order(**payload)
+
+    with pytest.raises(ValueError):
+        api.place_order(
+            category="spot",
+            symbol="ETHUSDT",
+            side="sell",
+            orderType="Limit",
+            qty=Decimal("0.75"),
+            price=Decimal("1790"),
+            orderLinkId="conflict-test",
+        )
+
+
+def test_place_order_does_not_cache_failed_attempts(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    create_attempts = 0
+    responses = [
+        {"retCode": 130001, "retMsg": "insufficient balance"},
+        {"retCode": 0, "result": {"orderId": "2", "orderLinkId": "retry"}},
+    ]
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        nonlocal create_attempts
+        if path == "/v5/order/create":
+            response = responses[min(create_attempts, len(responses) - 1)]
+            create_attempts += 1
+            return response
+        return {"retCode": 0, "result": {"list": []}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    payload = {
+        "category": "spot",
+        "symbol": "SOLUSDT",
+        "side": "buy",
+        "orderType": "Limit",
+        "qty": Decimal("3"),
+        "price": Decimal("25"),
+        "orderLinkId": "retry",
+    }
+
+    first = api.place_order(**payload)
+    second = api.place_order(**payload)
+
+    assert first == responses[0]
+    assert second == responses[1]
+    assert create_attempts == 2, "Failed attempt must trigger a new create request"
+
+
 def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
