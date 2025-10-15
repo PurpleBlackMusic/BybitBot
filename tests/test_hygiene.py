@@ -52,6 +52,8 @@ def test_cancel_stale_orders_sanitises_order_link_ids(monkeypatch: pytest.Monkey
     result = hygiene.cancel_stale_orders(api, category="spot", older_than_sec=60)
 
     assert result["total"] == 1
+    assert result["stale_total"] == 1
+    assert result["stale_symbols"] == ["BTCUSDT"]
     assert api.cancelled, "Expected cancel_batch to be called"
     sent_link = api.cancelled[0][0]["orderLinkId"]
     assert sent_link == ensure_link_id(long_link)
@@ -133,6 +135,8 @@ def test_cancel_stale_orders_respects_filters(monkeypatch: pytest.MonkeyPatch) -
     )
 
     assert result["total"] == 1
+    assert result["stale_total"] == 4
+    assert result["stale_symbols"] == ["BTCUSDT"]
     assert len(api.cancelled) == 1
     cancelled_payload = api.cancelled[0]
     assert len(cancelled_payload) == 1

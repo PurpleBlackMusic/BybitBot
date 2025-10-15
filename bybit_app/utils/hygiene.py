@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any, Dict, List, Set
 
 from .bybit_api import BybitAPI
 from .helpers import ensure_link_id
@@ -66,6 +67,9 @@ def cancel_stale_orders(
     now_ms = int(time.time() * 1000)
 
     to_cancel: list[dict[str, object]] = []
+    stale_candidates: List[Dict[str, Any]] = []
+    stale_symbols: Set[str] = set()
+
     for item in rows:
         if not isinstance(item, dict):
             continue
@@ -78,22 +82,36 @@ def cancel_stale_orders(
         if now_ms - created < older_than_sec * 1000:
             continue
 
+        symbol_value = _normalise_text(item.get("symbol")) or None
+        link_raw = _normalise_text(item.get("orderLinkId") or item.get("orderLinkID"))
         tif = _normalise_text(
             item.get("timeInForce")
             or item.get("timeInForceValue")
             or item.get("tif")
             or item.get("time_in_force")
         ).upper()
-        if tif_filter and (not tif or tif not in tif_filter):
-            continue
-
         order_type = _normalise_text(
             item.get("orderType") or item.get("orderTypeV2")
         ).lower()
+
+        stale_entry: Dict[str, Any] = {
+            "symbol": symbol_value,
+            "orderId": item.get("orderId"),
+            "orderLinkId": ensure_link_id(link_raw) if link_raw else None,
+            "timeInForce": tif or None,
+            "orderType": order_type or None,
+        }
+        stale_candidates.append(stale_entry)
+        if symbol_value:
+            stale_symbols.add(symbol_value.upper())
+
+        if tif_filter and (not tif or tif not in tif_filter):
+            continue
+
         if type_filter and (not order_type or order_type not in type_filter):
             continue
 
-        link = _normalise_text(item.get("orderLinkId") or item.get("orderLinkID"))
+        link = link_raw
         if prefix_filter:
             if not link:
                 continue
@@ -111,7 +129,15 @@ def cancel_stale_orders(
             continue
         to_cancel.append(payload)
 
-    result = {"total": len(to_cancel), "batches": []}
+    result: Dict[str, Any] = {
+        "total": len(to_cancel),
+        "batches": [],
+        "stale_total": len(stale_candidates),
+        "stale_symbols": sorted(stale_symbols),
+    }
+    if stale_candidates:
+        result["stale"] = stale_candidates
+
     for idx in range(0, len(to_cancel), batch_size):
         chunk = to_cancel[idx : idx + batch_size]
         payload = [

@@ -73,6 +73,7 @@ class BackgroundServices:
         self._order_sweep_last = 0.0
         self._order_sweep_lock = threading.Lock()
         self._order_sweep_prefixes: tuple[str, ...] = ("AI-",)
+        self._order_sweep_config_last = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -539,6 +540,7 @@ class BackgroundServices:
         return snapshot
 
     def _should_sweep_orders(self) -> bool:
+        self._refresh_order_sweeper_settings()
         if self._order_sweep_interval <= 0 or self._order_sweep_stale_after <= 0:
             return False
         now = time.time()
@@ -547,6 +549,43 @@ class BackgroundServices:
                 return False
             self._order_sweep_last = now
         return True
+
+    def _refresh_order_sweeper_settings(self) -> None:
+        if self._order_sweep_interval <= 0:
+            return
+
+        now = time.time()
+        refresh_after = max(self._order_sweep_interval, 30.0)
+        if now - self._order_sweep_config_last < refresh_after:
+            return
+
+        self._order_sweep_config_last = now
+
+        try:
+            settings = get_settings()
+        except Exception as exc:
+            log("background.automation.sweeper.settings_error", err=str(exc))
+            return
+
+        candidates: list[float] = []
+        for attr in ("reprice_unfilled_after_sec", "execution_watchdog_max_age_sec"):
+            value = getattr(settings, attr, None)
+            if isinstance(value, (int, float)):
+                candidates.append(float(value))
+
+        if not candidates:
+            return
+
+        positive = [value for value in candidates if value > 0]
+        if positive:
+            new_value = max(max(positive), 60.0)
+        else:
+            new_value = 0.0
+
+        if abs(new_value - self._order_sweep_stale_after) < 1e-6:
+            return
+
+        self._order_sweep_stale_after = new_value
 
     def _maybe_sweep_orders(self) -> bool:
         if not self._should_sweep_orders():
@@ -588,6 +627,8 @@ class BackgroundServices:
 
         total = 0
         batches = 0
+        stale_total = 0
+        stale_symbols: tuple[str, ...] = ()
         if isinstance(result, Mapping):
             try:
                 total = int(result.get("total", 0))
@@ -596,6 +637,13 @@ class BackgroundServices:
             batches_payload = result.get("batches")
             if isinstance(batches_payload, Sequence):
                 batches = len(batches_payload)
+            try:
+                stale_total = int(result.get("stale_total", 0))
+            except Exception:
+                stale_total = 0
+            symbols_payload = result.get("stale_symbols")
+            if isinstance(symbols_payload, Sequence) and not isinstance(symbols_payload, (str, bytes)):
+                stale_symbols = tuple(str(sym) for sym in symbols_payload if sym)
 
         now = time.time()
         sweeper_snapshot = {
@@ -604,7 +652,11 @@ class BackgroundServices:
             "stale_after": self._order_sweep_stale_after,
             "cancelled": total,
             "batches": batches,
+            "stale_total": stale_total,
+            "triggered_retry": total > 0,
         }
+        if stale_symbols:
+            sweeper_snapshot["stale_symbols"] = stale_symbols
 
         with self._automation_lock:
             self._automation_sweeper = sweeper_snapshot
