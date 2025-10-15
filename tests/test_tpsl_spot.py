@@ -52,5 +52,6 @@ def test_place_spot_limit_with_tpsl_sanitizes_long_link_id(monkeypatch) -> None:
     assert api.last_payload["orderLinkId"] == ensure_link_id(long_link)
     assert api.last_payload["qty"] == "1.124"
     assert api.last_payload["price"] == "30000.5"
+    assert api.last_payload["timeInForce"] == "GTC"
     assert api.last_payload.get("takeProfit") == "30500"
     assert api.last_payload.get("stopLoss") == "29000.5"

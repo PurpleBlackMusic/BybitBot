@@ -14,7 +14,7 @@ from .spot_rules import (
     render_spot_order_texts,
 )
 
-def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float, price: float, tp: float | None, sl: float | None, tp_order_type: str = "Market", sl_order_type: str = "Market", tp_limit: float | None = None, sl_limit: float | None = None, link_id: str | None = None, tif: str = "PostOnly"):
+def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float, price: float, tp: float | None, sl: float | None, tp_order_type: str = "Market", sl_order_type: str = "Market", tp_limit: float | None = None, sl_limit: float | None = None, link_id: str | None = None, tif: str = "GTC"):
     """Создать СПОТ лимит ордер с серверным TP/SL для UTA (v5 create order).
     Требует: category='spot'. Если tp/sl заданы и тип=Limit — должны быть tp_limit/sl_limit.
     Возвращает ответ API.
