@@ -19,6 +19,7 @@ from bybit_app.utils.signal_executor import (
     ExecutionResult,
     SignalExecutor,
 )
+from bybit_app.utils.ai.kill_switch import KillSwitchState
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     SpotTradeSnapshot,
@@ -42,6 +43,36 @@ def _clear_wallet_cache() -> None:
     _BALANCE_CACHE.clear()
     yield
     _BALANCE_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _kill_switch_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"paused": False, "until": None, "reason": None}
+
+    def fake_set_pause(minutes: float, reason: str) -> float:
+        try:
+            duration = float(minutes)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration <= 0.0:
+            state.update(paused=False, until=None, reason=None)
+            return time.time()
+        until = time.time() + duration * 60.0
+        state.update(paused=True, until=until, reason=reason)
+        return until
+
+    def fake_state() -> KillSwitchState:
+        until = state.get("until")
+        paused = bool(state.get("paused"))
+        if paused and isinstance(until, (int, float)) and until <= time.time():
+            state.update(paused=False, until=None, reason=None)
+            paused = False
+            until = None
+        return KillSwitchState(paused=paused, until=until, reason=state.get("reason"))
+
+    monkeypatch.setattr(signal_executor_module, "activate_kill_switch", fake_set_pause)
+    monkeypatch.setattr(signal_executor_module, "kill_switch_state", fake_state)
+    yield
 
 
 class StubBot:
@@ -419,6 +450,55 @@ def test_signal_executor_force_exit_skips_positive_exit_bps(
 
     assert forced_summary is None
     assert metadata is None
+
+
+def test_signal_executor_force_exit_triggers_on_trade_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": False, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_max_hold_minutes=0.0,
+        ai_min_exit_bps=None,
+        ai_max_trade_loss_pct=1.0,
+    )
+    bot = StubBot(summary, settings)
+    monkeypatch.setattr(bot, "trade_statistics", lambda limit=None: {})
+
+    positions = {
+        "ETHUSDT": {
+            "qty": 2.0,
+            "avg_cost": 100.0,
+            "realized_pnl": 0.0,
+            "hold_seconds": 120.0,
+            "price": 87.5,
+            "pnl_value": -25.0,
+            "pnl_bps": -1250.0,
+            "quote_notional": 175.0,
+        }
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_open_positions",
+        lambda self, settings, summary, **_: positions,
+    )
+
+    executor = SignalExecutor(bot)
+    forced_summary, metadata = executor._maybe_force_exit(
+        summary,
+        settings,
+        portfolio_total_equity=1000.0,
+    )
+
+    assert forced_summary is not None
+    assert forced_summary["symbol"] == "ETHUSDT"
+    assert forced_summary["mode"] == "sell"
+    assert metadata is not None
+    assert metadata.get("loss_value") == pytest.approx(25.0)
+    assert metadata.get("loss_percent") == pytest.approx(2.5)
+    triggers = metadata.get("triggers") or []
+    assert any(trigger.get("type") == "max_loss" for trigger in triggers)
 
 
 def test_signal_executor_force_exit_ignores_stale_summary_price(
@@ -5158,6 +5238,95 @@ def test_signal_executor_daily_loss_ignores_derivatives(monkeypatch: pytest.Monk
     assert result.status != "disabled"
     assert (result.context or {}).get("guard") != "daily_loss_limit"
     assert stub_api.orders == []
+
+
+def test_portfolio_loss_guard_triggers_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_portfolio_loss_limit_pct=2.0,
+        ai_kill_switch_cooldown_min=15.0,
+    )
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    positions = {
+        "BTCUSDT": {
+            "qty": 1.0,
+            "avg_cost": 100.0,
+            "realized_pnl": 0.0,
+            "hold_seconds": 300.0,
+            "price": 90.0,
+            "pnl_value": -10.0,
+            "pnl_bps": -1000.0,
+            "quote_notional": 90.0,
+        },
+        "ETHUSDT": {
+            "qty": 2.0,
+            "avg_cost": 50.0,
+            "realized_pnl": 0.0,
+            "hold_seconds": 180.0,
+            "price": 45.0,
+            "pnl_value": -10.0,
+            "pnl_bps": -1000.0,
+            "quote_notional": 90.0,
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_open_positions",
+        lambda self, settings, summary, **_: positions,
+    )
+
+    captured: Dict[str, object] = {}
+
+    def fake_set_pause(minutes: float, reason: str) -> float:
+        captured["minutes"] = minutes
+        captured["reason"] = reason
+        return 1700000000.0
+
+    monkeypatch.setattr(signal_executor_module, "activate_kill_switch", fake_set_pause)
+
+    now = time.time()
+    message, context = executor._portfolio_loss_guard(
+        settings,
+        summary,
+        total_equity=800.0,
+        current_time=now,
+        summary_meta=(None, None),
+        price_meta=(None, None),
+    )
+
+    assert message is not None and "Совокупный" in message
+    assert context.get("guard") == "portfolio_loss_limit"
+    assert context.get("loss_value") == pytest.approx(20.0)
+    assert context.get("loss_percent") == pytest.approx(2.5)
+    assert captured.get("minutes") == pytest.approx(15.0)
+    assert context.get("kill_switch_until") == pytest.approx(1700000000.0)
+
+
+def test_kill_switch_guard_reports_active_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "kill_switch_state",
+        lambda: KillSwitchState(paused=True, until=1700.0, reason="manual"),
+    )
+
+    guard = executor._kill_switch_guard()
+    assert guard is not None
+    message, context = guard
+    assert "Автоторговля" in message
+    assert context.get("guard") == "kill_switch"
+    assert context.get("reason") == "manual"
+    assert context.get("until") == pytest.approx(1700.0)
 
 
 def test_daily_loss_guard_uses_cached_summary(
