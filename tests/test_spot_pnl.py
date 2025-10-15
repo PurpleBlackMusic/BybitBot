@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from bybit_app.utils import pnl as pnl_module
 from bybit_app.utils.pnl import add_execution, read_ledger
 from bybit_app.utils.spot_pnl import spot_inventory_and_pnl
@@ -70,6 +72,10 @@ def test_spot_pnl_network_isolation(tmp_path: Path, monkeypatch) -> None:
     pnl_module._RECENT_KEYS.clear()
     pnl_module._RECENT_KEY_SET.clear()
     pnl_module._RECENT_WARMED.clear()
+    try:
+        pnl_module._listed_spot_symbols.cache_clear()
+    except AttributeError:
+        pass
 
     testnet_settings = SimpleNamespace(testnet=True)
     mainnet_settings = SimpleNamespace(testnet=False)
@@ -109,6 +115,84 @@ def test_spot_pnl_network_isolation(tmp_path: Path, monkeypatch) -> None:
     assert testnet_inventory["BTCUSDT"]["position_qty"] == 0.5
     assert set(mainnet_inventory) == {"ETHUSDT"}
     assert mainnet_inventory["ETHUSDT"]["position_qty"] == 1.0
+
+
+def test_add_execution_corrects_linear_category_for_spot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_dir = tmp_path / "data" / "pnl"
+    monkeypatch.setattr(pnl_module, "_LEDGER_DIR", base_dir)
+    pnl_module._RECENT_KEYS.clear()
+    pnl_module._RECENT_KEY_SET.clear()
+    pnl_module._RECENT_WARMED.clear()
+    pnl_module._listed_spot_symbols.cache_clear()
+
+    monkeypatch.setattr(
+        pnl_module,
+        "get_listed_spot_symbols",
+        lambda *, testnet: {"BTCUSDT"},
+    )
+    pnl_module._listed_spot_symbols.cache_clear()
+
+    add_execution(
+        {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "orderLinkId": "tn-2",
+            "execPrice": "10000",
+            "execQty": "0.1",
+            "execFee": "0.01",
+            "execTime": 3,
+            "category": "linear",
+        }
+    )
+
+    ledger_path = base_dir / "executions.testnet.jsonl"
+    with ledger_path.open("r", encoding="utf-8") as handle:
+        lines = [json.loads(raw) for raw in handle if raw.strip()]
+
+    assert len(lines) == 1
+    stored = lines[0]
+    assert stored["category"] == "spot"
+
+
+def test_add_execution_preserves_non_spot_when_symbol_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_dir = tmp_path / "data" / "pnl"
+    monkeypatch.setattr(pnl_module, "_LEDGER_DIR", base_dir)
+    pnl_module._RECENT_KEYS.clear()
+    pnl_module._RECENT_KEY_SET.clear()
+    pnl_module._RECENT_WARMED.clear()
+    pnl_module._listed_spot_symbols.cache_clear()
+
+    monkeypatch.setattr(
+        pnl_module,
+        "get_listed_spot_symbols",
+        lambda *, testnet: {"BTCUSDT"},
+    )
+    pnl_module._listed_spot_symbols.cache_clear()
+
+    add_execution(
+        {
+            "symbol": "XRPPERP",
+            "side": "Sell",
+            "orderLinkId": "tn-3",
+            "execPrice": "0.5",
+            "execQty": "10",
+            "execFee": "0.1",
+            "execTime": 4,
+            "category": "linear",
+        }
+    )
+
+    ledger_path = base_dir / "executions.testnet.jsonl"
+    with ledger_path.open("r", encoding="utf-8") as handle:
+        lines = [json.loads(raw) for raw in handle if raw.strip()]
+
+    assert len(lines) == 1
+    stored = lines[0]
+    assert stored["category"] == "linear"
 
 
 def test_read_ledger_supports_last_exec_id(tmp_path: Path, monkeypatch) -> None:
