@@ -5197,6 +5197,7 @@ class AutomationLoop:
         error_backoff: float = 5.0,
         on_cycle: Callable[[ExecutionResult, Optional[str], Tuple[bool, bool, bool]], None]
         | None = None,
+        sweeper: Callable[[], bool] | None = None,
     ) -> None:
         self.executor = executor
         self.poll_interval = max(float(poll_interval), 0.0)
@@ -5208,6 +5209,22 @@ class AutomationLoop:
         self._on_cycle = on_cycle
         self._last_attempt_ts: Optional[float] = None
         self._next_retry_ts: Optional[float] = None
+        self._sweeper = sweeper
+
+    def _invoke_sweeper(self) -> None:
+        if self._sweeper is None:
+            return
+        try:
+            triggered = bool(self._sweeper())
+        except Exception as exc:  # pragma: no cover - defensive callback guard
+            log("guardian.auto.loop.sweeper.error", err=str(exc))
+            return
+        if triggered:
+            self._last_key = None
+            self._last_status = None
+            self._last_result = None
+            self._last_attempt_ts = None
+            self._next_retry_ts = None
 
     def _should_execute(
         self, signature: Optional[str], settings_marker: Tuple[bool, bool, bool]
@@ -5229,6 +5246,7 @@ class AutomationLoop:
         return now >= self._next_retry_ts
 
     def _tick(self) -> float:
+        self._invoke_sweeper()
         signature = self.executor.current_signature()
         settings_marker = self.executor.settings_marker()
         key = (signature, settings_marker)

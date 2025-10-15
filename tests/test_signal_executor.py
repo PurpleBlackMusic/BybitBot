@@ -5282,6 +5282,46 @@ def test_automation_loop_skips_repeated_success(monkeypatch: pytest.MonkeyPatch)
     assert third_delay == 0.0
 
 
+def test_automation_loop_sweeper_forces_retry() -> None:
+    class _Executor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def current_signature(self) -> str:
+            return "sig"
+
+        def settings_marker(self) -> tuple[bool, bool, bool]:
+            return (True, True, True)
+
+        def execute_once(self) -> ExecutionResult:
+            self.calls += 1
+            return ExecutionResult(status="dry_run")
+
+    executor = _Executor()
+    sweeper_state = {"count": 0}
+
+    def sweeper() -> bool:
+        sweeper_state["count"] += 1
+        return sweeper_state["count"] == 2
+
+    loop = AutomationLoop(
+        executor,
+        poll_interval=0.0,
+        success_cooldown=60.0,
+        error_backoff=0.0,
+        sweeper=sweeper,
+    )
+
+    first_delay = loop._tick()
+    assert executor.calls == 1
+    assert first_delay == 60.0
+
+    second_delay = loop._tick()
+    assert executor.calls == 2
+    assert second_delay == 60.0
+    assert sweeper_state["count"] >= 2
+
+
 def test_automation_loop_retries_after_error(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)

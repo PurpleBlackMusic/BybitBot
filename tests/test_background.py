@@ -8,6 +8,7 @@ from typing import Callable
 import pytest
 
 from bybit_app.utils import background as background_module
+from bybit_app.utils import hygiene as hygiene_module
 from bybit_app.utils.background import BackgroundServices
 from bybit_app.utils.signal_executor import ExecutionResult
 from bybit_app.utils.ws_events import (
@@ -155,6 +156,80 @@ def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> N
     snapshot = svc.ws_snapshot()
     assert snapshot["public_stale"] is True
     assert snapshot["restart_count"] == 2
+
+
+def test_order_sweeper_cancels_old_orders(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+
+    class _FakeTime:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def time(self) -> float:
+            return self.value
+
+    fake_time = _FakeTime(10_000.0)
+    monkeypatch.setattr(background_module, "time", fake_time)
+    monkeypatch.setattr(hygiene_module, "time", fake_time)
+
+    class _SweeperApi:
+        def __init__(self) -> None:
+            self.cancelled: list[list[dict[str, object]]] = []
+
+        def open_orders(self, *, category: str, symbol: str | None = None, openOnly: int = 1):
+            del category, openOnly
+            stale_created = int((fake_time.value - 1_200.0) * 1000)
+            fresh_created = int((fake_time.value - 100.0) * 1000)
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": symbol or "BTCUSDT",
+                            "orderId": "1",
+                            "orderLinkId": "AI-TP-BTC-1",
+                            "orderType": "Limit",
+                            "timeInForce": "GTC",
+                            "createdTime": str(stale_created),
+                        },
+                        {
+                            "symbol": symbol or "BTCUSDT",
+                            "orderId": "2",
+                            "orderLinkId": "MANUAL-ORDER",
+                            "orderType": "Limit",
+                            "timeInForce": "GTC",
+                            "createdTime": str(stale_created),
+                        },
+                        {
+                            "symbol": symbol or "BTCUSDT",
+                            "orderId": "3",
+                            "orderLinkId": "AI-TP-BTC-2",
+                            "orderType": "Limit",
+                            "timeInForce": "GTC",
+                            "createdTime": str(fresh_created),
+                        },
+                    ]
+                }
+            }
+
+        def cancel_batch(self, *, category: str, request: list[dict[str, object]]):
+            del category
+            self.cancelled.append(request)
+            return {"retCode": 0}
+
+    api = _SweeperApi()
+    monkeypatch.setattr(background_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(background_module, "log", lambda *_, **__: None)
+
+    assert svc._maybe_sweep_orders() is True
+    assert api.cancelled
+    cancelled_ids = {entry.get("orderId") for entry in api.cancelled[0]}
+    assert cancelled_ids == {"1"}
+
+    snapshot = svc.automation_snapshot()
+    sweeper_info = snapshot.get("sweeper")
+    assert sweeper_info
+    assert sweeper_info["cancelled"] == 1
+    assert sweeper_info["batches"] == 1
 
 
 def test_private_ws_stale_triggers_targeted_restart(
