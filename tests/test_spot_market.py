@@ -611,6 +611,31 @@ def test_wallet_available_balances_subtracts_reserved_amounts():
     assert balances["USDT"] == Decimal("83")
 
 
+def test_wallet_available_balances_subtracts_open_orders_from_free():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "free": "100",
+                            "openOrderMargin": "12.5",
+                            "safetyFee": "2.5",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("85")
+
+
 def test_wallet_available_balances_prefers_available_without_double_subtraction():
     wallet_payload = {
         "result": {
