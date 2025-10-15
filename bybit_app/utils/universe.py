@@ -5,9 +5,10 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple, TypeVar, Generic, cast
 
 from .bybit_api import BybitAPI
 from .envs import get_settings, update_settings
@@ -63,6 +64,60 @@ _VOLATILITY_LOW_THRESHOLD = 3.0
 _VOLATILITY_HIGH_THRESHOLD = 12.0
 _INSTRUMENT_META_CACHE: dict[str, tuple[float, Mapping[str, object]]] = {}
 _INSTRUMENT_META_CACHE_TTL = 30.0 * 60.0
+_INSTRUMENT_META_CACHE_LOCK = threading.RLock()
+
+T = TypeVar("T")
+
+
+class _SingleFlightSlot(Generic[T]):
+    """Internal synchronisation primitive used to dedupe refreshes."""
+
+    __slots__ = ("event", "result", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: T | None = None
+        self.error: BaseException | None = None
+
+
+class _SingleFlightGroup(Generic[T]):
+    """Single-flight helper ensuring only one refresh operation runs at once."""
+
+    __slots__ = ("_lock", "_inflight")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inflight: Dict[object, _SingleFlightSlot[T]] = {}
+
+    def run(self, key: object, fn: Callable[[], T]) -> T:
+        with self._lock:
+            slot = self._inflight.get(key)
+            if slot is None:
+                slot = _SingleFlightSlot[T]()
+                self._inflight[key] = slot
+                leader = True
+            else:
+                leader = False
+
+        if not leader:
+            slot.event.wait()
+            if slot.error is not None:
+                raise slot.error
+            return cast(T, slot.result)
+
+        try:
+            slot.result = fn()
+            return slot.result
+        except BaseException as exc:  # pragma: no cover - defensive propagation
+            slot.error = exc
+            raise
+        finally:
+            slot.event.set()
+            with self._lock:
+                self._inflight.pop(key, None)
+
+
+_INSTRUMENT_META_REFRESH = _SingleFlightGroup[Dict[str, Mapping[str, object]]]()
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
@@ -102,24 +157,28 @@ def _resolve_cache_entries(symbols: set[str]) -> tuple[dict[str, Mapping[str, ob
     now = time.time()
     cached: dict[str, Mapping[str, object]] = {}
     missing: set[str] = set()
-    for symbol in symbols:
-        entry = _INSTRUMENT_META_CACHE.get(symbol)
-        if not entry:
-            missing.add(symbol)
-            continue
-        ts, meta = entry
-        if _INSTRUMENT_META_CACHE_TTL and now - ts > _INSTRUMENT_META_CACHE_TTL:
-            _INSTRUMENT_META_CACHE.pop(symbol, None)
-            missing.add(symbol)
-            continue
-        cached[symbol] = meta
+    with _INSTRUMENT_META_CACHE_LOCK:
+        for symbol in symbols:
+            entry = _INSTRUMENT_META_CACHE.get(symbol)
+            if not entry:
+                missing.add(symbol)
+                continue
+            ts, meta = entry
+            if _INSTRUMENT_META_CACHE_TTL and now - ts > _INSTRUMENT_META_CACHE_TTL:
+                _INSTRUMENT_META_CACHE.pop(symbol, None)
+                missing.add(symbol)
+                continue
+            cached[symbol] = meta
     return cached, missing
 
 
 def _cache_instrument_metadata(records: Mapping[str, Mapping[str, object]]) -> None:
     now = time.time()
-    for symbol, meta in records.items():
-        _INSTRUMENT_META_CACHE[symbol] = (now, meta)
+    if not records:
+        return
+    with _INSTRUMENT_META_CACHE_LOCK:
+        for symbol, meta in records.items():
+            _INSTRUMENT_META_CACHE[symbol] = (now, meta)
 
 
 def _fetch_instrument_metadata(
@@ -133,51 +192,61 @@ def _fetch_instrument_metadata(
     if not missing:
         return cached
 
-    metadata: dict[str, Mapping[str, object]] = dict(cached)
-    payload: Mapping[str, object]
+    pending = set(missing)
 
-    try:
-        payload = api._safe_req(
-            "GET",
-            "/v5/market/instruments-info",
-            params={"category": "spot"},
-        )
-    except Exception:
-        rows: list[Mapping[str, object]] = []
-    else:
-        result = payload.get("result") if isinstance(payload, Mapping) else None
-        rows = result.get("list") if isinstance(result, Mapping) else []
-        if not isinstance(rows, list):
-            rows = []
+    def _refresh() -> dict[str, Mapping[str, object]]:
+        fresh: dict[str, Mapping[str, object]] = {}
+        payload: Mapping[str, object]
 
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        symbol = _normalize_symbol(row.get("symbol"))
-        if symbol and symbol in missing:
-            metadata[symbol] = row
-
-    missing -= set(metadata.keys())
-
-    for symbol in list(missing):
         try:
-            detail = api._safe_req(
+            payload = api._safe_req(
                 "GET",
                 "/v5/market/instruments-info",
-                params={"category": "spot", "symbol": symbol},
+                params={"category": "spot"},
             )
         except Exception:
-            continue
-        result = detail.get("result") if isinstance(detail, Mapping) else None
-        rows = result.get("list") if isinstance(result, Mapping) else []
-        if isinstance(rows, list) and rows:
-            row = rows[0]
-            if isinstance(row, Mapping):
-                metadata[symbol] = row
+            rows: list[Mapping[str, object]] = []
+        else:
+            result = payload.get("result") if isinstance(payload, Mapping) else None
+            rows = result.get("list") if isinstance(result, Mapping) else []
+            if not isinstance(rows, list):
+                rows = []
 
-    if metadata:
-        _cache_instrument_metadata(metadata)
-    return metadata
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            symbol = _normalize_symbol(row.get("symbol"))
+            if symbol and symbol in pending:
+                fresh[symbol] = row
+
+        remaining = pending - set(fresh.keys())
+
+        for symbol in list(remaining):
+            try:
+                detail = api._safe_req(
+                    "GET",
+                    "/v5/market/instruments-info",
+                    params={"category": "spot", "symbol": symbol},
+                )
+            except Exception:
+                continue
+            result = detail.get("result") if isinstance(detail, Mapping) else None
+            rows = result.get("list") if isinstance(result, Mapping) else []
+            if isinstance(rows, list) and rows:
+                row = rows[0]
+                if isinstance(row, Mapping):
+                    fresh[symbol] = row
+
+        if fresh:
+            _cache_instrument_metadata(fresh)
+
+        refreshed, _ = _resolve_cache_entries(target)
+        return dict(refreshed)
+
+    refreshed = _INSTRUMENT_META_REFRESH.run("spot_instruments", _refresh)
+    merged = dict(cached)
+    merged.update(refreshed)
+    return merged
 
 
 def _has_allowed_quote(symbol: str, quotes: tuple[str, ...]) -> bool:
