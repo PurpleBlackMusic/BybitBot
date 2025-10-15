@@ -11,9 +11,87 @@ STORE = DATA_DIR / "oco_groups.json"
 _LOCK = threading.Lock()
 _LINK_FIELDS = ("primary", "tp", "sl")
 
+_LEG_STATUS_ACTIVE = "active"
+_LEG_STATUS_FILLED = "filled"
+_LEG_STATUS_CANCELLING = "cancelling"
+_LEG_STATUS_CANCELLED = "cancelled"
+_LEG_STATUS_CANCEL_ERROR = "cancel_error"
+
 
 def _save(data: dict) -> None:
     STORE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ensure_leg_structure(record: dict) -> bool:
+    changed = False
+    legs = record.get("legs")
+    if not isinstance(legs, dict):
+        legs = {}
+        changed = True
+
+    for field in _LINK_FIELDS:
+        leg = dict(legs.get(field) or {})
+        link = ensure_link_id(record.get(field))
+        if link:
+            if leg.get("link") != link:
+                leg["link"] = link
+                changed = True
+        elif "link" in leg:
+            leg.pop("link", None)
+            changed = True
+
+        if "status" not in leg:
+            leg["status"] = _LEG_STATUS_ACTIVE
+            changed = True
+
+        if legs.get(field) != leg:
+            legs[field] = leg
+            changed = True
+
+    if record.get("legs") != legs:
+        record["legs"] = legs
+        changed = True
+
+    return changed
+
+
+def _apply_leg_updates(record: dict, updates: dict[str, dict[str, str | None]]) -> bool:
+    if not updates:
+        return False
+
+    changed = False
+    legs = record.setdefault("legs", {})
+
+    for leg_name, payload in updates.items():
+        if not isinstance(payload, dict):
+            continue
+
+        current = dict(legs.get(leg_name) or {})
+
+        if "link" in payload:
+            link = ensure_link_id(payload["link"])
+            if link:
+                if current.get("link") != link:
+                    current["link"] = link
+                    changed = True
+            elif "link" in current:
+                current.pop("link", None)
+                changed = True
+
+        if "status" in payload and payload["status"]:
+            status = payload["status"]
+            if current.get("status") != status:
+                current["status"] = status
+                changed = True
+
+        if current and legs.get(leg_name) != current:
+            legs[leg_name] = current
+            changed = True
+
+    if changed:
+        record["legs"] = legs
+
+    return changed
 
 
 def _normalize_record(record: dict) -> bool:
@@ -33,6 +111,11 @@ def _normalize_record(record: dict) -> bool:
         record["raw_links"] = raw_links
     elif "raw_links" in record:
         record.pop("raw_links")
+        changed = True
+
+    if _ensure_leg_structure(record):
+        changed = True
+
     return changed
 
 
@@ -72,6 +155,11 @@ def _find_group(db: dict, link: str) -> tuple[str | None, dict | None]:
             raw_value = raw_links.get(field)
             if raw_value and ensure_link_id(raw_value) == normalized:
                 return group, record
+        legs = record.get("legs") or {}
+        for leg in legs.values():
+            stored_link = leg.get("link")
+            if stored_link and stored_link == normalized:
+                return group, record
     return None, None
 
 def register_group(group: str, symbol: str, category: str, primary: str, tp: str, sl: str):
@@ -101,6 +189,7 @@ def register_group(group: str, symbol: str, category: str, primary: str, tp: str
         }
         if raw_links:
             rec["raw_links"] = raw_links
+        _ensure_leg_structure(rec)
         db[group] = rec
         _save(db)
     log("oco.guard.register", group=group, symbol=symbol, category=category)
@@ -112,6 +201,22 @@ def mark_closed(group: str):
             db[group]["closed"] = True
             db[group]["closed_ts"] = int(time.time()*1000)
             _save(db)
+
+
+def _set_leg_status(group: str, leg: str, status: str) -> None:
+    if leg not in _LINK_FIELDS:
+        return
+
+    with _LOCK:
+        db = _load()
+        rec = db.get(group)
+        if not rec:
+            return
+        changed = _ensure_leg_structure(rec)
+        changed |= _apply_leg_updates(rec, {leg: {"status": status}})
+        if changed:
+            _save(db)
+
 
 def _api():
     return get_api_client()
@@ -179,25 +284,43 @@ def handle_private(msg: dict):
             status = str(ev.get("orderStatus", "")).lower()
             # Filled по TP/SL — отменяем другую ногу и закрываем группу
             if (link.endswith("-TP") or link.endswith("-SL")) and status == "filled":
+                filled_leg = "tp" if link.endswith("-TP") else "sl"
+                other_leg = "sl" if filled_leg == "tp" else "tp"
                 with _LOCK:
                     db = _load()
                     group_key, rec = _find_group(db, link)
+                    other_link = None
+                    if rec:
+                        changed = _ensure_leg_structure(rec)
+                        changed |= _apply_leg_updates(
+                            rec,
+                            {
+                                filled_leg: {"status": _LEG_STATUS_FILLED},
+                                other_leg: {"status": _LEG_STATUS_CANCELLING},
+                            },
+                        )
+                        other_link = rec.get(other_leg)
+                        if changed:
+                            _save(db)
+                    if other_link is None:
+                        other_link = link[:-3] + ("SL" if link.endswith("-TP") else "TP")
                 group_name = group_key or link[:-3]
-                if rec:
-                    other_link = rec["sl"] if link.endswith("-TP") else rec["tp"]
-                else:
-                    other_link = link[:-3] + ("SL" if link.endswith("-TP") else "TP")
                 try:
                     api = _api()
                     sym = str(ev.get("symbol", ""))
                     cat = str(ev.get("category", "spot") or "spot")
-                    api.cancel_order(category=cat, symbol=sym, orderLinkId=ensure_link_id(other_link))
-                    log("oco.guard.cancel_other", group=group_name, cancelled_link=other_link)
+                    sanitized_other = ensure_link_id(other_link)
+                    api.cancel_order(category=cat, symbol=sym, orderLinkId=sanitized_other)
+                    log("oco.guard.cancel_other", group=group_name, cancelled_link=sanitized_other)
+                    if group_key:
+                        _set_leg_status(group_key, other_leg, _LEG_STATUS_CANCELLED)
                     enqueue_telegram_message(
                         f"🧹 OCO [{group_name}] исполнено {link.split('-')[-1]}, вторая нога отменена."
                     )
                 except Exception as e:
                     log("oco.guard.cancel_error", error=str(e), group=group_name, other=other_link)
+                    if group_key:
+                        _set_leg_status(group_key, other_leg, _LEG_STATUS_CANCEL_ERROR)
                 if group_key:
                     mark_closed(group_key)
 
