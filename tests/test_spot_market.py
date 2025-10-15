@@ -805,6 +805,46 @@ def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
     assert Decimal(audit_live.get("order_notional")) <= tolerance_cap
 
 
+def test_place_spot_market_clamps_quote_after_quantization():
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "CLAMPUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "baseCoin": "CLAMP",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0",
+                    "qtyStep": "0.00000001",
+                    "minOrderAmtIncrement": "0.000001",
+                },
+                "priceFilter": {"tickSize": "0.01"},
+            }
+        ]
+    )
+    orderbook = {"result": {"a": [["1.01", "20"]], "b": [["1.00", "20"]]}}
+    api = DummyAPI(payload, orderbook_payload=orderbook)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="CLAMPUSDT",
+        side="Buy",
+        qty=Decimal("10.049999"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=0.0,
+    )
+
+    audit = response["_local"]["order_audit"]
+    requested = Decimal(audit.get("requested_quote_notional"))
+    order_notional = Decimal(audit.get("order_notional"))
+    tolerance_adjusted = Decimal(audit.get("tolerance_adjusted_notional"))
+
+    assert requested == Decimal("10.049999")
+    assert order_notional <= requested
+    assert tolerance_adjusted <= requested
+
 def test_place_spot_market_with_tolerance_merges_spot_balances_when_required_asset_missing():
     payload = _universe_payload(
         [

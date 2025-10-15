@@ -2258,7 +2258,9 @@ def prepare_spot_market_order(
                 limit_notional = qty_base * limit_price
                 _recalculate_effective_notional()
 
-    tolerance_margin = _TOLERANCE_MARGIN
+    tolerance_compare_margin = _TOLERANCE_MARGIN
+    if market_unit == "quoteCoin":
+        tolerance_compare_margin = Decimal("0")
     tolerance_guard_reduction: Decimal | None = None
 
     def _shrink_order_to_ceiling(max_quote_allowed: Decimal) -> bool:
@@ -2316,7 +2318,7 @@ def prepare_spot_market_order(
                     },
                 )
 
-            if candidate_notional - max_quote_allowed <= _TOLERANCE_MARGIN:
+            if candidate_notional - max_quote_allowed <= tolerance_compare_margin:
                 reduction = qty_base - candidate_qty
                 tolerance_guard_reduction = reduction if reduction > 0 else None
                 qty_base = candidate_qty
@@ -2363,7 +2365,7 @@ def prepare_spot_market_order(
 
     if target_quote is not None:
         tolerance_target = target_quote * tolerance_multiplier
-        if tolerance_target > 0 and limit_notional - tolerance_target > tolerance_margin:
+        if tolerance_target > 0 and limit_notional - tolerance_target > tolerance_compare_margin:
             if not _shrink_order_to_ceiling(tolerance_target):
                 raise OrderValidationError(
                     "Расчётный объём превышает допустимый предел с учётом толеранса.",
@@ -2379,7 +2381,10 @@ def prepare_spot_market_order(
                 )
 
     _recalculate_effective_notional()
-    tolerance_adjusted = effective_notional * tolerance_multiplier
+    guard_notional = effective_notional
+    if limit_notional > guard_notional:
+        guard_notional = limit_notional
+    tolerance_adjusted = guard_notional * tolerance_multiplier
 
     quote_ceiling: Decimal | None = None
     quote_ceiling_raw: Decimal | None = None
@@ -2387,14 +2392,16 @@ def prepare_spot_market_order(
     tick_gap = Decimal("0")
     if target_quote is not None:
         quote_ceiling_raw = target_quote * tolerance_multiplier
-        effective_quote = limit_notional if market_unit != "quoteCoin" else effective_notional
+        effective_quote = (
+            guard_notional if market_unit == "quoteCoin" else limit_notional
+        )
         if market_unit != "quoteCoin" and qty_step > 0:
             rounding_allowance = (qty_step * limit_price).copy_abs()
         if market_unit != "quoteCoin" and limit_price > worst_price:
             tick_gap = (limit_price - worst_price) * qty_base
         tick_allowance = tick_gap if (tolerance_decimal > 0 and market_unit != "quoteCoin") else Decimal("0")
         quote_ceiling = quote_ceiling_raw + rounding_allowance + tick_allowance
-        if effective_quote - quote_ceiling > tolerance_margin:
+        if effective_quote - quote_ceiling > tolerance_compare_margin:
             if not _shrink_order_to_ceiling(quote_ceiling_raw or tolerance_target):
                 raise OrderValidationError(
                     "Расчётный объём превышает допустимый предел с учётом толеранса.",
@@ -2412,17 +2419,20 @@ def prepare_spot_market_order(
                 )
 
             _recalculate_effective_notional()
+            guard_notional = effective_notional
+            if limit_notional > guard_notional:
+                guard_notional = limit_notional
             if market_unit != "quoteCoin":
                 effective_quote = limit_notional
             else:
-                effective_quote = effective_notional
+                effective_quote = guard_notional
 
             tick_gap = Decimal("0")
             if market_unit != "quoteCoin" and limit_price > worst_price:
                 tick_gap = (limit_price - worst_price) * qty_base
             tick_allowance = tick_gap if (tolerance_decimal > 0 and market_unit != "quoteCoin") else Decimal("0")
             quote_ceiling = (quote_ceiling_raw or Decimal("0")) + rounding_allowance + tick_allowance
-            if effective_quote - quote_ceiling > tolerance_margin:
+            if effective_quote - quote_ceiling > tolerance_compare_margin:
                 raise OrderValidationError(
                     "Расчётный объём превышает допустимый предел с учётом толеранса.",
                     code="tolerance_exceeded",
@@ -2439,7 +2449,7 @@ def prepare_spot_market_order(
                 )
 
     if max_available is not None:
-        if max_available <= 0 or tolerance_adjusted - max_available > tolerance_margin:
+        if max_available <= 0 or tolerance_adjusted - max_available > tolerance_compare_margin:
             raise OrderValidationError(
                 "Недостаточно свободного капитала с учётом допуска по проскальзыванию.",
                 code="max_quote",
