@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 if __package__ in (None, ""):
@@ -14,6 +15,7 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
+from bybit_app.utils.dataframe import arrow_safe
 from bybit_app.utils.ui import (
     build_pill,
     build_status_card,
@@ -824,7 +826,11 @@ def render_market_watchlist(
         st.caption("Пока нет тикеров в списке наблюдения — бот ждёт новый сигнал.")
         return
 
-    st.dataframe(watchlist, hide_index=True, use_container_width=True)
+    st.dataframe(
+        arrow_safe(pd.DataFrame(watchlist)),
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 def render_hidden_tools() -> None:

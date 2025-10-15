@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -11,11 +12,26 @@ from utils.paths import DATA_DIR
 from utils.spot_market import wallet_balance_payload
 from utils.ui import safe_set_page_config
 
+
+@st.cache_data(ttl=10)
+def _load_wallet_payload(account_type: str = "UNIFIED") -> dict[str, object]:
+    api_client = get_api_client()
+    return wallet_balance_payload(api_client, account_type=account_type)
+
+
+@st.cache_data(ttl=10)
+def _load_log_tail(path: Path, limit: int) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+
 safe_set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
 st.title("💰 PnL Дашборд")
 
 s = get_settings()
-api = get_api_client()
 
 def _first_numeric(source: Mapping[str, object], keys: Iterable[str]) -> float:
     """Return the first meaningful numeric value from the provided keys."""
@@ -60,7 +76,7 @@ def _iter_coin_rows(raw: object):
 
 colA, colB, colC = st.columns(3)
 try:
-    wal = wallet_balance_payload(api, account_type="UNIFIED")
+    wal = _load_wallet_payload("UNIFIED")
     lst = (wal.get("result") or {}).get("list") or []
     ava = bal = 0.0
     for account in _iter_accounts(lst):
@@ -90,7 +106,7 @@ try:
     p = DATA_DIR / "logs" / "app.log"
     sig = orders = errs = 0
     if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines()[-5000:]:
+        for line in _load_log_tail(p, 5000):
             try:
                 obj = json.loads(line)
             except Exception:
@@ -109,7 +125,7 @@ try:
     p = DATA_DIR / "logs" / "app.log"
     rows = []
     if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines()[-300:]:
+        for line in _load_log_tail(p, 300):
             try:
                 obj = json.loads(line)
             except Exception:
