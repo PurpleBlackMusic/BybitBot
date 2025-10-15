@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import types
 
+import pandas as pd
 import pytest
 
 from bybit_app.utils import ui
@@ -99,3 +100,28 @@ def test_dataframe_patch_converts_arrow_tables(monkeypatch: pytest.MonkeyPatch):
     assert result == "converted"
     assert dummy.calls == ["converted"]
     assert fake_table.converted is True
+
+
+def test_dataframe_patch_sanitises_object_columns(monkeypatch: pytest.MonkeyPatch):
+    frame = pd.DataFrame(
+        {
+            "timestamp": ["2024-01-01", "2024-01-02", None],
+            "quantity": ["1", "2", "oops"],
+        }
+    )
+
+    captured: list[pd.DataFrame] = []
+
+    def original(self, value, **kwargs):
+        captured.append(value)
+        return value
+
+    _patch_with(monkeypatch, original)
+
+    result = ui.st.dataframe(frame)
+
+    assert result is captured[0]
+    sanitised = captured[0]
+    assert sanitised is not frame
+    assert sanitised["quantity"].dtype.kind in {"f", "i"}
+    assert sanitised["timestamp"].dtype.kind == "M"
