@@ -16,6 +16,7 @@ from bybit_app.utils.market_scanner import (
     scan_market_opportunities,
     _CandleCache,
 )
+from bybit_app.utils.listing_guard import ListingStatusSnapshot
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
 from bybit_app.utils.trade_analytics import ExecutionRecord
@@ -195,6 +196,68 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert ada["probability"] < opportunities[1]["probability"]
     assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
     assert ada["model_metrics"]["correlation"] >= -0.5
+
+
+def test_scan_market_skips_stoplisted_usdc_pairs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [
+        {
+            "symbol": "BTCUSDT",
+            "turnover24h": "8000000",
+            "price24hPcnt": "2.5",
+            "bestBidPrice": "27000",
+            "bestAskPrice": "27010",
+            "volume24h": "3500",
+        },
+        {
+            "symbol": "ETHUSDC",
+            "turnover24h": "5000000",
+            "price24hPcnt": "1.4",
+            "bestBidPrice": "1800",
+            "bestAskPrice": "1800.5",
+            "volume24h": "2800",
+        },
+        {
+            "symbol": "LUNAUSDC",
+            "turnover24h": "1500000",
+            "price24hPcnt": "3.2",
+            "bestBidPrice": "0.0001",
+            "bestAskPrice": "0.00011",
+            "volume24h": "1200000",
+        },
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    snapshot = ListingStatusSnapshot(
+        timestamp=123.0,
+        trading=frozenset({"BTCUSDT"}),
+        maintenance=frozenset({"ETHUSDC"}),
+        delisted=frozenset({"LUNAUSDC"}),
+        statuses={
+            "ETHUSDC": "Maintenance",
+            "LUNAUSDC": "Delisted",
+        },
+    )
+
+    monkeypatch.setattr(
+        market_scanner_module,
+        "get_listing_status_snapshot",
+        lambda api, *, category="spot": snapshot,
+    )
+
+    opportunities = scan_market_opportunities(
+        api=object(),
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=0.0,
+        min_change_pct=-100.0,
+        max_spread_bps=1000.0,
+    )
+
+    symbols = {entry["symbol"] for entry in opportunities}
+    assert "BTCUSDT" in symbols
+    assert "ETHUSDT" not in symbols
+    assert "LUNAUSDT" not in symbols
 
 
 def test_normalise_candles_filters_outliers() -> None:

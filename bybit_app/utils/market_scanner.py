@@ -696,9 +696,22 @@ def scan_market_opportunities(
         except Exception as exc:  # pragma: no cover - defensive logging
             log("market_scanner.listing_status.error", err=str(exc))
         else:
-            maintenance_stoplist = listing_snapshot.maintenance_symbols()
-            delisted_stoplist = listing_snapshot.delisted_symbols()
-            status_lookup = dict(listing_snapshot.statuses)
+            maintenance_stoplist = _normalise_symbol_set(
+                listing_snapshot.maintenance_symbols()
+            )
+            delisted_stoplist = _normalise_symbol_set(
+                listing_snapshot.delisted_symbols()
+            )
+            normalised_status: Dict[str, str] = {}
+            for raw_symbol, status in listing_snapshot.statuses.items():
+                cleaned = str(raw_symbol).strip().upper()
+                if not cleaned:
+                    continue
+                normalised_status[cleaned] = status
+                canonical, _ = ensure_usdt_symbol(cleaned)
+                if canonical and canonical != cleaned:
+                    normalised_status.setdefault(canonical, status)
+            status_lookup = normalised_status
 
     reported_maintenance: Set[str] = set()
     reported_delisted: Set[str] = set()
