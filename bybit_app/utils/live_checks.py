@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings, active_api_key, active_api_secret, active_dry_run
@@ -670,6 +670,151 @@ def _latest_execution_details(executions: Iterable[object]) -> Optional[Dict[str
     }
 
 
+def _normalise_identifier(value: object) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+
+    if isinstance(value, bool):
+        candidate = str(value).strip()
+        return candidate or None
+
+    if isinstance(value, (int, float)):
+        candidate = str(int(value)) if isinstance(value, int) or (isinstance(value, float) and value.is_integer()) else str(value)
+        candidate = candidate.strip()
+        return candidate or None
+
+    try:
+        candidate = str(value).strip()
+    except Exception:  # pragma: no cover - defensive fallback
+        return None
+
+    return candidate or None
+
+
+def _collect_paginated_rows(
+    fetcher: Callable[..., Mapping[str, Any] | Sequence[Any] | None],
+    base_params: Dict[str, Any],
+    *,
+    timestamp_keys: Sequence[str],
+    id_keys: Sequence[str],
+    since_state: Dict[str, Optional[object]],
+    max_pages: int = 20,
+) -> List[Dict[str, Any]]:
+    cursor: Optional[str] = None
+    seen_cursors: set[str] = set()
+    collected: List[Dict[str, Any]] = []
+
+    newest_ts: Optional[float] = None
+    newest_id: Optional[str] = None
+
+    for _ in range(max_pages):
+        params = dict(base_params)
+        if cursor:
+            params["cursor"] = cursor
+
+        payload = fetcher(**params) if fetcher is not None else None
+        result: Mapping[str, Any] | Sequence[Any] | None
+        if isinstance(payload, Mapping):
+            result = payload.get("result")  # type: ignore[assignment]
+        else:
+            result = payload
+
+        if isinstance(result, Mapping):
+            rows_candidate = result.get("list")
+        else:
+            rows_candidate = result
+
+        rows_iterable: Sequence[Any]
+        if isinstance(rows_candidate, Sequence):
+            rows_iterable = rows_candidate
+        else:
+            rows_iterable = []
+
+        for entry in rows_iterable:
+            if not isinstance(entry, Mapping):
+                continue
+
+            row = dict(entry)
+            collected.append(row)
+
+            ts: Optional[float] = None
+            for key in timestamp_keys:
+                ts = _parse_epoch_seconds(row.get(key))
+                if ts is not None:
+                    break
+
+            identifier: Optional[str] = None
+            for key in id_keys:
+                identifier = _normalise_identifier(row.get(key))
+                if identifier:
+                    break
+
+            if newest_ts is None and ts is not None:
+                newest_ts = ts
+                newest_id = identifier
+
+        next_cursor_raw = None
+        if isinstance(result, Mapping):
+            next_cursor_raw = result.get("nextPageCursor")
+        next_cursor = str(next_cursor_raw).strip() if isinstance(next_cursor_raw, str) else ""
+
+        if not next_cursor or next_cursor in seen_cursors:
+            break
+
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    if newest_ts is not None:
+        since_state["since_ts"] = newest_ts
+    if newest_id:
+        since_state["since_id"] = newest_id
+
+    return collected
+
+
+_ORDER_PAGINATION_STATE: Dict[str, Optional[object]] = {"since_id": None, "since_ts": None}
+_EXECUTION_PAGINATION_STATE: Dict[str, Optional[object]] = {"since_id": None, "since_ts": None}
+
+
+def _fetch_all_open_orders(api: BybitAPI, *, category: str, open_only: int) -> List[Dict[str, Any]]:
+    params = {"category": category, "openOnly": int(open_only)}
+    return _collect_paginated_rows(
+        api.open_orders,
+        params,
+        timestamp_keys=("updatedTime", "createdTime", "ts", "transactTime"),
+        id_keys=("orderId", "orderID", "orderLinkId", "orderLinkID"),
+        since_state=_ORDER_PAGINATION_STATE,
+    )
+
+
+def _fetch_all_executions(
+    api: BybitAPI,
+    *,
+    category: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    params = {"category": category, "limit": int(limit)}
+    return _collect_paginated_rows(
+        api.execution_list,
+        params,
+        timestamp_keys=("execTime", "tradeTime", "updatedTime", "createdTime", "ts", "transactTime"),
+        id_keys=(
+            "execId",
+            "executionId",
+            "execID",
+            "executionID",
+            "execKey",
+            "tradeId",
+            "matchId",
+        ),
+        since_state=_EXECUTION_PAGINATION_STATE,
+    )
+
+
 def _format_duration(seconds: float) -> str:
     if seconds < 1:
         return "<1 сек"
@@ -776,8 +921,7 @@ def bybit_realtime_status(
     wallet_assets = _extract_wallet_assets(wallet)
 
     try:
-        orders_payload = client.open_orders(category="spot", openOnly=1)
-        orders = ((orders_payload or {}).get("result") or {}).get("list") or []
+        orders = _fetch_all_open_orders(client, category="spot", open_only=1)
     except Exception as exc:  # pragma: no cover - network errors in production only
         return {
             "title": title,
@@ -798,8 +942,7 @@ def bybit_realtime_status(
     )
 
     try:
-        executions_payload = client.execution_list(category="spot", limit=50)
-        executions = ((executions_payload or {}).get("result") or {}).get("list") or []
+        executions = _fetch_all_executions(client, category="spot", limit=50)
     except Exception as exc:  # pragma: no cover - network errors in production only
         return {
             "title": title,
