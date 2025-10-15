@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +54,17 @@ def feature_vector_from_map(features: Mapping[str, float]) -> List[float]:
     """Convert a feature mapping into an ordered vector matching the model schema."""
 
     return [float(features.get(name, 0.0)) for name in MODEL_FEATURES]
+
+
+@dataclass(frozen=True)
+class TrainingDataset:
+    """Container for training matrices and associated metadata."""
+
+    matrix: np.ndarray
+    labels: np.ndarray
+    recency_weights: np.ndarray
+    symbols: Tuple[str, ...]
+    timestamps: Tuple[Optional[float], ...]
 
 
 @dataclass
@@ -214,8 +225,8 @@ def build_training_dataset(
     data_dir: Path = DATA_DIR,
     ledger_path: Optional[Path] = None,
     limit: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return feature matrix, labels and recency weights from the execution ledger."""
+) -> TrainingDataset:
+    """Return feature matrix, labels and metadata from the execution ledger."""
 
     path = Path(ledger_path) if ledger_path is not None else _default_ledger_path(Path(data_dir))
     records = load_executions(path, limit)
@@ -223,6 +234,7 @@ def build_training_dataset(
     feature_rows: List[List[float]] = []
     targets: List[int] = []
     timestamps: List[Optional[float]] = []
+    symbols: List[str] = []
 
     for record in records:
         if record.side == "buy":
@@ -239,11 +251,18 @@ def build_training_dataset(
         feature_rows.append(vector)
         targets.append(1 if pnl > 0 else 0)
         timestamps.append(realised_ts.timestamp() if realised_ts is not None else None)
+        symbols.append(record.symbol)
 
     if not feature_rows:
         empty_matrix = np.empty((0, len(MODEL_FEATURES)))
         empty_vector = np.empty((0,))
-        return empty_matrix, empty_vector, empty_vector
+        return TrainingDataset(
+            matrix=empty_matrix,
+            labels=empty_vector,
+            recency_weights=empty_vector,
+            symbols=tuple(),
+            timestamps=tuple(),
+        )
 
     max_ts = max((ts for ts in timestamps if ts is not None), default=None)
     half_life = 6 * 3600.0  # six hours
@@ -265,7 +284,13 @@ def build_training_dataset(
     matrix = np.array(feature_rows, dtype=float)
     labels = np.array(targets, dtype=int)
     recency_weights = np.array(weights, dtype=float)
-    return matrix, labels, recency_weights
+    return TrainingDataset(
+        matrix=matrix,
+        labels=labels,
+        recency_weights=recency_weights,
+        symbols=tuple(symbols),
+        timestamps=tuple(timestamps),
+    )
 
 
 def _ensure_scaling(matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -316,6 +341,31 @@ def _balanced_sample_weights(labels: np.ndarray) -> np.ndarray:
     pos_weight = total / (2.0 * positives)
     neg_weight = total / (2.0 * negatives)
     return np.where(labels > 0, pos_weight, neg_weight)
+
+
+def _cross_sectional_weights(symbols: Sequence[str]) -> np.ndarray:
+    """Return weights that equalise contribution from each trading symbol."""
+
+    if not symbols:
+        return np.array([], dtype=float)
+
+    counts = Counter(symbols)
+    total_symbols = float(len(counts))
+    if total_symbols <= 0:
+        return np.ones(len(symbols), dtype=float)
+
+    weights = np.empty(len(symbols), dtype=float)
+    for index, name in enumerate(symbols):
+        count = float(counts.get(name, 0))
+        if count <= 0:
+            weights[index] = 0.0
+        else:
+            weights[index] = 1.0 / (total_symbols * count)
+
+    mean = weights.mean() if len(weights) else 1.0
+    if mean > 0:
+        weights /= mean
+    return weights
 
 
 def _logistic_loss(
@@ -460,6 +510,97 @@ def _train_logistic_regression(
     return weights, float(intercept)
 
 
+def _rolling_out_of_sample_metrics(
+    dataset: TrainingDataset,
+    *,
+    min_train_size: int = 25,
+    min_holdout_size: int = 5,
+) -> Mapping[str, float]:
+    """Evaluate the model with a rolling out-of-sample scheme.
+
+    The dataset is sorted chronologically and repeatedly split into a
+    growing training window with a fixed-size holdout.  Each fold is
+    retrained from scratch to avoid look-ahead bias.
+    """
+
+    total_samples = len(dataset.labels)
+    if total_samples < max(min_train_size + min_holdout_size, 2):
+        return {"folds": 0, "accuracy_mean": 0.0, "log_loss_mean": 0.0}
+
+    timestamps = list(dataset.timestamps)
+    if any(ts is not None for ts in timestamps):
+        order = sorted(
+            range(total_samples),
+            key=lambda idx: float(timestamps[idx]) if timestamps[idx] is not None else -math.inf,
+        )
+    else:
+        order = list(range(total_samples))
+
+    holdout = max(min_holdout_size, int(total_samples * 0.1))
+    train_start = max(min_train_size, holdout)
+    if train_start + holdout > total_samples:
+        train_start = max(total_samples - holdout, min_train_size)
+
+    accuracies: List[float] = []
+    losses: List[float] = []
+
+    step = max(1, holdout // 2)
+    for split in range(train_start, total_samples - holdout + 1, step):
+        train_idx = order[:split]
+        test_idx = order[split : split + holdout]
+
+        train_labels = dataset.labels[train_idx]
+        if len(train_labels) == 0:
+            continue
+
+        try:
+            class_weights = _balanced_sample_weights(train_labels)
+        except ValueError:
+            continue
+
+        train_features = dataset.matrix[train_idx]
+        normalized, means, stds = _ensure_scaling(train_features)
+
+        cross_weights = _cross_sectional_weights([dataset.symbols[i] for i in train_idx])
+        recency = dataset.recency_weights[train_idx]
+        if len(recency) == 0:
+            recency = np.ones(len(train_idx), dtype=float)
+
+        combined = class_weights * recency * cross_weights
+        combined = _normalise_sample_weights(combined)
+
+        coefficients, intercept = _train_logistic_regression(
+            normalized,
+            train_labels,
+            sample_weights=combined,
+        )
+
+        test_features = dataset.matrix[test_idx]
+        safe_stds = np.where(np.abs(stds) < 1e-8, 1e-8, stds)
+        test_normalized = (test_features - means) / safe_stds
+        test_labels = dataset.labels[test_idx]
+        if len(test_labels) == 0:
+            continue
+
+        accuracy, log_loss_value = _evaluate_training_metrics(
+            coefficients,
+            intercept,
+            test_normalized,
+            test_labels,
+            np.ones(len(test_labels), dtype=float),
+        )
+
+        accuracies.append(float(accuracy))
+        losses.append(float(log_loss_value))
+
+    if not accuracies:
+        return {"folds": 0, "accuracy_mean": 0.0, "log_loss_mean": 0.0}
+
+    accuracy_mean = float(np.mean(accuracies))
+    log_loss_mean = float(np.mean(losses))
+    return {"folds": len(accuracies), "accuracy_mean": accuracy_mean, "log_loss_mean": log_loss_mean}
+
+
 def train_market_model(
     *,
     data_dir: Path = DATA_DIR,
@@ -467,12 +608,27 @@ def train_market_model(
     limit: Optional[int] = None,
     model_path: Optional[Path] = None,
     min_samples: int = 25,
+    min_symbols: int = 2,
 ) -> Optional[MarketModel]:
     """Train a logistic regression model and persist it to disk."""
 
-    matrix, labels, recency_weights = build_training_dataset(
+    dataset = build_training_dataset(
         data_dir=data_dir, ledger_path=ledger_path, limit=limit
     )
+    matrix = dataset.matrix
+    labels = dataset.labels
+    recency_weights = dataset.recency_weights
+    cross_sectional = _cross_sectional_weights(dataset.symbols)
+    if len(cross_sectional) == 0:
+        cross_sectional = np.ones(len(labels), dtype=float)
+    unique_symbols = {symbol for symbol in dataset.symbols}
+    if min_symbols > 1 and len(unique_symbols) < min_symbols:
+        log(
+            "market_model.training_skipped",
+            reason="insufficient_symbols",
+            symbols=len(unique_symbols),
+        )
+        return None
     if len(matrix) < max(min_samples, 1):
         return None
 
@@ -488,10 +644,10 @@ def train_market_model(
         intercept = _logit(probability)
         feature_count = matrix.shape[1]
         coefficients = np.zeros(feature_count, dtype=float)
-        metrics_weights = _normalise_sample_weights(recency_weights)
+        metrics_weights = _normalise_sample_weights(recency_weights * cross_sectional)
     else:
         class_weights = _balanced_sample_weights(labels)
-        combined_weights = class_weights * recency_weights
+        combined_weights = class_weights * recency_weights * cross_sectional
         coefficients, intercept = _train_logistic_regression(
             normalized, labels, sample_weights=combined_weights
         )
@@ -501,12 +657,18 @@ def train_market_model(
         coefficients, intercept, normalized, labels, metrics_weights
     )
 
+    rolling_metrics = _rolling_out_of_sample_metrics(dataset)
+
     log(
         "market_model.training_metrics",
         samples=int(len(labels)),
         accuracy=float(accuracy),
         log_loss=float(log_loss_value),
         positive_rate=float(labels.mean() if len(labels) else 0.0),
+        symbols=len(unique_symbols),
+        oos_folds=int(rolling_metrics.get("folds", 0)),
+        oos_accuracy=float(rolling_metrics.get("accuracy_mean", 0.0)),
+        oos_log_loss=float(rolling_metrics.get("log_loss_mean", 0.0)),
     )
 
     payload = _serialize_model(

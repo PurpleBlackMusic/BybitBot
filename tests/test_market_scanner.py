@@ -279,12 +279,12 @@ def test_build_training_dataset_emits_recency_weights(tmp_path: Path) -> None:
     ]
     _write_ledger(ledger_path, records)
 
-    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+    dataset = ai_models.build_training_dataset(ledger_path=ledger_path)
 
-    assert matrix.shape[0] == 2
-    assert labels.tolist() == [1, 0]
-    assert np.all(recency > 0)
-    assert recency[0] < recency[1] <= 1.0
+    assert dataset.matrix.shape[0] == 2
+    assert dataset.labels.tolist() == [1, 0]
+    assert np.all(dataset.recency_weights > 0)
+    assert dataset.recency_weights[0] < dataset.recency_weights[1] <= 1.0
 
 
 def test_build_training_dataset_handles_negative_fees(tmp_path: Path) -> None:
@@ -320,12 +320,12 @@ def test_build_training_dataset_handles_negative_fees(tmp_path: Path) -> None:
     assert executions[1].raw_fee == pytest.approx(-0.1)
     assert executions[1].fee == pytest.approx(-10.0)
 
-    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+    dataset = ai_models.build_training_dataset(ledger_path=ledger_path)
 
-    assert matrix.shape == (1, len(ai_models.MODEL_FEATURES))
-    assert labels.tolist() == [1]
-    assert recency.shape == (1,)
-    assert recency[0] > 0
+    assert dataset.matrix.shape == (1, len(ai_models.MODEL_FEATURES))
+    assert dataset.labels.tolist() == [1]
+    assert dataset.recency_weights.shape == (1,)
+    assert dataset.recency_weights[0] > 0
 
 
 def test_train_market_model_logs_metrics_and_uses_weights(
@@ -370,12 +370,32 @@ def test_train_market_model_logs_metrics_and_uses_weights(
             "isMaker": False,
             "execTime": now - 840,
         },
+        {
+            "symbol": "ETHUSDT",
+            "side": "buy",
+            "execQty": "0.5",
+            "execPrice": "3000",
+            "execFee": "-0.25",
+            "isMaker": True,
+            "execTime": now - 400,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "side": "sell",
+            "execQty": "0.5",
+            "execPrice": "3300",
+            "execFee": "0.25",
+            "isMaker": False,
+            "execTime": now - 360,
+        },
     ]
     _write_ledger(ledger_path, records)
 
-    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+    dataset = ai_models.build_training_dataset(ledger_path=ledger_path)
+    labels = dataset.labels
     class_weights = ai_models._balanced_sample_weights(labels)
-    expected = class_weights * recency
+    cross_sectional = ai_models._cross_sectional_weights(dataset.symbols)
+    expected = class_weights * dataset.recency_weights * cross_sectional
 
     captured_weights: dict[str, np.ndarray] = {}
     original_train = ai_models._train_logistic_regression
@@ -440,6 +460,7 @@ def test_train_market_model_logs_metrics_and_uses_weights(
         ledger_path=ledger_path,
         model_path=model_path,
         min_samples=1,
+        min_symbols=2,
     )
 
     assert model is not None
@@ -452,10 +473,65 @@ def test_train_market_model_logs_metrics_and_uses_weights(
     assert logged
     event, payload = logged[-1]
     assert event == "market_model.training_metrics"
-    assert payload["samples"] == 2
+    assert payload["samples"] == len(labels)
     assert 0.0 <= payload["accuracy"] <= 1.0
     assert payload["log_loss"] >= 0.0
     assert payload["positive_rate"] == pytest.approx(float(labels.mean()))
+    assert payload["symbols"] >= 2
+    assert payload["oos_folds"] >= 0
+    assert payload["oos_accuracy"] >= 0.0
+    assert payload["oos_log_loss"] >= 0.0
+
+
+def test_train_market_model_requires_multiple_symbols(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = time.time()
+    ledger_path = tmp_path / "executions.jsonl"
+    records = [
+        {
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "execQty": "0.1",
+            "execPrice": "10000",
+            "execFee": "-0.1",
+            "isMaker": True,
+            "execTime": now - 120,
+        },
+        {
+            "symbol": "BTCUSDT",
+            "side": "sell",
+            "execQty": "0.1",
+            "execPrice": "10100",
+            "execFee": "0.1",
+            "isMaker": False,
+            "execTime": now - 60,
+        },
+    ]
+    _write_ledger(ledger_path, records)
+
+    logged: list[tuple[str, dict[str, object]]] = []
+
+    def fake_log(
+        event: str,
+        *,
+        severity: str | None = None,
+        exc: BaseException | None = None,
+        **payload: object,
+    ) -> None:
+        logged.append((event, payload))
+
+    monkeypatch.setattr(ai_models, "log", fake_log)
+
+    model = ai_models.train_market_model(
+        data_dir=tmp_path,
+        ledger_path=ledger_path,
+        min_samples=1,
+        min_symbols=2,
+    )
+
+    assert model is None
+    assert any(event == "market_model.training_skipped" for event, _ in logged)
 
 
 def test_market_scanner_respects_whitelist(tmp_path: Path) -> None:
