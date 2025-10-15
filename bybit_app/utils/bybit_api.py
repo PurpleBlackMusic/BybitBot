@@ -5,7 +5,9 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 import requests
 from functools import lru_cache
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from tenacity import (
@@ -48,6 +50,50 @@ class BybitCreds:
     secret: str
     testnet: bool = True
 
+@dataclass
+class _OrderRegistryEntry:
+    signature: str
+    payload: dict[str, object]
+    response: Mapping[str, object] | None
+    timestamp: float
+
+
+class _LocalOrderRegistry:
+    """Keep a bounded record of recently placed orders for idempotency."""
+
+    def __init__(self, *, max_entries: int = 256) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._entries: OrderedDict[str, _OrderRegistryEntry] = OrderedDict()
+
+    def _prune(self) -> None:
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def remember(
+        self,
+        link_id: str,
+        *,
+        signature: str,
+        payload: dict[str, object],
+        response: Mapping[str, object] | None,
+        timestamp: float,
+    ) -> None:
+        self._entries[link_id] = _OrderRegistryEntry(
+            signature=signature,
+            payload=dict(payload),
+            response=deepcopy(response) if isinstance(response, Mapping) else response,
+            timestamp=timestamp,
+        )
+        self._entries.move_to_end(link_id)
+        self._prune()
+
+    def lookup(self, link_id: str) -> _OrderRegistryEntry | None:
+        entry = self._entries.get(link_id)
+        if entry is not None:
+            self._entries.move_to_end(link_id)
+        return entry
+
+
 class BybitAPI:
     def __init__(self, creds: BybitCreds, recv_window: int = 15000, timeout: int = 10000, verify_ssl: bool = True):
         self.creds = creds
@@ -55,6 +101,7 @@ class BybitAPI:
         self.timeout = int(timeout)
         self.verify_ssl = bool(verify_ssl)
         self.session = requests.Session()
+        self._order_registry = _LocalOrderRegistry()
 
     @property
     def base(self) -> str:
@@ -277,6 +324,18 @@ class BybitAPI:
             payload[key] = sanitised
 
     @staticmethod
+    def _is_successful_response(response: Mapping[str, object] | None) -> bool:
+        if not isinstance(response, Mapping):
+            return False
+        ret_code = response.get("retCode")
+        if ret_code is None:
+            return False
+        try:
+            return int(ret_code) == 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _json_safe(value: Any) -> Any:
         if isinstance(value, Decimal):
             return format(value, "f")
@@ -466,7 +525,41 @@ class BybitAPI:
         self._normalise_numeric_fields(payload, numeric_fields)
         self._sanitise_order_link_id(payload)
 
+        order_link_id: str | None
+        link_candidate = payload.get("orderLinkId")
+        if isinstance(link_candidate, str) and link_candidate.strip():
+            order_link_id = link_candidate.strip()
+        else:
+            order_link_id = None
+
+        json_payload = self._json_safe(payload)
+        if isinstance(json_payload, Mapping):
+            json_payload = dict(json_payload)
+        payload_signature = json.dumps(
+            json_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
         log_meta = self._order_log_meta(payload)
+
+        if order_link_id:
+            existing = self._order_registry.lookup(order_link_id)
+            if existing is not None:
+                if existing.signature != payload_signature:
+                    log(
+                        "order.idempotent.conflict",
+                        **log_meta,
+                        existingPayload=existing.payload,
+                    )
+                    raise ValueError(
+                        "orderLinkId reused with different parameters; "
+                        "generate a new link id to submit a new order"
+                    )
+                log("order.idempotent.skip", **log_meta)
+                return deepcopy(existing.response) if isinstance(existing.response, Mapping) else existing.response
+
         normalised_changes = {}
         for key, before in pre_normalised.items():
             after = payload.get(key)
@@ -498,6 +591,20 @@ class BybitAPI:
 
         response_payload = self._json_safe(response)
         log("order.response", **log_meta, payload=response_payload)
+
+        if order_link_id and self._is_successful_response(response):
+            json_response = (
+                dict(response_payload)
+                if isinstance(response_payload, Mapping)
+                else response
+            )
+            self._order_registry.remember(
+                order_link_id,
+                signature=payload_signature,
+                payload=json_payload if isinstance(json_payload, dict) else {},
+                response=json_response if isinstance(json_response, Mapping) else None,
+                timestamp=time.time(),
+            )
 
         return response
 
