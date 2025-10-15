@@ -31,16 +31,15 @@ from .trade_notifications import format_sell_close_message
 from .ws_events import fetch_events as _fetch_ws_events
 from .ws_events import event_queue_stats as _ws_event_stats
 from .ws_events import publish_event as _publish_ws_event
-
-
-_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
+from .bybit_errors import parse_bybit_error_message
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
 def _extract_error_code(exc: Exception) -> Optional[str]:
-    match = _BYBIT_ERROR.search(str(exc))
-    if match:
-        return match.group("code")
+    parsed = parse_bybit_error_message(str(exc))
+    if parsed:
+        code, _ = parsed
+        return code
     return None
 
 
