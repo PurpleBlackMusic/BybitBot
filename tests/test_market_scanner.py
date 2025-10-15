@@ -34,6 +34,11 @@ if "sklearn" not in sys.modules:  # pragma: no cover - test shim for optional de
     base_module.BaseEstimator = _DummyBaseEstimator
     base_module.ClassifierMixin = _DummyClassifierMixin
 
+    def _clone(estimator, safe=True):  # pragma: no cover - dummy implementation
+        return estimator
+
+    base_module.clone = _clone
+
     linear_module = types.ModuleType("sklearn.linear_model")
 
     class _DummyLogisticRegression:
@@ -403,6 +408,11 @@ def test_scan_market_opportunities_includes_trade_costs(
 
     monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
 
+    def fake_fee_rate_for_symbol(*_, **__):
+        return FeeRateSnapshot(maker_rate=0.0002, taker_rate=0.0006)
+
+    monkeypatch.setattr(market_scanner_module, "fee_rate_for_symbol", fake_fee_rate_for_symbol)
+
     settings = Settings(
         testnet=False,
         ai_live_only=False,
@@ -427,10 +437,19 @@ def test_scan_market_opportunities_includes_trade_costs(
     costs = entry.get("costs_bps")
     assert costs is not None
     expected_spread = ((10.02 - 10.0) / 10.02) * 10_000.0
+    expected_guard = 0.0006 * 2 * 10_000.0
     assert costs["spread"] == pytest.approx(expected_spread, rel=1e-6)
-    assert costs["fees"] == pytest.approx(12.0, rel=1e-6)
+    expected_fee_round_trip = (
+        costs["maker_fee_bps"] * costs["maker_ratio"]
+        + costs["taker_fee_bps"] * (1.0 - costs["maker_ratio"])
+    ) * 2.0
+    assert costs["fees"] == pytest.approx(expected_fee_round_trip, rel=1e-6)
     assert costs["slippage"] == pytest.approx(4.0, rel=1e-6)
-    assert costs["total"] == pytest.approx(costs["fees"] + costs["slippage"] + costs["spread"], rel=1e-6)
+    assert costs["fee_guard_bps"] == pytest.approx(expected_guard, rel=1e-6)
+    assert costs["total"] == pytest.approx(
+        costs["fees"] + costs["slippage"] + costs["spread"] + expected_guard,
+        rel=1e-6,
+    )
 
     gross = entry.get("gross_ev_bps")
     assert gross is not None and gross > 0
@@ -495,6 +514,12 @@ def test_scan_market_opportunities_uses_api_fee_rate(
     assert costs["maker_fee_bps"] == pytest.approx(6.0, rel=1e-6)
     assert costs["taker_fee_bps"] == pytest.approx(12.0, rel=1e-6)
     assert costs["fee_source"] == "api"
+    expected_guard = 0.0012 * 2 * 10_000.0
+    assert costs["fee_guard_bps"] == pytest.approx(expected_guard, rel=1e-6)
+    assert costs["total"] == pytest.approx(
+        costs["fees"] + costs["slippage"] + costs["spread"] + expected_guard,
+        rel=1e-6,
+    )
 
 
 def test_training_dataset_prorates_fee_for_oversized_sell(tmp_path: Path) -> None:
