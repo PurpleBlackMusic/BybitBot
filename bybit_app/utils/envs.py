@@ -1,7 +1,7 @@
 from __future__ import annotations
-import os, json
+import os, json, re
 from dataclasses import dataclass, asdict, fields
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
@@ -334,6 +334,50 @@ def _read_env() -> Dict[str, Optional[str]]:
     return {k: os.getenv(v) for k, v in _ENV_MAP.items()}
 
 
+def _normalise_symbol_csv(value: object) -> Optional[str]:
+    """Convert environment overrides to a canonical comma separated list.
+
+    The trading stack historically accepted both comma and whitespace separated
+    inputs for symbol filters. When the configuration is supplied via
+    environment variables (for example ``AI_SYMBOLS`` or ``AI_WHITELIST``) the
+    value can therefore contain spaces, new lines or repeated entries. Without
+    normalisation the downstream logic would often end up with a single symbol
+    (everything after the first separator being ignored), leading to the
+    "торгуется только один тикер" behaviour on the testnet.  By converting the
+    environment override into an uppercase, comma separated, de-duplicated
+    payload we ensure the rest of the application sees the full list of
+    requested instruments regardless of the separator style.
+    """
+
+    if value is None:
+        return None
+
+    items: Iterable[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        # Split on commas, semicolons or whitespace to support flexible env
+        # formatting (including multi-line values).
+        tokens = re.split(r"[\s,;]+", stripped)
+        items = [token for token in tokens if token]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+    else:
+        items = str(value).split(",")
+
+    cleaned: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        symbol = text.upper()
+        if symbol not in cleaned:
+            cleaned.append(symbol)
+
+    return ",".join(cleaned)
+
+
 def _env_signature(env: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
     return tuple(sorted(env.items()))
 
@@ -388,6 +432,11 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
     m["ai_max_hold_minutes"] = _cast_float(m.get("ai_max_hold_minutes"))
     m["ai_min_exit_bps"] = _cast_float(m.get("ai_min_exit_bps"))
+
+    for csv_field in ("ai_symbols", "ai_whitelist"):
+        cleaned = _normalise_symbol_csv(m.get(csv_field))
+        if cleaned is not None:
+            m[csv_field] = cleaned
 
     m["recv_window_ms"] = _cast_int(m.get("recv_window_ms"))
     m["http_timeout_ms"] = _cast_int(m.get("http_timeout_ms"))
