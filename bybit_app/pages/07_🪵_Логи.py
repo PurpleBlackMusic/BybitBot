@@ -5,11 +5,16 @@ from utils.dataframe import arrow_safe
 from utils.log import read_tail
 from utils.ui import safe_set_page_config, inject_css
 
+
+@st.cache_data(ttl=10)
+def _load_log_tail(limit: int) -> list[str]:
+    return read_tail(limit)
+
 safe_set_page_config(page_title="Логи", page_icon="🪵", layout="wide")
 inject_css()
 st.title("🪵 Логи")
 
-lines = read_tail(1000)
+lines = _load_log_tail(1000)
 rows = []
 full = []
 for ln in lines:
