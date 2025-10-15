@@ -3139,6 +3139,132 @@ def test_signal_executor_clamps_percent_slippage(monkeypatch: pytest.MonkeyPatch
     assert captured["tol_value"] == pytest.approx(5.0)
 
 
+def test_signal_executor_follows_up_partial_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    monkeypatch.setattr(
+        SignalExecutor,
+        "_ledger_rows_snapshot",
+        lambda self, **_: ([], None),
+    )
+    monkeypatch.setattr(
+        SignalExecutor,
+        "_place_tp_ladder",
+        lambda *args, **kwargs: ([], {}),
+    )
+    monkeypatch.setattr(
+        SignalExecutor,
+        "_maybe_notify_trade",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "private_snapshot",
+        lambda: {},
+    )
+
+    def fake_compute_notional(
+        self,
+        settings_obj: Settings,
+        total_equity: float,
+        available_equity: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> Tuple[float, float, bool, bool]:
+        return 100.0, available_equity, False, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute_notional,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    def _attempt_payload(executed_quote: str, leaves_base: str) -> dict[str, object]:
+        return {
+            "executed_base": str(Decimal(executed_quote) / Decimal("25000")),
+            "executed_quote": executed_quote,
+            "leaves_base": leaves_base,
+        }
+
+    responses = [
+        {
+            "result": {"cumExecQty": "0.002", "cumExecValue": "50"},
+            "_local": {
+                "order_audit": {
+                    "quote_step": "0.01",
+                    "min_order_amt": "5",
+                    "qty_step": "0.00000001",
+                },
+                "attempts": [
+                    _attempt_payload("50", "0.002"),
+                ],
+            },
+        },
+        {
+            "result": {"cumExecQty": "0.002", "cumExecValue": "50"},
+            "_local": {
+                "order_audit": {
+                    "quote_step": "0.01",
+                    "min_order_amt": "5",
+                    "qty_step": "0.00000001",
+                },
+                "attempts": [
+                    _attempt_payload("50", "0"),
+                ],
+            },
+        },
+    ]
+
+    def fake_place(api_obj, **kwargs):
+        attempts.append(kwargs)
+        response = responses[min(len(attempts) - 1, len(responses) - 1)]
+        return copy.deepcopy(response)
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        fake_place,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(attempts) == 2
+    assert result.order is not None
+    partial_meta = result.order.get("partial_fill")
+    assert isinstance(partial_meta, dict)
+    assert partial_meta.get("status") == "complete"
+    followups = partial_meta.get("followups")
+    assert isinstance(followups, list) and followups
+    assert followups[0].get("status") == "filled"
+    assert followups[0].get("executed_quote") == "50"
+
+    response_meta = result.response.get("_local") if isinstance(result.response, dict) else {}
+    attempts_meta = response_meta.get("attempts") if isinstance(response_meta, dict) else None
+    assert isinstance(attempts_meta, list)
+    assert len(attempts_meta) == 2
+
+
 def test_signal_executor_prefers_trade_candidate_over_holdings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
