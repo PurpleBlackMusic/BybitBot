@@ -245,6 +245,58 @@ def _resolve_trade_cost_profile(
     return _cached_cost_profile(signature, taker_hint, maker_hint, slippage_hint)
 
 
+def _default_fee_guard_bps(settings: Optional["Settings"]) -> float:
+    """Return the configured fallback fee guard expressed in basis points."""
+
+    return max(_safe_setting_float(settings, "spot_tp_fee_guard_bps", 20.0), 0.0)
+
+
+def _resolve_symbol_fee_guard_bps(
+    symbol: str,
+    *,
+    settings: Optional["Settings"],
+    api: Optional[BybitAPI],
+    cache: Dict[str, float],
+) -> float:
+    """Resolve the dynamic fee guard for a symbol in basis points."""
+
+    if not symbol:
+        return 0.0
+
+    cached = cache.get(symbol)
+    if cached is not None:
+        return cached
+
+    sentinel = _default_fee_guard_bps(settings)
+    override_value: Optional[float] = None
+    if settings is not None:
+        candidate = _safe_float(getattr(settings, "spot_tp_fee_guard_bps", None))
+        if candidate is not None and candidate > 0:
+            override_value = float(candidate)
+
+    if override_value is not None and override_value > 0 and override_value != sentinel:
+        guard_bps = override_value
+    else:
+        guard_bps = sentinel
+        snapshot = fee_rate_for_symbol(category="spot", symbol=symbol)
+        combined: Optional[float] = None
+        if snapshot is not None:
+            taker_bps = snapshot.taker_fee_bps
+            maker_bps = snapshot.maker_fee_bps
+            if taker_bps is not None and taker_bps != 0:
+                combined = abs(float(taker_bps)) * 2.0
+            elif maker_bps is not None and maker_bps != 0:
+                combined = abs(float(maker_bps)) * 2.0
+        if combined is not None and combined > 0:
+            guard_bps = combined
+        elif override_value is not None and override_value > 0:
+            guard_bps = override_value
+
+    guard_bps = max(float(guard_bps), 0.0)
+    cache[symbol] = guard_bps
+    return guard_bps
+
+
 class MarketScannerError(RuntimeError):
     """Raised when the market snapshot cannot be loaded."""
 
@@ -893,6 +945,7 @@ def scan_market_opportunities(
         return normalised
 
     entries: List[Dict[str, object]] = []
+    fee_guard_cache: Dict[str, float] = {}
     wset = _normalise_symbol_set(whitelist or ())
     bset = _normalise_symbol_set(blacklist or ())
 
@@ -1068,7 +1121,6 @@ def scan_market_opportunities(
             direction = -1
 
         gross_bps: Optional[float] = None
-        total_cost_bps: Optional[float] = None
         spread_component = max(float(spread_bps or 0.0), 0.0)
 
         maker_fee_bps = base_maker_fee_bps
@@ -1094,15 +1146,33 @@ def scan_market_opportunities(
         effective_fee_bps = maker_fee_bps * maker_ratio + taker_fee_bps * (1.0 - maker_ratio)
         fee_round_trip_bps = effective_fee_bps * 2.0
 
+        base_cost_bps = fee_round_trip_bps + slippage_cost_bps + spread_component
+        guard_key = symbol if symbol else ""
+        fee_guard_bps_value = (
+            _resolve_symbol_fee_guard_bps(
+                guard_key,
+                settings=settings,
+                api=api,
+                cache=fee_guard_cache,
+            )
+            if guard_key
+            else 0.0
+        )
+        fee_guard_bps_value = max(float(fee_guard_bps_value), 0.0)
+        total_cost_bps = max(base_cost_bps + fee_guard_bps_value, 0.0)
+
         if change_pct is not None:
             directional_change = float(change_pct)
             if direction != 0:
                 directional_change *= direction
-            gross_bps = directional_change * 100.0
-            total_cost_bps = fee_round_trip_bps + slippage_cost_bps + spread_component
-            ev_bps = gross_bps - total_cost_bps
+            ev_pct_raw = directional_change
+            gross_bps = ev_pct_raw * 100.0
+            total_cost_pct = total_cost_bps / 100.0
+            ev_pct = ev_pct_raw - total_cost_pct
+            ev_bps = ev_pct * 100.0
         else:
             ev_bps = None
+            total_cost_bps = total_cost_bps if total_cost_bps > 0 else 0.0
 
         note_parts: List[str] = []
         if change_pct is not None:
@@ -1166,6 +1236,7 @@ def scan_market_opportunities(
                 "fees": fee_round_trip_bps,
                 "slippage": slippage_cost_bps,
                 "spread": spread_component,
+                "fee_guard_bps": fee_guard_bps_value,
                 "maker_fee_bps": maker_fee_bps,
                 "taker_fee_bps": taker_fee_bps,
                 "maker_ratio": maker_ratio,
