@@ -18,6 +18,7 @@ orders without making extra HTTP calls.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass
@@ -102,6 +103,10 @@ class SymbolResolver:
         self._by_symbol: Dict[str, InstrumentMetadata] = {}
         self._last_refresh: float = 0.0
         self._lock = threading.Lock()
+        self._refresh_lock: asyncio.Lock | None = None
+        self._refresh_lock_loop: asyncio.AbstractEventLoop | None = None
+        self._refresh_future: asyncio.Future[None] | None = None
+        self._refresh_future_loop: asyncio.AbstractEventLoop | None = None
 
         if bootstrap_rows is not None:
             self._build_index(bootstrap_rows)
@@ -113,12 +118,60 @@ class SymbolResolver:
     def refresh(self) -> None:
         """Fetch the latest instrument catalogue from the Bybit API."""
 
+        rows = self._fetch_rows()
+        self._build_index(rows)
+
+    async def refresh_async(self) -> None:
+        """Refresh the instrument catalogue without duplicate network calls."""
+
         if self.api is None:
             raise RuntimeError("API client not configured for SymbolResolver")
 
-        response = self.api.instruments_info(category=self.category)
-        rows = _extract_rows(response)
-        self._build_index(rows)
+        loop = asyncio.get_running_loop()
+
+        future = self._refresh_future
+        if (
+            future is not None
+            and not future.done()
+            and self._refresh_future_loop is loop
+        ):
+            await asyncio.shield(future)
+            return
+
+        lock = self._ensure_refresh_lock(loop)
+
+        async with lock:
+            future = self._refresh_future
+            if (
+                future is not None
+                and not future.done()
+                and self._refresh_future_loop is loop
+            ):
+                await asyncio.shield(future)
+                return
+
+            future = loop.create_future()
+            self._refresh_future = future
+            self._refresh_future_loop = loop
+
+            try:
+                rows = await loop.run_in_executor(None, self._fetch_rows)
+                self._build_index(rows)
+            except Exception as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                self._refresh_future = None
+                self._refresh_future_loop = None
+                raise
+            else:
+                if not future.done():
+                    future.set_result(None)
+
+        await asyncio.shield(future)
+
+        if future.done() and self._refresh_future is future:
+            self._refresh_future = None
+            self._refresh_future_loop = None
 
     @property
     def last_refresh(self) -> float:
@@ -208,6 +261,21 @@ class SymbolResolver:
             self._index = index
             self._by_symbol = by_symbol
             self._last_refresh = time.time()
+
+    def _fetch_rows(self) -> Sequence[Mapping[str, object]]:
+        if self.api is None:
+            raise RuntimeError("API client not configured for SymbolResolver")
+
+        response = self.api.instruments_info(category=self.category)
+        return _extract_rows(response)
+
+    def _ensure_refresh_lock(self, loop: asyncio.AbstractEventLoop) -> asyncio.Lock:
+        lock = self._refresh_lock
+        if lock is None or self._refresh_lock_loop is not loop:
+            lock = asyncio.Lock()
+            self._refresh_lock = lock
+            self._refresh_lock_loop = loop
+        return lock
 
 
 # ----------------------------------------------------------------------

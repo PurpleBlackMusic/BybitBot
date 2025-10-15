@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from decimal import Decimal
 
 from bybit_app.utils.symbol_resolver import InstrumentMetadata, SymbolResolver
@@ -139,4 +141,29 @@ def test_symbol_resolver_prefers_canonical_listing_over_alias() -> None:
     btc = resolver.resolve_symbol("btc")
     assert btc is not None
     assert btc.symbol == "BTCUSDT"
+
+
+def test_symbol_resolver_refresh_async_coalesces() -> None:
+    rows = _sample_rows()
+    api = DummyAPI(rows)
+    resolver = SymbolResolver(api=api, refresh=False)
+
+    def slow_instruments_info(category: str = "spot", symbol: str | None = None):
+        api.calls += 1
+        time.sleep(0.05)
+        return {"result": {"category": category, "list": list(rows)}}
+
+    api.instruments_info = slow_instruments_info  # type: ignore[assignment]
+
+    async def _run() -> None:
+        await asyncio.gather(
+            resolver.refresh_async(),
+            resolver.refresh_async(),
+            resolver.refresh_async(),
+        )
+
+    asyncio.run(_run())
+
+    assert api.calls == 1
+    assert resolver.metadata("BBSOLUSDT") is not None
 
