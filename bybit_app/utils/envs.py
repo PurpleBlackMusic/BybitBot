@@ -120,6 +120,9 @@ class Settings:
     ai_buy_threshold: float = 0.55
     ai_sell_threshold: float = 0.45
     ai_daily_loss_limit_pct: float = 3.0
+    ai_max_trade_loss_pct: float = 0.0
+    ai_portfolio_loss_limit_pct: float = 0.0
+    ai_kill_switch_cooldown_min: float = 60.0
     ai_min_ev_bps: float = 0.0
     ai_retrain_minutes: int = 60
     ai_max_concurrent: int = 3
@@ -299,6 +302,9 @@ _ENV_MAP = {
     "ai_sell_threshold": "AI_SELL_THRESHOLD",
     "ai_risk_per_trade_pct": "AI_RISK_PER_TRADE_PCT",
     "ai_daily_loss_limit_pct": "AI_DAILY_LOSS_LIMIT_PCT",
+    "ai_max_trade_loss_pct": "AI_MAX_TRADE_LOSS_PCT",
+    "ai_portfolio_loss_limit_pct": "AI_PORTFOLIO_LOSS_LIMIT_PCT",
+    "ai_kill_switch_cooldown_min": "AI_KILL_SWITCH_COOLDOWN_MIN",
     "ai_min_ev_bps": "AI_MIN_EV_BPS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
@@ -438,6 +444,13 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_slippage_bps"] = _cast_int(m.get("ai_slippage_bps"))
     m["ai_risk_per_trade_pct"] = _cast_float(m.get("ai_risk_per_trade_pct"))
     m["ai_daily_loss_limit_pct"] = _cast_float(m.get("ai_daily_loss_limit_pct"))
+    m["ai_max_trade_loss_pct"] = _cast_float(m.get("ai_max_trade_loss_pct"))
+    m["ai_portfolio_loss_limit_pct"] = _cast_float(
+        m.get("ai_portfolio_loss_limit_pct")
+    )
+    m["ai_kill_switch_cooldown_min"] = _cast_float(
+        m.get("ai_kill_switch_cooldown_min")
+    )
     m["ai_min_ev_bps"] = _cast_float(m.get("ai_min_ev_bps"))
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))

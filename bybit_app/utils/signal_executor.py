@@ -44,6 +44,7 @@ from .pnl import (
     read_ledger,
     invalidate_daily_pnl_cache,
 )
+from .ai.kill_switch import get_state as kill_switch_state, set_pause as activate_kill_switch
 from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -1572,6 +1573,7 @@ class SignalExecutor:
         current_time: Optional[float] = None,
         summary_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
         price_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
+        portfolio_total_equity: Optional[float] = None,
     ) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
         if not isinstance(summary, Mapping):
             return None, None
@@ -1596,6 +1598,18 @@ class SignalExecutor:
 
         defaults_applied: Dict[str, object] = {}
         defaults_meta: Dict[str, object] = {}
+
+        try:
+            trade_loss_limit_pct = float(
+                getattr(settings, "ai_max_trade_loss_pct", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            trade_loss_limit_pct = 0.0
+
+        equity_base = None
+        if isinstance(portfolio_total_equity, (int, float)):
+            if math.isfinite(portfolio_total_equity) and portfolio_total_equity > 0:
+                equity_base = float(portfolio_total_equity)
 
         if hold_limit_minutes <= 0 or pnl_limit is None:
             trade_stats: Optional[Mapping[str, object]]
@@ -1636,7 +1650,7 @@ class SignalExecutor:
                 **defaults_meta,
             )
 
-        if hold_limit_minutes <= 0 and pnl_limit is None:
+        if hold_limit_minutes <= 0 and pnl_limit is None and trade_loss_limit_pct <= 0:
             return None, None
 
         now = current_time if current_time is not None else self._current_time()
@@ -1699,6 +1713,25 @@ class SignalExecutor:
                         "threshold_bps": float(pnl_limit),
                     }
                 )
+
+            pnl_value = info.get("pnl_value")
+            if (
+                trade_loss_limit_pct > 0
+                and equity_base is not None
+                and isinstance(pnl_value, (int, float))
+                and pnl_value < 0
+            ):
+                loss_value = -float(pnl_value)
+                loss_pct = (loss_value / equity_base) * 100.0 if equity_base > 0 else 0.0
+                if loss_pct >= trade_loss_limit_pct:
+                    triggers.append(
+                        {
+                            "type": "max_loss",
+                            "loss_value": loss_value,
+                            "loss_percent": loss_pct,
+                            "threshold_percent": float(trade_loss_limit_pct),
+                        }
+                    )
 
             if not triggers:
                 continue
@@ -1764,6 +1797,21 @@ class SignalExecutor:
                 f"PnL {pnl_bps:.1f} б.п. ≤ лимита {limit_value:.1f}"
             )
 
+        loss_trigger = next(
+            (trigger for trigger in triggers if trigger.get("type") == "max_loss"),
+            None,
+        )
+        if loss_trigger:
+            loss_value = _safe_float(loss_trigger.get("loss_value"))
+            loss_pct = _safe_float(loss_trigger.get("loss_percent"))
+            threshold_pct = _safe_float(loss_trigger.get("threshold_percent"))
+            if loss_value is not None and loss_pct is not None and threshold_pct is not None:
+                reason_parts.append(
+                    (
+                        "убыток {value:.2f} USDT ({loss:.2f}%) ≥ лимита {limit:.2f}%"
+                    ).format(value=loss_value, loss=loss_pct, limit=threshold_pct)
+                )
+
         reason_text = (
             "; ".join(reason_parts)
             if reason_parts
@@ -1810,6 +1858,17 @@ class SignalExecutor:
         }
 
         metadata = {key: value for key, value in metadata.items() if value is not None}
+
+        if loss_trigger:
+            loss_value = _safe_float(loss_trigger.get("loss_value"))
+            loss_pct = _safe_float(loss_trigger.get("loss_percent"))
+            threshold_pct = _safe_float(loss_trigger.get("threshold_percent"))
+            if loss_value is not None:
+                metadata["loss_value"] = loss_value
+            if loss_pct is not None:
+                metadata["loss_percent"] = loss_pct
+            if threshold_pct is not None:
+                metadata["max_loss_threshold_pct"] = threshold_pct
 
         log(
             "guardian.auto.force_exit",
@@ -1880,12 +1939,50 @@ class SignalExecutor:
         now = self._current_time()
         summary_meta = self._resolve_summary_update_meta(summary, now)
         price_meta = self._resolve_price_update_meta(summary, now)
+        guard = self._kill_switch_guard()
+        if guard is not None:
+            message, context = guard
+            return self._decision("disabled", reason=message, context=context)
+
+        guard = self._private_ws_guard(settings)
+        if guard is not None:
+            message, context = guard
+            return self._decision("disabled", reason=message, context=context)
+
+        try:
+            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
+                require_success=not active_dry_run(settings)
+            )
+        except Exception as exc:
+            reason_text = f"Не удалось получить баланс: {exc}"
+            if not creds_ok(settings) and not active_dry_run(settings):
+                reason_text = (
+                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
+                )
+            return self._decision(
+                "error",
+                reason=reason_text,
+            )
+
+        total_equity, available_equity = wallet_totals
+        if not math.isfinite(total_equity):
+            total_equity = 0.0
+        if not math.isfinite(available_equity):
+            available_equity = 0.0
+
+        equity_for_limits: Optional[float]
+        if total_equity > 0:
+            equity_for_limits = float(total_equity)
+        else:
+            equity_for_limits = None
+
         forced_summary, forced_meta = self._maybe_force_exit(
             summary,
             settings,
             current_time=now,
             summary_meta=summary_meta,
             price_meta=price_meta,
+            portfolio_total_equity=equity_for_limits,
         )
         forced_exit_meta = forced_meta
         if forced_summary is not None:
@@ -1907,7 +2004,14 @@ class SignalExecutor:
                 reason="Автоматизация выключена — включите AI сигналы в настройках.",
             )
 
-        guard_result = self._apply_runtime_guards(settings)
+        guard_result = self._apply_runtime_guards(
+            settings,
+            summary,
+            total_equity=equity_for_limits,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
         if guard_result is not None:
             return guard_result
 
@@ -1946,26 +2050,6 @@ class SignalExecutor:
                 or (price_age is not None and price_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
             ):
                 summary_price_snapshot = None
-
-        try:
-            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
-                require_success=not active_dry_run(settings)
-            )
-        except Exception as exc:
-            reason_text = f"Не удалось получить баланс: {exc}"
-            if not creds_ok(settings) and not active_dry_run(settings):
-                reason_text = (
-                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
-                )
-            return self._decision(
-                "error",
-                reason=reason_text,
-            )
-        total_equity, available_equity = wallet_totals
-        if not math.isfinite(total_equity):
-            total_equity = 0.0
-        if not math.isfinite(available_equity):
-            available_equity = 0.0
 
         quote_wallet_cap_value = quote_wallet_cap
         if quote_wallet_cap_value is not None:
@@ -4740,20 +4824,151 @@ class SignalExecutor:
 
         return call_get_settings(get_settings, force_reload=True)
 
-    def _apply_runtime_guards(self, settings: Settings) -> Optional[ExecutionResult]:
-        guard = self._daily_loss_guard(settings)
+    def _apply_runtime_guards(
+        self,
+        settings: Settings,
+        summary: Mapping[str, object],
+        *,
+        total_equity: Optional[float],
+        current_time: float,
+        summary_meta: Optional[Tuple[Optional[float], Optional[float]]],
+        price_meta: Optional[Tuple[Optional[float], Optional[float]]],
+    ) -> Optional[ExecutionResult]:
+        guard = self._portfolio_loss_guard(
+            settings,
+            summary,
+            total_equity=total_equity,
+            current_time=current_time,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
         if guard is not None:
             message, context = guard
             return self._decision("disabled", reason=message, context=context)
 
-        guard = self._private_ws_guard(settings)
+        guard = self._daily_loss_guard(settings, total_equity=total_equity)
         if guard is not None:
             message, context = guard
             return self._decision("disabled", reason=message, context=context)
         return None
 
+    def _kill_switch_guard(self) -> Optional[Tuple[str, Dict[str, object]]]:
+        state = kill_switch_state()
+        if not state.paused:
+            return None
+
+        pretty_until = None
+        if isinstance(state.until, (int, float)) and state.until > 0:
+            try:
+                pretty_until = datetime.fromtimestamp(state.until, tz=timezone.utc).strftime(
+                    "%H:%M:%S UTC"
+                )
+            except (OSError, ValueError):
+                pretty_until = None
+
+        message_parts = ["Автоторговля приостановлена защитой портфеля"]
+        if state.reason:
+            message_parts.append(f": {state.reason}")
+        if pretty_until:
+            message_parts.append(f" (до {pretty_until})")
+
+        context = {"guard": "kill_switch", "until": state.until, "reason": state.reason}
+        return "".join(message_parts), context
+
+    def _portfolio_loss_guard(
+        self,
+        settings: Settings,
+        summary: Mapping[str, object],
+        *,
+        total_equity: Optional[float],
+        current_time: float,
+        summary_meta: Optional[Tuple[Optional[float], Optional[float]]],
+        price_meta: Optional[Tuple[Optional[float], Optional[float]]],
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        try:
+            limit_pct = float(getattr(settings, "ai_portfolio_loss_limit_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            limit_pct = 0.0
+
+        if limit_pct <= 0 or total_equity is None or total_equity <= 0:
+            return None
+
+        positions = self._collect_open_positions(
+            settings,
+            summary,
+            current_time=current_time,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
+        if not positions:
+            return None
+
+        total_loss = 0.0
+        per_symbol_losses: List[Dict[str, object]] = []
+        for symbol, info in positions.items():
+            pnl_value = _safe_float(info.get("pnl_value"))
+            if pnl_value is None or pnl_value >= 0:
+                continue
+            loss_value = -pnl_value
+            total_loss += loss_value
+            per_symbol_losses.append({"symbol": symbol, "loss_value": loss_value})
+
+        if total_loss <= 0:
+            return None
+
+        loss_pct = (total_loss / total_equity) * 100.0
+        if loss_pct <= limit_pct:
+            return None
+
+        reason = (
+            "Совокупный нереализованный убыток {loss:.2f} USDT ({pct:.2f}%) превышает лимит {limit:.2f}%."
+        ).format(loss=total_loss, pct=loss_pct, limit=limit_pct)
+
+        try:
+            cooldown_minutes = float(
+                getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            cooldown_minutes = 0.0
+
+        kill_until = None
+        if cooldown_minutes > 0:
+            kill_until = activate_kill_switch(cooldown_minutes, reason)
+
+        log(
+            "guardian.auto.guard.portfolio_loss",
+            loss=round(total_loss, 2),
+            percent=round(loss_pct, 4),
+            limit=limit_pct,
+            equity=round(total_equity, 2),
+            cooldown_minutes=cooldown_minutes,
+        )
+
+        message = reason
+        if kill_until:
+            try:
+                resume_at = datetime.fromtimestamp(kill_until, tz=timezone.utc).strftime(
+                    "%H:%M:%S UTC"
+                )
+            except (OSError, ValueError):
+                resume_at = None
+            else:
+                message += f" Kill-switch активирован до {resume_at}."
+
+        context: Dict[str, object] = {
+            "guard": "portfolio_loss_limit",
+            "loss_value": total_loss,
+            "loss_percent": loss_pct,
+            "limit_percent": limit_pct,
+            "total_equity": total_equity,
+            "positions": per_symbol_losses,
+        }
+        if kill_until:
+            context["kill_switch_until"] = kill_until
+        return message, context
+
     def _daily_loss_guard(
-        self, settings: Settings
+        self, settings: Settings, *, total_equity: Optional[float] = None
     ) -> Optional[Tuple[str, Dict[str, object]]]:
         try:
             limit_pct = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
@@ -4823,20 +5038,27 @@ class SignalExecutor:
         if net_result >= 0.0:
             return None
 
-        try:
-            _, wallet_totals, _, _ = self._resolve_wallet(require_success=False)
-        except Exception:
-            return None
+        equity_value: Optional[float] = None
+        if isinstance(total_equity, (int, float)) and math.isfinite(total_equity):
+            if total_equity > 0:
+                equity_value = float(total_equity)
 
-        if not isinstance(wallet_totals, Sequence) or len(wallet_totals) < 1:
-            return None
+        if equity_value is None:
+            try:
+                _, wallet_totals, _, _ = self._resolve_wallet(require_success=False)
+            except Exception:
+                return None
 
-        total_equity = _safe_float(wallet_totals[0])
-        if total_equity is None or total_equity <= 0.0:
-            return None
+            if not isinstance(wallet_totals, Sequence) or len(wallet_totals) < 1:
+                return None
+
+            equity_candidate = _safe_float(wallet_totals[0])
+            if equity_candidate is None or equity_candidate <= 0.0:
+                return None
+            equity_value = equity_candidate
 
         loss_value = -net_result
-        loss_pct = (loss_value / total_equity) * 100.0 if total_equity > 0 else 0.0
+        loss_pct = (loss_value / equity_value) * 100.0 if equity_value > 0 else 0.0
 
         if loss_pct <= limit_pct:
             return None
@@ -4848,21 +5070,47 @@ class SignalExecutor:
             "loss_value": loss_value,
             "loss_percent": loss_pct,
             "limit_percent": limit_pct,
-            "total_equity": total_equity,
+            "total_equity": equity_value,
         }
+
+        try:
+            cooldown_minutes = float(
+                getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            cooldown_minutes = 0.0
+
+        kill_until = None
+        if cooldown_minutes > 0:
+            reason = (
+                "Дневной лимит убытка {limit:.2f}% превышен ({loss:.2f}%)."
+            ).format(limit=limit_pct, loss=loss_pct)
+            kill_until = activate_kill_switch(cooldown_minutes, reason)
+            context["kill_switch_until"] = kill_until
 
         log(
             "guardian.auto.guard.daily_loss",
             loss=round(loss_value, 2),
             percent=round(loss_pct, 4),
             limit=limit_pct,
-            equity=round(total_equity, 2),
+            equity=round(equity_value, 2),
         )
 
         message = (
             "Дневной убыток {loss:.2f} USDT ({percent:.2f}% капитала) превысил лимит {limit:.2f}% —"
             " автоматика приостановлена до конца суток"
         ).format(loss=loss_value, percent=loss_pct, limit=limit_pct)
+
+        if kill_until:
+            try:
+                resume_at = datetime.fromtimestamp(kill_until, tz=timezone.utc).strftime(
+                    "%H:%M:%S UTC"
+                )
+            except (OSError, ValueError):
+                resume_at = None
+            else:
+                message += f" Kill-switch активирован до {resume_at}."
+
         context["message"] = message
         return message, context
 

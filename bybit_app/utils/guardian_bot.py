@@ -4381,11 +4381,22 @@ class GuardianBot:
         risk_per_trade = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
         reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
         daily_loss_limit = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
+        trade_loss_limit = float(getattr(settings, "ai_max_trade_loss_pct", 0.0) or 0.0)
+        portfolio_stop = float(getattr(settings, "ai_portfolio_loss_limit_pct", 0.0) or 0.0)
+        kill_switch_pause = float(
+            getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0
+        )
         cash_only = bool(getattr(settings, "spot_cash_only", True))
         risk_line_parts = [f"Риск на сделку ограничен {risk_per_trade:.2f}% капитала"]
         risk_line_parts.append(f"резервируем в кэше не менее {reserve_pct:.1f}%")
         if daily_loss_limit > 0:
             risk_line_parts.append(f"дневной стоп по убытку {daily_loss_limit:.2f}%")
+        if trade_loss_limit > 0:
+            risk_line_parts.append(
+                f"максимальный убыток на позицию {trade_loss_limit:.2f}%"
+            )
+        if portfolio_stop > 0:
+            risk_line_parts.append(f"портфельный стоп {portfolio_stop:.2f}%")
         if cash_only:
             risk_line_parts.append("работаем без заимствований")
         else:
@@ -4393,6 +4404,11 @@ class GuardianBot:
         lines.append(
             ", ".join(risk_line_parts) + "."
         )
+
+        if portfolio_stop > 0 and kill_switch_pause > 0:
+            lines.append(
+                f"При срабатывании портфельного стопа включается пауза автоматики на {kill_switch_pause:.0f} мин."
+            )
 
         max_concurrent = int(getattr(settings, "ai_max_concurrent", 0) or 0)
         if max_concurrent > 0:
