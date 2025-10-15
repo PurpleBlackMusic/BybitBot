@@ -114,19 +114,26 @@ def arrow_safe(frame: pd.DataFrame | None) -> pd.DataFrame | None:
     if frame is None:
         return None
 
+    object_like: list[str] = []
+    for column, dtype in frame.dtypes.items():
+        if dtype == object or str(dtype).startswith("string"):
+            object_like.append(str(column))
+
+    if not object_like:
+        return frame
+
     df = frame.copy()
 
-    for column in df.columns:
+    for column in object_like:
         series = df[column]
-        if isinstance(series, pd.Series):
-            if series.dtype == object or str(series.dtype).startswith("string"):
-                name = str(column)
-                if _looks_like_time(name):
-                    df[column] = _coerce_datetime(series)
-                else:
-                    coerced = _coerce_numeric(series)
-                    if coerced is not series:
-                        df[column] = coerced
+        if not isinstance(series, pd.Series):
+            continue
+        if _looks_like_time(column):
+            df[column] = _coerce_datetime(series)
+        else:
+            coerced = _coerce_numeric(series)
+            if coerced is not series:
+                df[column] = coerced
 
     return df.convert_dtypes()
 

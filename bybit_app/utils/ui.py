@@ -9,6 +9,11 @@ from pathlib import Path, PurePosixPath
 from textwrap import dedent
 from typing import Any, Callable
 
+try:  # pragma: no cover - pandas is an optional dependency in tests
+    import pandas as pd
+except Exception:  # pragma: no cover - if pandas is unavailable skip coercion
+    pd = None
+
 
 def _load_get_script_run_ctx() -> Callable[[], Any]:
     """Return ``get_script_run_ctx`` compatible with different Streamlit versions."""
@@ -37,6 +42,8 @@ get_script_run_ctx = _load_get_script_run_ctx()
 
 import streamlit as st
 from collections.abc import Iterable, Mapping
+
+from .dataframe import arrow_safe
 
 
 _streamlit_errors_spec = util.find_spec("streamlit.errors")
@@ -88,6 +95,20 @@ def _coerce_arrow_table(value: Any) -> Any:
     return value
 
 
+def _sanitize_dataframe(value: Any) -> Any:
+    """Return *value* converted to an Arrow-friendly dataframe when possible."""
+
+    coerced = _coerce_arrow_table(value)
+
+    if pd is None:
+        return coerced
+
+    if isinstance(coerced, pd.DataFrame):
+        return arrow_safe(coerced)
+
+    return coerced
+
+
 def _patch_responsive_dataframe() -> None:
     """Remap deprecated ``use_container_width`` to the new API once."""
 
@@ -115,11 +136,11 @@ def _patch_responsive_dataframe() -> None:
 
     def patched(*args: Any, **kwargs: Any):  # type: ignore[override]
         if args:
-            coerced = _coerce_arrow_table(args[0])
+            coerced = _sanitize_dataframe(args[0])
             if coerced is not args[0]:
                 args = (coerced,) + args[1:]
         if "data" in kwargs:
-            kwargs["data"] = _coerce_arrow_table(kwargs["data"])
+            kwargs["data"] = _sanitize_dataframe(kwargs["data"])
 
         use_container = kwargs.pop("use_container_width", None)
         if use_container and "width" not in kwargs:
