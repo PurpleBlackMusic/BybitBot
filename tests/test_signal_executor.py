@@ -69,10 +69,22 @@ class StubBot:
 
 
 class StubAPI:
-    def __init__(self, total: float = 0.0, available: float = 0.0) -> None:
+    def __init__(
+        self,
+        total: float = 0.0,
+        available: float = 0.0,
+        *,
+        orderbook_payload: Optional[dict[str, object]] = None,
+    ) -> None:
         self._total = total
         self._available = available
         self.orders: list[dict[str, object]] = []
+        self._orderbook_payload = orderbook_payload or {
+            "result": {
+                "a": [["100.0", "25"]],
+                "b": [["99.9", "25"]],
+            }
+        }
 
     def wallet_balance(self, *args: object, **kwargs: object) -> dict:
         return {
@@ -104,6 +116,25 @@ class StubAPI:
                 "orderId": order_id,
             },
         }
+
+    def orderbook(
+        self,
+        *,
+        category: str = "spot",
+        symbol: str | None = None,
+        limit: int = 1,
+    ) -> dict[str, object]:
+        assert category == "spot"
+        result = copy.deepcopy(self._orderbook_payload)
+        if limit <= 0 or not isinstance(result, dict):
+            return result
+        payload_result = result.get("result") if isinstance(result, dict) else None
+        if isinstance(payload_result, dict):
+            for key in ("a", "b"):
+                levels = payload_result.get(key)
+                if isinstance(levels, list) and limit < len(levels):
+                    payload_result[key] = levels[:limit]
+        return result
 
     def instruments_info(self, category: str = "spot", symbol: str | None = None, **_: object) -> dict:
         symbol_text = symbol or "BTCUSDT"
@@ -649,6 +680,7 @@ def test_signal_executor_uses_spot_fallback_when_unified_short(monkeypatch: pyte
         spot_cash_reserve_pct=0.0,
         spot_max_cap_per_trade_pct=0.0,
         ai_max_slippage_bps=0,
+        ai_max_spread_bps=150.0,
     )
     bot = StubBot(summary, settings)
 
@@ -3799,6 +3831,111 @@ def test_signal_executor_incremental_pnl_helper(monkeypatch: pytest.MonkeyPatch)
 
     assert messages, "notification should be sent"
     assert "+6.00 USDT" in messages[0]
+
+def test_signal_executor_skips_on_wide_spread(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    wide_orderbook = {
+        "result": {
+            "a": [["110.0", "50"]],
+            "b": [["100.0", "50"]],
+        }
+    }
+
+    api = StubAPI(total=1000.0, available=800.0, orderbook_payload=wide_orderbook)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: pytest.fail("liquidity guard should skip before order placement"),
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None and "спред" in result.reason
+    assert result.context is not None
+    guard_meta = result.context.get("liquidity_guard")
+    assert isinstance(guard_meta, dict)
+    assert guard_meta.get("spread_bps") > guard_meta.get("max_spread_bps", 0.0)
+
+
+def test_signal_executor_skips_on_thin_top_of_book(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        ai_top_depth_coverage=0.9,
+        ai_top_depth_shortfall_usd=2.0,
+    )
+    bot = StubBot(summary, settings)
+
+    thin_orderbook = {
+        "result": {
+            "a": [["100.0", "0.1"]],
+            "b": [["99.9", "50"]],
+        }
+    }
+
+    api = StubAPI(total=1000.0, available=800.0, orderbook_payload=thin_orderbook)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_compute_notional(
+        self,
+        settings: Settings,
+        total_equity: float,
+        available_equity: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> tuple[float, float, bool, bool]:
+        return 100.0, available_equity, False, False
+
+    monkeypatch.setattr(
+        SignalExecutor,
+        "_compute_notional",
+        fake_compute_notional,
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: pytest.fail("liquidity guard should skip before order placement"),
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason is not None
+    assert "первом уровне" in result.reason or "дефицит" in result.reason
+    assert result.context is not None
+    guard_meta = result.context.get("liquidity_guard")
+    assert isinstance(guard_meta, dict)
+    assert guard_meta.get("coverage_ratio", 1.0) < guard_meta.get("coverage_threshold", 1.0)
+
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
