@@ -320,7 +320,7 @@ def test_signal_executor_force_exit_uses_trade_stats_defaults(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_collect_open_positions",
-        lambda self, settings, summary: positions,
+        lambda self, settings, summary, **_: positions,
     )
 
     events: list[tuple[str, dict[str, object]]] = []
@@ -380,7 +380,7 @@ def test_signal_executor_force_exit_skips_positive_exit_bps(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_collect_open_positions",
-        lambda self, settings, summary: positions,
+        lambda self, settings, summary, **_: positions,
     )
 
     executor = SignalExecutor(bot)
@@ -5241,4 +5241,147 @@ def test_automation_loop_emits_results_via_callback(monkeypatch: pytest.MonkeyPa
     assert isinstance(marker, tuple)
     assert loop._last_result is not None
     assert loop._last_result.status == "dry_run"
+
+
+def _configure_sell_snapshot_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    summary: dict[str, object],
+) -> dict[str, object]:
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=10.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+    now = time.time()
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_current_time",
+        lambda self: now,
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    def fake_resolve_wallet(self, *, require_success: bool):
+        api = object()
+        totals = (1000.0, 800.0)
+        return api, totals, None, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+
+    def fake_compute_notional(
+        self,
+        settings_obj: Settings,
+        total_equity: float,
+        available_equity: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> Tuple[float, float, bool, bool]:
+        return 100.0, available_equity, False, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute_notional,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_sell_notional(
+        self,
+        api: object,
+        symbol: str,
+        *,
+        summary: Optional[Mapping[str, object]] = None,
+        expected_base_requirement: Optional[float] = None,
+    ) -> Tuple[Optional[float], Optional[Dict[str, object]], Optional[float]]:
+        captured["expected_base_requirement"] = expected_base_requirement
+        return 100.0, {"price_snapshot": summary.get("price") if summary else None}, None
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_sell_notional_from_holdings",
+        fake_sell_notional,
+    )
+
+    def fake_place_order(api_obj: object, **payload: object) -> dict[str, object]:
+        return {"retCode": 0, "result": {"orderId": "snapshot-check"}}
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        fake_place_order,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_ledger_rows_snapshot",
+        lambda self, **_: ([], None),
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+    assert result.status == "filled"
+    return captured
+
+
+def test_signal_executor_sell_skips_stale_summary_price_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "ETHUSDT",
+        "price": 25.0,
+        "age_seconds": 12.0,
+        "price_meta": {"age_seconds": 12.0},
+    }
+
+    captured = _configure_sell_snapshot_environment(monkeypatch, summary)
+    assert captured.get("expected_base_requirement") is None
+
+
+def test_signal_executor_sell_skips_stale_price_meta_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "ETHUSDT",
+        "price": 40.0,
+        "age_seconds": 0.5,
+        "price_meta": {"age_seconds": 10.0},
+    }
+
+    captured = _configure_sell_snapshot_environment(monkeypatch, summary)
+    assert captured.get("expected_base_requirement") is None
+
+
+def test_signal_executor_sell_uses_fresh_summary_price_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "sell",
+        "symbol": "ETHUSDT",
+        "price": 50.0,
+        "age_seconds": 0.5,
+        "price_meta": {"age_seconds": 0.1},
+    }
+
+    captured = _configure_sell_snapshot_environment(monkeypatch, summary)
+    expected = captured.get("expected_base_requirement")
+    assert expected is not None
+    assert expected == pytest.approx(2.0)
 

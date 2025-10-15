@@ -55,6 +55,7 @@ _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
+_SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 
 
@@ -803,8 +804,106 @@ class SignalExecutor:
         resolved_age = max(0.0, now - resolved_ts)
         return resolved_ts, resolved_age
 
+    def _resolve_price_update_meta(
+        self, summary: Mapping[str, object], now: float
+    ) -> Tuple[Optional[float], Optional[float]]:
+        if not isinstance(summary, Mapping):
+            return None, None
+
+        candidates: List[float] = []
+
+        def _append_timestamp(value: object) -> None:
+            ts = self._coerce_timestamp(value)
+            if ts is not None and math.isfinite(ts):
+                candidates.append(ts)
+
+        def _append_age(age_value: object) -> None:
+            age = _safe_float(age_value)
+            if age is not None and age >= 0:
+                candidates.append(now - age)
+
+        for key in (
+            "price_age_seconds",
+            "priceAgeSeconds",
+            "price_age_sec",
+            "priceAgeSec",
+        ):
+            if key in summary:
+                _append_age(summary.get(key))
+
+        for key in (
+            "price_updated_ts",
+            "priceUpdatedTs",
+            "price_updated_at",
+            "priceUpdatedAt",
+            "price_ts",
+            "priceTs",
+        ):
+            if key in summary:
+                _append_timestamp(summary.get(key))
+
+        price_meta = summary.get("price_meta")
+        if isinstance(price_meta, Mapping):
+            ts, age = self._resolve_summary_update_meta(price_meta, now)
+            if ts is not None:
+                candidates.append(ts)
+            if age is not None:
+                candidates.append(now - age)
+            for nested_key in (
+                "ticker",
+                "summary",
+                "market",
+                "orderbook",
+                "source",
+            ):
+                nested_meta = price_meta.get(nested_key)
+                if isinstance(nested_meta, Mapping):
+                    nested_ts, nested_age = self._resolve_summary_update_meta(
+                        nested_meta, now
+                    )
+                    if nested_ts is not None:
+                        candidates.append(nested_ts)
+                    if nested_age is not None:
+                        candidates.append(now - nested_age)
+
+        status_meta = summary.get("status")
+        if isinstance(status_meta, Mapping):
+            for nested_key in ("price", "ticker", "market"):
+                nested_meta = status_meta.get(nested_key)
+                if isinstance(nested_meta, Mapping):
+                    nested_ts, nested_age = self._resolve_summary_update_meta(
+                        nested_meta, now
+                    )
+                    if nested_ts is not None:
+                        candidates.append(nested_ts)
+                    if nested_age is not None:
+                        candidates.append(now - nested_age)
+
+        ticker_meta = summary.get("ticker")
+        if isinstance(ticker_meta, Mapping):
+            ticker_ts, ticker_age = self._resolve_summary_update_meta(
+                ticker_meta, now
+            )
+            if ticker_ts is not None:
+                candidates.append(ticker_ts)
+            if ticker_age is not None:
+                candidates.append(now - ticker_age)
+
+        if not candidates:
+            return None, None
+
+        resolved_ts = max(candidates)
+        resolved_age = max(0.0, now - resolved_ts)
+        return resolved_ts, resolved_age
+
     def _collect_open_positions(
-        self, settings: Settings, summary: Mapping[str, object]
+        self,
+        settings: Settings,
+        summary: Mapping[str, object],
+        *,
+        current_time: Optional[float] = None,
+        summary_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
+        price_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
     ) -> Dict[str, Dict[str, object]]:
         summary_symbols: Set[str] = set()
         primary_symbol = _safe_symbol(summary.get("symbol")) if isinstance(summary, Mapping) else None
@@ -967,8 +1066,15 @@ class SignalExecutor:
                                 continue
                             portfolio_map[entry_symbol] = entry
 
-        now = self._current_time()
-        summary_ts, summary_age = self._resolve_summary_update_meta(summary, now)
+        now = current_time if current_time is not None else self._current_time()
+        if summary_meta is None:
+            summary_ts, summary_age = self._resolve_summary_update_meta(summary, now)
+        else:
+            summary_ts, summary_age = summary_meta
+        if price_meta is None:
+            price_ts, price_age = self._resolve_price_update_meta(summary, now)
+        else:
+            price_ts, price_age = price_meta
         try:
             raw_slippage_bps = float(getattr(settings, "ai_max_slippage_bps", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1034,12 +1140,26 @@ class SignalExecutor:
                 summary_too_old = (
                     summary_age is not None and summary_age > _SUMMARY_PRICE_STALE_SECONDS
                 )
+                price_too_old = (
+                    price_age is not None and price_age > _SUMMARY_PRICE_STALE_SECONDS
+                )
                 summary_before_entry = (
                     summary_ts is not None
                     and entry_ts is not None
                     and summary_ts + _SUMMARY_PRICE_ENTRY_GRACE < entry_ts
                 )
-                if deviation_exceeds or summary_too_old or summary_before_entry:
+                price_before_entry = (
+                    price_ts is not None
+                    and entry_ts is not None
+                    and price_ts + _SUMMARY_PRICE_ENTRY_GRACE < entry_ts
+                )
+                if (
+                    deviation_exceeds
+                    or summary_too_old
+                    or summary_before_entry
+                    or price_too_old
+                    or price_before_entry
+                ):
                     price_stale = True
 
             if price_stale:
@@ -1164,7 +1284,13 @@ class SignalExecutor:
         return resolved
 
     def _maybe_force_exit(
-        self, summary: Mapping[str, object], settings: Settings
+        self,
+        summary: Mapping[str, object],
+        settings: Settings,
+        *,
+        current_time: Optional[float] = None,
+        summary_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
+        price_meta: Optional[Tuple[Optional[float], Optional[float]]] = None,
     ) -> Tuple[Optional[Dict[str, object]], Optional[Dict[str, object]]]:
         if not isinstance(summary, Mapping):
             return None, None
@@ -1232,7 +1358,27 @@ class SignalExecutor:
         if hold_limit_minutes <= 0 and pnl_limit is None:
             return None, None
 
-        positions = self._collect_open_positions(settings, summary)
+        now = current_time if current_time is not None else self._current_time()
+        summary_ts: Optional[float]
+        summary_age: Optional[float]
+        if summary_meta is None:
+            summary_ts, summary_age = self._resolve_summary_update_meta(summary, now)
+        else:
+            summary_ts, summary_age = summary_meta
+        price_ts: Optional[float]
+        price_age: Optional[float]
+        if price_meta is None:
+            price_ts, price_age = self._resolve_price_update_meta(summary, now)
+        else:
+            price_ts, price_age = price_meta
+
+        positions = self._collect_open_positions(
+            settings,
+            summary,
+            current_time=now,
+            summary_meta=(summary_ts, summary_age),
+            price_meta=(price_ts, price_age),
+        )
         if not positions:
             return None, None
 
@@ -1450,10 +1596,21 @@ class SignalExecutor:
         self._spot_inventory_snapshot = None
         summary = self._fetch_summary()
         settings = self._resolve_settings()
-        forced_summary, forced_meta = self._maybe_force_exit(summary, settings)
+        now = self._current_time()
+        summary_meta = self._resolve_summary_update_meta(summary, now)
+        price_meta = self._resolve_price_update_meta(summary, now)
+        forced_summary, forced_meta = self._maybe_force_exit(
+            summary,
+            settings,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
         forced_exit_meta = forced_meta
         if forced_summary is not None:
             summary = forced_summary
+            summary_meta = self._resolve_summary_update_meta(summary, now)
+            price_meta = self._resolve_price_update_meta(summary, now)
         elif not summary.get("actionable"):
             return self._decision(
                 "skipped",
@@ -1500,6 +1657,14 @@ class SignalExecutor:
 
         side = "Buy" if mode == "buy" else "Sell"
         summary_price_snapshot = self._extract_market_price(summary, symbol)
+        summary_age = summary_meta[1] if summary_meta is not None else None
+        price_age = price_meta[1] if price_meta is not None else None
+        if summary_price_snapshot is not None:
+            if (
+                (summary_age is not None and summary_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
+                or (price_age is not None and price_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
+            ):
+                summary_price_snapshot = None
 
         try:
             api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
