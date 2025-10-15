@@ -10,6 +10,12 @@ import pytest
 from bybit_app.utils import background as background_module
 from bybit_app.utils.background import BackgroundServices
 from bybit_app.utils.signal_executor import ExecutionResult
+from bybit_app.utils.ws_events import (
+    event_queue_stats,
+    fetch_events,
+    publish_event,
+    reset_event_queue,
+)
 
 
 class StubExecutor:
@@ -66,6 +72,10 @@ def _make_service(
             force_public_fallback=lambda *args, **kwargs: False,
             latest_order_update=lambda: {},
             latest_execution=lambda: {},
+            private_events=lambda *, since=None, limit=None: fetch_events(
+                scope="private", since=since, limit=limit
+            ),
+            private_event_stats=lambda: event_queue_stats(),
         )
     monkeypatch.setattr(background_module, "ws_manager", ws_stub)
 
@@ -116,6 +126,8 @@ def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> N
         force_public_fallback=fake_force_public_fallback,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
+        private_events=lambda *args, **kwargs: [],
+        private_event_stats=lambda: {"latest_id": 0, "size": 0, "dropped": 0},
     )
 
     svc = _make_service(monkeypatch, ws_stub=ws_stub)
@@ -227,6 +239,8 @@ def test_restart_ws_forces_stop(monkeypatch: pytest.MonkeyPatch) -> None:
         force_public_fallback=lambda *_, **__: False,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
+        private_events=lambda *args, **kwargs: [],
+        private_event_stats=lambda: {"latest_id": 0, "size": 0, "dropped": 0},
     )
 
     svc = _make_service(monkeypatch, ws_stub=ws_stub)
@@ -375,6 +389,8 @@ def test_ensure_started_waits_for_private_ready(monkeypatch: pytest.MonkeyPatch)
         force_public_fallback=lambda *_, **__: False,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
+        private_events=lambda *args, **kwargs: [],
+        private_event_stats=lambda: {"latest_id": 0, "size": 0, "dropped": 0},
     )
 
     svc = _make_service(monkeypatch, ws_stub=ws_stub)
@@ -397,3 +413,16 @@ def test_ensure_started_skips_automation_without_private(monkeypatch: pytest.Mon
     svc.ensure_started()
 
     assert svc._automation_restart_count == 0
+
+
+def test_ws_events_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+    reset_event_queue()
+    publish_event(scope="private", topic="orders", payload={"id": 1})
+    publish_event(scope="private", topic="executions", payload={"id": 2})
+
+    events_payload = svc.ws_events()
+    assert isinstance(events_payload, dict)
+    assert events_payload["events"]
+    assert events_payload["events"][-1]["topic"] == "executions"
+    assert isinstance(events_payload["stats"], dict)

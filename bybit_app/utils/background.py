@@ -530,6 +530,7 @@ class BackgroundServices:
             public_ttl=self._ws_public_stale_after or None,
             private_ttl=self._ws_private_stale_after or None,
         )
+        event_stats = ws_manager.private_event_stats()
 
         public = status.get("public") or {}
         private = status.get("private") or {}
@@ -559,7 +560,20 @@ class BackgroundServices:
             "private_stale_after": self._ws_private_stale_after,
             "last_started_at": self._ws_last_started_at or None,
             "restart_count": self._ws_restart_count,
+            "private_event_cursor": event_stats.get("latest_id"),
+            "private_event_backlog": event_stats.get("size"),
+            "private_event_dropped": event_stats.get("dropped"),
         }
+
+    def ws_events(
+        self,
+        *,
+        since: int | None = None,
+        limit: int | None = 100,
+    ) -> Dict[str, Any]:
+        events = ws_manager.private_events(since=since, limit=limit)
+        stats = ws_manager.private_event_stats()
+        return {"events": events, "stats": stats}
 
 
 _state = BackgroundServices()
@@ -583,3 +597,7 @@ def restart_automation() -> bool:
 
 def restart_websockets() -> bool:
     return _state.restart_ws()
+
+
+def get_ws_events(*, since: int | None = None, limit: int | None = 100) -> Dict[str, Any]:
+    return _state.ws_events(since=since, limit=limit)
