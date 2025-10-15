@@ -94,3 +94,52 @@ def test_release_ignored_for_unallocated_symbol() -> None:
     allocation = manager.request_allocation("XRPUSDT", now=base_time + 1)
     assert allocation is not None
 
+
+def test_cluster_limit_blocks_correlated_symbols() -> None:
+    manager = PortfolioManager(total_capital=1000, max_positions=5, risk_per_trade=0.1, min_allocation=50.0)
+
+    sol_meta = {"factors": {"chain": ["Solana"], "theme": ["Meme"]}}
+
+    first = manager.request_allocation("BONKUSDT", metadata=sol_meta, now=0.0)
+    assert first is not None
+    assert first.notional == Decimal("100.00")
+    clusters = manager.clusters_for("BONKUSDT")
+    assert "solana" in clusters
+    assert "chain:solana" in clusters
+
+    second = manager.request_allocation("SAMOUSDT", metadata=sol_meta, now=5.0)
+    assert second is None
+
+    manager.release("BONKUSDT", now=10.0)
+    recovered = manager.request_allocation("SAMOUSDT", metadata=sol_meta, now=20.0)
+    assert recovered is not None
+    assert recovered.notional == Decimal("100.00")
+
+
+def test_cluster_limit_allows_partial_allocation_with_custom_cap() -> None:
+    manager = PortfolioManager(
+        total_capital=1000,
+        max_positions=5,
+        risk_per_trade=0.1,
+        min_allocation=50.0,
+        cluster_limits={
+            "solana": 1.5,
+            "chain:solana": 1.5,
+            "meme": 1.5,
+            "theme:meme": 1.5,
+        },
+    )
+    meta = {"factors": {"chain": ["solana"], "theme": ["meme"]}}
+
+    primary = manager.request_allocation("BONKUSDT", metadata=meta, now=0.0)
+    assert primary is not None
+    assert primary.notional == Decimal("100.00")
+
+    secondary = manager.request_allocation("SAMOUSDT", metadata=meta, now=1.0)
+    assert secondary is not None
+    assert secondary.notional == Decimal("50.00")
+
+    usage = manager.cluster_usage()
+    assert usage["solana"] == 150.0
+    assert usage["chain:solana"] == 150.0
+
