@@ -4,9 +4,11 @@ import copy
 import json
 import math
 import random
+import re
 import time
 from functools import lru_cache
 from pathlib import Path
+from statistics import fmean, pstdev
 from typing import (
     Callable,
     Dict,
@@ -46,6 +48,33 @@ DEFAULT_CACHE_TTL = 300.0
 _TRADE_COST_SAMPLE = 600
 _DEFAULT_MAKER_RATIO = 0.25
 _DEFAULT_TAKER_FEE_BPS = 5.0
+
+_OUTLIER_PERCENT_FIELDS: Tuple[str, ...] = (
+    "price5mPcnt",
+    "price15mPcnt",
+    "price1hPcnt",
+    "price4hPcnt",
+    "price24hPcnt",
+    "price7dPcnt",
+)
+_OUTLIER_Z_THRESHOLD = 4.5
+_OUTLIER_IQR_MULTIPLIER = 3.5
+_OUTLIER_MIN_MAGNITUDE = 80.0
+_MAINTENANCE_KEYS: Tuple[str, ...] = (
+    "maintenance",
+    "maintenanceSymbols",
+    "maintenance_symbols",
+    "maintenance_list",
+)
+_DELIST_KEYS: Tuple[str, ...] = (
+    "delist",
+    "delists",
+    "delisting",
+    "delistingSymbols",
+    "delisting_symbols",
+    "delist_symbols",
+    "delistList",
+)
 
 
 def _ledger_path_for_costs(data_dir: Path, testnet: Optional[bool]) -> Path:
@@ -303,6 +332,196 @@ def _normalised_turnover(value: Optional[float]) -> float:
 def _score_turnover(turnover: Optional[float]) -> float:
     normalised = _normalised_turnover(turnover)
     return liquidity_feature(normalised)
+
+
+def _quantile(sorted_values: Sequence[float], q: float) -> Optional[float]:
+    if not sorted_values:
+        return None
+    if q <= 0:
+        return float(sorted_values[0])
+    if q >= 1:
+        return float(sorted_values[-1])
+    position = (len(sorted_values) - 1) * q
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return float(sorted_values[lower_index])
+    lower = float(sorted_values[lower_index])
+    upper = float(sorted_values[upper_index])
+    fraction = position - lower_index
+    return lower + (upper - lower) * fraction
+
+
+def _normalise_epoch_seconds(value: object) -> Optional[float]:
+    numeric = _safe_float(value)
+    if numeric is None:
+        return None
+    absolute = abs(numeric)
+    if absolute >= 1e18:
+        seconds = numeric / 1_000_000_000.0
+    elif absolute >= 1e15:
+        seconds = numeric / 1_000_000.0
+    elif absolute >= 1e12:
+        seconds = numeric / 1000.0
+    elif absolute >= 1e9:
+        seconds = float(numeric)
+    elif absolute >= 1e6:
+        seconds = float(numeric)
+    else:
+        seconds = float(numeric)
+    return seconds
+
+
+def _collect_symbol_candidates(value: object) -> Set[str]:
+    symbols: Set[str] = set()
+    if value is None:
+        return symbols
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return symbols
+        parts = re.split(r"[\s,;]+", text)
+        for part in parts:
+            candidate, _ = ensure_usdt_symbol(part)
+            if candidate:
+                symbols.add(candidate)
+        return symbols
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key_text = str(key).lower()
+            if any(token in key_text for token in ("symbol", "pair", "instrument", "asset", "name")):
+                symbols.update(_collect_symbol_candidates(nested))
+            elif isinstance(nested, (Mapping, list, tuple, set, frozenset)):
+                symbols.update(_collect_symbol_candidates(nested))
+        return symbols
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            symbols.update(_collect_symbol_candidates(item))
+        return symbols
+    candidate, _ = ensure_usdt_symbol(value)
+    if candidate:
+        symbols.add(candidate)
+    return symbols
+
+
+def _extract_snapshot_stoplist(snapshot: Mapping[str, object], keys: Sequence[str]) -> Set[str]:
+    stoplist: Set[str] = set()
+    for key in keys:
+        value = snapshot.get(key)
+        if value is None:
+            continue
+        stoplist.update(_collect_symbol_candidates(value))
+    return stoplist
+
+
+def _detect_outlier_symbols(rows: Sequence[Mapping[str, object]]) -> Set[str]:
+    field_samples: Dict[str, List[Tuple[str, float]]] = {field: [] for field in _OUTLIER_PERCENT_FIELDS}
+    for raw in rows:
+        symbol, _ = ensure_usdt_symbol(raw.get("symbol"))
+        if not symbol:
+            continue
+        for field in _OUTLIER_PERCENT_FIELDS:
+            value = _normalise_percent(raw.get(field))
+            if value is None or not math.isfinite(value):
+                continue
+            field_samples[field].append((symbol, float(value)))
+
+    outliers: Set[str] = set()
+    for field, samples in field_samples.items():
+        if len(samples) < 5:
+            continue
+        values = [value for _, value in samples]
+        sorted_values = sorted(values)
+        lower_quartile = _quantile(sorted_values, 0.25)
+        upper_quartile = _quantile(sorted_values, 0.75)
+        if lower_quartile is None or upper_quartile is None:
+            continue
+        iqr = upper_quartile - lower_quartile
+        lower_bound = lower_quartile - _OUTLIER_IQR_MULTIPLIER * iqr
+        upper_bound = upper_quartile + _OUTLIER_IQR_MULTIPLIER * iqr
+        mean_value = fmean(values)
+        std_dev = pstdev(values) if len(values) > 1 else 0.0
+
+        for symbol, value in samples:
+            magnitude = abs(value)
+            if magnitude < _OUTLIER_MIN_MAGNITUDE:
+                continue
+            flagged = False
+            if std_dev > 1e-9:
+                z_score = abs((value - mean_value) / std_dev)
+                if z_score > _OUTLIER_Z_THRESHOLD:
+                    flagged = True
+            if not flagged and iqr > 0:
+                if value < lower_bound or value > upper_bound:
+                    flagged = True
+            if flagged:
+                outliers.add(symbol)
+    return outliers
+
+
+def _row_in_maintenance(row: Mapping[str, object]) -> bool:
+    status_keys = ("status", "symbolStatus", "tradingStatus", "state")
+    for key in status_keys:
+        raw = row.get(key)
+        if not isinstance(raw, str):
+            continue
+        text = raw.strip().lower()
+        if not text:
+            continue
+        if any(word in text for word in ("maint", "suspend", "halt", "pause", "down")):
+            return True
+    flag_keys = ("maintenance", "underMaintenance", "isSuspended", "suspended")
+    for key in flag_keys:
+        raw = row.get(key)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+        elif raw:
+            return True
+    return False
+
+
+def _row_delisted(row: Mapping[str, object], *, now: Optional[float] = None) -> bool:
+    status_keys = ("status", "symbolStatus", "state", "tradingStatus")
+    for key in status_keys:
+        raw = row.get(key)
+        if isinstance(raw, str):
+            text = raw.strip().lower()
+            if "delist" in text or "terminate" in text:
+                return True
+
+    timestamp_keys = (
+        "delistingTime",
+        "delistTime",
+        "deliveryTime",
+        "expiryTime",
+        "expireTime",
+    )
+    reference = now if now is not None else time.time()
+    for key in timestamp_keys:
+        ts = _normalise_epoch_seconds(row.get(key))
+        if ts is None:
+            continue
+        if ts <= reference + 24 * 3600:
+            return True
+    return False
+
+
+def _apply_stoplists_from_settings(
+    settings: Optional["Settings"],
+    *,
+    maintenance: Set[str],
+    delisted: Set[str],
+) -> None:
+    if settings is None:
+        return
+    manual_maintenance = getattr(settings, "ai_maintenance_stoplist", None)
+    if manual_maintenance is not None:
+        maintenance.update(_collect_symbol_candidates(manual_maintenance))
+    manual_delist = getattr(settings, "ai_delist_stoplist", None)
+    if manual_delist is not None:
+        delisted.update(_collect_symbol_candidates(manual_delist))
 
 
 def _logit(probability: float) -> float:
@@ -677,6 +896,15 @@ def scan_market_opportunities(
     wset = _normalise_symbol_set(whitelist or ())
     bset = _normalise_symbol_set(blacklist or ())
 
+    maintenance_symbols: Set[str] = set()
+    delist_symbols: Set[str] = set()
+    if isinstance(snapshot, Mapping):
+        maintenance_symbols = _extract_snapshot_stoplist(snapshot, _MAINTENANCE_KEYS)
+        delist_symbols = _extract_snapshot_stoplist(snapshot, _DELIST_KEYS)
+    _apply_stoplists_from_settings(settings, maintenance=maintenance_symbols, delisted=delist_symbols)
+
+    outlier_symbols = _detect_outlier_symbols(rows if isinstance(rows, list) else [])
+
     try:
         model: Optional[MarketModel] = ensure_market_model(data_dir=data_dir)
     except Exception as exc:  # pragma: no cover - defensive logging
@@ -703,6 +931,24 @@ def scan_market_opportunities(
         if bset and symbol in bset:
             continue
 
+        force_include = symbol in wset
+
+        if not force_include and symbol in maintenance_symbols:
+            log("market_scanner.filter.maintenance", symbol=symbol, source="snapshot")
+            continue
+        if not force_include and _row_in_maintenance(raw):
+            log("market_scanner.filter.maintenance", symbol=symbol, source="row")
+            continue
+        if not force_include and symbol in delist_symbols:
+            log("market_scanner.filter.delist", symbol=symbol, source="snapshot")
+            continue
+        if not force_include and _row_delisted(raw, now=now):
+            log("market_scanner.filter.delist", symbol=symbol, source="row")
+            continue
+        if not force_include and symbol in outlier_symbols:
+            log("market_scanner.filter.outlier", symbol=symbol)
+            continue
+
         turnover = _safe_float(raw.get("turnover24h"))
         change_pct = _normalise_percent(raw.get("price24hPcnt"))
         volume = _safe_float(raw.get("volume24h"))
@@ -724,7 +970,6 @@ def scan_market_opportunities(
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
 
-        force_include = symbol in wset
         if not force_include and turnover is not None and turnover < min_turnover:
             turnover_ok = False
         else:
