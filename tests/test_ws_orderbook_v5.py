@@ -7,6 +7,7 @@ import json
 
 import pytest
 import threading
+import time
 
 
 from bybit_app.utils.ws_orderbook_v5 import WSOrderbookV5
@@ -180,4 +181,84 @@ def test_ws_orderbook_v5_updates_topics_without_restarting(monkeypatch):
     assert stop_event.wait(timeout=1)
     first_thread.join(timeout=1)
     assert not first_thread.is_alive()
+
+
+def test_ws_orderbook_v5_enforces_sequence_and_resubscribes(monkeypatch):
+    ob = WSOrderbookV5()
+    topic = f"orderbook.{ob.levels}.BTCUSDT"
+    sent_payloads: list[dict] = []
+
+    class _DummyWS:
+        def send(self, payload: str):
+            sent_payloads.append(json.loads(payload))
+
+    ob._ws = _DummyWS()
+    with ob._topic_lock:
+        ob._topics = {topic}
+        ob._topic_symbols = {topic: "BTCUSDT"}
+
+    ob._mark_symbols_for_snapshot(["BTCUSDT"], clear_book=True)
+
+    snapshot = {
+        "topic": topic,
+        "data": {
+            "type": "snapshot",
+            "ts": 1000,
+            "s": "BTCUSDT",
+            "u": 10,
+            "b": [["100", "1"]],
+            "a": [["101", "2"]],
+        },
+    }
+    ob._on_msg(None, json.dumps(snapshot))
+
+    book = ob.get("BTCUSDT")
+    assert book is not None
+    assert book["b"] == [(100.0, 1.0)]
+    assert book["a"] == [(101.0, 2.0)]
+
+    delta_ok = {
+        "topic": topic,
+        "data": {
+            "type": "delta",
+            "ts": 1100,
+            "s": "BTCUSDT",
+            "pu": 10,
+            "u": 11,
+            "b": [["100", "3"]],
+            "a": [],
+        },
+    }
+    ob._on_msg(None, json.dumps(delta_ok))
+
+    book_after_delta = ob.get("BTCUSDT")
+    assert book_after_delta is not None
+    assert book_after_delta["b"] == [(100.0, 3.0)]
+
+    sent_payloads.clear()
+    delta_out_of_order = {
+        "topic": topic,
+        "data": {
+            "type": "delta",
+            "ts": 1200,
+            "s": "BTCUSDT",
+            "pu": 5,
+            "u": 6,
+            "b": [["99", "1"]],
+            "a": [],
+        },
+    }
+    ob._on_msg(None, json.dumps(delta_out_of_order))
+
+    assert [p["op"] for p in sent_payloads] == ["unsubscribe", "subscribe"]
+
+    # После рассинхронизации предыдущая книга сбрасывается и ждёт snapshot.
+    assert ob.get("BTCUSDT") is None
+    assert "BTCUSDT" in ob._waiting_snapshot
+
+    # Следующий delta до snapshot будет проигнорирован, но спустя время повторится resubscribe.
+    sent_payloads.clear()
+    ob._last_resubscribe["BTCUSDT"] = time.time() - 2
+    ob._on_msg(None, json.dumps(delta_ok))
+    assert [p["op"] for p in sent_payloads] == ["unsubscribe", "subscribe"]
 
