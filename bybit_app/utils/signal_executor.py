@@ -34,6 +34,7 @@ from .spot_market import (
     wallet_balance_payload,
     parse_price_limit_error_details,
     place_spot_market_with_tolerance,
+    prepare_spot_market_order,
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
@@ -61,6 +62,9 @@ _SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 _PARTIAL_FILL_MAX_FOLLOWUPS = 3
 _PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
+_DUST_FLUSH_INTERVAL = 12.0
+_DUST_RETRY_DELAY = 45.0
+_DUST_MIN_QUOTE = Decimal("0.00000001")
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -139,6 +143,8 @@ class SignalExecutor:
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
         self._tp_sweeper_last_run: float = 0.0
+        self._dust_positions: Dict[str, Dict[str, object]] = {}
+        self._dust_last_flush: float = 0.0
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -155,17 +161,39 @@ class SignalExecutor:
             else:
                 sweeper_last_run = max(min(float(self._tp_sweeper_last_run), now_wall), 0.0)
 
+        dust_state: Dict[str, Dict[str, object]] = {}
+        for symbol, entry in self._dust_positions.items():
+            if not isinstance(symbol, str):
+                continue
+            quote_value = self._decimal_from(entry.get("quote"))
+            if quote_value <= 0:
+                continue
+            serialized: Dict[str, object] = {
+                "quote": self._format_decimal_for_meta(quote_value),
+            }
+            min_notional = self._decimal_from(entry.get("min_notional"))
+            if min_notional > 0:
+                serialized["min_notional"] = self._format_decimal_for_meta(min_notional)
+            cooldown_until = entry.get("cooldown_until")
+            if isinstance(cooldown_until, (int, float)) and math.isfinite(cooldown_until):
+                serialized["cooldown_until"] = float(cooldown_until)
+            dust_state[symbol] = serialized
+
         return {
             "validation_penalties": copy.deepcopy(self._validation_penalties),
             "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
             "price_limit_backoff": copy.deepcopy(self._price_limit_backoff),
             "tp_sweeper": {"last_run": sweeper_last_run},
+            "dust": dust_state,
+            "dust_last_flush": float(self._dust_last_flush) if self._dust_last_flush > 0 else 0.0,
         }
 
     def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
         self._validation_penalties = {}
         self._symbol_quarantine = {}
         self._price_limit_backoff = {}
+        self._dust_positions = {}
+        self._dust_last_flush = 0.0
         if not state:
             return
 
@@ -245,6 +273,38 @@ class SignalExecutor:
                     restored_backoff[symbol] = cleaned
             if restored_backoff:
                 self._price_limit_backoff = restored_backoff
+
+        dust_state = state.get("dust") if isinstance(state, Mapping) else None
+        if isinstance(dust_state, Mapping):
+            restored_dust: Dict[str, Dict[str, object]] = {}
+            for symbol, payload in dust_state.items():
+                if not isinstance(symbol, str) or not isinstance(payload, Mapping):
+                    continue
+                quote_value = self._decimal_from(payload.get("quote"))
+                if quote_value <= 0:
+                    continue
+                restored_entry: Dict[str, object] = {"quote": quote_value}
+                min_notional_value = self._decimal_from(payload.get("min_notional"))
+                if min_notional_value > 0:
+                    restored_entry["min_notional"] = min_notional_value
+                cooldown_until = payload.get("cooldown_until")
+                try:
+                    cooldown_float = float(cooldown_until)
+                except (TypeError, ValueError):
+                    cooldown_float = None
+                if cooldown_float is not None and math.isfinite(cooldown_float):
+                    restored_entry["cooldown_until"] = cooldown_float
+                restored_dust[symbol] = restored_entry
+            if restored_dust:
+                self._dust_positions = restored_dust
+
+        dust_flush_value = state.get("dust_last_flush") if isinstance(state, Mapping) else None
+        try:
+            dust_flush_float = float(dust_flush_value) if dust_flush_value is not None else 0.0
+        except (TypeError, ValueError):
+            dust_flush_float = 0.0
+        if math.isfinite(dust_flush_float) and dust_flush_float > 0:
+            self._dust_last_flush = dust_flush_float
 
         sweeper_state = (
             state.get("tp_sweeper")
@@ -1914,6 +1974,8 @@ class SignalExecutor:
             elif quote_wallet_cap_value < 0.0:
                 quote_wallet_cap_value = 0.0
 
+        self._maybe_flush_dust(api, settings, now=now)
+
         min_notional = 5.0
         instrument_limits: Optional[Mapping[str, object]] = None
         if api is not None:
@@ -2775,6 +2837,24 @@ class SignalExecutor:
                     response=response if isinstance(response, Mapping) else None,
                     context=order_context,
                 )
+            if side.lower() == "sell" and partial_meta.get("status") == "complete_below_minimum":
+                remaining_quote = self._decimal_from(partial_meta.get("remaining_quote"))
+                if remaining_quote > _DUST_MIN_QUOTE:
+                    min_meta = self._decimal_from(partial_meta.get("min_order_amt"))
+                    price_hint = None
+                    if isinstance(audit, Mapping):
+                        price_hint = self._decimal_from(
+                            audit.get("limit_price")
+                            or audit.get("price_payload")
+                            or audit.get("price")
+                        )
+                    self._register_dust(
+                        symbol,
+                        quote=remaining_quote,
+                        min_notional=min_meta if min_meta > 0 else None,
+                        price=price_hint if price_hint and price_hint > 0 else None,
+                        source="partial_fill",
+                    )
 
         private_snapshot = ws_manager.private_snapshot()
         ledger_rows_after, _ = self._ledger_rows_snapshot(
@@ -4116,6 +4196,209 @@ class SignalExecutor:
             response["_local"] = local
         local["attempts"] = list(attempts)
 
+    def _register_dust(
+        self,
+        symbol: str,
+        *,
+        quote: Decimal | None,
+        min_notional: Decimal | None = None,
+        price: Decimal | None = None,
+        source: str = "unknown",
+    ) -> None:
+        if not symbol:
+            return
+        quote_value = self._decimal_from(quote)
+        if quote_value <= _DUST_MIN_QUOTE:
+            return
+        symbol_upper = symbol.upper()
+        entry = self._dust_positions.setdefault(symbol_upper, {})
+        current_quote = self._decimal_from(entry.get("quote"))
+        entry["quote"] = current_quote + quote_value
+        min_notional_value = self._decimal_from(min_notional)
+        if min_notional_value > 0:
+            existing_min = self._decimal_from(entry.get("min_notional"))
+            if min_notional_value > existing_min:
+                entry["min_notional"] = min_notional_value
+        if price is not None and price > 0:
+            entry["price_hint"] = price
+        entry["updated"] = self._current_time()
+        entry["source"] = source
+        log(
+            "guardian.auto.dust.register",
+            symbol=symbol_upper,
+            source=source,
+            quote=self._format_decimal_for_meta(self._decimal_from(entry.get("quote"))),
+            min_notional=self._format_decimal_for_meta(self._decimal_from(entry.get("min_notional"))),
+        )
+
+    def _maybe_flush_dust(
+        self,
+        api: object,
+        settings: Settings,
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        if not self._dust_positions:
+            return
+        if api is None or not hasattr(api, "place_order"):
+            return
+        if active_dry_run(settings):
+            return
+
+        timestamp = self._current_time() if now is None else now
+        if self._dust_last_flush > 0 and timestamp - self._dust_last_flush < _DUST_FLUSH_INTERVAL:
+            return
+
+        removable: list[str] = []
+
+        for symbol, entry in self._dust_positions.items():
+            quote_value = self._decimal_from(entry.get("quote"))
+            if quote_value <= _DUST_MIN_QUOTE:
+                removable.append(symbol)
+                continue
+
+            cooldown_until = entry.get("cooldown_until")
+            if isinstance(cooldown_until, (int, float)) and math.isfinite(cooldown_until):
+                if cooldown_until > timestamp:
+                    continue
+
+            try:
+                snapshot = prepare_spot_trade_snapshot(
+                    api,
+                    symbol,
+                    include_limits=True,
+                    include_price=True,
+                    include_balances=True,
+                    force_refresh=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("guardian.auto.dust.snapshot_error", symbol=symbol, err=str(exc))
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+
+            limits = snapshot.limits or {}
+            balances = snapshot.balances or {}
+            price = snapshot.price if isinstance(snapshot.price, Decimal) else None
+            if price is None or price <= 0:
+                log("guardian.auto.dust.price_missing", symbol=symbol)
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+
+            min_notional = self._decimal_from(entry.get("min_notional"))
+            limit_min_notional = self._decimal_from(limits.get("min_order_amt"))
+            if limit_min_notional > 0 and limit_min_notional > min_notional:
+                min_notional = limit_min_notional
+                entry["min_notional"] = min_notional
+
+            base_asset = str(limits.get("base_coin") or "").upper()
+            if not base_asset and symbol.upper().endswith("USDT"):
+                base_asset = symbol.upper()[:-4]
+            available_base = self._decimal_from(balances.get(base_asset))
+            if available_base <= 0:
+                removable.append(symbol)
+                continue
+
+            quote_available = (available_base * price).copy_abs()
+            if quote_available <= 0:
+                removable.append(symbol)
+                continue
+
+            effective_quote = min(quote_value, quote_available)
+            entry["quote"] = effective_quote
+            if min_notional > 0 and effective_quote < min_notional:
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+
+            try:
+                prepared = prepare_spot_market_order(
+                    api,
+                    symbol,
+                    "Sell",
+                    effective_quote,
+                    unit="quoteCoin",
+                    tol_type="Percent",
+                    tol_value=0.5,
+                    price_snapshot=price,
+                    balances=balances,
+                    limits=limits,
+                    settings=settings,
+                )
+            except OrderValidationError as exc:
+                details = getattr(exc, "details", {}) or {}
+                detail_min = self._decimal_from(details.get("min_notional"))
+                if detail_min > 0 and detail_min > min_notional:
+                    entry["min_notional"] = detail_min
+                log(
+                    "guardian.auto.dust.prepare_error",
+                    symbol=symbol,
+                    code=exc.code,
+                    error=str(exc),
+                )
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("guardian.auto.dust.prepare_runtime", symbol=symbol, error=str(exc))
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+
+            payload = dict(prepared.payload)
+            payload["timeInForce"] = "IOC"
+            payload["orderLinkId"] = ensure_link_id(
+                f"DUST-{symbol}-{int(timestamp * 1000)}"
+            )
+
+            try:
+                response = api.place_order(**payload)  # type: ignore[call-arg]
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("guardian.auto.dust.place_error", symbol=symbol, error=str(exc))
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+                continue
+
+            log(
+                "guardian.auto.dust.convert",
+                symbol=symbol,
+                quote=self._format_decimal_for_meta(effective_quote),
+                payload=payload,
+                response=response,
+            )
+
+            remaining_quote = Decimal("0")
+            try:
+                refreshed = prepare_spot_trade_snapshot(
+                    api,
+                    symbol,
+                    include_limits=False,
+                    include_price=True,
+                    include_balances=True,
+                    force_refresh=True,
+                )
+            except Exception:  # pragma: no cover - defensive guard
+                refreshed = None
+
+            if refreshed is not None and refreshed.balances is not None:
+                remaining_base = self._decimal_from(
+                    refreshed.balances.get(base_asset)
+                )
+                price_after = (
+                    refreshed.price
+                    if isinstance(refreshed.price, Decimal) and refreshed.price > 0
+                    else price
+                )
+                if remaining_base > 0 and price_after > 0:
+                    remaining_quote = remaining_base * price_after
+
+            if remaining_quote <= _DUST_MIN_QUOTE:
+                removable.append(symbol)
+            else:
+                entry["quote"] = remaining_quote
+                entry["cooldown_until"] = timestamp + _DUST_RETRY_DELAY
+
+            self._dust_last_flush = timestamp
+            break
+
+        for symbol in removable:
+            self._dust_positions.pop(symbol, None)
+
     def _partial_fill_threshold(
         self,
         audit: Mapping[str, object] | None,
@@ -4860,6 +5143,15 @@ class SignalExecutor:
             return None, context, float(min_order_amt) if min_order_amt > 0 else None
 
         context["quote_notional"] = float(quote_notional)
+
+        if min_order_amt > 0 and quote_notional < min_order_amt:
+            self._register_dust(
+                symbol,
+                quote=quote_notional,
+                min_notional=min_order_amt,
+                price=price,
+                source="holdings_shortfall",
+            )
 
         return (
             float(quote_notional),

@@ -22,6 +22,7 @@ from bybit_app.utils.signal_executor import (
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     SpotTradeSnapshot,
+    PreparedSpotMarketOrder,
     _BALANCE_CACHE,
 )
 from bybit_app.utils.ws_manager import WSManager
@@ -3295,6 +3296,206 @@ def test_signal_executor_follows_up_partial_fill(monkeypatch: pytest.MonkeyPatch
     attempts_meta = response_meta.get("attempts") if isinstance(response_meta, dict) else None
     assert isinstance(attempts_meta, list)
     assert len(attempts_meta) == 2
+
+
+def test_signal_executor_records_dust_after_partial_fill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=400.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_maybe_notify_trade",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_place_tp_ladder",
+        lambda *args, **kwargs: ([], {}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_maybe_flush_dust",
+        lambda self, api_obj, settings_obj, now=None: None,
+    )
+
+    def fake_compute_notional(
+        self,
+        settings_obj: Settings,
+        total_equity: float,
+        available_equity: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> Tuple[float, float, bool, bool]:
+        return 50.0, available_equity, False, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute_notional,
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_sell_notional_from_holdings",
+        lambda self, api_obj, symbol, **kwargs: (50.0, {}, 5.0),
+    )
+
+    response_payload = {
+        "result": {"orderId": "dust-stub"},
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.0001",
+                "min_order_amt": "5",
+                "price_payload": "100.0",
+            }
+        },
+    }
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: copy.deepcopy(response_payload),
+    )
+
+    partial_meta = {
+        "status": "complete_below_minimum",
+        "remaining_quote": "3.2",
+        "min_order_amt": "5",
+    }
+
+    def fake_chase(self, **kwargs):
+        return response_payload, Decimal("0.01"), Decimal("50"), partial_meta
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_chase_partial_fill",
+        fake_chase,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    dust_entry = executor._dust_positions.get("BTCUSDT")
+    assert dust_entry is not None
+    assert executor._decimal_from(dust_entry.get("quote")) == Decimal("3.2")
+    assert (
+        executor._decimal_from(dust_entry.get("min_notional"))
+        == Decimal("5")
+    )
+
+
+def test_signal_executor_liquidates_dust_via_ioc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "sell", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, dry_run=False)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    api = StubAPI(total=1000.0, available=900.0)
+
+    def fake_snapshot(
+        api_obj,
+        symbol: str,
+        *,
+        include_limits: bool = True,
+        include_price: bool = True,
+        include_balances: bool = True,
+        force_refresh: bool = False,
+    ) -> SpotTradeSnapshot:
+        if getattr(fake_snapshot, "calls", 0) == 0:
+            fake_snapshot.calls = 1
+            return SpotTradeSnapshot(
+                symbol=symbol,
+                price=Decimal("2000"),
+                balances={"ETH": Decimal("0.003")},
+                limits={
+                    "min_order_amt": Decimal("5"),
+                    "base_coin": "ETH",
+                    "quote_coin": "USDT",
+                },
+            )
+        return SpotTradeSnapshot(
+            symbol=symbol,
+            price=Decimal("2000"),
+            balances={"ETH": Decimal("0")},
+            limits={
+                "min_order_amt": Decimal("5"),
+                "base_coin": "ETH",
+                "quote_coin": "USDT",
+            },
+        )
+
+    fake_snapshot.calls = 0
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_trade_snapshot",
+        fake_snapshot,
+    )
+
+    def fake_prepare(
+        api_obj,
+        symbol: str,
+        side: str,
+        qty: object,
+        **kwargs: object,
+    ) -> PreparedSpotMarketOrder:
+        return PreparedSpotMarketOrder(
+            payload={
+                "category": "spot",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Limit",
+                "qty": "0.003",
+                "price": "2000",
+                "timeInForce": "GTC",
+                "orderFilter": "Order",
+                "accountType": "UNIFIED",
+            },
+            audit={"min_order_amt": "5"},
+        )
+
+    monkeypatch.setattr(
+        signal_executor_module,
+        "prepare_spot_market_order",
+        fake_prepare,
+    )
+
+    executor._register_dust(
+        "ETHUSDT",
+        quote=Decimal("6"),
+        min_notional=Decimal("5"),
+        price=Decimal("2000"),
+        source="test",
+    )
+
+    executor._maybe_flush_dust(api, settings, now=time.time())
+
+    assert api.orders
+    order = api.orders[0]
+    assert order["timeInForce"] == "IOC"
+    assert order["side"] == "Sell"
+    assert order["qty"] == "0.003"
+    assert executor._dust_positions.get("ETHUSDT") is None
 
 
 def test_signal_executor_prefers_trade_candidate_over_holdings(
