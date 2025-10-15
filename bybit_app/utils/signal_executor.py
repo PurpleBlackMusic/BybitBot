@@ -2121,6 +2121,9 @@ class SignalExecutor:
             if portfolio_snapshot["total_exposure"] or portfolio_snapshot["symbol_exposure"]:
                 risk_context["portfolio"] = portfolio_snapshot
 
+            trade_cap_pct = _safe_float(getattr(settings, "spot_max_cap_per_trade_pct", None))
+            caps_disabled = trade_cap_pct is not None and trade_cap_pct <= 0
+
             symbol_cap_pct = _safe_float(
                 getattr(settings, "spot_max_cap_per_symbol_pct", None)
             )
@@ -2158,10 +2161,11 @@ class SignalExecutor:
                 }
 
             cap_candidates: List[Tuple[float, str]] = []
-            if symbol_cap_available is not None:
-                cap_candidates.append((symbol_cap_available, "symbol_cap"))
-            if portfolio_cap_available is not None:
-                cap_candidates.append((portfolio_cap_available, "portfolio_cap"))
+            if not caps_disabled:
+                if symbol_cap_available is not None:
+                    cap_candidates.append((symbol_cap_available, "symbol_cap"))
+                if portfolio_cap_available is not None:
+                    cap_candidates.append((portfolio_cap_available, "portfolio_cap"))
 
             if cap_candidates:
                 cap_candidates.sort(key=lambda item: item[0])
@@ -2192,7 +2196,26 @@ class SignalExecutor:
             quote_balance_cap=quote_balance_cap,
         )
 
+        is_minimum_buy_request = False
+        if (
+            side == "Buy"
+            and min_notional > 0
+            and math.isfinite(min_notional)
+            and math.isfinite(notional)
+        ):
+            is_minimum_buy_request = math.isclose(
+                notional,
+                min_notional,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+
         if side == "Buy" and cap_limit_value is not None:
+            if is_minimum_buy_request and cap_limit_value < min_notional:
+                cap_limit_value = min_notional
+                cap_entry = risk_context.get("cap_adjustment")
+                if cap_entry is not None:
+                    cap_entry["limit"] = cap_limit_value
             cap_applied = False
             if cap_limit_value <= 0:
                 notional = 0.0
@@ -2348,19 +2371,12 @@ class SignalExecutor:
 
         tolerance_multiplier, _, _, _ = _resolve_slippage_tolerance("Percent", slippage_pct)
 
-        is_minimum_buy_request = False
-        if (
-            side == "Buy"
-            and min_notional > 0
-            and math.isfinite(min_notional)
-            and math.isfinite(notional)
-        ):
-            is_minimum_buy_request = math.isclose(
-                notional,
-                min_notional,
-                rel_tol=1e-9,
-                abs_tol=1e-9,
-            )
+        if side == "Buy" and is_minimum_buy_request and notional < min_notional:
+            notional = min_notional
+            cap_entry = risk_context.get("cap_adjustment")
+            if cap_entry is not None:
+                cap_entry["applied"] = False
+                cap_entry["final_notional"] = notional
 
         adjusted_notional = notional
         if side == "Buy" and tolerance_multiplier > 0:
@@ -2507,6 +2523,8 @@ class SignalExecutor:
                 if available_equity > 0:
                     allowed_quote = min(required_quote, available_equity)
                 cap_for_min_buy = usable_after_reserve
+                if reserve_relaxed_for_min:
+                    cap_for_min_buy = max(cap_for_min_buy, required_quote)
                 if (
                     quote_wallet_cap_value is not None
                     and math.isfinite(quote_wallet_cap_value)

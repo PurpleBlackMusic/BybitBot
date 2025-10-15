@@ -10,6 +10,7 @@ from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
+import time
 
 from tenacity import (
     RetryCallState,
@@ -106,6 +107,8 @@ class BybitAPI:
         self._order_registry = _LocalOrderRegistry()
         self._clock_offset_ms: float = 0.0
         self._clock_latency_ms: float = 0.0
+        self._quota_lock = threading.Lock()
+        self._last_quota: dict[str, object] = {}
 
     def _thread_local_session(self) -> requests.Session:
         session = getattr(self._http_local, "session", None)
@@ -216,6 +219,7 @@ class BybitAPI:
             r = self.session.request(method.upper(), url, params=None, data=q, headers=headers,
                                      timeout=self.timeout, verify=self.verify_ssl)
         r.raise_for_status()
+        self._record_quota_headers(r)
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
@@ -321,6 +325,47 @@ class BybitAPI:
             if isinstance(final, BaseException):
                 raise final
             raise
+
+    def _record_quota_headers(self, response: requests.Response | None) -> None:
+        if response is None:
+            return
+        headers = getattr(response, "headers", None)
+        if not headers:
+            return
+
+        quota_fields: dict[str, object] = {}
+        for key, value in headers.items():
+            lower_key = key.lower()
+            if "quota" not in lower_key and "ratelimit" not in lower_key:
+                continue
+            if value is None:
+                continue
+            parsed: object = value
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    try:
+                        if "." in stripped:
+                            parsed = float(stripped)
+                        else:
+                            parsed = int(stripped)
+                    except ValueError:
+                        parsed = stripped
+                else:
+                    parsed = stripped
+            quota_fields[key] = parsed
+
+        if not quota_fields:
+            return
+
+        quota_fields["updated_at"] = time.time()
+        with self._quota_lock:
+            self._last_quota = quota_fields
+
+    @property
+    def quota_snapshot(self) -> dict[str, object]:
+        with self._quota_lock:
+            return dict(self._last_quota)
 
     @staticmethod
     def _normalise_numeric_fields(payload: dict[str, object], numeric_fields: set[str]) -> None:

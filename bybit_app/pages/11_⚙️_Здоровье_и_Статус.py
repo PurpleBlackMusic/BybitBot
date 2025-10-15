@@ -10,6 +10,7 @@ import streamlit as st
 from utils.background import (
     ensure_background_services,
     get_automation_status,
+    get_preflight_snapshot,
     get_ws_events,
     get_ws_snapshot,
     restart_automation,
@@ -144,9 +145,66 @@ def _render_ws_channel(
             st.success(f"Обновления поступают вовремя ({age_text}).")
 
 
+preflight_snapshot = get_preflight_snapshot()
 ws_snapshot = get_ws_snapshot()
 automation_snapshot = get_automation_status()
 events_payload = get_ws_events(limit=20)
+
+_render_preflight_section(preflight_snapshot)
+
+st.divider()
+
+
+def _render_preflight_section(snapshot: Mapping[str, Any]) -> None:
+    state = snapshot if isinstance(snapshot, Mapping) else {}
+    ok = bool(state.get("ok"))
+    checked_at = _to_float(state.get("checked_at"))
+    age_text = _format_duration(
+        max(0.0, time.time() - checked_at) if checked_at else None
+    )
+    header = "🟢 Система готова" if ok else "🔴 Требует внимания"
+
+    with st.container(border=True):
+        st.markdown("### Pre-flight диагностика")
+        st.markdown(f"**Статус:** {header}")
+        st.caption(f"Проверено: {_format_timestamp(checked_at)} · Возраст: {age_text}")
+
+        components_order = [
+            ("realtime", "Реальное время"),
+            ("websocket", "WebSocket"),
+            ("limits", "Торговые лимиты"),
+            ("metadata", "Метаданные"),
+            ("quotas", "API квоты"),
+        ]
+
+        columns = st.columns(2)
+        for idx, (key, fallback_title) in enumerate(components_order):
+            column = columns[idx % 2]
+            component = state.get(key)
+            with column:
+                _render_preflight_component(component, fallback_title)
+
+
+def _render_preflight_component(payload: object, fallback_title: str) -> None:
+    container = st.container(border=True)
+    with container:
+        if not isinstance(payload, Mapping):
+            st.markdown(f"#### {fallback_title}")
+            st.warning("Данных нет.")
+            return
+
+        title = str(payload.get("title") or fallback_title)
+        ok = bool(payload.get("ok"))
+        message = str(payload.get("message") or "")
+        icon = "🟢" if ok else "🔴"
+
+        st.markdown(f"#### {title}")
+        st.write(f"{icon} {message}")
+
+        details = payload.get("details")
+        if isinstance(details, Mapping) or isinstance(details, list):
+            with st.expander("Подробности", expanded=False):
+                st.json(details)
 
 ws_status = ws_snapshot.get("status") if isinstance(ws_snapshot, Mapping) else {}
 public_info = ws_status.get("public") if isinstance(ws_status, Mapping) else {}

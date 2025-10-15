@@ -538,3 +538,28 @@ def test_ws_events_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     assert events_payload["events"]
     assert events_payload["events"][-1]["topic"] == "executions"
     assert isinstance(events_payload["stats"], dict)
+
+
+def test_preflight_snapshot_exposes_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+
+    fake_snapshot = {"ok": True, "checked_at": 123.0, "realtime": {"ok": True}}
+
+    monkeypatch.setattr(
+        background_module,
+        "get_settings",
+        lambda: SimpleNamespace(api_key="key", api_secret="secret"),
+    )
+    monkeypatch.setattr(background_module, "get_api_client", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        background_module,
+        "collect_preflight_snapshot",
+        lambda *args, **kwargs: fake_snapshot,
+    )
+
+    svc._run_preflight_healthcheck()
+    snapshot = svc.preflight_snapshot()
+
+    assert snapshot["ok"] is True
+    assert snapshot["state"]["ok"] is True
+    assert snapshot["realtime"]["ok"] is True

@@ -12,6 +12,7 @@ from .log import log
 from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
 from .ws_manager import manager as ws_manager
 from .realtime_cache import get_realtime_cache
+from .preflight import collect_preflight_snapshot
 
 BotFactory = Callable[[], GuardianBot]
 ExecutorFactory = Callable[[GuardianBot], SignalExecutor]
@@ -88,6 +89,11 @@ class BackgroundServices:
         self._guardian_poll_interval = 12.0
         self._guardian_error_backoff = 5.0
 
+        self._preflight_lock = threading.Lock()
+        self._preflight_state: Dict[str, Any] = {}
+        self._preflight_last_run: float = 0.0
+        self._preflight_error: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     def ensure_started(self) -> None:
@@ -96,6 +102,8 @@ class BackgroundServices:
             return
 
         self._run_startup_hygiene()
+
+        self._run_preflight_healthcheck()
 
         if not self._await_private_ready():
             return
@@ -330,6 +338,48 @@ class BackgroundServices:
                 log("background.hygiene.twap.cleaned", total=0)
 
             self._hygiene_performed = True
+
+    def _run_preflight_healthcheck(self) -> None:
+        now = time.time()
+        with self._preflight_lock:
+            if self._preflight_state and now - self._preflight_last_run < 15.0:
+                return
+            self._preflight_last_run = now
+
+        try:
+            settings = get_settings()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            with self._preflight_lock:
+                self._preflight_error = str(exc)
+            log("background.preflight.settings_error", err=str(exc))
+            return
+
+        try:
+            api = get_api_client()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            with self._preflight_lock:
+                self._preflight_error = str(exc)
+            log("background.preflight.api_unavailable", err=str(exc))
+            return
+
+        ws_status = self._safe_ws_status()
+
+        try:
+            snapshot = collect_preflight_snapshot(
+                settings,
+                api=api,
+                ws_status=ws_status,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            with self._preflight_lock:
+                self._preflight_error = str(exc)
+            log("background.preflight.error", err=str(exc))
+            return
+
+        with self._preflight_lock:
+            self._preflight_state = snapshot
+            self._preflight_error = None
+            self._preflight_last_run = time.time()
 
     def restart_ws(self) -> bool:
         return self.ensure_ws_started(force=True)
@@ -688,6 +738,23 @@ class BackgroundServices:
             if event is not None:
                 event.set()
 
+    def preflight_snapshot(self) -> Dict[str, Any]:
+        with self._preflight_lock:
+            state = copy.deepcopy(self._preflight_state)
+            error = self._preflight_error
+            last_run = self._preflight_last_run
+
+        snapshot: Dict[str, Any] = {
+            "state": state,
+            "last_run_at": last_run or None,
+            "error": error,
+        }
+        if last_run:
+            snapshot["age_seconds"] = max(0.0, time.time() - last_run)
+        if isinstance(state, Mapping):
+            snapshot.update(state)
+        return snapshot
+
     def _should_sweep_orders(self) -> bool:
         self._refresh_order_sweeper_settings()
         if self._order_sweep_interval <= 0 or self._order_sweep_stale_after <= 0:
@@ -894,6 +961,10 @@ def get_ws_snapshot() -> Dict[str, Any]:
 
 def get_guardian_state() -> Dict[str, Any]:
     return _state.guardian_snapshot()
+
+
+def get_preflight_snapshot() -> Dict[str, Any]:
+    return _state.preflight_snapshot()
 
 
 def restart_automation() -> bool:
