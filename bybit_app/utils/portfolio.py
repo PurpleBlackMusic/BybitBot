@@ -7,6 +7,7 @@ from .bybit_api import BybitAPI, BybitCreds
 from .envs import get_settings
 from .paths import DATA_DIR
 from .log import log
+from .ohlcv import normalise_ohlcv_frame
 
 RISK_DIR = DATA_DIR / "risk"
 RISK_DIR.mkdir(parents=True, exist_ok=True)
@@ -20,10 +21,14 @@ def fetch_klines_df(api: BybitAPI, symbol: str, interval: str = "60", lookback_h
     rows = list(reversed(rows))
     if not rows:
         return pd.DataFrame(columns=["start","open","high","low","close","volume"])
-    df = pd.DataFrame(rows, columns=["start","open","high","low","close","volume","turnover"][:len(rows[0])])
-    df["start"] = pd.to_datetime(df["start"].astype("int64"), unit="ms")
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+    df = pd.DataFrame(
+        rows,
+        columns=["start","open","high","low","close","volume","turnover"][: len(rows[0])],
+    )
+    numeric_cols = [col for col in ["open", "high", "low", "close", "volume", "turnover"] if col in df.columns]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = normalise_ohlcv_frame(df, timestamp_col="start")
     return df
 
 def compute_returns(df: pd.DataFrame) -> pd.Series:
