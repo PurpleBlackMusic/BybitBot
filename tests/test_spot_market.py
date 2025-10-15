@@ -661,6 +661,87 @@ def test_wallet_available_balances_prefers_available_without_double_subtraction(
     assert balances["USDT"] == Decimal("80")
 
 
+def test_wallet_available_balances_handles_cash_and_freezed_fields():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "SPOT",
+                    "coin": [
+                        {
+                            "coin": "SOL",
+                            "cash": "1.25",
+                            "freezed": "0.75",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="SPOT")
+
+    assert balances["SOL"] == Decimal("1.25")
+
+
+def test_wallet_available_balances_extracts_base_quote_details_from_exchange_payload():
+    wallet_payload = {
+        "UNIFIED": {
+            "result": {
+                "list": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {"coin": "USDT", "availableBalance": "0"},
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    exchange_asset_payload = {
+        "result": {
+            "spot": [
+                {
+                    "details": [
+                        {
+                            "baseCoin": "BBSOL",
+                            "baseAvailableBalance": "2.5",
+                            "baseLocked": "0.5",
+                            "quoteCoin": "USDT",
+                            "quoteAvailableBalance": "100",
+                            "quoteLocked": "5",
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    class SpotFallbackAPI(DummyAPI):
+        def wallet_balance(self, accountType="UNIFIED"):
+            if accountType and accountType.upper() != "UNIFIED":
+                self.wallet_calls += 1
+                raise RuntimeError(
+                    "Bybit error 10001: accountType only support UNIFIED (/v5/account/wallet-balance)"
+                )
+            return super().wallet_balance(accountType=accountType)
+
+    api = SpotFallbackAPI(
+        {},
+        wallet_payload=wallet_payload,
+        exchange_asset_payload=exchange_asset_payload,
+    )
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("100")
+    assert balances["BBSOL"] == Decimal("2.5")
+
+
 def test_wallet_available_balances_cache_scoped_by_network():
     def wallet_payload(amount: str) -> dict:
         return {
