@@ -108,10 +108,11 @@ class BybitAPI:
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
-        attempts = 2 if signed else 1
+        max_attempts = 5 if signed else 3
+        backoff_base = 0.5
         last_error: RuntimeError | None = None
 
-        for attempt in range(attempts):
+        for attempt in range(1, max_attempts + 1):
             try:
                 resp = self._req(method, path, params=params, body=body, signed=signed)
             except requests.exceptions.HTTPError as exc:
@@ -135,20 +136,28 @@ class BybitAPI:
                         "Bybit authentication failed: please verify API key/secret, permissions, and network selection."
                         f" ({message})"
                     ) from exc
-                raise RuntimeError(f"HTTP error {status_code or 'unknown'} while calling {path}: {message}") from exc
+
+                error = RuntimeError(f"HTTP error {status_code or 'unknown'} while calling {path}: {message}")
+                last_error = error
+
+                if status_code in {429, 503} and attempt < max_attempts:
+                    time.sleep(backoff_base * (2 ** (attempt - 1)))
+                    continue
+
+                raise error from exc
 
             if not isinstance(resp, dict):
                 return resp
 
             ret_code = resp.get("retCode", 0)
-            numeric_code = ret_code
-            if isinstance(numeric_code, str):
-                try:
-                    numeric_code = int(numeric_code)
-                except ValueError:
-                    numeric_code = ret_code
+            ret_code_str = str(ret_code)
+            numeric_code: int | None = None
+            try:
+                numeric_code = int(ret_code_str)
+            except (TypeError, ValueError):
+                pass
 
-            if numeric_code in (0, "0"):
+            if numeric_code == 0 or ret_code_str == "0":
                 return resp
 
             error = RuntimeError(
@@ -156,9 +165,13 @@ class BybitAPI:
             )
             last_error = error
 
-            if signed and attempt == 0 and numeric_code == 10002:
+            if signed and numeric_code == 10002 and attempt < max_attempts:
                 invalidate_synced_clock(self.base)
                 self._timestamp_ms(force_refresh=True)
+                continue
+
+            if (numeric_code == 10016 or ret_code_str == "10016") and attempt < max_attempts:
+                time.sleep(backoff_base * (2 ** (attempt - 1)))
                 continue
 
             raise error
