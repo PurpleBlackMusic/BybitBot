@@ -46,6 +46,7 @@ from .pnl import (
 from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
+from .tp_targets import resolve_fee_guard_fraction, target_multiplier
 from .trade_notifications import format_sell_close_message
 from .ws_manager import manager as ws_manager
 
@@ -2733,9 +2734,11 @@ class SignalExecutor:
             mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
             time_in_force = mapping.get(tif_upper, tif_upper)
 
+        fee_guard_fraction = resolve_fee_guard_fraction(settings)
         aggregated: list[Dict[str, object]] = []
         for step_cfg, qty in allocations:
-            price = avg_price * (Decimal("1") + step_cfg.profit_fraction)
+            multiplier = target_multiplier(step_cfg.profit_fraction, fee_guard_fraction)
+            price = avg_price * multiplier
             price = self._round_to_step(price, price_step, rounding=ROUND_UP)
             price = self._clamp_price_to_band(
                 price,

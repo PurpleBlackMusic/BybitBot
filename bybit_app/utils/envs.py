@@ -99,6 +99,7 @@ class Settings:
     spot_tp_ladder_split_pct: str = '50,30,20'
     spot_tp_reprice_threshold_bps: float = 5.0
     spot_tp_reprice_qty_buffer: float = 0.0
+    spot_tp_fee_guard_bps: float = 20.0
 
     # AI — общие
     ai_enabled: bool = True
@@ -319,6 +320,7 @@ _ENV_MAP = {
     "max_amendments": "MAX_AMENDMENTS",
     "spot_tp_reprice_threshold_bps": "SPOT_TP_REPRICE_THRESHOLD_BPS",
     "spot_tp_reprice_qty_buffer": "SPOT_TP_REPRICE_QTY_BUFFER",
+    "spot_tp_fee_guard_bps": "SPOT_TP_FEE_GUARD_BPS",
     "telegram_token": "TG_BOT_TOKEN",
     "telegram_chat_id": "TG_CHAT_ID",
     "telegram_notify": "TG_NOTIFY",
@@ -460,6 +462,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
     m["spot_tp_ladder_bps"] = m.get("spot_tp_ladder_bps") or "35,70,110"
     m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "50,30,20"
+    m["spot_tp_fee_guard_bps"] = _cast_float(m.get("spot_tp_fee_guard_bps", 20.0))
     m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"

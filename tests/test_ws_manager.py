@@ -567,15 +567,15 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
         {
             "qty": Decimal("0.20"),
             "qty_text": "0.20",
-            "price": Decimal("101.0"),
-            "price_text": "101.0",
+            "price": Decimal("100.7"),
+            "price_text": "100.7",
             "profit_labels": ["50"],
         },
         {
             "qty": Decimal("0.10"),
             "qty_text": "0.10",
-            "price": Decimal("102.0"),
-            "price_text": "102.0",
+            "price": Decimal("101.2"),
+            "price_text": "101.2",
             "profit_labels": ["100"],
         },
     ]
@@ -653,8 +653,8 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     executed_symbol, payload = execute_calls[0]
     assert executed_symbol == "BTCUSDT"
     assert [entry.get("price_text") for entry in payload] == [
-        "101.0",
-        "102.0",
+        "100.7",
+        "101.2",
     ]
     assert [entry.get("qty_text") for entry in payload] == ["0.20", "0.10"]
 
@@ -663,7 +663,7 @@ def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.Monkey
     ladder_payload = plan_state.get("ladder")
     if ladder_payload is not None:
         assert isinstance(ladder_payload, tuple)
-        assert ladder_payload[0][0] == "101.0"
+        assert ladder_payload[0][0] == "100.7"
         assert ladder_payload[0][1] == "0.20"
 
 

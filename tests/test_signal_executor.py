@@ -2421,8 +2421,8 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert second["orderType"] == "Limit"
     assert Decimal(first["qty"]) == Decimal("0.45")
     assert Decimal(second["qty"]) == Decimal("0.30")
-    assert Decimal(first["price"]) == Decimal("100.5")
-    assert Decimal(second["price"]) == Decimal("101")
+    assert Decimal(first["price"]) == Decimal("100.7")
+    assert Decimal(second["price"]) == Decimal("101.2")
     assert result.order is not None
     assert result.order.get("take_profit_orders")
     assert result.context is not None
@@ -2649,7 +2649,7 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
     assert len(api.orders) == 1
     order = api.orders[0]
     assert order["qty"] == "1.0"
-    assert order["price"] == "100.1"
+    assert order["price"] == "100.3"
     assert result.order is not None
     ladder = result.order.get("take_profit_orders")
     assert ladder is not None
@@ -3052,7 +3052,7 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
     qtys = [Decimal(order["qty"]) for order in api.orders]
     prices = [Decimal(order["price"]) for order in api.orders]
     assert qtys == [Decimal("0.37"), Decimal("0.22"), Decimal("0.16")]
-    assert prices == [Decimal("100.35"), Decimal("100.7"), Decimal("101.1")]
+    assert prices == [Decimal("100.55"), Decimal("100.9"), Decimal("101.3")]
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
