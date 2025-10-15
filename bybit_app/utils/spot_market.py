@@ -347,6 +347,20 @@ _WALLET_AVAILABLE_FIELDS = (
 )
 _WALLET_FALLBACK_FIELDS = ("walletBalance",)
 _WALLET_SYMBOL_FIELDS = ("coin", "asset", "currency")
+_WALLET_RESERVED_FIELDS = (
+    "orderMargin",
+    "order_margin",
+    "totalOrderIM",
+    "totalOrderMargin",
+    "locked",
+    "lockedBalance",
+    "frozenBalance",
+    "frozen",
+    "serviceCash",
+    "commission",
+    "pendingCommission",
+    "pendingFee",
+)
 _KNOWN_QUOTES = (
     "USDT",
     "USDC",
@@ -719,6 +733,40 @@ def _orderbook_snapshot(api: BybitAPI, symbol: str) -> tuple[list[tuple[Decimal,
     asks = _normalise_orderbook_levels(asks_raw, descending=False)
     bids = _normalise_orderbook_levels(bids_raw, descending=True)
     return asks, bids
+
+
+def _synthetic_orderbook_levels(
+    price: Decimal,
+    *,
+    min_amount: Decimal,
+    min_qty: Decimal,
+    qty_step: Decimal,
+    target_quote: Decimal | None,
+    target_base: Decimal | None,
+) -> list[tuple[Decimal, Decimal]]:
+    if price <= 0:
+        return []
+
+    qty_candidate = Decimal("1")
+    if target_base is not None and target_base > 0:
+        qty_candidate = max(qty_candidate, target_base)
+    if target_quote is not None and target_quote > 0 and price > 0:
+        qty_from_quote = target_quote / price
+        if qty_from_quote > qty_candidate:
+            qty_candidate = qty_from_quote
+    if min_amount > 0 and price > 0:
+        qty_from_min_notional = min_amount / price
+        if qty_from_min_notional > qty_candidate:
+            qty_candidate = qty_from_min_notional
+    if min_qty > 0 and min_qty > qty_candidate:
+        qty_candidate = min_qty
+
+    if qty_step > 0:
+        qty_candidate = _round_up(qty_candidate, qty_step)
+    if qty_candidate <= 0:
+        qty_candidate = qty_step if qty_step > 0 else Decimal("0.00000001")
+
+    return [(price, qty_candidate)]
 
 
 def _plan_limit_ioc_order(
@@ -1245,8 +1293,11 @@ def _is_unsupported_wallet_account_type_error(error: object) -> bool:
 
 def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
     """Pick the most tradable balance value from a wallet row."""
-    best_positive: Decimal | None = None
-    best_non_positive: Decimal | None = None
+
+    available_positive: Decimal | None = None
+    available_non_positive: Decimal | None = None
+    fallback_positive: Decimal | None = None
+    fallback_non_positive: Decimal | None = None
 
     for field in _WALLET_AVAILABLE_FIELDS:
         candidate = row.get(field)
@@ -1254,13 +1305,10 @@ def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
             continue
         amount = _to_decimal(candidate)
         if amount > 0:
-            if best_positive is None or amount > best_positive:
-                best_positive = amount
-        elif best_non_positive is None:
-            best_non_positive = amount
-
-    if best_positive is not None:
-        return best_positive
+            if available_positive is None or amount > available_positive:
+                available_positive = amount
+        elif available_non_positive is None or amount > available_non_positive:
+            available_non_positive = amount
 
     for field in _WALLET_FALLBACK_FIELDS:
         candidate = row.get(field)
@@ -1268,15 +1316,51 @@ def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
             continue
         amount = _to_decimal(candidate)
         if amount > 0:
-            if best_positive is None or amount > best_positive:
-                best_positive = amount
-        elif best_non_positive is None:
-            best_non_positive = amount
+            if fallback_positive is None or amount > fallback_positive:
+                fallback_positive = amount
+        elif fallback_non_positive is None or amount > fallback_non_positive:
+            fallback_non_positive = amount
 
-    if best_positive is not None:
-        return best_positive
+    reserved_total = Decimal("0")
+    for field in _WALLET_RESERVED_FIELDS:
+        candidate = row.get(field)
+        if candidate is None:
+            continue
+        amount = _to_decimal(candidate)
+        if amount > 0:
+            reserved_total += amount
 
-    return best_non_positive
+    fallback_net_positive: Decimal | None = None
+    fallback_net_non_positive: Decimal | None = fallback_non_positive
+
+    if fallback_positive is not None:
+        net = fallback_positive - reserved_total
+        if net > 0:
+            fallback_net_positive = net
+        else:
+            fallback_net_non_positive = net
+    elif fallback_non_positive is not None and reserved_total > 0:
+        net = fallback_non_positive - reserved_total
+        if fallback_net_non_positive is None or net > fallback_net_non_positive:
+            fallback_net_non_positive = net
+
+    positive_candidates = [
+        amount
+        for amount in (available_positive, fallback_net_positive)
+        if amount is not None and amount > 0
+    ]
+    if positive_candidates:
+        return max(positive_candidates)
+
+    non_positive_candidates = [
+        amount
+        for amount in (available_non_positive, fallback_net_non_positive)
+        if amount is not None
+    ]
+    if non_positive_candidates:
+        return max(non_positive_candidates)
+
+    return None
 
 
 def _iter_wallet_rows(payload: object, *, _seen: Optional[set[int]] = None) -> List[Mapping[str, object]]:
@@ -2120,6 +2204,28 @@ def prepare_spot_market_order(
             instrument_floor_enforced = True
 
     asks, bids = _orderbook_snapshot(api, symbol)
+
+    def _with_synthetic_depth(levels: list[tuple[Decimal, Decimal]]) -> list[tuple[Decimal, Decimal]]:
+        if levels:
+            return levels
+        fallback_price = price_hint if isinstance(price_hint, Decimal) else _to_decimal(price_hint)
+        if fallback_price <= 0:
+            fallback_price = _latest_price(api, symbol)
+        synthetic = _synthetic_orderbook_levels(
+            fallback_price,
+            min_amount=min_amount,
+            min_qty=min_qty,
+            qty_step=qty_step,
+            target_quote=target_quote,
+            target_base=target_base,
+        )
+        return synthetic if synthetic else levels
+
+    if side_normalised == "buy" and not asks:
+        asks = _with_synthetic_depth(asks)
+    if side_normalised == "sell" and not bids:
+        bids = _with_synthetic_depth(bids)
+
     worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
         asks=asks,
         bids=bids,

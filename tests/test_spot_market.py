@@ -492,6 +492,48 @@ def test_place_spot_market_omits_slippage_when_zero_tolerance():
     assert "slippageToleranceType" not in placed
 
 
+def test_place_spot_market_uses_ticker_when_orderbook_empty():
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "ETHUSDT",
+                    "status": "Trading",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "minOrderAmtIncrement": "0.01",
+                        "minOrderQty": "0.0001",
+                        "qtyStep": "0.0001",
+                    },
+                    "priceFilter": {"tickSize": "0.01"},
+                }
+            ]
+        }
+    }
+    orderbook_payload = {"result": {"a": [], "b": []}}
+    ticker_payload = {"result": {"list": [{"symbol": "ETHUSDT", "lastPrice": "101"}]}}
+    api = DummyAPI(
+        payload,
+        ticker_payload=ticker_payload,
+        orderbook_payload=orderbook_payload,
+    )
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="ETHUSDT",
+        side="Buy",
+        qty=10.0,
+        unit="quoteCoin",
+        tol_value=0.5,
+    )
+
+    assert response["ok"] is True
+    assert api.place_calls
+    placed = api.place_calls[0]
+    assert placed["category"] == "spot"
+    assert Decimal(placed["price"]) == Decimal("101")
+
+
 def test_wallet_available_balances_use_wallet_balance_when_withdraw_zero():
     wallet_payload = {
         "result": {
@@ -540,6 +582,58 @@ def test_wallet_available_balances_pick_positive_amount_if_present():
     balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
 
     assert balances["USDT"] == Decimal("10")
+
+
+def test_wallet_available_balances_subtracts_reserved_amounts():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "availableToWithdraw": "0",
+                            "availableBalance": "0",
+                            "walletBalance": "100",
+                            "orderMargin": "15",
+                            "commission": "2",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("83")
+
+
+def test_wallet_available_balances_prefers_available_without_double_subtraction():
+    wallet_payload = {
+        "result": {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "availableBalance": "80",
+                            "walletBalance": "100",
+                            "orderMargin": "20",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    api = DummyAPI({}, wallet_payload=wallet_payload)
+
+    balances = spot_market_module._wallet_available_balances(api, account_type="UNIFIED")
+
+    assert balances["USDT"] == Decimal("80")
 
 
 def test_wallet_available_balances_cache_scoped_by_network():
