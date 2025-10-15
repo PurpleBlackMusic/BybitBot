@@ -1023,6 +1023,51 @@ def test_prepare_spot_market_target_quote_min_notional_adjustment():
     assert Decimal(audit.get("order_qty_base")) > Decimal("0")
 
 
+def test_prepare_spot_market_formats_payload_with_validator_steps():
+    instrument = {
+        "symbol": "FOOUSDT",
+        "quoteCoin": "USDT",
+        "baseCoin": "FOO",
+        "lotSizeFilter": {
+            "qtyStep": "0.001",
+            "minOrderQty": "0.001",
+            "minOrderAmt": "5",
+        },
+        "priceFilter": {"tickSize": "0.01"},
+    }
+    payload = {"result": {"list": [instrument]}}
+    orderbook = {"result": {"a": [["5.01", "10"], ["5.02", "10"]], "b": [["5.00", "10"]]}}
+    api = DummyAPI(payload, orderbook_payload=orderbook)
+
+    limits = {
+        "min_order_amt": "5",
+        "quote_step": "0.01",
+        "min_order_qty": "0",
+        "qty_step": "0.00000001",
+        "quote_coin": "USDT",
+        "base_coin": "FOO",
+        "tick_size": "0",
+        "_instrument": instrument,
+    }
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="FOOUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        limits=limits,
+    )
+
+    payload = prepared.payload
+    assert payload["qty"].count(".") == 0 or len(payload["qty"].split(".")[1]) <= 3
+    assert payload["price"].count(".") == 0 or len(payload["price"].split(".")[1]) <= 2
+
+    audit = prepared.audit
+    assert audit["qty_step"] == "0.001"
+    assert audit["tick_size"] == "0.01"
+
+
 def test_prepare_spot_market_ceiling_rounds_down_to_allowed_tick():
     orderbook = {"result": {"a": [["100.05", "2"], ["100.1", "2"]], "b": [["99.5", "2"]]}}
     limits = _basic_limits()
