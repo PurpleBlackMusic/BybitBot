@@ -161,26 +161,39 @@ def test_build_universe_skips_blacklisted_pairs(monkeypatch: pytest.MonkeyPatch)
         ai_min_turnover_usd = 2_000_000.0
         ai_max_spread_bps = 25.0
 
+    instrument_meta = {
+        "BULLUSDT": {"symbol": "BULLUSDT", "age_days": 180.0, "meanSpreadBps": 8.0, "volatilityRank": "medium"},
+        "BTCUSDT": {"symbol": "BTCUSDT", "age_days": 365.0, "meanSpreadBps": 5.0, "volatilityRank": "medium"},
+    }
+
     class DummyAPI:
         def _safe_req(self, method, path, params=None, body=None, signed=False):
-            return {
-                "result": {
-                    "list": [
-                        {
-                            "symbol": "BULLUSDT",
-                            "turnover24h": "10000000",
-                            "bestBidPrice": "1",
-                            "bestAskPrice": "1.0005",
-                        },
-                        {
-                            "symbol": "BTCUSDT",
-                            "turnover24h": "15000000",
-                            "bestBidPrice": "30000",
-                            "bestAskPrice": "30010",
-                        },
-                    ]
+            if path == "/v5/market/tickers":
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "BULLUSDT",
+                                "turnover24h": "10000000",
+                                "bestBidPrice": "1",
+                                "bestAskPrice": "1.0005",
+                            },
+                            {
+                                "symbol": "BTCUSDT",
+                                "turnover24h": "15000000",
+                                "bestBidPrice": "30000",
+                                "bestAskPrice": "30010",
+                            },
+                        ]
+                    }
                 }
-            }
+            if path == "/v5/market/instruments-info":
+                if params and params.get("symbol"):
+                    symbol = params["symbol"]
+                    meta = instrument_meta.get(symbol)
+                    return {"result": {"list": [meta] if meta else []}}
+                return {"result": {"list": list(instrument_meta.values())}}
+            raise AssertionError(f"unexpected path: {path}")
 
     monkeypatch.setattr(universe_module, "get_settings", lambda: DummySettings())
     monkeypatch.setattr(
@@ -188,6 +201,7 @@ def test_build_universe_skips_blacklisted_pairs(monkeypatch: pytest.MonkeyPatch)
         "filter_listed_spot_symbols",
         lambda symbols, **kwargs: list(symbols),
     )
+    monkeypatch.setattr(universe_module, "_INSTRUMENT_META_CACHE", {})
 
     result = universe_module.build_universe(DummyAPI(), size=5)
 
@@ -199,32 +213,46 @@ def test_build_universe_retains_size_after_listing_filter(monkeypatch: pytest.Mo
         ai_min_turnover_usd = 2_000_000.0
         ai_max_spread_bps = 25.0
 
+    instrument_meta = {
+        "FAKEUSDT": {"symbol": "FAKEUSDT", "age_days": 120.0, "meanSpreadBps": 25.0, "volatilityRank": "medium"},
+        "ETHUSDT": {"symbol": "ETHUSDT", "age_days": 400.0, "meanSpreadBps": 6.0, "volatilityRank": "medium"},
+        "SOLUSDT": {"symbol": "SOLUSDT", "age_days": 250.0, "meanSpreadBps": 9.0, "volatilityRank": "medium"},
+    }
+
     class DummyAPI:
         def _safe_req(self, method, path, params=None, body=None, signed=False):
-            return {
-                "result": {
-                    "list": [
-                        {
-                            "symbol": "FAKEUSDT",
-                            "turnover24h": "5000000",
-                            "bestBidPrice": "1",
-                            "bestAskPrice": "1.0005",
-                        },
-                        {
-                            "symbol": "ETHUSDT",
-                            "turnover24h": "15000000",
-                            "bestBidPrice": "3000",
-                            "bestAskPrice": "3000.3",
-                        },
-                        {
-                            "symbol": "SOLUSDT",
-                            "turnover24h": "10000000",
-                            "bestBidPrice": "20",
-                            "bestAskPrice": "20.02",
-                        },
-                    ]
+            if path == "/v5/market/tickers":
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "FAKEUSDT",
+                                "turnover24h": "5000000",
+                                "bestBidPrice": "1",
+                                "bestAskPrice": "1.0005",
+                            },
+                            {
+                                "symbol": "ETHUSDT",
+                                "turnover24h": "15000000",
+                                "bestBidPrice": "3000",
+                                "bestAskPrice": "3000.3",
+                            },
+                            {
+                                "symbol": "SOLUSDT",
+                                "turnover24h": "10000000",
+                                "bestBidPrice": "20",
+                                "bestAskPrice": "20.02",
+                            },
+                        ]
+                    }
                 }
-            }
+            if path == "/v5/market/instruments-info":
+                if params and params.get("symbol"):
+                    symbol = params["symbol"]
+                    meta = instrument_meta.get(symbol)
+                    return {"result": {"list": [meta] if meta else []}}
+                return {"result": {"list": list(instrument_meta.values())}}
+            raise AssertionError(f"unexpected path: {path}")
 
     monkeypatch.setattr(universe_module, "get_settings", lambda: DummySettings())
     monkeypatch.setattr(
@@ -232,7 +260,79 @@ def test_build_universe_retains_size_after_listing_filter(monkeypatch: pytest.Mo
         "filter_listed_spot_symbols",
         lambda symbols, **kwargs: [symbol for symbol in symbols if symbol != "FAKEUSDT"],
     )
+    monkeypatch.setattr(universe_module, "_INSTRUMENT_META_CACHE", {})
 
     result = universe_module.build_universe(DummyAPI(), size=2)
 
     assert result == ["ETHUSDT", "SOLUSDT"]
+
+
+def test_build_universe_applies_age_spread_and_volatility_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummySettings:
+        ai_min_turnover_usd = 0.0
+        ai_max_spread_bps = 100.0
+
+    instrument_meta = {
+        "LEGACYUSDT": {"symbol": "LEGACYUSDT", "age_days": 200.0, "meanSpreadBps": 12.0, "volatilityRank": "medium"},
+        "YOUNGUSDT": {"symbol": "YOUNGUSDT", "age_days": 10.0, "meanSpreadBps": 8.0, "volatilityRank": "medium"},
+        "WIDESPREADUSDT": {"symbol": "WIDESPREADUSDT", "age_days": 150.0, "meanSpreadBps": 45.0, "volatilityRank": "medium"},
+        "HYPERVOLUSDT": {"symbol": "HYPERVOLUSDT", "age_days": 160.0, "meanSpreadBps": 10.0, "volatilityRank": "high"},
+    }
+
+    class DummyAPI:
+        def _safe_req(self, method, path, params=None, body=None, signed=False):
+            if path == "/v5/market/tickers":
+                return {
+                    "result": {
+                        "list": [
+                            {
+                                "symbol": "LEGACYUSDT",
+                                "turnover24h": "5000000",
+                                "bestBidPrice": "10",
+                                "bestAskPrice": "10.012",
+                            },
+                            {
+                                "symbol": "YOUNGUSDT",
+                                "turnover24h": "7000000",
+                                "bestBidPrice": "2",
+                                "bestAskPrice": "2.002",
+                            },
+                            {
+                                "symbol": "WIDESPREADUSDT",
+                                "turnover24h": "8000000",
+                                "bestBidPrice": "5",
+                                "bestAskPrice": "5.005",
+                            },
+                            {
+                                "symbol": "HYPERVOLUSDT",
+                                "turnover24h": "6000000",
+                                "bestBidPrice": "1",
+                                "bestAskPrice": "1.001",
+                                "price24hPcnt": "0.25",
+                            },
+                        ]
+                    }
+                }
+            if path == "/v5/market/instruments-info":
+                if params and params.get("symbol"):
+                    symbol = params["symbol"]
+                    meta = instrument_meta.get(symbol)
+                    return {"result": {"list": [meta] if meta else []}}
+                return {"result": {"list": list(instrument_meta.values())}}
+            raise AssertionError(f"unexpected path: {path}")
+
+    monkeypatch.setattr(universe_module, "get_settings", lambda: DummySettings())
+    monkeypatch.setattr(
+        universe_module,
+        "filter_listed_spot_symbols",
+        lambda symbols, **kwargs: list(symbols),
+    )
+    monkeypatch.setattr(universe_module, "_INSTRUMENT_META_CACHE", {})
+
+    scored = universe_module.build_universe_scored(
+        DummyAPI(), size=0, min_turnover=0.0, max_spread_bps=100.0
+    )
+
+    assert [symbol for symbol, _ in scored] == ["LEGACYUSDT"]
