@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 import json, time, threading
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 from .log import log
 from .envs import get_settings
 
@@ -13,6 +13,10 @@ class WSOrderbookV5:
         self.url = url
         self.levels = levels
         self._book: Dict[str, Dict[str, List[Tuple[float,float]]]] = {}  # {sym: {'b':[(px,qty)], 'a':[]}, 'ts': ms}
+        self._seq: Dict[str, int] = {}
+        self._waiting_snapshot: set[str] = set()
+        self._topic_symbols: Dict[str, str] = {}
+        self._last_resubscribe: Dict[str, float] = {}
         self._lock = threading.Lock()
         self._topic_lock = threading.Lock()
         self._stop = False
@@ -27,13 +31,32 @@ class WSOrderbookV5:
             log("ws.orderbook.disabled", reason="no websocket-client", err=str(e))
             return False
         new_topics = {f"orderbook.{self.levels}.{s}" for s in symbols}
+        topic_symbols = {topic: self._extract_symbol(topic) for topic in new_topics}
         with self._topic_lock:
             old_topics = set(self._topics)
+            old_symbol_map = dict(self._topic_symbols)
             self._topics = new_topics
+            self._topic_symbols = topic_symbols
+            removed_topics = sorted(old_topics - new_topics)
+            added_topics = sorted(new_topics - old_topics)
+
+        removed_symbols = [
+            old_symbol_map.get(topic, self._extract_symbol(topic))
+            for topic in removed_topics
+        ]
+        added_symbols = [
+            topic_symbols.get(topic, self._extract_symbol(topic))
+            for topic in added_topics
+        ]
+
+        if removed_symbols:
+            self._clear_symbol_state(removed_symbols)
+        if added_symbols:
+            self._mark_symbols_for_snapshot(added_symbols, clear_book=True)
 
         if self._thread and self._thread.is_alive():
-            to_unsubscribe = sorted(old_topics - new_topics)
-            to_subscribe = sorted(new_topics - old_topics)
+            to_unsubscribe = removed_topics
+            to_subscribe = added_topics
             ws = self._ws
             if ws is not None:
                 for op, args in (("unsubscribe", to_unsubscribe), ("subscribe", to_subscribe)):
@@ -44,6 +67,7 @@ class WSOrderbookV5:
                     except Exception as e:
                         log("ws.orderbook.send_err", err=str(e))
             return True
+        self._mark_symbols_for_snapshot(topic_symbols.values(), clear_book=True)
         self._stop = False
 
         def run():
@@ -96,8 +120,11 @@ class WSOrderbookV5:
     def _on_open(self, ws):
         with self._topic_lock:
             topics = sorted(self._topics)
+            symbols = [self._topic_symbols.get(t) or self._extract_symbol(t) for t in topics]
         if not topics:
             return
+        if symbols:
+            self._mark_symbols_for_snapshot(symbols, clear_book=True)
         sub = {"op": "subscribe", "args": topics}
         try:
             ws.send(json.dumps(sub))
@@ -121,6 +148,65 @@ class WSOrderbookV5:
             arr = sorted(book.items(), key=lambda x: x[0])
         return arr[: self.levels]
 
+    def _extract_symbol(self, topic: str) -> str:
+        parts = topic.split(".")
+        if len(parts) >= 3:
+            return parts[-1]
+        return topic
+
+    def _mark_symbols_for_snapshot(self, symbols: Iterable[str], *, clear_book: bool = False) -> None:
+        symbols_list = [s for s in symbols if s]
+        if not symbols_list:
+            return
+        with self._lock:
+            for symbol in symbols_list:
+                if clear_book:
+                    self._book.pop(symbol, None)
+                self._seq.pop(symbol, None)
+                self._waiting_snapshot.add(symbol)
+                self._last_resubscribe.pop(symbol, None)
+
+    def _clear_symbol_state(self, symbols: Iterable[str]) -> None:
+        if not symbols:
+            return
+        with self._lock:
+            for symbol in symbols:
+                self._book.pop(symbol, None)
+                self._seq.pop(symbol, None)
+                self._waiting_snapshot.discard(symbol)
+                self._last_resubscribe.pop(symbol, None)
+
+    def _coerce_int(self, value) -> int | None:
+        try:
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str) and value.strip():
+                return int(float(value))
+        except (ValueError, TypeError):
+            return None
+        return None
+
+    def _trigger_resubscribe(self, topic: str) -> None:
+        ws = self._ws
+        if ws is None:
+            return
+        with self._topic_lock:
+            if topic not in self._topics:
+                return
+            symbol = self._topic_symbols.get(topic) or self._extract_symbol(topic)
+        if not symbol:
+            return
+        now = time.time()
+        last = self._last_resubscribe.get(symbol)
+        if last is not None and now - last < 1.0:
+            return
+        self._last_resubscribe[symbol] = now
+        for op in ("unsubscribe", "subscribe"):
+            try:
+                ws.send(json.dumps({"op": op, "args": [topic]}))
+            except Exception as e:
+                log("ws.orderbook.send_err", err=str(e))
+
     def _on_msg(self, ws, msg):
         try:
             j = json.loads(msg)
@@ -132,20 +218,55 @@ class WSOrderbookV5:
         if not topic.startswith("orderbook."):
             return
         data = j.get("data") or {}
-        ts = int(data.get("ts", int(time.time()*1000)))
+        ts = int(self._coerce_int(data.get("ts")) or int(time.time()*1000))
+        symbol = data.get("s") or self._extract_symbol(topic)
+        symbol = str(symbol or "").upper()
+        if not symbol:
+            return
         with self._lock:
-            sym = data.get("s") or topic.split('.')[-1]
-            entry = self._book.get(sym) or {"b": [], "a": [], "ts": ts}
-            if data.get("type") == "snapshot":
-                # full snapshot arrays 'b' and 'a'
-                entry["b"] = [(float(x[0]), float(x[1])) for x in data.get("b", [])][: self.levels]
-                entry["a"] = [(float(x[0]), float(x[1])) for x in data.get("a", [])][: self.levels]
-                entry["ts"] = ts
-            elif data.get("type") == "delta":
-                entry["b"] = self._apply_delta('b', entry.get("b", []), data.get("b", []))
-                entry["a"] = self._apply_delta('a', entry.get("a", []), data.get("a", []))
-                entry["ts"] = ts
-            self._book[sym] = entry
+            waiting_snapshot = symbol in self._waiting_snapshot
+            last_seq = self._seq.get(symbol)
+        update_type = data.get("type")
+        if update_type == "snapshot":
+            bids = [(float(x[0]), float(x[1])) for x in data.get("b", [])][: self.levels]
+            asks = [(float(x[0]), float(x[1])) for x in data.get("a", [])][: self.levels]
+            seq = self._coerce_int(data.get("u"))
+            with self._lock:
+                entry = {"b": bids, "a": asks, "ts": ts}
+                self._book[symbol] = entry
+                if seq is not None:
+                    self._seq[symbol] = seq
+                else:
+                    self._seq.pop(symbol, None)
+                self._waiting_snapshot.discard(symbol)
+            return
+
+        if update_type != "delta":
+            return
+
+        pu = self._coerce_int(data.get("pu"))
+        seq = self._coerce_int(data.get("u"))
+
+        if waiting_snapshot or last_seq is None:
+            self._mark_symbols_for_snapshot([symbol], clear_book=True)
+            self._trigger_resubscribe(topic)
+            return
+
+        if pu is None or seq is None or pu != last_seq:
+            self._mark_symbols_for_snapshot([symbol], clear_book=True)
+            self._trigger_resubscribe(topic)
+            return
+
+        bids_delta = data.get("b", [])
+        asks_delta = data.get("a", [])
+        with self._lock:
+            entry = self._book.get(symbol) or {"b": [], "a": [], "ts": ts}
+            entry["b"] = self._apply_delta('b', entry.get("b", []), bids_delta)
+            entry["a"] = self._apply_delta('a', entry.get("a", []), asks_delta)
+            entry["ts"] = ts
+            self._book[symbol] = entry
+            self._seq[symbol] = seq
+            self._waiting_snapshot.discard(symbol)
 
     def get(self, symbol: str):
         with self._lock:
