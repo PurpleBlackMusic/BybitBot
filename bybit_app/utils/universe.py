@@ -367,7 +367,10 @@ def _resolve_liquidity_filters(
 
 
 def filter_available_spot_pairs(
-    symbols: Iterable[str], *, quote_assets: Iterable[str] | None = None
+    symbols: Iterable[str],
+    *,
+    quote_assets: Iterable[str] | None = None,
+    as_of: float | int | None = None,
 ) -> list[str]:
     """Return tradable spot pairs filtered by quote asset and listing status."""
 
@@ -380,7 +383,9 @@ def filter_available_spot_pairs(
 
     listed = (
         _normalize_symbol(symbol)
-        for symbol in filter_listed_spot_symbols(quoted_only, testnet=is_testnet)
+        for symbol in filter_listed_spot_symbols(
+            quoted_only, testnet=is_testnet, as_of=as_of
+        )
     )
     filtered_listed = filter_blacklisted_symbols(listed)
     if filtered_listed:
@@ -430,7 +435,9 @@ def load_universe(*, quote_assets: Iterable[str] | None = None) -> list[str]:
     try:
         data = json.loads(UNIVERSE_FILE.read_text(encoding="utf-8"))
         return filter_available_spot_pairs(
-            data.get("symbols") or [], quote_assets=quote_assets
+            data.get("symbols") or [],
+            quote_assets=quote_assets,
+            as_of=data.get("ts"),
         )
     except Exception:
         return []

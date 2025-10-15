@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 import bybit_app.utils.universe as universe_module
@@ -119,6 +122,36 @@ def test_filter_available_spot_pairs_defaults_to_usdt_quotes(
     )
 
     assert result == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_load_universe_uses_historical_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = {"ts": 1_701_234_567_890, "symbols": ["AAAUSDT", "CCCUSDT"]}
+    universe_path = tmp_path / "universe.json"
+    universe_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    captured: dict[str, object] = {}
+
+    def fake_filter(
+        symbols,
+        *,
+        testnet: bool,
+        force_refresh: bool = False,
+        as_of=None,
+    ):
+        captured["symbols"] = list(symbols)
+        captured["as_of"] = as_of
+        return [symbol for symbol in symbols if symbol.endswith("USDT")]
+
+    monkeypatch.setattr(universe_module, "UNIVERSE_FILE", universe_path)
+    monkeypatch.setattr(universe_module, "filter_listed_spot_symbols", fake_filter)
+
+    result = universe_module.load_universe()
+
+    assert result == ["AAAUSDT", "CCCUSDT"]
+    assert captured["symbols"] == payload["symbols"]
+    assert captured["as_of"] == payload["ts"]
 
 
 def test_filter_blacklisted_symbols_ignores_non_strings() -> None:

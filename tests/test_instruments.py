@@ -1,5 +1,7 @@
-from types import SimpleNamespace
+import json
 import threading
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,9 +20,10 @@ class _FakeResponse:
 
 
 @pytest.fixture(autouse=True)
-def _reset_instrument_cache():
+def _reset_instrument_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     instruments._CACHE.clear()
     instruments._IN_FLIGHT.clear()
+    monkeypatch.setattr(instruments, "_HISTORY_DIR", tmp_path / "history")
     yield
     instruments._CACHE.clear()
     instruments._IN_FLIGHT.clear()
@@ -172,3 +175,65 @@ def test_get_listed_spot_symbols_concurrent_fetch(monkeypatch: pytest.MonkeyPatc
     assert not errors
     assert results == [{"SOLUSDT"}, {"SOLUSDT"}]
     assert calls.count == 1
+
+
+def test_get_listed_spot_symbols_persists_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = [
+        {"result": {"list": [{"symbol": "AAAUSDT"}]}},
+        {"result": {"list": [{"symbol": "AAAUSDT"}, {"symbol": "BBBUSDT"}]}}
+    ]
+
+    call_index = SimpleNamespace(value=0)
+
+    def fake_get(url, params=None, timeout=None):
+        idx = min(call_index.value, len(payloads) - 1)
+        call_index.value += 1
+        return _FakeResponse(payloads[idx])
+
+    time_values = iter([1_000_000.0, 1_000_100.0, 1_000_100.0])
+
+    def fake_time() -> float:
+        try:
+            return next(time_values)
+        except StopIteration:  # pragma: no cover - defensive guard
+            return 1_000_100.0
+
+    monkeypatch.setattr(instruments.requests, "get", fake_get)
+    monkeypatch.setattr(instruments.time, "time", fake_time)
+
+    first = instruments.get_listed_spot_symbols(testnet=True, force_refresh=True)
+    second = instruments.get_listed_spot_symbols(testnet=True, force_refresh=True)
+
+    assert first == {"AAAUSDT"}
+    assert second == {"AAAUSDT", "BBBUSDT"}
+
+    history_path = instruments._history_path(True)
+    assert history_path.exists()
+    lines = history_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+    entries = [json.loads(line) for line in lines]
+    assert entries[0]["symbols"] == ["AAAUSDT"]
+    assert entries[1]["symbols"] == ["AAAUSDT", "BBBUSDT"]
+
+
+def test_get_listed_spot_symbols_at_returns_snapshot(tmp_path: Path) -> None:
+    history_path = instruments._history_path(True)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"ts": 1_000_000.0, "symbols": ["AAAUSDT"]},
+        {"ts": 1_000_200.0, "symbols": ["AAAUSDT", "BBBUSDT"]},
+    ]
+    history_path.write_text(
+        "\n".join(json.dumps(row) for row in rows),
+        encoding="utf-8",
+    )
+
+    before_listing = instruments.get_listed_spot_symbols_at(500_000.0, testnet=True)
+    assert before_listing == set()
+
+    mid_snapshot = instruments.get_listed_spot_symbols_at(1_000_100.0, testnet=True)
+    assert mid_snapshot == {"AAAUSDT"}
+
+    ms_query = instruments.get_listed_spot_symbols_at(1_000_250_000.0, testnet=True)
+    assert ms_query == {"AAAUSDT", "BBBUSDT"}
