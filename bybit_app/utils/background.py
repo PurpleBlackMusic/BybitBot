@@ -75,6 +75,19 @@ class BackgroundServices:
         self._order_sweep_prefixes: tuple[str, ...] = ("AI-",)
         self._order_sweep_config_last = 0.0
 
+        # guardian snapshot worker
+        self._guardian_lock = threading.Lock()
+        self._guardian_thread: Optional[threading.Thread] = None
+        self._guardian_stop_event: Optional[threading.Event] = None
+        self._guardian_refresh_event: Optional[threading.Event] = None
+        self._guardian_state: Dict[str, Any] = {}
+        self._guardian_error: Optional[str] = None
+        self._guardian_started_at: float = 0.0
+        self._guardian_last_refresh: float = 0.0
+        self._guardian_restart_count: int = 0
+        self._guardian_poll_interval = 12.0
+        self._guardian_error_backoff = 5.0
+
     # ------------------------------------------------------------------
     # Lifecycle
     def ensure_started(self) -> None:
@@ -88,6 +101,7 @@ class BackgroundServices:
             return
 
         self.ensure_automation_loop()
+        self.ensure_guardian_worker()
 
     def _await_private_ready(self, timeout: float | None = None) -> bool:
         """Wait until the private websocket reports a fresh heartbeat."""
@@ -406,6 +420,41 @@ class BackgroundServices:
         return self.ensure_automation_loop(force=True)
 
     # ------------------------------------------------------------------
+    # Guardian snapshot worker
+    def ensure_guardian_worker(self, *, force: bool = False) -> bool:
+        with self._guardian_lock:
+            thread = self._guardian_thread
+            if thread and thread.is_alive() and not force:
+                return True
+
+            if thread and thread.is_alive():
+                stop_event = self._guardian_stop_event
+                if stop_event:
+                    stop_event.set()
+                thread.join(timeout=2.0)
+
+            stop_event = threading.Event()
+            refresh_event = threading.Event()
+            self._guardian_stop_event = stop_event
+            self._guardian_refresh_event = refresh_event
+            self._guardian_thread = threading.Thread(
+                target=self._run_guardian_worker,
+                args=(stop_event, refresh_event),
+                daemon=True,
+            )
+            self._guardian_restart_count += 1
+            self._guardian_started_at = time.time()
+            self._guardian_error = None
+
+            thread = self._guardian_thread
+
+        thread.start()
+        return True
+
+    def restart_guardian_worker(self) -> bool:
+        return self.ensure_guardian_worker(force=True)
+
+    # ------------------------------------------------------------------
     # Automation
     def _create_loop(
         self,
@@ -538,6 +587,106 @@ class BackgroundServices:
             is_stale = age > stale_after
         snapshot["stale"] = is_stale
         return snapshot
+
+    def _run_guardian_worker(
+        self,
+        stop_event: threading.Event,
+        refresh_event: threading.Event,
+    ) -> None:
+        bot: GuardianBot | None = None
+        backoff_until = 0.0
+
+        while not stop_event.is_set():
+            now = time.time()
+            if now < backoff_until:
+                sleep_for = max(0.1, backoff_until - now)
+                if stop_event.wait(timeout=sleep_for):
+                    break
+                continue
+
+            if bot is None:
+                try:
+                    bot = self._bot_factory()
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    backoff_until = time.time() + self._guardian_error_backoff
+                    with self._guardian_lock:
+                        self._guardian_error = str(exc)
+                    continue
+
+            cycle_started = time.time()
+            state_payload: Dict[str, Any] = {}
+            error: Optional[str] = None
+
+            try:
+                bot.refresh()
+                report = bot.unified_report()
+                brief = bot.generate_brief()
+                scorecard = bot.signal_scorecard(brief)
+                plan_steps = bot.plan_steps(brief)
+                safety_notes = bot.safety_notes()
+                risk_summary = bot.risk_summary()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                error = str(exc)
+                backoff_until = time.time() + self._guardian_error_backoff
+            else:
+                state_payload = {
+                    "report": copy.deepcopy(report),
+                    "brief": brief.to_dict(),
+                    "scorecard": copy.deepcopy(scorecard),
+                    "plan_steps": list(plan_steps),
+                    "safety_notes": list(safety_notes),
+                    "risk_summary": str(risk_summary),
+                }
+                backoff_until = 0.0
+
+            with self._guardian_lock:
+                if state_payload:
+                    self._guardian_state = state_payload
+                    self._guardian_last_refresh = time.time()
+                if error:
+                    self._guardian_error = error
+                elif state_payload:
+                    self._guardian_error = None
+
+            elapsed = time.time() - cycle_started
+            wait_for = max(0.0, self._guardian_poll_interval - elapsed)
+
+            if refresh_event.is_set():
+                refresh_event.clear()
+                wait_for = 0.0
+
+            if wait_for <= 0:
+                continue
+
+            if stop_event.wait(timeout=wait_for):
+                break
+
+    def guardian_snapshot(self) -> Dict[str, Any]:
+        with self._guardian_lock:
+            state = copy.deepcopy(self._guardian_state)
+            error = self._guardian_error
+            started_at = self._guardian_started_at
+            last_refresh = self._guardian_last_refresh
+            restart_count = self._guardian_restart_count
+            thread_alive = self._guardian_thread and self._guardian_thread.is_alive()
+
+        snapshot: Dict[str, Any] = {
+            "thread_alive": bool(thread_alive),
+            "started_at": started_at or None,
+            "last_refresh_at": last_refresh or None,
+            "restart_count": restart_count,
+            "error": error,
+            "state": state,
+        }
+        if last_refresh:
+            snapshot["age_seconds"] = max(0.0, time.time() - last_refresh)
+        return snapshot
+
+    def request_guardian_refresh(self) -> None:
+        with self._guardian_lock:
+            event = self._guardian_refresh_event
+            if event is not None:
+                event.set()
 
     def _should_sweep_orders(self) -> bool:
         self._refresh_order_sweeper_settings()
@@ -743,12 +892,24 @@ def get_ws_snapshot() -> Dict[str, Any]:
     return _state.ws_snapshot()
 
 
+def get_guardian_state() -> Dict[str, Any]:
+    return _state.guardian_snapshot()
+
+
 def restart_automation() -> bool:
     return _state.restart_automation_loop()
 
 
 def restart_websockets() -> bool:
     return _state.restart_ws()
+
+
+def restart_guardian() -> bool:
+    return _state.restart_guardian_worker()
+
+
+def request_guardian_refresh() -> None:
+    _state.request_guardian_refresh()
 
 
 def get_ws_events(*, since: int | None = None, limit: int | None = 100) -> Dict[str, Any]:
