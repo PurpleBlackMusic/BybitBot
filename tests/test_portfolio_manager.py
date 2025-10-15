@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import bybit_app.utils.portfolio as portfolio_module
+from bybit_app.utils.portfolio import fetch_klines_df
 from bybit_app.utils.portfolio_manager import Allocation, PortfolioManager
 
 
@@ -93,4 +95,35 @@ def test_release_ignored_for_unallocated_symbol() -> None:
 
     allocation = manager.request_allocation("XRPUSDT", now=base_time + 1)
     assert allocation is not None
+
+
+def test_fetch_klines_df_drops_incomplete_bar(monkeypatch) -> None:
+    class DummyAPI:
+        def __init__(self) -> None:
+            self.closed_start: int | None = None
+            self.open_start: int | None = None
+
+        def kline(self, category, symbol, interval, start, end, limit):
+            interval_minutes = max(int(interval), 1)
+            interval_ms = interval_minutes * 60_000
+            self.closed_start = end - interval_ms * 2
+            self.open_start = end - max(interval_ms // 2, 1)
+            return {
+                "result": {
+                    "list": [
+                        [str(self.closed_start), "1", "2", "0.5", "1.5", "10"],
+                        [str(self.open_start), "1", "2", "0.5", "1.5", "5"],
+                    ]
+                }
+            }
+
+    api = DummyAPI()
+    monkeypatch.setattr(portfolio_module.time, "time", lambda: 1_700_000_000.0)
+
+    df = fetch_klines_df(api, "BTCUSDT", interval="60", lookback_hours=2)
+
+    assert len(df) == 1
+    start_values = {int(ts.timestamp() * 1000) for ts in df["start"]}
+    assert api.closed_start in start_values
+    assert api.open_start not in start_values
 

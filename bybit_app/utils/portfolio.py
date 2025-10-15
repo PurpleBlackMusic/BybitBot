@@ -1,29 +1,130 @@
 
 from __future__ import annotations
-import time, math, json
+
+import json
+import math
+import time
+from collections.abc import Mapping, Sequence
+from typing import Optional
+
 import numpy as np
 import pandas as pd
+
 from .bybit_api import BybitAPI, BybitCreds
 from .envs import get_settings
-from .paths import DATA_DIR
 from .log import log
+from .paths import DATA_DIR
 
 RISK_DIR = DATA_DIR / "risk"
 RISK_DIR.mkdir(parents=True, exist_ok=True)
 
-def fetch_klines_df(api: BybitAPI, symbol: str, interval: str = "60", lookback_hours: int = 24*30) -> pd.DataFrame:
-    end = int(time.time()*1000)
-    start = end - lookback_hours*60*60*1000
-    r = api.kline(category="spot", symbol=symbol, interval=interval, start=start, end=end, limit=1000)
-    rows = (r.get("result") or {}).get("list") or []
-    # bybit returns reverse chronological
-    rows = list(reversed(rows))
+
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _interval_to_milliseconds(interval: object) -> int:
+    """Translate Bybit interval identifiers into milliseconds."""
+
+    if isinstance(interval, (int, float)):
+        minutes = float(interval)
+    else:
+        text = str(interval or "").strip().lower()
+        if not text:
+            minutes = 0.0
+        elif text.endswith("ms"):
+            return int(max(_safe_float(text[:-2]) or 0.0, 0.0))
+        elif text.endswith("s") and not text.endswith("ms"):
+            return int(max(_safe_float(text[:-1]) or 0.0, 0.0) * 1_000.0)
+        elif text.endswith("m"):
+            minutes = _safe_float(text[:-1]) or 0.0
+        elif text.endswith("h"):
+            minutes = (_safe_float(text[:-1]) or 0.0) * 60.0
+        elif text.endswith("d"):
+            minutes = (_safe_float(text[:-1]) or 0.0) * 1_440.0
+        elif text.endswith("w"):
+            minutes = (_safe_float(text[:-1]) or 0.0) * 10_080.0
+        else:
+            minutes = _safe_float(text) or 0.0
+
+    return int(max(minutes, 0.0) * 60_000.0)
+
+
+def _row_start_milliseconds(row: object) -> Optional[int]:
+    start_value: object
+    if isinstance(row, Mapping):
+        start_value = (
+            row.get("start")
+            or row.get("openTime")
+            or row.get("timestamp")
+            or row.get("open_time")
+        )
+    elif isinstance(row, Sequence) and row:
+        start_value = row[0]
+    else:
+        return None
+
+    numeric = _safe_float(start_value)
+    if numeric is None:
+        return None
+
+    if numeric > 1e18:  # nanoseconds
+        numeric /= 1e6
+    elif numeric > 1e15:  # microseconds
+        numeric /= 1e3
+    elif numeric > 1e12:  # milliseconds
+        pass
+    elif numeric > 1e10:  # guard for high-resolution seconds
+        numeric /= 1e3
+    else:  # seconds
+        numeric *= 1_000.0
+    return int(numeric)
+
+
+def _drop_incomplete_bars(
+    rows: list[object], interval_ms: int, end_ms: int
+) -> list[object]:
+    if interval_ms <= 0 or not rows:
+        return rows
+
+    cutoff = end_ms - interval_ms
+    filtered: list[object] = []
+    for row in rows:
+        start_ms = _row_start_milliseconds(row)
+        if start_ms is None:
+            continue
+        if start_ms <= cutoff:
+            filtered.append(row)
+
+    if filtered:
+        return filtered
+    return []
+
+
+def fetch_klines_df(
+    api: BybitAPI, symbol: str, interval: str = "60", lookback_hours: int = 24 * 30
+) -> pd.DataFrame:
+    end = int(time.time() * 1000)
+    start = end - lookback_hours * 60 * 60 * 1000
+    response = api.kline(
+        category="spot", symbol=symbol, interval=interval, start=start, end=end, limit=1000
+    )
+    rows = (response.get("result") or {}).get("list") or []
+    rows = list(reversed(rows))  # API returns reverse chronological order
+    interval_ms = _interval_to_milliseconds(interval)
+    rows = _drop_incomplete_bars(rows, interval_ms, end)
     if not rows:
-        return pd.DataFrame(columns=["start","open","high","low","close","volume"])
-    df = pd.DataFrame(rows, columns=["start","open","high","low","close","volume","turnover"][:len(rows[0])])
+        return pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(
+        rows,
+        columns=["start", "open", "high", "low", "close", "volume", "turnover"][: len(rows[0])],
+    )
     df["start"] = pd.to_datetime(df["start"].astype("int64"), unit="ms")
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = df[column].astype(float)
     return df
 
 def compute_returns(df: pd.DataFrame) -> pd.Series:

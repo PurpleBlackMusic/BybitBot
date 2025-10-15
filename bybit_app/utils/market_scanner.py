@@ -735,6 +735,61 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
     return candles
 
 
+def _candle_start_to_seconds(start: object) -> Optional[float]:
+    """Convert a candle ``start`` timestamp to seconds since epoch."""
+
+    if start is None:
+        return None
+    try:
+        numeric = float(start)
+    except (TypeError, ValueError):
+        return None
+
+    if numeric > 1e18:  # nanoseconds
+        numeric /= 1e6
+    elif numeric > 1e15:  # microseconds
+        numeric /= 1e3
+    elif numeric > 1e12:  # milliseconds
+        numeric /= 1e3
+    elif numeric > 1e10:  # guard against higher resolution seconds
+        numeric /= 1e3
+    return numeric
+
+
+def _filter_closed_candles(
+    candles: Sequence[Dict[str, object]], interval_minutes: int, now: float
+) -> List[Dict[str, object]]:
+    """Drop candles that are still forming at ``now`` for the given interval."""
+
+    try:
+        minutes = float(interval_minutes)
+    except (TypeError, ValueError):
+        return list(candles)
+
+    interval_seconds = max(minutes, 0.0) * 60.0
+    if interval_seconds <= 0:
+        return list(candles)
+
+    cutoff = now - interval_seconds
+    filtered: List[Dict[str, object]] = []
+    for candle in candles:
+        start_seconds = _candle_start_to_seconds(candle.get("start"))
+        if start_seconds is None:
+            continue
+        if start_seconds <= cutoff:
+            filtered.append(candle)
+
+    if filtered:
+        return filtered
+
+    # Fallback to retain at least the earliest candle if nothing qualified.
+    if candles:
+        for candle in candles:
+            if candle.get("start") is not None:
+                return [candle]
+    return []
+
+
 class _CandleCache:
     """Small helper that caches recent kline snapshots per symbol."""
 
@@ -780,6 +835,7 @@ class _CandleCache:
                 continue
 
             candles = _normalise_candles(payload)
+            candles = _filter_closed_candles(candles, interval, now)
             self._cache[key] = (now, candles)
             bundle[f"{interval}m"] = candles
 

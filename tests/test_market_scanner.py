@@ -715,10 +715,28 @@ def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
 class _DummyAPI:
     def __init__(self) -> None:
         self.kline_calls: list[tuple[str, int]] = []
+        self.closed_starts: dict[tuple[str, int], int] = {}
+        self.open_starts: dict[tuple[str, int], int] = {}
+        self.now_seconds = 1_700_000_000.0
 
     def kline(self, category: str, symbol: str, interval: int, limit: int):  # noqa: D401 - test stub
         self.kline_calls.append((symbol, interval))
-        return {"result": {"list": [[1, "1", "1", "1", "1", "100", "1000"]]}}
+        interval_minutes = max(int(interval), 1)
+        interval_seconds = interval_minutes * 60
+        current_ms = int(self.now_seconds * 1000)
+        closed_start = current_ms - interval_seconds * 2 * 1000
+        open_start = current_ms - max(interval_seconds // 2, 1) * 1000
+        key = (symbol, interval_minutes)
+        self.closed_starts[key] = closed_start
+        self.open_starts[key] = open_start
+        return {
+            "result": {
+                "list": [
+                    [str(closed_start), "1", "1", "1", "1", "100", "1000"],
+                    [str(open_start), "1", "1", "1", "1", "50", "500"],
+                ]
+            }
+        }
 
 
 def _resolver_rows() -> list[dict[str, object]]:
@@ -787,11 +805,21 @@ def test_stateful_market_scanner_enriches_candidates(tmp_path: Path) -> None:
         refresh_interval=(5.0, 5.0),
     )
 
-    results = scanner.refresh(force=True, now=1000.0)
+    results = scanner.refresh(force=True, now=api.now_seconds)
     assert len(results) == 4
     first = results[0]
     assert first["instrument"]["symbol"] == "BBSOLUSDT"
     assert "1m" in first["candles"] and "5m" in first["candles"]
+
+    canonical_symbol = first["instrument"]["symbol"]
+    one_minute = first["candles"]["1m"]
+    five_minute = first["candles"]["5m"]
+    assert len(one_minute) == 1
+    assert len(five_minute) == 1
+    assert one_minute[0]["start"] == api.closed_starts[(canonical_symbol, 1)]
+    assert five_minute[0]["start"] == api.closed_starts[(canonical_symbol, 5)]
+    assert one_minute[0]["start"] != api.open_starts[(canonical_symbol, 1)]
+    assert five_minute[0]["start"] != api.open_starts[(canonical_symbol, 5)]
 
     assert len(api.kline_calls) == 8  # four symbols, two intervals each
     assert scan_calls  # scanner executed at least once
@@ -800,7 +828,7 @@ def test_stateful_market_scanner_enriches_candidates(tmp_path: Path) -> None:
     assert "активных: 0/5" in messages[0]
 
     # Within the refresh window the cached payload should be reused
-    cached = scanner.refresh(force=False, now=1002.0)
+    cached = scanner.refresh(force=False, now=api.now_seconds + 2.0)
     assert cached == results
     assert len(scan_calls) == 1
     assert len(api.kline_calls) == 8
