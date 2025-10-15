@@ -350,6 +350,8 @@ _WALLET_SYMBOL_FIELDS = ("coin", "asset", "currency")
 _WALLET_RESERVED_FIELDS = (
     "orderMargin",
     "order_margin",
+    "openOrderMargin",
+    "open_order_margin",
     "totalOrderIM",
     "totalOrderMargin",
     "locked",
@@ -360,6 +362,8 @@ _WALLET_RESERVED_FIELDS = (
     "commission",
     "pendingCommission",
     "pendingFee",
+    "safetyFee",
+    "safety_fee",
 )
 _KNOWN_QUOTES = (
     "USDT",
@@ -1294,16 +1298,29 @@ def _is_unsupported_wallet_account_type_error(error: object) -> bool:
 def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
     """Pick the most tradable balance value from a wallet row."""
 
+    reserved_total = Decimal("0")
+    for field in _WALLET_RESERVED_FIELDS:
+        candidate = row.get(field)
+        if candidate is None:
+            continue
+        amount = _to_decimal(candidate)
+        if amount > 0:
+            reserved_total += amount
+
     available_positive: Decimal | None = None
     available_non_positive: Decimal | None = None
     fallback_positive: Decimal | None = None
     fallback_non_positive: Decimal | None = None
+    free_amount: Decimal | None = None
 
     for field in _WALLET_AVAILABLE_FIELDS:
         candidate = row.get(field)
         if candidate is None:
             continue
         amount = _to_decimal(candidate)
+        if field.lower() == "free":
+            free_amount = amount
+            continue
         if amount > 0:
             if available_positive is None or amount > available_positive:
                 available_positive = amount
@@ -1321,14 +1338,13 @@ def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
         elif fallback_non_positive is None or amount > fallback_non_positive:
             fallback_non_positive = amount
 
-    reserved_total = Decimal("0")
-    for field in _WALLET_RESERVED_FIELDS:
-        candidate = row.get(field)
-        if candidate is None:
-            continue
-        amount = _to_decimal(candidate)
-        if amount > 0:
-            reserved_total += amount
+    if free_amount is not None:
+        net_free = free_amount - reserved_total
+        if net_free > 0:
+            if available_positive is None or net_free > available_positive:
+                available_positive = net_free
+        elif available_non_positive is None or net_free > available_non_positive:
+            available_non_positive = net_free
 
     fallback_net_positive: Decimal | None = None
     fallback_net_non_positive: Decimal | None = fallback_non_positive
