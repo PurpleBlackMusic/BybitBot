@@ -7,7 +7,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping, Optional
 
 from .bybit_api import BybitAPI
 from .envs import get_settings, update_settings
@@ -34,6 +34,9 @@ class LiquiditySnapshot:
     symbol: str
     turnover: float
     spread_bps: float
+    age_days: Optional[float] = None
+    mean_spread_bps: Optional[float] = None
+    volatility_rank: Optional[str] = None
 
 _BLACKLIST_PATTERNS = (
     re.compile(r"^BB"),
@@ -53,11 +56,27 @@ def _extract_base_asset(symbol: str) -> str:
     return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
+_MS_PER_DAY = 86_400_000.0
+_MIN_LISTING_AGE_DAYS = 90.0
+_MEAN_SPREAD_BPS_THRESHOLD = 20.0
+_VOLATILITY_LOW_THRESHOLD = 3.0
+_VOLATILITY_HIGH_THRESHOLD = 12.0
+_INSTRUMENT_META_CACHE: dict[str, tuple[float, Mapping[str, object]]] = {}
+_INSTRUMENT_META_CACHE_TTL = 30.0 * 60.0
+
+
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _to_float(value: object) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _dedupe_preserve_order(symbols: Iterable[str]) -> list[str]:
@@ -79,11 +98,195 @@ def _normalize_quote_assets(quotes: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(cleaned or ["USDT"])
 
 
+def _resolve_cache_entries(symbols: set[str]) -> tuple[dict[str, Mapping[str, object]], set[str]]:
+    now = time.time()
+    cached: dict[str, Mapping[str, object]] = {}
+    missing: set[str] = set()
+    for symbol in symbols:
+        entry = _INSTRUMENT_META_CACHE.get(symbol)
+        if not entry:
+            missing.add(symbol)
+            continue
+        ts, meta = entry
+        if _INSTRUMENT_META_CACHE_TTL and now - ts > _INSTRUMENT_META_CACHE_TTL:
+            _INSTRUMENT_META_CACHE.pop(symbol, None)
+            missing.add(symbol)
+            continue
+        cached[symbol] = meta
+    return cached, missing
+
+
+def _cache_instrument_metadata(records: Mapping[str, Mapping[str, object]]) -> None:
+    now = time.time()
+    for symbol, meta in records.items():
+        _INSTRUMENT_META_CACHE[symbol] = (now, meta)
+
+
+def _fetch_instrument_metadata(
+    api: BybitAPI, symbols: Iterable[str]
+) -> dict[str, Mapping[str, object]]:
+    target = {_normalize_symbol(sym) for sym in symbols if _normalize_symbol(sym)}
+    if not target:
+        return {}
+
+    cached, missing = _resolve_cache_entries(target)
+    if not missing:
+        return cached
+
+    metadata: dict[str, Mapping[str, object]] = dict(cached)
+    payload: Mapping[str, object]
+
+    try:
+        payload = api._safe_req(
+            "GET",
+            "/v5/market/instruments-info",
+            params={"category": "spot"},
+        )
+    except Exception:
+        rows: list[Mapping[str, object]] = []
+    else:
+        result = payload.get("result") if isinstance(payload, Mapping) else None
+        rows = result.get("list") if isinstance(result, Mapping) else []
+        if not isinstance(rows, list):
+            rows = []
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        symbol = _normalize_symbol(row.get("symbol"))
+        if symbol and symbol in missing:
+            metadata[symbol] = row
+
+    missing -= set(metadata.keys())
+
+    for symbol in list(missing):
+        try:
+            detail = api._safe_req(
+                "GET",
+                "/v5/market/instruments-info",
+                params={"category": "spot", "symbol": symbol},
+            )
+        except Exception:
+            continue
+        result = detail.get("result") if isinstance(detail, Mapping) else None
+        rows = result.get("list") if isinstance(result, Mapping) else []
+        if isinstance(rows, list) and rows:
+            row = rows[0]
+            if isinstance(row, Mapping):
+                metadata[symbol] = row
+
+    if metadata:
+        _cache_instrument_metadata(metadata)
+    return metadata
+
+
 def _has_allowed_quote(symbol: str, quotes: tuple[str, ...]) -> bool:
     if not quotes:
         return True
     return any(symbol.endswith(quote) for quote in quotes)
 
+
+def _resolve_age_days(meta: Mapping[str, object] | None) -> Optional[float]:
+    if not meta:
+        return None
+
+    direct_keys = ("age_days", "ageDays")
+    for key in direct_keys:
+        value = _to_float(meta.get(key)) if isinstance(meta, Mapping) else None
+        if value is not None and value >= 0:
+            return value
+
+    timestamp_keys = (
+        "launchTime",
+        "createdTime",
+        "listTime",
+        "created_at",
+        "listedAt",
+    )
+    now_ms = time.time() * 1000.0
+    now_sec = time.time()
+    for key in timestamp_keys:
+        raw = meta.get(key)
+        ts = _to_float(raw)
+        if ts is None or ts <= 0:
+            continue
+        if ts > 1_000_000_000_000.0:
+            age_ms = max(now_ms - ts, 0.0)
+            return age_ms / _MS_PER_DAY
+        age_sec = max(now_sec - ts, 0.0)
+        return age_sec / 86_400.0
+    return None
+
+
+def _resolve_mean_spread(
+    spread_bps: float, meta: Mapping[str, object] | None
+) -> Optional[float]:
+    if meta:
+        for key in (
+            "meanSpreadBps",
+            "mean_spread_bps",
+            "avgSpreadBps",
+            "averageSpreadBps",
+        ):
+            value = meta.get(key)
+            spread = _to_float(value)
+            if spread is not None:
+                return max(spread, 0.0)
+    return max(spread_bps, 0.0) if spread_bps is not None else None
+
+
+def _estimate_volatility_pct(row: Mapping[str, object]) -> Optional[float]:
+    high = _to_float(row.get("highPrice24h") or row.get("highPrice"))
+    low = _to_float(row.get("lowPrice24h") or row.get("lowPrice"))
+    last = _to_float(row.get("lastPrice") or row.get("closePrice"))
+    if (
+        high is not None
+        and low is not None
+        and last is not None
+        and last > 0.0
+        and high >= low
+    ):
+        return max(((high - low) / last) * 100.0, 0.0)
+
+    change_pct = _to_float(row.get("price24hPcnt"))
+    if change_pct is not None:
+        # Bybit reports percentage change as a decimal (0.05 for 5%).
+        return abs(change_pct) * 100.0
+
+    return None
+
+
+def _resolve_volatility_rank(
+    row: Mapping[str, object], meta: Mapping[str, object] | None
+) -> Optional[str]:
+    if meta:
+        for key in ("volatilityRank", "volatility_rank", "volatilityLevel"):
+            raw = meta.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, str):
+                value = raw.strip().lower()
+                if value in {"low", "medium", "mid", "medium_low"}:
+                    return "medium" if value in {"medium", "mid"} else value
+                if value in {"high", "low"}:
+                    return value
+            else:
+                numeric = _to_float(raw)
+                if numeric is not None:
+                    if numeric < _VOLATILITY_LOW_THRESHOLD:
+                        return "low"
+                    if numeric < _VOLATILITY_HIGH_THRESHOLD:
+                        return "medium"
+                    return "high"
+
+    volatility_pct = _estimate_volatility_pct(row)
+    if volatility_pct is None:
+        return None
+    if volatility_pct < _VOLATILITY_LOW_THRESHOLD:
+        return "low"
+    if volatility_pct < _VOLATILITY_HIGH_THRESHOLD:
+        return "medium"
+    return "high"
 
 def filter_quote_pairs(
     symbols: Iterable[str], quote_assets: Iterable[str] | None = None
@@ -274,8 +477,10 @@ def build_universe_scored(
     }
 
     seen: set[str] = set()
-    snapshots: list[LiquiditySnapshot] = []
+    candidates: list[tuple[str, Mapping[str, object]]] = []
     for item in rows:
+        if not isinstance(item, Mapping):
+            continue
         sym = _normalize_symbol(item.get("symbol"))
         if not sym or sym in seen:
             continue
@@ -288,6 +493,12 @@ def build_universe_scored(
         if is_symbol_blacklisted(sym):
             continue
 
+        candidates.append((sym, item))
+
+    instrument_meta = _fetch_instrument_metadata(api, (sym for sym, _ in candidates))
+
+    snapshots: list[LiquiditySnapshot] = []
+    for sym, item in candidates:
         turnover = _safe_float(item.get("turnover24h"))
         bid = _safe_float(item.get("bestBidPrice"))
         ask = _safe_float(item.get("bestAskPrice"))
@@ -295,8 +506,33 @@ def build_universe_scored(
             continue
 
         spread_bps = max(((ask - bid) / ask) * 10_000.0, 0.0)
+
+        meta = instrument_meta.get(sym)
+        age_days = _resolve_age_days(meta)
+        mean_spread = _resolve_mean_spread(spread_bps, meta)
+        volatility_rank = _resolve_volatility_rank(item, meta)
+
+        is_whitelisted = sym in whitelist_set
+
+        if not is_whitelisted:
+            if age_days is None or age_days <= _MIN_LISTING_AGE_DAYS:
+                continue
+            if mean_spread is None or mean_spread >= _MEAN_SPREAD_BPS_THRESHOLD:
+                continue
+            if volatility_rank != "medium":
+                continue
+
         if turnover >= float(min_turnover) and spread_bps <= float(max_spread_bps):
-            snapshots.append(LiquiditySnapshot(sym, turnover, spread_bps))
+            snapshots.append(
+                LiquiditySnapshot(
+                    sym,
+                    turnover,
+                    spread_bps,
+                    age_days=age_days,
+                    mean_spread_bps=mean_spread,
+                    volatility_rank=volatility_rank,
+                )
+            )
 
     scored = [
         (snapshot.symbol, float(score_fn(snapshot.turnover, snapshot.spread_bps)))
