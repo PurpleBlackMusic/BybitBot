@@ -5,6 +5,7 @@ import json
 import math
 import random
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Callable,
@@ -31,14 +32,186 @@ from .paths import DATA_DIR
 from .market_features import build_feature_bundle
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
+from .trade_analytics import load_executions
 
 if TYPE_CHECKING:  # pragma: no cover - for type checking only
     from .portfolio_manager import PortfolioManager
     from .symbol_resolver import InstrumentMetadata, SymbolResolver
     from .envs import Settings
+    from .trade_analytics import ExecutionRecord
 
 SNAPSHOT_FILENAME = "market_snapshot.json"
 DEFAULT_CACHE_TTL = 300.0
+_TRADE_COST_SAMPLE = 600
+_DEFAULT_MAKER_RATIO = 0.25
+_DEFAULT_TAKER_FEE_BPS = 5.0
+
+
+def _ledger_path_for_costs(data_dir: Path, testnet: Optional[bool]) -> Path:
+    data_dir = Path(data_dir)
+    pnl_dir = data_dir / "pnl"
+    legacy = pnl_dir / "executions.jsonl"
+    if testnet is None:
+        # fall back to whichever ledger exists, preferring the freshest network specific file
+        testnet_path = pnl_dir / "executions.testnet.jsonl"
+        mainnet_path = pnl_dir / "executions.mainnet.jsonl"
+        candidates = [path for path in (testnet_path, mainnet_path) if path.exists()]
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) == 2:
+            try:
+                testnet_mtime = testnet_path.stat().st_mtime
+                mainnet_mtime = mainnet_path.stat().st_mtime
+            except OSError:
+                testnet_mtime = mainnet_mtime = 0.0
+            return testnet_path if testnet_mtime >= mainnet_mtime else mainnet_path
+        return legacy
+
+    marker = "testnet" if bool(testnet) else "mainnet"
+    candidate = pnl_dir / f"executions.{marker}.jsonl"
+    if candidate.exists():
+        return candidate
+    if legacy.exists():
+        return legacy
+    return candidate
+
+
+def _ledger_signature(path: Path) -> Tuple[str, int, int]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return str(path), 0, 0
+
+    mtime_ns = getattr(stat, "st_mtime_ns", None)
+    if mtime_ns is None:
+        mtime_ns = int(stat.st_mtime * 1_000_000_000)
+    size = int(getattr(stat, "st_size", 0))
+    return str(path), int(mtime_ns), size
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(value, upper))
+
+
+def _safe_setting_float(settings: Optional["Settings"], name: str, default: float) -> float:
+    if settings is None:
+        return default
+    try:
+        value = getattr(settings, name)
+    except AttributeError:
+        return default
+    numeric = _safe_float(value)
+    if numeric is None or not math.isfinite(numeric):
+        return default
+    return float(numeric)
+
+
+def _maker_fee_hint(settings: Optional["Settings"], taker_hint: float) -> float:
+    if settings is None:
+        return taker_hint * 0.5
+    raw = _safe_float(getattr(settings, "ai_maker_fee_bps", None))
+    if raw is None or not math.isfinite(raw):
+        return taker_hint * 0.5
+    return float(raw)
+
+
+def _extract_fee_components(records: Sequence["ExecutionRecord"]) -> Tuple[Optional[float], Optional[float], Optional[float], int, int]:
+    maker_notional = 0.0
+    maker_fees = 0.0
+    taker_notional = 0.0
+    taker_fees = 0.0
+    maker_samples = 0
+    taker_samples = 0
+
+    for record in records:
+        notional = float(getattr(record, "notional", 0.0) or 0.0)
+        if notional <= 0:
+            continue
+        fee = float(getattr(record, "fee", 0.0) or 0.0)
+        if fee < 0:
+            fee = 0.0
+        is_maker = getattr(record, "is_maker", None)
+        if is_maker is True:
+            maker_notional += notional
+            maker_fees += fee
+            maker_samples += 1
+        else:
+            taker_notional += notional
+            taker_fees += fee
+            taker_samples += 1
+
+    maker_fee_bps: Optional[float]
+    if maker_notional > 0 and maker_fees > 0:
+        maker_fee_bps = (maker_fees / maker_notional) * 10_000.0
+    else:
+        maker_fee_bps = None
+
+    taker_fee_bps: Optional[float]
+    if taker_notional > 0 and taker_fees > 0:
+        taker_fee_bps = (taker_fees / taker_notional) * 10_000.0
+    else:
+        taker_fee_bps = None
+
+    total_notional = maker_notional + taker_notional
+    maker_ratio = maker_notional / total_notional if total_notional > 0 else None
+
+    return maker_fee_bps, taker_fee_bps, maker_ratio, maker_samples, taker_samples
+
+
+@lru_cache(maxsize=16)
+def _cached_cost_profile(
+    signature: Tuple[str, int, int],
+    taker_hint: float,
+    maker_hint: float,
+    slippage_hint: float,
+) -> Dict[str, float]:
+    path_str, _, _ = signature
+    path = Path(path_str)
+    records = load_executions(path, limit=_TRADE_COST_SAMPLE) if path_str else []
+    maker_fee_raw, taker_fee_raw, maker_ratio_raw, maker_samples, taker_samples = _extract_fee_components(records)
+
+    taker_fee = taker_fee_raw if taker_fee_raw is not None else taker_hint
+    if taker_fee <= 0:
+        taker_fee = taker_hint if taker_hint > 0 else _DEFAULT_TAKER_FEE_BPS
+    taker_fee = _clamp(float(taker_fee), 0.0, 50.0)
+
+    maker_fee = maker_fee_raw if maker_fee_raw is not None else maker_hint
+    if maker_fee <= 0:
+        maker_fee = maker_hint
+    if maker_fee <= 0:
+        maker_fee = taker_fee * 0.5
+    maker_fee = _clamp(float(maker_fee), 0.0, taker_fee)
+
+    maker_ratio = maker_ratio_raw if maker_ratio_raw is not None else _DEFAULT_MAKER_RATIO
+    maker_ratio = _clamp(float(maker_ratio), 0.0, 1.0)
+
+    effective_fee = maker_fee * maker_ratio + taker_fee * (1.0 - maker_ratio)
+    round_trip_fee = effective_fee * 2.0
+    slippage = _clamp(float(slippage_hint), 0.0, 500.0)
+
+    return {
+        "maker_fee_bps": maker_fee,
+        "taker_fee_bps": taker_fee,
+        "maker_ratio": maker_ratio,
+        "effective_fee_bps": effective_fee,
+        "round_trip_fee_bps": round_trip_fee,
+        "slippage_bps": slippage,
+        "sample_size": maker_samples + taker_samples,
+    }
+
+
+def _resolve_trade_cost_profile(
+    data_dir: Path,
+    settings: Optional["Settings"],
+    testnet: Optional[bool],
+) -> Dict[str, float]:
+    taker_hint = _safe_setting_float(settings, "ai_fee_bps", _DEFAULT_TAKER_FEE_BPS)
+    maker_hint = _maker_fee_hint(settings, taker_hint)
+    slippage_hint = _safe_setting_float(settings, "ai_slippage_bps", 0.0)
+
+    ledger_path = _ledger_path_for_costs(Path(data_dir), testnet)
+    signature = _ledger_signature(ledger_path)
+    return _cached_cost_profile(signature, taker_hint, maker_hint, slippage_hint)
 
 
 class MarketScannerError(RuntimeError):
@@ -473,6 +646,10 @@ def scan_market_opportunities(
         log("market_scanner.model.error", err=str(exc))
         model = None
 
+    cost_profile = _resolve_trade_cost_profile(data_dir, settings, testnet)
+    fee_round_trip_bps = float(cost_profile.get("round_trip_fee_bps", 0.0) or 0.0)
+    slippage_cost_bps = float(cost_profile.get("slippage_bps", 0.0) or 0.0)
+
     for raw in rows:
         if not isinstance(raw, dict):
             continue
@@ -579,7 +756,19 @@ def scan_market_opportunities(
         elif trend == "sell":
             direction = -1
 
-        ev_bps = change_pct * 100.0 if change_pct is not None else None
+        gross_bps: Optional[float] = None
+        total_cost_bps: Optional[float] = None
+        spread_component = max(float(spread_bps or 0.0), 0.0)
+
+        if change_pct is not None:
+            directional_change = float(change_pct)
+            if direction != 0:
+                directional_change *= direction
+            gross_bps = directional_change * 100.0
+            total_cost_bps = fee_round_trip_bps + slippage_cost_bps + spread_component
+            ev_bps = gross_bps - total_cost_bps
+        else:
+            ev_bps = None
 
         note_parts: List[str] = []
         if change_pct is not None:
@@ -588,6 +777,8 @@ def scan_market_opportunities(
             note_parts.append(f"оборот ${turnover / 1_000_000:.2f}M")
         if spread_bps is not None:
             note_parts.append(f"спред {spread_bps:.1f} б.п.")
+        if total_cost_bps is not None:
+            note_parts.append(f"издержки ≈ {total_cost_bps:.1f} б.п.")
         if quote_source == "USDC":
             note_parts.append("конвертировано из USDC")
         if volatility_pct is not None:
@@ -617,6 +808,15 @@ def scan_market_opportunities(
             "trend": trend,
             "probability": probability,
             "ev_bps": ev_bps,
+            "gross_ev_bps": gross_bps,
+            "costs_bps": {
+                "total": total_cost_bps,
+                "fees": fee_round_trip_bps,
+                "slippage": slippage_cost_bps,
+                "spread": spread_component,
+            }
+            if total_cost_bps is not None
+            else None,
             "score": score,
             "note": ", ".join(note_parts) or None,
             "turnover_usd": turnover,

@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 import numpy as np
 
+import bybit_app.utils.market_scanner as market_scanner_module
 from bybit_app.utils.ai import models as ai_models
+from bybit_app.utils.envs import Settings
 from bybit_app.utils.market_scanner import (
     MarketScanner,
     MarketScannerError,
@@ -172,6 +174,109 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
 def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+
+
+def test_scan_market_opportunities_includes_trade_costs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    now = datetime.now(timezone.utc)
+    ledger_rows = [
+        {
+            "symbol": "AAAUSDT",
+            "side": "Buy",
+            "execPrice": 10.0,
+            "execQty": 5.0,
+            "execFee": 0.01,
+            "feeCurrency": "USDT",
+            "isMaker": True,
+            "execTime": now.timestamp(),
+        },
+        {
+            "symbol": "AAAUSDT",
+            "side": "Sell",
+            "execPrice": 10.0,
+            "execQty": 5.0,
+            "execFee": 0.05,
+            "feeCurrency": "USDT",
+            "isMaker": False,
+            "execTime": now.timestamp() + 60.0,
+        },
+    ]
+    ledger_path = tmp_path / "pnl" / "executions.mainnet.jsonl"
+    _write_ledger(ledger_path, ledger_rows)
+
+    snapshot_rows = [
+        {
+            "symbol": "AAAUSDT",
+            "turnover24h": 4_000_000.0,
+            "price24hPcnt": 3.0,
+            "price1hPcnt": 1.0,
+            "price4hPcnt": 2.0,
+            "price7dPcnt": 5.0,
+            "bestBidPrice": 10.0,
+            "bestAskPrice": 10.02,
+            "volume24h": 1_000_000.0,
+            "volume1h": 100_000.0,
+            "prevVolume1h": 50_000.0,
+            "volume4h": 300_000.0,
+            "prevVolume4h": 150_000.0,
+            "prevVolume24h": 80_000.0,
+            "highPrice24h": 10.5,
+            "lowPrice24h": 9.8,
+            "lastPrice": 10.1,
+            "highPrice1h": 10.2,
+            "lowPrice1h": 9.9,
+            "closePrice1h": 10.05,
+            "highPrice4h": 10.4,
+            "lowPrice4h": 9.7,
+            "closePrice4h": 10.0,
+            "highPrice7d": 11.0,
+            "lowPrice7d": 9.5,
+            "closePrice7d": 10.2,
+            "bid1Size": 10_000.0,
+            "ask1Size": 9_000.0,
+            "corr_btc": 0.3,
+            "corr_market": 0.2,
+        }
+    ]
+    _write_snapshot(tmp_path, snapshot_rows)
+
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+
+    settings = Settings(
+        testnet=False,
+        ai_live_only=False,
+        ai_fee_bps=9.0,
+        ai_slippage_bps=4.0,
+    )
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=1,
+        min_turnover=0.0,
+        min_change_pct=0.5,
+        max_spread_bps=200.0,
+        settings=settings,
+        testnet=False,
+    )
+
+    assert opportunities, "scanner should return the prepared opportunity"
+    entry = opportunities[0]
+
+    costs = entry.get("costs_bps")
+    assert costs is not None
+    expected_spread = ((10.02 - 10.0) / 10.02) * 10_000.0
+    assert costs["spread"] == pytest.approx(expected_spread, rel=1e-6)
+    assert costs["fees"] == pytest.approx(12.0, rel=1e-6)
+    assert costs["slippage"] == pytest.approx(4.0, rel=1e-6)
+    assert costs["total"] == pytest.approx(costs["fees"] + costs["slippage"] + costs["spread"], rel=1e-6)
+
+    gross = entry.get("gross_ev_bps")
+    assert gross is not None and gross > 0
+    assert entry["ev_bps"] == pytest.approx(gross - costs["total"], rel=1e-6)
+    assert entry["ev_bps"] < gross
+    assert entry["note"] and "издержки" in entry["note"]
 
 
 def test_training_dataset_prorates_fee_for_oversized_sell(tmp_path: Path) -> None:
