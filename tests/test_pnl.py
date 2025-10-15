@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 from bybit_app.utils import pnl as pnl_module
+from bybit_app.utils.fees import FeeRateSnapshot
 from bybit_app.utils.pnl import read_ledger
 
 
@@ -66,3 +68,26 @@ def test_execution_fee_in_quote_infers_base_for_low_price_fill() -> None:
 
     assert fee_in_quote == pytest.approx(0.1 * 0.02)
     assert execution.get("feeCurrency") == "ABC"
+
+
+def test_execution_fee_in_quote_estimates_missing_fee(monkeypatch: pytest.MonkeyPatch) -> None:
+    execution = {
+        "execQty": "2",
+        "execPrice": "100",
+        "symbol": "ABCUSDT",
+    }
+
+    def fake_fee_rate_for_symbol(*_, **__):
+        return FeeRateSnapshot(
+            maker_rate=0.0005,
+            taker_rate=0.0010,
+            symbol="ABCUSDT",
+            category="spot",
+            fetched_at=time.time(),
+        )
+
+    monkeypatch.setattr(pnl_module, "fee_rate_for_symbol", fake_fee_rate_for_symbol)
+
+    fee_in_quote = pnl_module.execution_fee_in_quote(execution)
+
+    assert fee_in_quote == pytest.approx(0.0010 * 2.0 * 100.0)
