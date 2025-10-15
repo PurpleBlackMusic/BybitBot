@@ -45,6 +45,12 @@ def test_register_group_persists_sanitized_links(temp_store):
     assert record["raw_links"]["primary"] == primary
     assert record["raw_links"]["tp"] == tp
     assert record["raw_links"]["sl"] == sl
+    assert record["legs"]["primary"]["link"] == ensure_link_id(primary)
+    assert record["legs"]["primary"]["status"] == "active"
+    assert record["legs"]["tp"]["link"] == ensure_link_id(tp)
+    assert record["legs"]["tp"]["status"] == "active"
+    assert record["legs"]["sl"]["link"] == ensure_link_id(sl)
+    assert record["legs"]["sl"]["status"] == "active"
 
 
 def test_load_normalizes_existing_records(temp_store):
@@ -75,6 +81,12 @@ def test_load_normalizes_existing_records(temp_store):
     assert record["sl"] == ensure_link_id(sl)
     assert record["raw_links"]["primary"] == primary
     assert json.loads(temp_store.read_text(encoding="utf-8"))[group]["primary"] == record["primary"]
+    assert record["legs"]["primary"]["link"] == ensure_link_id(primary)
+    assert record["legs"]["primary"]["status"] == "active"
+    assert record["legs"]["tp"]["link"] == ensure_link_id(tp)
+    assert record["legs"]["tp"]["status"] == "active"
+    assert record["legs"]["sl"]["link"] == ensure_link_id(sl)
+    assert record["legs"]["sl"]["status"] == "active"
 
 
 def test_handle_private_updates_long_group(temp_store, monkeypatch):
@@ -155,4 +167,44 @@ def test_handle_private_closes_on_fill(temp_store, monkeypatch):
             "orderLinkId": ensure_link_id(sl),
         }
     ]
-    assert oco_guard._load()[group]["closed"] is True
+    record = oco_guard._load()[group]
+    assert record["closed"] is True
+    assert record["legs"]["tp"]["status"] == "filled"
+    assert record["legs"]["sl"]["status"] == "cancelled"
+
+
+def test_handle_private_cancel_error_marks_state(temp_store, monkeypatch):
+    class FailingAPI:
+        def cancel_order(self, **payload: Any) -> None:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(oco_guard, "_api", lambda: FailingAPI())
+    monkeypatch.setattr(
+        oco_guard,
+        "enqueue_telegram_message",
+        lambda *args, **kwargs: None,
+    )
+
+    group = "OCO-" + "Q" * 31
+    primary = f"{group}-PRIMARY"
+    tp = f"{group}-TP"
+    sl = f"{group}-SL"
+    oco_guard.register_group(group, "BTCUSDT", "spot", primary, tp, sl)
+
+    tp_link = ensure_link_id(tp)
+    oco_guard.handle_private(
+        {
+            "topic": "order",
+            "data": {
+                "orderLinkId": tp_link,
+                "orderStatus": "Filled",
+                "symbol": "BTCUSDT",
+                "category": "spot",
+            },
+        }
+    )
+
+    record = oco_guard._load()[group]
+    assert record["closed"] is True
+    assert record["legs"]["tp"]["status"] == "filled"
+    assert record["legs"]["sl"]["status"] == "cancel_error"
