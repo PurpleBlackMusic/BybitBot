@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-import math
+from collections import deque
+from collections.abc import Mapping
+
 import pandas as pd
 import streamlit as st
 
@@ -10,6 +12,7 @@ from utils.ui import safe_set_page_config
 from utils.dataframe import arrow_safe
 from utils.guardian_bot import GuardianBot
 from utils.pnl import _ledger_path_for
+from utils.timestamps import extract_exec_timestamp
 
 safe_set_page_config(page_title="Мониторинг сделок", page_icon="📈", layout="wide")
 
@@ -23,45 +26,16 @@ trade_stats = bot.trade_statistics()
 health = bot.data_health()
 
 
-def _normalise_exec_time(raw: object) -> int | None:
-    """Return unix timestamp in milliseconds for heterogeneous ``execTime`` values."""
+def _safe_float(value: object, default: float = 0.0) -> float:
+    """Return *value* coerced to ``float`` while tolerating invalid entries."""
 
-    if raw is None:
-        return None
+    if value in (None, ""):
+        return default
 
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return None
-        try:
-            parsed = pd.to_datetime(text, utc=True, errors="coerce")
-        except (ValueError, TypeError):
-            parsed = pd.NaT
-        if pd.notna(parsed):
-            return int(parsed.to_pydatetime().timestamp() * 1000)
-        try:
-            raw = float(text)
-        except (TypeError, ValueError):
-            return None
-
-    if isinstance(raw, (int, float)):
-        if isinstance(raw, float) and (math.isnan(raw) or not math.isfinite(raw)):
-            return None
-        value = float(raw)
-        magnitude = abs(value)
-        if magnitude >= 1e18:
-            seconds = value / 1e9
-        elif magnitude >= 1e15:
-            seconds = value / 1e6
-        elif magnitude >= 1e12:
-            seconds = value / 1e3
-        elif magnitude >= 1e9:
-            seconds = value
-        else:
-            return None
-        return int(seconds * 1000)
-
-    return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 with st.container(border=True):
     st.subheader("Диагностика источников данных")
@@ -239,22 +213,33 @@ ledger_path = _ledger_path_for()
 if not ledger_path.exists():
     st.warning("Журнал исполнений пока пуст.")
 else:
+    payloads: deque[Mapping[str, object]] = deque(maxlen=200)
+    try:
+        with ledger_path.open("r", encoding="utf-8") as source:
+            for raw_line in source:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, Mapping):
+                    payloads.append(parsed)
+    except OSError:
+        payloads = deque()
+
     rows = []
-    for line in ledger_path.read_text(encoding="utf-8").splitlines()[-200:]:
-        if not line.strip():
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for payload in payloads:
+        ts = extract_exec_timestamp(payload)
         rows.append(
             {
-                "ts": _normalise_exec_time(payload.get("execTime")),
+                "ts": ts,
                 "symbol": payload.get("symbol"),
                 "side": payload.get("side"),
-                "price": float(payload.get("execPrice") or 0.0),
-                "qty": float(payload.get("execQty") or 0.0),
-                "fee": float(payload.get("execFee") or 0.0),
+                "price": _safe_float(payload.get("execPrice")),
+                "qty": _safe_float(payload.get("execQty")),
+                "fee": _safe_float(payload.get("execFee")),
                 "is_maker": payload.get("isMaker"),
             }
         )
