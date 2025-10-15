@@ -19,7 +19,12 @@ from utils.background import (
 from utils.dataframe import arrow_safe
 from utils.envs import active_dry_run, creds_ok
 from utils.guardian_bot import GuardianBot
-from utils.ui import auto_refresh, rerun, safe_set_page_config
+from utils.ui import auto_refresh, safe_set_page_config
+
+
+safe_set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
+
+FEEDBACK_TTL_SECONDS = 30.0
 
 
 def _format_age(seconds: float) -> str:
@@ -330,7 +335,21 @@ def _format_order_caption(order: dict[str, object]) -> str:
     return f"{symbol} · {side} · Нотионал {amount_text}{slippage_text}"
 
 
-safe_set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
+def _render_restart_feedback(placeholder, target: str, success: bool) -> None:
+    if target == "automation":
+        ok_message = "Автоцикл перезапущен."
+        fail_message = "Не удалось перезапустить автоцикл."
+    elif target == "ws":
+        ok_message = "WebSocket перезапущен."
+        fail_message = "Не удалось перезапустить WebSocket."
+    else:
+        ok_message = "Операция выполнена."
+        fail_message = "Операция завершилась ошибкой."
+
+    if success:
+        placeholder.success(ok_message)
+    else:
+        placeholder.error(fail_message)
 
 DEFAULT_REFRESH_SECONDS = 30
 previous_refresh_ts = float(st.session_state.get("simple_mode_last_refresh") or 0.0)
@@ -379,9 +398,10 @@ st.caption(
 )
 
 refresh = st.button("🔄 Обновить данные", use_container_width=True)
+refresh_feedback = st.empty()
 if refresh:
     bot.refresh()
-    rerun()
+    refresh_feedback.success("Данные обновлены.")
 
 if st.session_state.get("simple_mode_auto_enabled", True):
     interval_seconds = max(
@@ -391,7 +411,45 @@ if st.session_state.get("simple_mode_auto_enabled", True):
 
 st.markdown("#### Фоновые службы")
 with st.container(border=True):
-    feedback = st.session_state.pop("simple_mode_restart_feedback", None)
+    feedback_placeholder = st.empty()
+    feedback_raw = st.session_state.get("simple_mode_restart_feedback")
+    feedback_target: str | None = None
+    feedback_ok: bool | None = None
+    feedback_ts: float | None = None
+
+    if isinstance(feedback_raw, dict):
+        feedback_target = _clean_text(feedback_raw.get("target"))
+        raw_ok = feedback_raw.get("success")
+        feedback_ok = bool(raw_ok) if raw_ok is not None else None
+        ts_candidate = feedback_raw.get("ts")
+        try:
+            feedback_ts = float(ts_candidate) if ts_candidate is not None else None
+        except (TypeError, ValueError):
+            feedback_ts = None
+    elif isinstance(feedback_raw, (list, tuple)) and len(feedback_raw) >= 2:
+        feedback_target = _clean_text(feedback_raw[0])
+        raw_ok = feedback_raw[1]
+        feedback_ok = bool(raw_ok) if raw_ok is not None else None
+        if len(feedback_raw) >= 3:
+            try:
+                feedback_ts = float(feedback_raw[2])
+            except (TypeError, ValueError):
+                feedback_ts = None
+        if feedback_target and feedback_ok is not None:
+            payload = {
+                "target": feedback_target,
+                "success": feedback_ok,
+                "ts": time.time() if feedback_ts is None else feedback_ts,
+            }
+            st.session_state["simple_mode_restart_feedback"] = payload
+            feedback_ts = payload["ts"]
+
+    now = time.time()
+    if feedback_target and feedback_ok is not None:
+        if feedback_ts is None or now - feedback_ts <= FEEDBACK_TTL_SECONDS:
+            _render_restart_feedback(feedback_placeholder, feedback_target, feedback_ok)
+        else:
+            st.session_state.pop("simple_mode_restart_feedback", None)
 
     auto_alive = bool(automation_status.get("thread_alive"))
     auto_restart_count = int(automation_status.get("restart_count") or 0)
@@ -480,32 +538,21 @@ with st.container(border=True):
     if ws_error:
         st.error(f"WebSocket: {ws_error}")
 
-    if feedback:
-        target, ok = feedback
-        if target == "automation":
-            if ok:
-                st.success("Автоцикл перезапущен.")
-            else:
-                st.error("Не удалось перезапустить автоцикл.")
-        elif target == "ws":
-            if ok:
-                st.success("WebSocket перезапущен.")
-            else:
-                st.error("Не удалось перезапустить WebSocket.")
-
     button_cols = st.columns(2)
     if button_cols[0].button(
         "Перезапустить автоматику", use_container_width=True
     ):
-        success = restart_automation()
-        st.session_state["simple_mode_restart_feedback"] = ("automation", success)
-        rerun()
+        success = bool(restart_automation())
+        payload = {"target": "automation", "success": success, "ts": time.time()}
+        st.session_state["simple_mode_restart_feedback"] = payload
+        _render_restart_feedback(feedback_placeholder, "automation", success)
     if button_cols[1].button(
         "Перезапустить WebSocket", use_container_width=True
     ):
-        success = restart_websockets()
-        st.session_state["simple_mode_restart_feedback"] = ("ws", success)
-        rerun()
+        success = bool(restart_websockets())
+        payload = {"target": "ws", "success": success, "ts": time.time()}
+        st.session_state["simple_mode_restart_feedback"] = payload
+        _render_restart_feedback(feedback_placeholder, "ws", success)
 
 summary = bot.status_summary()
 brief = bot.generate_brief()
@@ -1214,4 +1261,3 @@ for message in st.session_state["guardian_chat"]:
 if prompt := st.chat_input("Спросите о рисках, прибыли или плане…"):
     st.session_state["guardian_chat"].append({"role": "user", "content": prompt})
     st.session_state["guardian_chat"].append({"role": "assistant", "content": bot.answer(prompt)})
-    rerun()
