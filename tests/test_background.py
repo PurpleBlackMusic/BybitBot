@@ -56,11 +56,14 @@ def _make_service(
     if ws_stub is None:
         ws_stub = SimpleNamespace(
             start=lambda *args, **kwargs: True,
+            start_private=lambda *args, **kwargs: True,
             status=lambda: {
                 "public": {"running": True, "age_seconds": 0.0},
                 "private": {"running": True, "age_seconds": 0.0},
             },
             stop_all=lambda: None,
+            stop_private=lambda: None,
+            force_public_fallback=lambda *args, **kwargs: False,
             latest_order_update=lambda: {},
             latest_execution=lambda: {},
         )
@@ -78,7 +81,7 @@ def _make_service(
 
 def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
-
+    
     def fake_start(*_: object) -> bool:
         calls.append("start")
         return True
@@ -87,6 +90,12 @@ def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> N
 
     def fake_stop() -> None:
         stops.append("stop")
+
+    fallback_calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_force_public_fallback(reason: str, **payload: object) -> bool:
+        fallback_calls.append((reason, dict(payload)))
+        return True
 
     statuses: list[dict] = [
         {
@@ -100,8 +109,11 @@ def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> N
 
     ws_stub = SimpleNamespace(
         start=fake_start,
+        start_private=lambda: True,
         status=fake_status,
         stop_all=fake_stop,
+        stop_private=lambda: None,
+        force_public_fallback=fake_force_public_fallback,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
     )
@@ -122,10 +134,81 @@ def test_ws_restart_triggered_by_staleness(monkeypatch: pytest.MonkeyPatch) -> N
     assert svc.ensure_ws_started() is True
     assert calls == ["start", "start"]
     assert stops == ["stop"]
+    assert len(fallback_calls) == 1
+    fallback_reason, fallback_payload = fallback_calls[0]
+    assert fallback_reason == "public_channel_stale"
+    assert fallback_payload["threshold"] == 0.25
+    assert fallback_payload["age"] == pytest.approx(5.0, rel=0, abs=1e-6)
 
     snapshot = svc.ws_snapshot()
     assert snapshot["public_stale"] is True
     assert snapshot["restart_count"] == 2
+
+
+def test_private_ws_stale_triggers_targeted_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start_calls: list[str] = []
+    private_start_calls: list[str] = []
+    private_stops: list[str] = []
+
+    def fake_start() -> bool:
+        start_calls.append("start")
+        return True
+
+    def fake_start_private() -> bool:
+        private_start_calls.append("start_private")
+        return True
+
+    def fake_stop_private() -> None:
+        private_stops.append("stop_private")
+
+    statuses: list[dict[str, object]] = [
+        {
+            "public": {"running": True, "age_seconds": 0.0},
+            "private": {"running": True, "age_seconds": 0.0},
+        }
+    ]
+
+    def fake_status() -> dict[str, object]:
+        return statuses[-1]
+
+    fallback_calls: list[int] = []
+
+    def fake_force_public_fallback(*_: object, **__: object) -> bool:
+        fallback_calls.append(1)
+        return True
+
+    ws_stub = SimpleNamespace(
+        start=fake_start,
+        start_private=fake_start_private,
+        status=fake_status,
+        stop_all=lambda: None,
+        stop_private=fake_stop_private,
+        force_public_fallback=fake_force_public_fallback,
+        latest_order_update=lambda: {},
+        latest_execution=lambda: {},
+    )
+
+    svc = _make_service(monkeypatch, ws_stub=ws_stub)
+
+    assert svc.ensure_ws_started() is True
+    assert start_calls == ["start"]
+    assert private_start_calls == []
+
+    statuses.append(
+        {
+            "public": {"running": True, "age_seconds": 0.0},
+            "private": {"running": True, "age_seconds": 5.0},
+        }
+    )
+
+    assert svc.ensure_ws_started() is True
+    assert private_stops == ["stop_private"]
+    assert private_start_calls == ["start_private"]
+    assert start_calls == ["start"]
+    assert fallback_calls == []
+    assert svc._ws_restart_count == 1
 
 
 def test_restart_ws_forces_stop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,11 +217,14 @@ def test_restart_ws_forces_stop(monkeypatch: pytest.MonkeyPatch) -> None:
 
     ws_stub = SimpleNamespace(
         start=lambda: (start_calls.append(1) or True),
+        start_private=lambda: True,
         status=lambda: {
             "public": {"running": True, "age_seconds": 0.0},
             "private": {"running": True, "age_seconds": 0.0},
         },
         stop_all=lambda: stop_calls.append(1),
+        stop_private=lambda: None,
+        force_public_fallback=lambda *_, **__: False,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
     )
@@ -282,8 +368,11 @@ def test_ensure_started_waits_for_private_ready(monkeypatch: pytest.MonkeyPatch)
 
     ws_stub = SimpleNamespace(
         start=lambda *_, **__: True,
+        start_private=lambda: True,
         status=fake_status,
         stop_all=lambda: None,
+        stop_private=lambda: None,
+        force_public_fallback=lambda *_, **__: False,
         latest_order_update=lambda: {},
         latest_execution=lambda: {},
     )

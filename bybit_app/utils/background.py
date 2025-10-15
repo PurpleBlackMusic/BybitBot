@@ -131,72 +131,141 @@ class BackgroundServices:
             log("background.ws.status.error", err=str(exc))
             return {}
 
-    def _ws_needs_restart(self, status: Dict[str, Any]) -> bool:
+    def _analyze_ws_status(
+        self, status: Dict[str, Any]
+    ) -> tuple[bool, bool, Optional[Dict[str, object]]]:
         if not status:
-            return True
+            return True, True, None
 
         public = status.get("public") or {}
         private = status.get("private") or {}
 
+        def _coerce_age(value: object) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        restart_public = False
+        restart_private = False
+        fallback_payload: Optional[Dict[str, object]] = None
+
         public_running = bool(public.get("running"))
-        public_age = public.get("age_seconds")
+        public_age = _coerce_age(public.get("age_seconds"))
         if not public_running:
-            return True
-        if (
+            restart_public = True
+        elif (
             self._ws_public_stale_after
-            and isinstance(public_age, (int, float))
+            and public_age is not None
             and public_age > self._ws_public_stale_after
         ):
-            return True
+            restart_public = True
+            fallback_payload = {
+                "age": round(public_age, 3),
+                "threshold": self._ws_public_stale_after,
+            }
 
         private_running = bool(private.get("running"))
-        private_age = private.get("age_seconds")
+        private_age = _coerce_age(private.get("age_seconds"))
         if private and not private_running:
-            return True
+            restart_private = True
         if (
             self._ws_private_stale_after
-            and isinstance(private_age, (int, float))
+            and private_age is not None
             and private_age > self._ws_private_stale_after
         ):
-            return True
+            restart_private = True
 
-        return False
+        return restart_public, restart_private, fallback_payload
 
     def ensure_ws_started(self, *, force: bool = False) -> bool:
         with self._ws_lock:
             status: Dict[str, Any] | None = None
+            restart_public = False
+            restart_private = False
+            fallback_payload: Optional[Dict[str, object]] = None
+
             if not force and self._ws_started:
                 status = self._safe_ws_status()
-                if self._ws_needs_restart(status):
-                    force = True
+                (
+                    restart_public,
+                    restart_private,
+                    fallback_payload,
+                ) = self._analyze_ws_status(status)
 
             if force:
+                restart_public = True
+                restart_private = True
+
+            if restart_public:
                 try:
                     ws_manager.stop_all()
                 except Exception as exc:  # pragma: no cover - defensive guard
                     log("background.ws.stop.error", err=str(exc))
                 self._ws_started = False
                 self._hygiene_performed = False
+            elif restart_private:
+                stop_private = getattr(ws_manager, "stop_private", None)
+                if callable(stop_private):
+                    try:
+                        stop_private()
+                    except Exception as exc:  # pragma: no cover - defensive guard
+                        log("background.ws.private.stop.error", err=str(exc))
+
+            if fallback_payload and hasattr(ws_manager, "force_public_fallback"):
+                try:
+                    ws_manager.force_public_fallback(
+                        "public_channel_stale",
+                        **fallback_payload,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    log("background.ws.fallback.error", err=str(exc))
 
             previous_started = self._ws_started
+            start_mode = None
+            if not self._ws_started or restart_public:
+                start_mode = "full"
+            elif restart_private:
+                start_mode = "private"
+
+            if start_mode is None:
+                return self._ws_started
+
             try:
-                ok = ws_manager.start()
+                if start_mode == "full":
+                    ok = ws_manager.start()
+                else:
+                    start_private = getattr(ws_manager, "start_private", None)
+                    if not callable(start_private):
+                        return self._ws_started
+                    ok = start_private()
             except Exception as exc:  # pragma: no cover - defensive guard
                 self._ws_error = str(exc)
-                self._ws_started = False
+                if start_mode == "full":
+                    self._ws_started = False
                 log("background.ws.start.error", err=str(exc))
                 return False
 
+            if start_mode == "full":
+                if ok:
+                    self._ws_started = True
+                    self._ws_error = None
+                    self._ws_last_started_at = time.time()
+                    if restart_public or force or not previous_started:
+                        self._ws_restart_count += 1
+                else:
+                    self._ws_started = False
+                    self._ws_error = "manager.start returned False"
+                return self._ws_started
+
+            # private-only restart path
             if ok:
-                self._ws_started = True
                 self._ws_error = None
-                self._ws_last_started_at = time.time()
-                if force or not previous_started:
-                    self._ws_restart_count += 1
-            else:
-                self._ws_started = False
-                self._ws_error = "manager.start returned False"
-            return self._ws_started
+                return True
+
+            self._ws_error = "manager.start_private returned False"
+            log("background.ws.private.restart.failed")
+            return False
 
     def _run_startup_hygiene(self) -> None:
         with self._hygiene_lock:
