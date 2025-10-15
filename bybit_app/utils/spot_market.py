@@ -1064,7 +1064,9 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
             details={"status": status, "symbol": key},
         )
 
-    lot = instrument.get("lotSizeFilter") or {}
+    lot_raw = instrument.get("lotSizeFilter")
+    lot = dict(lot_raw) if isinstance(lot_raw, Mapping) else {}
+
     min_amount = _to_decimal(lot.get("minOrderAmt") or lot.get("minNotional") or lot.get("minOrderAmtValue"))
     quote_step = _to_decimal(lot.get("minOrderAmtIncrement") or lot.get("quotePrecision") or "0.01", Decimal("0.01"))
     if quote_step <= 0:
@@ -1076,16 +1078,21 @@ def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
         or lot.get("minOrderQtyValue")
         or "0"
     )
-    qty_step = _to_decimal(
-        lot.get("qtyStep")
-        or lot.get("stepSize")
-        or lot.get("minOrderQtyIncrement")
-        or lot.get("basePrecision")
-        or "0.00000001",
-        Decimal("0.00000001"),
-    )
+    qty_step = Decimal("0")
+    for key in ("qtyStep", "basePrecision", "stepSize", "minOrderQtyIncrement"):
+        candidate = lot.get(key)
+        if candidate is None:
+            continue
+        value = _to_decimal(candidate)
+        if value > 0:
+            qty_step = value
+            break
     if qty_step <= 0:
         qty_step = Decimal("0.00000001")
+
+    lot["stepSize"] = _decimal_to_text(qty_step)
+    instrument = dict(instrument)
+    instrument["lotSizeFilter"] = lot
 
     base_coin = str(
         instrument.get("baseCoin")

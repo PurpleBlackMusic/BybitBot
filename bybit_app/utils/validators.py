@@ -161,7 +161,15 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
     )
     qty_step = _instrument_decimal(
         instrument,
-        ( ("lotSizeFilter", "qtyStep"), ("qtyStep",), ("lotSize",), ),
+        (
+            ("lotSizeFilter", "qtyStep"),
+            ("lotSizeFilter", "basePrecision"),
+            ("lotSizeFilter", "stepSize"),
+            ("qtyStep",),
+            ("basePrecision",),
+            ("stepSize",),
+            ("lotSize",),
+        ),
         default="0.00000001",
     )
     min_qty = _instrument_decimal(
