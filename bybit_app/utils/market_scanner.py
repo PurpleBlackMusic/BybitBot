@@ -680,6 +680,30 @@ def _extract_kline_rows(payload: object) -> Sequence[object]:
     return []
 
 
+def _interpret_confirm_flag(value: object) -> Optional[bool]:
+    """Best effort conversion of Bybit candle ``confirm`` fields to ``bool``."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            numeric = int(float(value))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return None
+        return bool(numeric)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "nan"}:
+            return None
+        if text in {"1", "true", "closed", "confirm", "yes"}:
+            return True
+        if text in {"0", "false", "open", "no"}:
+            return False
+    return None
+
+
 def _normalise_candles(payload: object) -> List[Dict[str, object]]:
     candles: List[Dict[str, object]] = []
     for entry in _extract_kline_rows(payload):
@@ -690,6 +714,7 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
         close: Optional[float]
         volume: Optional[float]
         turnover: Optional[float] = None
+        confirm: Optional[bool] = None
 
         if isinstance(entry, Mapping):
             start = _safe_int(entry.get("start") or entry.get("openTime") or entry.get("timestamp"))
@@ -699,6 +724,12 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
             close = _safe_float(entry.get("close"))
             volume = _safe_float(entry.get("volume"))
             turnover = _safe_float(entry.get("turnover"))
+            confirm = _interpret_confirm_flag(
+                entry.get("confirm")
+                or entry.get("isClosed")
+                or entry.get("is_close")
+                or entry.get("closed")
+            )
         elif isinstance(entry, Sequence):
             sequence = list(entry)
             if not sequence:
@@ -710,10 +741,15 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
             close = _safe_float(sequence[4]) if len(sequence) > 4 else None
             volume = _safe_float(sequence[5]) if len(sequence) > 5 else None
             turnover = _safe_float(sequence[6]) if len(sequence) > 6 else None
+            confirm = _interpret_confirm_flag(sequence[7]) if len(sequence) > 7 else None
         else:
             continue
 
         if start is None:
+            continue
+
+        if confirm is False:
+            # Explicitly flagged by the API as "not yet closed" – skip.
             continue
 
         record: Dict[str, object] = {"start": start}
@@ -733,6 +769,34 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
 
     candles.sort(key=lambda row: row.get("start") or 0)
     return candles
+
+
+def _select_closed_candles(
+    candles: Sequence[Mapping[str, object]], *, interval_minutes: int, now: float
+) -> List[Dict[str, object]]:
+    """Filter out candles that are still forming at *now*."""
+
+    if not candles:
+        return []
+
+    try:
+        interval_ms = int(max(interval_minutes, 0)) * 60_000
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        interval_ms = 0
+
+    now_ms = int(float(now) * 1000.0)
+    closed: List[Dict[str, object]] = []
+
+    for candle in candles:
+        start_raw = candle.get("start") if isinstance(candle, Mapping) else None
+        start = _safe_int(start_raw) if start_raw is not None else None
+        if start is None:
+            continue
+        if interval_ms > 0 and start + interval_ms > now_ms:
+            continue
+        closed.append(dict(candle))
+
+    return closed
 
 
 class _CandleCache:
@@ -780,8 +844,10 @@ class _CandleCache:
                 continue
 
             candles = _normalise_candles(payload)
-            self._cache[key] = (now, candles)
-            bundle[f"{interval}m"] = candles
+            closed = _select_closed_candles(candles, interval_minutes=interval, now=now)
+            self._cache[key] = (now, closed)
+            if closed:
+                bundle[f"{interval}m"] = closed
 
         return bundle
 
