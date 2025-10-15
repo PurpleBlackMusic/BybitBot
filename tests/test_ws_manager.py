@@ -12,6 +12,7 @@ from bybit_app.utils import ws_manager as ws_manager_module
 import bybit_app.utils.pnl as pnl_module
 from bybit_app.utils.ws_manager import WSManager
 from bybit_app.utils.ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
+from bybit_app.utils.ws_events import fetch_events, reset_event_queue
 
 
 def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25,6 +26,9 @@ def test_ws_manager_status_reports_heartbeat(monkeypatch: pytest.MonkeyPatch) ->
         _thread = SimpleNamespace(is_alive=lambda: True)
 
         def is_running(self) -> bool:
+            return True
+
+        def start(self, *_, **__):
             return True
 
     manager._priv = DummyPrivate()
@@ -1397,7 +1401,7 @@ def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) ->
             captured["url"] = url
             captured["callback"] = on_msg
 
-        def start(self) -> bool:
+        def start(self, *_, **__) -> bool:
             captured["started"] = True
             return True
 
@@ -1431,6 +1435,7 @@ def test_start_private_uses_correct_callback(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_ws_manager_captures_order_update() -> None:
+    reset_event_queue()
     manager = WSManager()
     payload = {
         "topic": "order",
@@ -1454,8 +1459,15 @@ def test_ws_manager_captures_order_update() -> None:
     assert update["updatedTime"] == "1700000000000"
     assert update["raw"]["orderStatus"] == "Cancelled"
 
+    events = fetch_events(scope="private")
+    assert events
+    last_event = events[-1]
+    assert last_event["topic"] == "order"
+    assert last_event["payload"]["orderStatus"] == "Cancelled"
+
 
 def test_ws_manager_captures_execution_update() -> None:
+    reset_event_queue()
     manager = WSManager()
     payload = {
         "topic": "execution",
@@ -1478,6 +1490,12 @@ def test_ws_manager_captures_execution_update() -> None:
     assert execution["orderLinkId"] == "abc"
     assert execution["raw"]["symbol"] == "ETHUSDT"
 
+    events = fetch_events(scope="private")
+    assert events
+    last_event = events[-1]
+    assert last_event["topic"] == "execution"
+    assert last_event["payload"]["orderLinkId"] == "abc"
+
 
 def test_start_private_does_not_restart_running_client(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = WSManager()
@@ -1492,7 +1510,7 @@ def test_start_private_does_not_restart_running_client(monkeypatch: pytest.Monke
         def is_running(self) -> bool:
             return self._running
 
-        def start(self) -> bool:
+        def start(self, *_, **__) -> bool:
             self.started += 1
             self._running = True
             return True
@@ -1512,7 +1530,7 @@ def test_start_private_does_not_restart_running_client(monkeypatch: pytest.Monke
     assert priv.started == 1
 
     assert manager.start_private() is True
-    assert priv.started == 1  # second call should be a no-op
+    assert priv.started == 2  # second call refreshes subscriptions without rebuilding the client
 
 
 def test_start_private_handles_start_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1523,7 +1541,7 @@ def test_start_private_handles_start_failure(monkeypatch: pytest.MonkeyPatch) ->
             self.url = url
             self.on_msg = on_msg
 
-        def start(self) -> bool:
+        def start(self, *_, **__) -> bool:
             return False
 
         def stop(self) -> None:  # pragma: no cover - parity with real class
@@ -1564,7 +1582,7 @@ def test_start_private_restarts_when_environment_changes(monkeypatch: pytest.Mon
         def is_running(self) -> bool:
             return self._running
 
-        def start(self) -> bool:
+        def start(self, *_, **__) -> bool:
             self.started += 1
             self._running = True
             return True

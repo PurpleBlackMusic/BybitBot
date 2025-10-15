@@ -21,13 +21,16 @@ from .paths import DATA_DIR
 from .pnl import read_ledger
 from .store import JLStore
 from .log import log
-from .ws_private_v5 import WSPrivateV5
+from .ws_private_v5 import WSPrivateV5, DEFAULT_TOPICS
 from .realtime_cache import get_realtime_cache
 from .spot_pnl import spot_inventory_and_pnl, _replay_events
 from .spot_market import _instrument_limits
 from .precision import format_to_step, quantize_to_step
 from .telegram_notify import enqueue_telegram_message
 from .trade_notifications import format_sell_close_message
+from .ws_events import fetch_events as _fetch_ws_events
+from .ws_events import event_queue_stats as _ws_event_stats
+from .ws_events import publish_event as _publish_ws_event
 
 
 _BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
@@ -344,9 +347,12 @@ class WSManager:
                     on_msg=_on_private_msg,
                 )
                 self._priv_url = url
+            topics = list(DEFAULT_TOPICS)
             if getattr(self._priv, "is_running", None) and self._priv.is_running():
-                return True
-            started = self._priv.start()
+                # Refresh subscriptions on already running clients to recover after hiccups.
+                refreshed = self._priv.start(topics=topics)
+                return bool(refreshed)
+            started = self._priv.start(topics=topics)
             if not started:
                 self._priv = None
                 self._priv_url = None
@@ -575,6 +581,12 @@ class WSManager:
         if not rows:
             return
 
+        for row in rows:
+            try:
+                _publish_ws_event(scope="private", topic=topic, payload=row)
+            except ValueError:
+                continue
+
         self._realtime_cache.update_private(topic, {"rows": rows})
 
         if "execution" in topic:
@@ -687,6 +699,28 @@ class WSManager:
             if self._last_execution is None:
                 return None
             return deepcopy(self._last_execution)
+
+    def private_events(
+        self,
+        *,
+        since: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        """Return recent private websocket events in chronological order."""
+
+        return _fetch_ws_events(scope="private", since=since, limit=limit)
+
+    def private_event_cursor(self) -> int:
+        """Return the identifier of the latest queued private event."""
+
+        stats = _ws_event_stats()
+        return int(stats.get("latest_id", 0))
+
+    def private_event_stats(self) -> dict[str, int]:
+        """Expose internal queue statistics for monitoring."""
+
+        stats = _ws_event_stats().copy()
+        return {str(key): int(value) for key, value in stats.items()}
 
     def _handle_execution_fill(self, rows: list[dict]) -> None:
         fills = [row for row in rows if self._is_fill_row(row)]

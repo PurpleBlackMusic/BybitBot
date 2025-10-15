@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import time
 from typing import Any, Mapping
 
@@ -9,6 +10,7 @@ import streamlit as st
 from utils.background import (
     ensure_background_services,
     get_automation_status,
+    get_ws_events,
     get_ws_snapshot,
     restart_automation,
     restart_websockets,
@@ -51,6 +53,23 @@ def _format_duration(seconds: float | None) -> str:
     if not parts:
         parts.append(f"{secs} с")
     return " ".join(parts)
+
+
+def _format_event_header(event: Mapping[str, Any], *, now: float | None = None) -> str:
+    event_id = event.get("id")
+    try:
+        event_id = int(event_id) if event_id is not None else 0
+    except (TypeError, ValueError):
+        event_id = 0
+    topic = str(event.get("topic") or "?")
+    timestamp = _to_float(event.get("received_at"))
+    age = None
+    if timestamp is not None:
+        reference = now if isinstance(now, (int, float)) else time.time()
+        age = max(0.0, reference - timestamp)
+    age_text = _format_duration(age)
+    suffix = "назад" if age is not None else ""
+    return f"#{event_id} · {topic} · {age_text} {suffix}".strip()
 
 
 def _format_timestamp(value: object | None) -> str:
@@ -127,6 +146,7 @@ def _render_ws_channel(
 
 ws_snapshot = get_ws_snapshot()
 automation_snapshot = get_automation_status()
+events_payload = get_ws_events(limit=20)
 
 ws_status = ws_snapshot.get("status") if isinstance(ws_snapshot, Mapping) else {}
 public_info = ws_status.get("public") if isinstance(ws_status, Mapping) else {}
@@ -150,6 +170,33 @@ with col1:
         stale=bool(ws_snapshot.get("private_stale")),
         threshold=private_threshold,
     )
+
+    recent_events = events_payload.get("events") if isinstance(events_payload, Mapping) else []
+    cursor = ws_snapshot.get("private_event_cursor")
+    backlog = ws_snapshot.get("private_event_backlog")
+    dropped = ws_snapshot.get("private_event_dropped")
+
+    with st.container(border=True):
+        st.markdown("### Очередь приватных событий")
+        cols = st.columns(3)
+        cols[0].metric("Последний ID", int(cursor or 0))
+        cols[1].metric("В очереди", int(backlog or 0))
+        cols[2].metric("Пропущено", int(dropped or 0))
+
+        if not recent_events:
+            st.caption("События ещё не поступали или очередь пуста.")
+        else:
+            now = time.time()
+            for event in reversed(recent_events):
+                header = _format_event_header(event, now=now)
+                with st.expander(header, expanded=False):
+                    payload = event.get("payload")
+                    if isinstance(payload, Mapping) or isinstance(payload, list):
+                        st.json(payload or {})
+                    else:
+                        st.write(payload)
+                    meta = {k: v for k, v in event.items() if k not in {"payload"}}
+                    st.caption(json.dumps(meta, ensure_ascii=False))
 
 with col2:
     st.subheader("Автоисполнение")
