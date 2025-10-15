@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from .envs import get_api_client
 from .log import log
+from .http_client import create_session
 
 _SERVER_TIME_KEYS: tuple[str, ...] = (
     "timeNano",
@@ -142,7 +143,7 @@ class _SyncedClock:
             url = base_url.rstrip("/") + "/v5/market/time"
             close_http = False
             if session is None:
-                http = requests.Session()
+                http = create_session()
                 close_http = True
             else:
                 http = session

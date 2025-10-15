@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hmac, hashlib, json, time, uuid
+import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
@@ -7,6 +8,7 @@ import requests
 from functools import lru_cache
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
+from weakref import WeakSet
 
 from tenacity import (
     RetryCallState,
@@ -33,6 +35,10 @@ from .bybit_errors import (
 )
 from .log import log
 from .time_sync import invalidate_synced_clock, synced_timestamp_ms
+from .http_client import create_session
+
+
+_API_INSTANCES: WeakSet["BybitAPI"] = WeakSet()
 
 
 class _RetryableRequestError(RuntimeError):
@@ -54,7 +60,44 @@ class BybitAPI:
         self.recv_window = int(recv_window)
         self.timeout = int(timeout)
         self.verify_ssl = bool(verify_ssl)
-        self.session = requests.Session()
+        self._session_local = threading.local()
+        self._sessions: WeakSet[requests.Session] = WeakSet()
+        self._sessions_lock = threading.Lock()
+
+    def _build_session(self) -> requests.Session:
+        session = create_session()
+        with self._sessions_lock:
+            self._sessions.add(session)
+        return session
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = self._build_session()
+            setattr(self._session_local, "session", session)
+        return session
+
+    @session.setter
+    def session(self, value: requests.Session) -> None:
+        if value is None:
+            raise ValueError("session cannot be None")
+        with self._sessions_lock:
+            self._sessions.add(value)
+        setattr(self._session_local, "session", value)
+
+    def close(self) -> None:
+        """Close all HTTP sessions created for this API instance."""
+
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            finally:
+                pass
+        self._session_local = threading.local()
 
     @property
     def base(self) -> str:
@@ -1040,7 +1083,9 @@ class BybitAPI:
 @lru_cache(maxsize=16)
 def _build_api(key: str, secret: str, testnet: bool, recv_window: int, timeout: int, verify_ssl: bool) -> BybitAPI:
     creds = BybitCreds(key=key, secret=secret, testnet=testnet)
-    return BybitAPI(creds, recv_window=recv_window, timeout=timeout, verify_ssl=verify_ssl)
+    api = BybitAPI(creds, recv_window=recv_window, timeout=timeout, verify_ssl=verify_ssl)
+    _API_INSTANCES.add(api)
+    return api
 
 
 def get_api(
@@ -1068,6 +1113,9 @@ def get_api(
 def clear_api_cache() -> None:
     """Reset the cached API clients (useful in tests)."""
 
+    for api in list(_API_INSTANCES):
+        api.close()
+    _API_INSTANCES.clear()
     _build_api.cache_clear()
     invalidate_synced_clock(API_MAIN)
     invalidate_synced_clock(API_TEST)

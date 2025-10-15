@@ -122,7 +122,7 @@ def test_synced_clock_refresh_closes_local_session(monkeypatch: pytest.MonkeyPat
     payload = {"time": 1_000.0}
     response = _DummyResponse(payload)
     dummy_session = _DummySession(response)
-    monkeypatch.setattr(time_sync.requests, "Session", lambda: dummy_session)
+    monkeypatch.setattr(time_sync, "create_session", lambda: dummy_session)
     monkeypatch.setattr(time_sync, "extract_server_epoch", lambda payload: 123.0)
     _install_time(monkeypatch)
 
@@ -140,7 +140,7 @@ def test_synced_clock_refresh_keeps_external_session(monkeypatch: pytest.MonkeyP
     def boom_session():  # pragma: no cover - ensures factory is unused
         raise AssertionError("requests.Session should not be called")
 
-    monkeypatch.setattr(time_sync.requests, "Session", boom_session)
+    monkeypatch.setattr(time_sync, "create_session", boom_session)
     monkeypatch.setattr(time_sync, "extract_server_epoch", lambda payload: 123.0)
     _install_time(monkeypatch)
 
