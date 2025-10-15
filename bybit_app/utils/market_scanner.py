@@ -581,10 +581,11 @@ def scan_market_opportunities(
         elif trend == "sell":
             direction = -1
 
-        ev_bps_raw = change_pct * 100.0 if change_pct is not None else None
+        ev_pct_raw = change_pct if change_pct is not None else None
 
         fee_guard_bps = 0.0
         guard_key = symbol if symbol else ""
+        cached_guard = 0.0
         if guard_key:
             cached_guard = fee_guard_cache.get(guard_key)
             if cached_guard is None:
@@ -597,10 +598,15 @@ def scan_market_opportunities(
                     cached_guard = float(guard_decimal)
                 except (TypeError, ValueError):
                     cached_guard = 0.0
-                fee_guard_cache[guard_key] = cached_guard
-            fee_guard_bps = max(cached_guard, 0.0)
+            fee_guard_cache[guard_key] = cached_guard
+        fee_guard_bps = max(cached_guard, 0.0)
 
-        ev_bps = ev_bps_raw - fee_guard_bps if ev_bps_raw is not None else None
+        ev_pct = (
+            ev_pct_raw - (fee_guard_bps / 100.0)
+            if ev_pct_raw is not None
+            else None
+        )
+        ev_bps = ev_pct * 100.0 if ev_pct is not None else None
 
         note_parts: List[str] = []
         if change_pct is not None:
