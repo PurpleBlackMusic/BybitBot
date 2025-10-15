@@ -180,13 +180,33 @@ def _maybe_disable_arrow_warning() -> None:
 _maybe_disable_arrow_warning()
 
 
-def rerun() -> None:
-    """Trigger a Streamlit rerun across supported versions."""
+def rerun(*, interval_ms: int = 2000, key: str = "_bybit_rerun") -> None:
+    """Trigger a Streamlit rerun without relying on experimental APIs."""
 
-    for candidate in (getattr(st, "rerun", None), getattr(st, "experimental_rerun", None)):
-        if callable(candidate):
-            candidate()
-            return
+    rerun_fn = getattr(st, "rerun", None)
+    if callable(rerun_fn):
+        rerun_fn()
+        return
+
+    refresh = getattr(st, "autorefresh", None)
+    if callable(refresh):
+        try:
+            refresh(interval=interval_ms, limit=1, key=key)
+        except TypeError:
+            refresh(interval=interval_ms, key=key)
+        return
+
+    script = f"""
+    <script>
+    const rerunKey = {json.dumps(key)};
+    window._bybitSingleRerun = window._bybitSingleRerun || {{}};
+    if (!window._bybitSingleRerun[rerunKey]) {{
+        window._bybitSingleRerun[rerunKey] = true;
+        setTimeout(() => window.location.reload(), {interval_ms});
+    }}
+    </script>
+    """
+    st.markdown(script, unsafe_allow_html=True)
 
 
 def auto_refresh(interval_seconds: float, *, key: str | None = None) -> None:
