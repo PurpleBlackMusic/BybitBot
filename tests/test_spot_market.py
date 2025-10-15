@@ -1,4 +1,6 @@
+import copy
 import time
+from collections import deque
 from decimal import Decimal
 from typing import Mapping
 
@@ -1850,6 +1852,226 @@ def test_place_spot_market_twap_skips_tail_below_min_notional(
     assert tail_event["min_threshold"] == "5"
     assert tail_event["unit"] == "quote"
 
+
+def test_place_spot_market_monitors_until_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = DummyAPI(_universe_payload([]))
+
+    events: list[tuple[str, dict]] = []
+
+    def fake_log(event: str, **payload) -> None:
+        events.append((event, payload))
+
+    monkeypatch.setattr(spot_market_module, "log", fake_log)
+
+    prepared_requests: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        prepared_requests.append(qty_decimal)
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "2",
+            "timeInForce": "GTC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+        }
+        audit = {
+            "qty_step": "0.1",
+            "quote_step": "0.1",
+            "min_order_qty": "0.1",
+            "min_order_amt": "1",
+        }
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+
+    monitor_sequences = [
+        [
+            {
+                "result": {
+                    "list": [
+                        {
+                            "orderId": "ORDER-1",
+                            "orderStatus": "PartiallyFilled",
+                            "qty": "10",
+                            "price": "2",
+                            "cumExecQty": "6",
+                            "cumExecValue": "12",
+                            "leavesQty": "4",
+                        }
+                    ]
+                }
+            },
+            {
+                "result": {
+                    "list": [
+                        {
+                            "orderId": "ORDER-1",
+                            "orderStatus": "Filled",
+                            "qty": "10",
+                            "price": "2",
+                            "cumExecQty": "10",
+                            "cumExecValue": "20",
+                            "leavesQty": "0",
+                        }
+                    ]
+                }
+            },
+        ]
+    ]
+
+    place_responses = [
+        {"result": {"orderId": "ORDER-1", "orderStatus": "New", "qty": "10", "price": "2"}},
+    ]
+
+    active_sequence = {"queue": deque()}
+    call_index = {"value": 0}
+
+    def fake_place_order(**payload):
+        api.place_calls.append(payload)
+        idx = call_index["value"]
+        if idx < len(monitor_sequences):
+            active_sequence["queue"] = deque(monitor_sequences[idx])
+        else:
+            active_sequence["queue"] = deque()
+        call_index["value"] += 1
+        return copy.deepcopy(place_responses[min(idx, len(place_responses) - 1)])
+
+    def fake_open_orders(**kwargs):
+        queue = active_sequence["queue"]
+        if queue:
+            return copy.deepcopy(queue.popleft())
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders, raising=False)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="baseCoin",
+    )
+
+    assert isinstance(response, Mapping)
+    assert len(api.place_calls) == 1
+    assert prepared_requests == [Decimal("10")]
+
+    monitor_events = [entry for entry in events if entry[0] == "spot.market.order_monitor"]
+    assert monitor_events, "monitor event should be logged"
+    payload = monitor_events[-1][1]
+    assert payload["status"] == "filled"
+    assert payload["executed_base"] == "10"
+    assert payload["leaves_base"] == "0"
+
+
+def test_place_spot_market_retries_after_partial_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = DummyAPI(_universe_payload([]))
+
+    events: list[tuple[str, dict]] = []
+
+    def fake_log(event: str, **payload) -> None:
+        events.append((event, payload))
+
+    monkeypatch.setattr(spot_market_module, "log", fake_log)
+
+    prepared_requests: list[Decimal] = []
+
+    def fake_prepare(api_obj, symbol, side, chunk_qty, **kwargs):
+        qty_decimal = Decimal(str(chunk_qty))
+        prepared_requests.append(qty_decimal)
+        payload = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Limit",
+            "qty": format(qty_decimal, "f"),
+            "price": "2",
+            "timeInForce": "GTC",
+            "orderFilter": "Order",
+            "accountType": "UNIFIED",
+        }
+        audit = {
+            "qty_step": "0.1",
+            "quote_step": "0.1",
+            "min_order_qty": "0.1",
+            "min_order_amt": "1",
+        }
+        return spot_market_module.PreparedSpotMarketOrder(payload=payload, audit=audit)
+
+    monkeypatch.setattr(spot_market_module, "prepare_spot_market_order", fake_prepare)
+
+    monitor_sequences = [
+        [
+            {
+                "result": {
+                    "list": [
+                        {
+                            "orderId": "ORDER-1",
+                            "orderStatus": "PartiallyFilledCanceled",
+                            "qty": "10",
+                            "price": "2",
+                            "cumExecQty": "6",
+                            "cumExecValue": "12",
+                            "leavesQty": "0",
+                        }
+                    ]
+                }
+            }
+        ],
+        [],
+    ]
+
+    place_responses = [
+        {"result": {"orderId": "ORDER-1", "orderStatus": "New", "qty": "10", "price": "2"}},
+        {"result": {"orderId": "ORDER-2", "orderStatus": "Filled", "qty": "4", "price": "2", "cumExecQty": "4", "cumExecValue": "8"}},
+    ]
+
+    active_sequence = {"queue": deque()}
+    call_index = {"value": 0}
+
+    def fake_place_order(**payload):
+        api.place_calls.append(payload)
+        idx = call_index["value"]
+        if idx < len(monitor_sequences):
+            active_sequence["queue"] = deque(monitor_sequences[idx])
+        else:
+            active_sequence["queue"] = deque()
+        call_index["value"] += 1
+        return copy.deepcopy(place_responses[min(idx, len(place_responses) - 1)])
+
+    def fake_open_orders(**kwargs):
+        queue = active_sequence["queue"]
+        if queue:
+            return copy.deepcopy(queue.popleft())
+        return {"result": {"list": []}}
+
+    monkeypatch.setattr(api, "place_order", fake_place_order)
+    monkeypatch.setattr(api, "open_orders", fake_open_orders, raising=False)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="baseCoin",
+    )
+
+    assert isinstance(response, Mapping)
+    assert len(api.place_calls) == 2
+    assert prepared_requests == [Decimal("10"), Decimal("4")]
+
+    monitor_events = [entry for entry in events if entry[0] == "spot.market.order_monitor"]
+    assert monitor_events, "monitor event should be recorded"
+    first_payload = monitor_events[0][1]
+    assert first_payload["status"] == "partiallyfilledcanceled"
+    assert first_payload["executed_base"] == "6"
+    assert first_payload["leaves_base"] == "4"
 
 def test_place_spot_market_accepts_bps_suffix():
     payload = {

@@ -13,6 +13,7 @@ from .log import log
 from . import validators
 from .envs import Settings
 from .precision import ceil_qty_to_min_notional, format_to_step
+from .helpers import ensure_link_id
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -50,6 +51,35 @@ _PRICE_LIMIT_COMPARISONS = re.compile(
 _PRICE_LIMIT_KEY_ALIASES = {
     "price_cap": {"pricecap", "maxprice", "upperlimit", "upperprice", "pricelimitupper"},
     "price_floor": {"pricefloor", "minprice", "lowerlimit", "lowerprice", "pricelimitlower"},
+}
+
+
+_OPEN_ORDER_STATUS_KEYS = {
+    "created",
+    "new",
+    "pendingnew",
+    "partiallyfilled",
+    "active",
+    "pendingcancel",
+    "triggered",
+    "untriggered",
+    "live",
+    "open",
+    "accepted",
+}
+
+_CLOSED_ORDER_STATUS_KEYS = {
+    "filled",
+    "cancelled",
+    "canceled",
+    "rejected",
+    "deactivated",
+    "expired",
+    "closed",
+    "terminated",
+    "completed",
+    "partiallyfilledcanceled",
+    "partiallyfilledcancelled",
 }
 
 
@@ -803,7 +833,8 @@ def _execution_stats(
 
     fields = _extract_order_fields(response)
     order_qty = _to_decimal(fields.get("orderQty") or fields.get("qty") or expected_qty)
-    leaves_qty = _to_decimal(fields.get("leavesQty"))
+    leaves_raw = fields.get("leavesQty")
+    leaves_qty = _to_decimal(leaves_raw)
     cum_exec_qty = _to_decimal(fields.get("cumExecQty"))
     cum_exec_value = _to_decimal(fields.get("cumExecValue"))
     avg_price = _to_decimal(fields.get("avgPrice"))
@@ -811,7 +842,7 @@ def _execution_stats(
     executed_qty = Decimal("0")
     if cum_exec_qty > 0:
         executed_qty = cum_exec_qty
-    elif order_qty > 0 and leaves_qty >= 0:
+    elif order_qty > 0 and leaves_raw is not None:
         executed_qty = order_qty - leaves_qty
 
     executed_quote = Decimal("0")
@@ -821,9 +852,208 @@ def _execution_stats(
         ref_price = avg_price if avg_price > 0 else limit_price
         executed_quote = executed_qty * ref_price
 
-    remaining_qty = leaves_qty if leaves_qty > 0 else max(order_qty - executed_qty, Decimal("0"))
+    remaining_qty = (
+        leaves_qty
+        if leaves_raw is not None and leaves_qty > 0
+        else max(order_qty - executed_qty, Decimal("0"))
+    )
 
     return executed_qty, executed_quote, remaining_qty
+
+
+def _normalise_order_status(value: object) -> str | None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+    elif value is None:
+        return None
+    else:
+        cleaned = str(value).strip()
+
+    if not cleaned:
+        return None
+
+    return cleaned.lower().replace("_", "").replace(" ", "")
+
+
+def _order_status_from_mapping(data: Mapping[str, object] | None) -> str | None:
+    if not isinstance(data, Mapping):
+        return None
+    status_value = data.get("orderStatus")
+    if status_value is None:
+        status_value = data.get("status")
+    return _normalise_order_status(status_value)
+
+
+def _should_monitor_order(status_key: str | None, leaves_qty: Decimal) -> bool:
+    if leaves_qty <= 0:
+        return False
+    if status_key is None:
+        return True
+    if status_key in _CLOSED_ORDER_STATUS_KEYS:
+        return False
+    if status_key in _OPEN_ORDER_STATUS_KEYS:
+        return True
+    return True
+
+
+def _extract_order_entries(payload: Mapping[str, object] | None) -> List[Mapping[str, object]]:
+    if not isinstance(payload, Mapping):
+        return []
+
+    result = payload.get("result")
+    if isinstance(result, Mapping):
+        entries = result.get("list")
+    else:
+        entries = result
+
+    if isinstance(entries, list):
+        return [entry for entry in entries if isinstance(entry, Mapping)]
+    if isinstance(entries, tuple):
+        return [entry for entry in entries if isinstance(entry, Mapping)]
+    return []
+
+
+def _find_matching_order(
+    entries: List[Mapping[str, object]],
+    order_link_id: str | None,
+    order_id: str | None,
+) -> Mapping[str, object] | None:
+    for row in entries:
+        if not isinstance(row, Mapping):
+            continue
+
+        if order_link_id:
+            candidate_link = row.get("orderLinkId")
+            if isinstance(candidate_link, str):
+                candidate_link = ensure_link_id(candidate_link)
+            else:
+                candidate_link = None
+            if candidate_link == order_link_id:
+                return row
+
+        if order_id:
+            candidate_id = row.get("orderId")
+            if isinstance(candidate_id, (str, int)):
+                candidate_text = str(candidate_id).strip()
+                if candidate_text == order_id:
+                    return row
+
+    return None
+
+
+def _extract_order_identifiers(
+    payload: Mapping[str, object],
+    response: Mapping[str, object] | None,
+) -> tuple[str, str | None, str | None, str | None]:
+    result = response.get("result") if isinstance(response, Mapping) else None
+
+    category_value = payload.get("category")
+    if not isinstance(category_value, str) or not category_value.strip():
+        if isinstance(result, Mapping):
+            category_value = result.get("category")
+    category = str(category_value).strip() if isinstance(category_value, str) else ""
+    if not category:
+        category = "spot"
+
+    symbol_value = payload.get("symbol")
+    if not isinstance(symbol_value, str) or not symbol_value.strip():
+        if isinstance(result, Mapping):
+            symbol_value = result.get("symbol")
+    symbol = str(symbol_value).strip().upper() if isinstance(symbol_value, str) else None
+
+    link_value = payload.get("orderLinkId")
+    if not isinstance(link_value, str) or not link_value.strip():
+        if isinstance(result, Mapping):
+            link_value = result.get("orderLinkId")
+    order_link_id = ensure_link_id(link_value) if isinstance(link_value, str) else None
+
+    order_id_value = payload.get("orderId")
+    if not isinstance(order_id_value, (str, int)) or (isinstance(order_id_value, str) and not order_id_value.strip()):
+        if isinstance(result, Mapping):
+            order_id_value = result.get("orderId")
+    if isinstance(order_id_value, (str, int)):
+        order_id = str(order_id_value).strip()
+        if not order_id:
+            order_id = None
+    else:
+        order_id = None
+
+    return category, symbol, order_link_id, order_id
+
+
+def _monitor_order_progress(
+    api: BybitAPI,
+    *,
+    category: str,
+    symbol: str | None,
+    order_link_id: str | None,
+    order_id: str | None,
+    expected_qty: Decimal,
+    limit_price: Decimal,
+    max_checks: int = 6,
+    delay: float = 0.3,
+) -> tuple[Mapping[str, object] | None, Decimal | None, Decimal | None, Decimal | None, str | None, int]:
+    open_orders_fn = getattr(api, "open_orders", None)
+    if not callable(open_orders_fn):
+        return None, None, None, None, None, 0
+
+    latest_row: Mapping[str, object] | None = None
+    checks = 0
+
+    for attempt in range(max(1, max_checks)):
+        checks = attempt + 1
+        try:
+            payload = open_orders_fn(category=category, symbol=symbol, openOnly=0)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "spot.market.order_monitor_error",
+                category=category,
+                symbol=symbol,
+                orderLinkId=order_link_id,
+                orderId=order_id,
+                attempt=checks,
+                err=str(exc),
+            )
+            break
+
+        entries = _extract_order_entries(payload)
+        match = _find_matching_order(entries, order_link_id, order_id)
+        if match:
+            latest_row = match
+            status = _order_status_from_mapping(match)
+            if status in _CLOSED_ORDER_STATUS_KEYS:
+                break
+        else:
+            if latest_row is not None:
+                break
+
+        if checks >= max_checks:
+            break
+        if delay > 0:
+            time.sleep(delay)
+
+    if latest_row is None:
+        return None, None, None, None, None, checks
+
+    status = _order_status_from_mapping(latest_row)
+    exec_base, exec_quote, leaves_base = _execution_stats(
+        latest_row, expected_qty=expected_qty, limit_price=limit_price
+    )
+
+    log(
+        "spot.market.order_monitor",
+        category=category,
+        symbol=symbol,
+        orderLinkId=order_link_id,
+        orderId=order_id,
+        status=status,
+        executed_base=_format_decimal(exec_base),
+        executed_quote=_format_decimal(exec_quote),
+        leaves_base=_format_decimal(leaves_base),
+        attempts=checks,
+    )
+
+    return latest_row, exec_base, exec_quote, leaves_base, status, checks
 
 
 def _instrument_limits(api: BybitAPI, symbol: str) -> Dict[str, object]:
@@ -2922,11 +3152,51 @@ def place_spot_market_with_tolerance(
 
         qty_decimal = _to_decimal(prepared.payload.get("qty"))
         price_decimal = _to_decimal(prepared.payload.get("price"))
+        response_mapping = response if isinstance(response, Mapping) else None
         exec_base, exec_quote, leaves_base = _execution_stats(
-            response if isinstance(response, Mapping) else None,
+            response_mapping,
             expected_qty=qty_decimal,
             limit_price=price_decimal,
         )
+
+        status_key = _order_status_from_mapping(
+            _extract_order_fields(response_mapping) if isinstance(response_mapping, Mapping) else None
+        )
+
+        category_value, monitor_symbol, order_link_id, order_id = _extract_order_identifiers(
+            prepared.payload,
+            response_mapping,
+        )
+        if not monitor_symbol:
+            monitor_symbol = symbol
+
+        monitor_attempts = 0
+        if (order_link_id or order_id) and _should_monitor_order(status_key, leaves_base):
+            (
+                _,
+                monitored_base,
+                monitored_quote,
+                monitored_leaves,
+                monitored_status,
+                monitor_attempts,
+            ) = _monitor_order_progress(
+                api,
+                category=category_value,
+                symbol=monitor_symbol,
+                order_link_id=order_link_id,
+                order_id=order_id,
+                expected_qty=qty_decimal,
+                limit_price=price_decimal,
+            )
+
+            if monitored_base is not None:
+                exec_base = monitored_base
+            if monitored_quote is not None:
+                exec_quote = monitored_quote
+            if monitored_leaves is not None:
+                leaves_base = monitored_leaves
+            if monitored_status is not None:
+                status_key = monitored_status
 
         executed_base_total += exec_base
         executed_quote_total += exec_quote
@@ -2940,10 +3210,17 @@ def place_spot_market_with_tolerance(
             "executed_quote": _format_decimal(exec_quote),
             "leaves_base": _format_decimal(leaves_base),
         }
+        if status_key:
+            log_entry["status"] = status_key
+        if monitor_attempts:
+            log_entry["monitor_attempts"] = monitor_attempts
         if twap_active:
             log_entry["twap_slices"] = target_slices
             log_entry["twap_order_index"] = twap_orders_sent
         attempt_logs.append(log_entry)
+
+        if order_link_id is None and order_id is None and exec_base <= 0 and exec_quote <= 0:
+            break
 
         step_value = _to_decimal(
             prepared.audit.get("quote_step") if unit_normalised == "quotecoin" else prepared.audit.get("qty_step")
