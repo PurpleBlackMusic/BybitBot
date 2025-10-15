@@ -173,10 +173,10 @@ def test_batch_cancel_requires_identifier_per_entry() -> None:
 def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured.update(
+        calls.append(
             {
                 "method": method,
                 "path": path,
@@ -199,11 +199,13 @@ def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
     )
 
     assert resp == {"retCode": 0, "result": {}}
-    assert captured["method"] == "POST"
-    assert captured["path"] == "/v5/order/cancel-batch"
-    assert captured["params"] is None
-    assert captured["signed"] is True
-    assert captured["body"] == {
+    assert calls, "_safe_req was not invoked"
+    first_call = calls[0]
+    assert first_call["method"] == "POST"
+    assert first_call["path"] == "/v5/order/cancel-batch"
+    assert first_call["params"] is None
+    assert first_call["signed"] is True
+    assert first_call["body"] == {
         "category": "spot",
         "request": [{"orderId": "1"}, {"orderLinkId": "abc"}],
         "symbol": "BTCUSDT",
@@ -333,10 +335,10 @@ def test_cancel_batch_requires_identifier_per_entry() -> None:
 def test_amend_order_uses_signed_endpoint(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured.update(
+        calls.append(
             {
                 "method": method,
                 "path": path,
@@ -359,11 +361,13 @@ def test_amend_order_uses_signed_endpoint(monkeypatch) -> None:
     resp = api.amend_order(**payload)
 
     assert resp == {"retCode": 0, "result": {}}
-    assert captured["method"] == "POST"
-    assert captured["path"] == "/v5/order/amend"
-    assert captured["params"] is None
-    assert captured["body"] == payload
-    assert captured["signed"] is True
+    assert calls, "_safe_req was not invoked"
+    first_call = calls[0]
+    assert first_call["method"] == "POST"
+    assert first_call["path"] == "/v5/order/amend"
+    assert first_call["params"] is None
+    assert first_call["body"] == payload
+    assert first_call["signed"] is True
 
 
 def test_amend_order_normalises_numeric_fields(monkeypatch) -> None:
@@ -444,10 +448,10 @@ def test_amend_order_sanitises_order_link_id(monkeypatch) -> None:
 def test_place_order_normalises_payload(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured.update(
+        calls.append(
             {
                 "method": method,
                 "path": path,
@@ -473,23 +477,27 @@ def test_place_order_normalises_payload(monkeypatch) -> None:
     resp = api.place_order(**payload)
 
     assert resp == {"retCode": 0, "result": {}}
-    assert captured["method"] == "POST"
-    assert captured["path"] == "/v5/order/create"
-    assert captured["params"] is None
-    assert captured["signed"] is True
-    assert captured["body"]["side"] == "Buy"
-    assert captured["body"]["qty"] == "1.2345"
-    assert captured["body"]["price"] == "42000"
-    assert captured["body"]["orderValue"] == "12345"
+    assert calls, "_safe_req was not invoked"
+    first_call = calls[0]
+    assert first_call["method"] == "POST"
+    assert first_call["path"] == "/v5/order/create"
+    assert first_call["params"] is None
+    assert first_call["signed"] is True
+    body = first_call["body"]
+    assert isinstance(body, dict)
+    assert body["side"] == "Buy"
+    assert body["qty"] == "1.2345"
+    assert body["price"] == "42000"
+    assert body["orderValue"] == "12345"
 
 
 def test_place_order_normalises_string_numerics(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    captured: dict[str, Any] = {}
+    calls: list[dict[str, Any]] = []
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        captured.update(
+        calls.append(
             {
                 "method": method,
                 "path": path,
@@ -514,9 +522,13 @@ def test_place_order_normalises_string_numerics(monkeypatch) -> None:
 
     api.place_order(**payload)
 
-    assert captured["body"]["qty"] == "1"
-    assert captured["body"]["price"] == "25000"
-    assert captured["body"]["triggerPrice"] == "24950.5"
+    assert calls, "_safe_req was not invoked"
+    first_call = calls[0]
+    body = first_call["body"]
+    assert isinstance(body, dict)
+    assert body["qty"] == "1"
+    assert body["price"] == "25000"
+    assert body["triggerPrice"] == "24950.5"
 
 
 def test_place_order_requires_required_fields() -> None:
@@ -702,8 +714,12 @@ def test_place_order_self_check_logs_presence(monkeypatch) -> None:
 
     assert any(call["path"] == "/v5/order/create" for call in calls)
     assert events
-    event_name, payload = events[-1]
-    assert event_name == "order.self_check.place"
+    self_check_event = next(
+        ((name, payload) for name, payload in events if name == "order.self_check.place"),
+        None,
+    )
+    assert self_check_event is not None
+    _, payload = self_check_event
     assert payload["ok"] is True
     assert payload["found"] is True
     assert payload["orderLinkId"] == ensure_link_id(long_link)
@@ -800,10 +816,15 @@ def test_place_order_self_check_handles_order_id(monkeypatch) -> None:
     )
 
     assert records
-    name, payload = records[-1]
-    assert name == "order.self_check.place"
+    self_check_event = next(
+        ((name, payload) for name, payload in records if name == "order.self_check.place"),
+        None,
+    )
+    assert self_check_event is not None
+    _, payload = self_check_event
     assert payload["orderId"] == "abc123"
-    assert payload["orderLinkId"] is None
+    assert isinstance(payload["orderLinkId"], str)
+    assert payload["orderLinkId"]
     assert payload["found"] is True
     assert payload["ok"] is True
     assert payload["status"] == "PartiallyFilled"
@@ -842,8 +863,12 @@ def test_place_order_self_check_allows_immediate_fill(monkeypatch) -> None:
     )
 
     assert events
-    event, payload = events[-1]
-    assert event == "order.self_check.place"
+    self_check_event = next(
+        ((name, payload) for name, payload in events if name == "order.self_check.place"),
+        None,
+    )
+    assert self_check_event is not None
+    _, payload = self_check_event
     assert payload["orderId"] == "filled-1"
     assert payload["found"] is False
     assert payload["ok"] is True
@@ -886,7 +911,12 @@ def test_place_order_self_check_retries_realtime_lookup(monkeypatch) -> None:
     assert all(call.get("category") == "spot" for call in realtime_calls)
     assert any(call.get("orderLinkId") == long_link for call in realtime_calls)
     assert events
-    _, payload = events[-1]
+    self_check_event = next(
+        ((name, payload) for name, payload in events if name == "order.self_check.place"),
+        None,
+    )
+    assert self_check_event is not None
+    _, payload = self_check_event
     assert payload["found"] is True
     assert payload["ok"] is True
 
