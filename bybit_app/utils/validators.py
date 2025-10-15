@@ -193,15 +193,27 @@ def validate_spot_rules(*args, **kwargs) -> SpotValidationResult:
         default="0",
     )
 
-    price_q = _quantize(price_decimal, tick_size, rounding=rounding_mode)
-    qty_q = _quantize(qty_decimal, qty_step, rounding=rounding_mode)
-
-    reasons: list[str] = []
+    price_q = price_decimal
+    qty_q = qty_decimal
     notional = price_q * qty_q
 
+    quantized_price = _quantize(price_q, tick_size, rounding=rounding_mode)
+    if quantized_price != price_q:
+        price_q = quantized_price
+        notional = price_q * qty_q
+
+    quantized_qty = _quantize(qty_q, qty_step, rounding=rounding_mode)
+    if quantized_qty != qty_q:
+        qty_q = quantized_qty
+    if quantized_price != price_decimal or quantized_qty != qty_decimal:
+        notional = price_q * qty_q
+
+    reasons: list[str] = []
+
+    qty_abs = qty_q.copy_abs()
     tolerance_components = [Decimal("0.00000001")]
-    if tick_size > 0 and qty_q > 0:
-        tolerance_components.append((tick_size * qty_q).copy_abs())
+    if tick_size > 0 and qty_abs > 0:
+        tolerance_components.append((tick_size * qty_abs).copy_abs())
     if price_q > 0 and qty_step > 0:
         tolerance_components.append((price_q * qty_step).copy_abs())
     if min_notional > 0:
