@@ -107,6 +107,56 @@ def test_guardian_brief_prefers_status_symbol(tmp_path: Path) -> None:
     assert summary["symbol"] == "SOLUSDT"
 
 
+def test_guardian_resolves_symbol_universe_without_synthetics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(ai_live_only=False, ai_symbols="")
+    bot = _make_bot(tmp_path, settings)
+
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "load_universe",
+        lambda **_: ["BBSOLUSDT", "ETHUSDT", "BTCUSDT"],
+    )
+
+    universe = bot._resolve_symbol_universe(settings, refresh=True)
+
+    assert "BBSOLUSDT" not in universe
+    assert "ETHUSDT" in universe
+    assert settings.ai_symbols
+
+
+def test_market_scanner_watchlist_filters_by_universe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(ai_live_only=False)
+    settings.ai_symbols = ""
+
+    bot = _make_bot(tmp_path, settings)
+    bot.settings.ai_market_scan_enabled = True
+
+    monkeypatch.setattr(guardian_bot_module, "get_api_client", lambda: None)
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "scan_market_opportunities",
+        lambda *_, **__: [
+            {"symbol": "BTCUSDT"},
+            {"symbol": "BBSOLUSDT"},
+            {"symbol": "ETHUSDT"},
+        ],
+    )
+    monkeypatch.setattr(
+        bot,
+        "_resolve_symbol_universe",
+        lambda *_args, **_kwargs: ["BTCUSDT", "ETHUSDT"],
+    )
+
+    watchlist = bot._market_scanner_watchlist(settings)
+    symbols = [entry["symbol"] for entry in watchlist]
+
+    assert symbols == ["BTCUSDT", "ETHUSDT"]
+
+
 def test_guardian_brief_respects_explicit_mode_hint(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",

@@ -18,6 +18,19 @@ from statistics import StatisticsError, median, quantiles
 WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 
+DEFAULT_SYMBOL_UNIVERSE: Tuple[str, ...] = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "TONUSDT",
+    "LINKUSDT",
+    "LTCUSDT",
+)
+
 from .envs import Settings, active_dry_run, get_settings, get_api_client
 from .settings_loader import call_get_settings
 from .paths import DATA_DIR
@@ -35,6 +48,7 @@ from .live_signal import LiveSignalError, LiveSignalFetcher
 from .market_scanner import scan_market_opportunities
 from .instruments import get_listed_spot_symbols
 from .log import log
+from .universe import build_universe, is_symbol_blacklisted, load_universe
 
 
 @dataclass(frozen=True)
@@ -118,6 +132,7 @@ class GuardianBot:
         self._pair_trades_cache: Optional[Tuple[Dict[str, object], ...]] = None
         self._live_fetcher: Optional[LiveSignalFetcher] = None
         self._listed_spot_symbols: Optional[Set[str]] = None
+        self._symbol_universe_cache: Optional[Tuple[float, Tuple[str, ...]]] = None
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -381,6 +396,90 @@ class GuardianBot:
 
         self._listed_spot_symbols = set(listed)
         return self._listed_spot_symbols
+
+    def _resolve_symbol_universe(
+        self,
+        settings: Optional[Settings] = None,
+        *,
+        refresh: bool = False,
+    ) -> List[str]:
+        settings = settings or self.settings
+
+        cache = self._symbol_universe_cache
+        now = time.time()
+        cache_ttl = 600.0
+        if (
+            not refresh
+            and cache is not None
+            and now - cache[0] < cache_ttl
+        ):
+            return list(cache[1])
+
+        try:
+            concurrent = int(getattr(settings, "ai_max_concurrent", 0) or 0)
+        except Exception:
+            concurrent = 0
+        size_hint = concurrent * 6
+        if size_hint <= 0:
+            size_hint = 40
+        size_hint = max(size_hint, len(DEFAULT_SYMBOL_UNIVERSE))
+        size_hint = min(size_hint, 120)
+
+        raw_symbols = self._parse_symbol_list(getattr(settings, "ai_symbols", ""))
+
+        if not raw_symbols:
+            try:
+                universe_snapshot = load_universe(quote_assets=("USDT",))
+            except Exception:
+                universe_snapshot = []
+            else:
+                raw_symbols = list(universe_snapshot)
+
+        if not raw_symbols:
+            try:
+                api = get_api_client()
+            except Exception:
+                api = None
+            if api is not None:
+                try:
+                    raw_symbols = list(
+                        build_universe(
+                            api,
+                            size=size_hint,
+                            quote_assets=("USDT",),
+                            persist=True,
+                        )
+                    )
+                except Exception:
+                    raw_symbols = []
+
+        if not raw_symbols:
+            raw_symbols = list(DEFAULT_SYMBOL_UNIVERSE)
+
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        for item in raw_symbols:
+            symbol = str(item).strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            if is_symbol_blacklisted(symbol):
+                continue
+            seen.add(symbol)
+            cleaned.append(symbol)
+            if len(cleaned) >= size_hint:
+                break
+
+        if not cleaned:
+            cleaned = list(DEFAULT_SYMBOL_UNIVERSE)
+
+        if not getattr(settings, "ai_symbols", ""):
+            try:
+                settings.ai_symbols = ",".join(cleaned)
+            except Exception:
+                pass
+
+        self._symbol_universe_cache = (now, tuple(cleaned))
+        return list(cleaned)
 
     @staticmethod
     def _parse_symbol_list(raw: object) -> List[str]:
@@ -1133,14 +1232,35 @@ class GuardianBot:
         if min_change_pct <= 0:
             min_change_pct = 0.5
 
-        raw_whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
-        whitelist: Optional[Sequence[str]] = raw_whitelist or None
-
-        blacklist = self._parse_symbol_list(getattr(settings, "ai_blacklist", ""))
-
         limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0) * 4
         if limit_hint <= 0:
             limit_hint = 25
+
+        raw_whitelist = self._parse_symbol_list(getattr(settings, "ai_whitelist", ""))
+        symbol_universe = self._resolve_symbol_universe(settings)
+
+        whitelist_sources: List[str] = []
+        if raw_whitelist:
+            whitelist_sources.extend(raw_whitelist)
+
+        if symbol_universe:
+            limit_slice = max(limit_hint, len(DEFAULT_SYMBOL_UNIVERSE))
+            whitelist_sources.extend(symbol_universe[:limit_slice])
+
+        combined_whitelist: List[str] = []
+        whitelist_seen: Set[str] = set()
+        for candidate in whitelist_sources:
+            cleaned = str(candidate).strip().upper()
+            if not cleaned or cleaned in whitelist_seen:
+                continue
+            whitelist_seen.add(cleaned)
+            combined_whitelist.append(cleaned)
+
+        whitelist: Optional[Sequence[str]] = combined_whitelist or None
+
+        universe_set: Set[str] = {sym.strip().upper() for sym in symbol_universe if sym}
+
+        blacklist = self._parse_symbol_list(getattr(settings, "ai_blacklist", ""))
 
         try:
             api = get_api_client()
@@ -1150,7 +1270,7 @@ class GuardianBot:
         testnet = bool(getattr(settings, "testnet", False))
 
         try:
-            return scan_market_opportunities(
+            opportunities = scan_market_opportunities(
                 api,
                 data_dir=self.data_dir,
                 limit=limit_hint,
@@ -1164,6 +1284,21 @@ class GuardianBot:
             )
         except Exception:
             return []
+
+        if universe_set:
+            allowed_symbols = set(universe_set)
+            allowed_symbols.update(whitelist_seen)
+            filtered_entries = []
+            for entry in opportunities:
+                symbol_value = entry.get("symbol")
+                if not isinstance(symbol_value, str):
+                    continue
+                symbol_key = symbol_value.strip().upper()
+                if symbol_key in allowed_symbols:
+                    filtered_entries.append(entry)
+            if filtered_entries:
+                opportunities = filtered_entries
+        return opportunities
 
     def _symbol_plan_signature(
         self,
@@ -3006,6 +3141,12 @@ class GuardianBot:
                 if candidate:
                     symbol = candidate.upper()
                     break
+
+        if not symbol:
+            universe = self._resolve_symbol_universe(settings)
+            if universe:
+                symbol = universe[0]
+                symbol_source = "universe"
 
         if not symbol:
             symbol = "BTCUSDT"
