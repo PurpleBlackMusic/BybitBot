@@ -14,7 +14,7 @@ from .log import log
 from . import validators
 from .envs import Settings
 from .paths import CACHE_DIR
-from .precision import ceil_qty_to_min_notional, format_to_step
+from .precision import ceil_qty_to_min_notional, format_to_step, quantize_to_step
 from .bybit_errors import parse_bybit_error_message
 
 _MIN_QUOTE = Decimal("5")
@@ -789,6 +789,7 @@ def _plan_limit_ioc_order(
     min_qty: Decimal,
     max_price: Decimal | None = None,
     min_price: Decimal | None = None,
+    quote_shortfall_tolerance: Decimal = Decimal("0"),
 ) -> tuple[Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
     side_normalised = side
     levels = asks if side_normalised == "buy" else bids
@@ -817,6 +818,7 @@ def _plan_limit_ioc_order(
         )
 
     price_limit_hit = False
+    rounding_shortfall = Decimal("0")
 
     for price, qty in levels:
         if side_normalised == "buy" and max_price is not None:
@@ -850,8 +852,16 @@ def _plan_limit_ioc_order(
             level_quote = qty * price
             if level_quote >= remaining_quote:
                 take_base = remaining_quote / price
+                if qty_step > 0:
+                    take_base = quantize_to_step(take_base, qty_step, rounding=ROUND_DOWN)
+                if take_base <= 0:
+                    break
+                take_quote = take_base * price
+                shortfall = remaining_quote - take_quote
+                if shortfall > rounding_shortfall:
+                    rounding_shortfall = shortfall
                 accumulated_base += take_base
-                accumulated_quote += remaining_quote
+                accumulated_quote += take_quote
                 consumed.append((price, take_base))
                 break
             accumulated_base += qty
@@ -885,7 +895,11 @@ def _plan_limit_ioc_order(
             },
         )
 
-    if target_quote is not None and accumulated_quote < target_quote:
+    effective_shortfall_tolerance = quote_shortfall_tolerance
+    if rounding_shortfall > effective_shortfall_tolerance:
+        effective_shortfall_tolerance = rounding_shortfall
+
+    if target_quote is not None and accumulated_quote + effective_shortfall_tolerance < target_quote:
         raise OrderValidationError(
             "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
             code="insufficient_liquidity",
@@ -2326,6 +2340,32 @@ def prepare_spot_market_order(
     if side_normalised == "sell" and not bids:
         bids = _with_synthetic_depth(bids)
 
+    quote_shortfall_tolerance = Decimal("0")
+    if target_quote is not None:
+        reference_levels = asks if side_normalised == "buy" else bids
+        reference_price = reference_levels[0][0] if reference_levels else Decimal("0")
+        if reference_price > 0:
+            qty_from_quote = target_quote / reference_price
+            if qty_step > 0:
+                qty_from_quote = quantize_to_step(qty_from_quote, qty_step, rounding=ROUND_DOWN)
+                if qty_from_quote <= 0:
+                    raise OrderValidationError(
+                        "Расчётное количество меньше шага инструмента.",
+                        code="qty_step",
+                        details={
+                            "target_quote": _format_decimal(target_quote),
+                            "reference_price": _format_decimal(reference_price),
+                            "qty_step": _format_decimal(qty_step),
+                        },
+                    )
+            estimated_quote = qty_from_quote * reference_price
+            if target_quote > estimated_quote:
+                quote_shortfall_tolerance = target_quote - estimated_quote
+            if qty_step > 0 and reference_price > 0:
+                rounding_allowance = qty_step * reference_price
+                if rounding_allowance > quote_shortfall_tolerance:
+                    quote_shortfall_tolerance = rounding_allowance
+
     worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
         asks=asks,
         bids=bids,
@@ -2336,6 +2376,7 @@ def prepare_spot_market_order(
         min_qty=min_qty,
         max_price=max_price_allowed,
         min_price=min_price_allowed,
+        quote_shortfall_tolerance=quote_shortfall_tolerance,
     )
 
 
