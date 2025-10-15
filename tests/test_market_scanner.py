@@ -14,6 +14,7 @@ from bybit_app.utils.market_scanner import (
     MarketScanner,
     MarketScannerError,
     scan_market_opportunities,
+    _CandleCache,
 )
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
@@ -950,3 +951,44 @@ def test_stateful_market_scanner_enriches_candidates(tmp_path: Path) -> None:
     assert cached == results
     assert len(scan_calls) == 1
     assert len(api.kline_calls) == 8
+def test_candle_cache_filters_unclosed_payload() -> None:
+    now = 10_000.0
+    interval = 1
+    interval_ms = interval * 60_000
+    base_ms = int(now * 1000.0)
+
+    closed_start = base_ms - 2 * interval_ms
+    almost_closed_start = base_ms - interval_ms
+    open_with_flag = base_ms - interval_ms // 2
+    open_by_time = base_ms - interval_ms + 10_000
+
+    class DummyAPI:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def kline(self, category: str, symbol: str, interval: int, limit: int):
+            self.calls.append((symbol, interval))
+            return {
+                "result": {
+                    "list": [
+                        [closed_start, "1", "1", "1", "1", "10", "100", 1],
+                        [almost_closed_start, "1", "1", "1", "1", "11", "110", 1],
+                        [open_with_flag, "1", "1", "1", "1", "12", "120", 0],
+                        [open_by_time, "1", "1", "1", "1", "13", "130"],
+                    ]
+                }
+            }
+
+    api = DummyAPI()
+    cache = _CandleCache(api, intervals=(interval,), ttl=0.0, limit=10)
+
+    bundle = cache.fetch("BTCUSDT", now)
+
+    assert "1m" in bundle
+    candles = bundle["1m"]
+    starts = [candle["start"] for candle in candles]
+
+    assert starts == [closed_start, almost_closed_start]
+    assert all(start + interval_ms <= base_ms for start in starts)
+    assert api.calls == [("BTCUSDT", interval)]
+
