@@ -8,9 +8,34 @@ from collections import deque
 from typing import Callable, Optional
 
 import requests
+from tenacity import (
+    RetryError,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_none,
+    wait_random,
+)
 
 from .envs import get_settings
 from .log import log
+
+
+class _RetryableTelegramError(RuntimeError):
+    """Internal marker indicating a transient Telegram delivery failure."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+_REQUEST_SEMAPHORE = threading.BoundedSemaphore(value=1)
+
+
+def _acquire_request_slot() -> threading.Semaphore:
+    _REQUEST_SEMAPHORE.acquire()
+    return _REQUEST_SEMAPHORE
 
 
 class TelegramDispatcher:
@@ -53,6 +78,18 @@ class TelegramDispatcher:
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._sleep = sleep or time.sleep
+
+    def _retry_wait(self):
+        if self._initial_backoff <= 0:
+            return wait_none()
+
+        max_backoff: float | None = self._max_backoff if self._max_backoff > 0 else None
+        wait = wait_exponential(
+            multiplier=self._initial_backoff,
+            min=self._initial_backoff,
+            max=max_backoff,
+        )
+        return wait + wait_random(0, min(0.25, self._initial_backoff))
 
     def enqueue_message(self, text: str) -> None:
         """Schedule message for asynchronous delivery without blocking."""
@@ -107,17 +144,24 @@ class TelegramDispatcher:
                 break
 
     def _deliver(self, item: tuple[str, int]) -> None:
-        text, attempts = item
-        try:
-            self._rate_guard()
-            result = _send_telegram_http(text, http_post=self._http_post)
-        except Exception as exc:  # pragma: no cover - defensive catch for worker loop
-            log("telegram.error", error=str(exc))
-            self._handle_delivery_failure(text, attempts, error=str(exc))
-            return
+        text, _ = item
 
-        ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
-        if not ok:
+        def _attempt() -> dict[str, object]:
+            semaphore = _acquire_request_slot()
+            try:
+                try:
+                    self._rate_guard()
+                    result = _send_telegram_http(text, http_post=self._http_post)
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    log("telegram.error", error=str(exc))
+                    raise _RetryableTelegramError(str(exc)) from exc
+            finally:
+                semaphore.release()
+
+            ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
+            if ok:
+                return result  # type: ignore[return-value]
+
             error: str | None = None
             if isinstance(result, dict):
                 error_value = result.get("error") or result.get("description")
@@ -125,28 +169,27 @@ class TelegramDispatcher:
                     error = str(error_value)
             if error is None:
                 error = "telegram_delivery_failed"
-            self._handle_delivery_failure(text, attempts, error=error)
+            raise _RetryableTelegramError(error)
 
-    def _handle_delivery_failure(self, text: str, attempts: int, *, error: str) -> None:
-        next_attempt = attempts + 1
-        if next_attempt >= self._max_attempts:
+        retrying = Retrying(
+            stop=stop_after_attempt(self._max_attempts),
+            wait=self._retry_wait(),
+            retry=retry_if_exception_type(_RetryableTelegramError),
+            sleep=self._sleep,
+            reraise=False,
+        )
+
+        try:
+            retrying(_attempt)
+        except RetryError as exc:
+            attempts = exc.last_attempt.attempt_number
+            error_message = str(exc.last_attempt.exception()) or "telegram_delivery_failed"
             log(
                 "telegram.delivery_failed",
                 text=text,
-                attempts=next_attempt,
-                error=error,
+                attempts=attempts,
+                error=error_message,
             )
-            return
-
-        delay = 0.0
-        if self._initial_backoff > 0:
-            delay = self._initial_backoff * (2**attempts)
-            if self._max_backoff > 0:
-                delay = min(delay, self._max_backoff)
-        if delay > 0:
-            self._sleep(delay)
-
-        self._put_with_overflow_handling((text, next_attempt))
 
     def _put_with_overflow_handling(
         self,
@@ -196,8 +239,61 @@ class TelegramDispatcher:
 def send_telegram(text: str):
     """Send Telegram message synchronously respecting rate limits."""
 
-    _rate_guard()
-    return _send_telegram_http(text)
+    def _attempt() -> dict[str, object]:
+        semaphore = _acquire_request_slot()
+        try:
+            try:
+                _rate_guard()
+                return _send_telegram_http(text)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("telegram.error", error=str(exc))
+                raise _RetryableTelegramError(str(exc)) from exc
+        finally:
+            semaphore.release()
+
+    wait_strategy = wait_exponential(multiplier=1.0, min=1.0, max=30.0) + wait_random(0, 0.25)
+
+    retrying = Retrying(
+        stop=stop_after_attempt(5),
+        wait=wait_strategy,
+        retry=retry_if_exception_type(_RetryableTelegramError),
+        sleep=time.sleep,
+        reraise=False,
+    )
+
+    last_result: dict[str, object] | None = None
+
+    def _wrapped_attempt() -> dict[str, object]:
+        nonlocal last_result
+        result = _attempt()
+        last_result = result if isinstance(result, dict) else None
+        ok = bool(getattr(result, "get", lambda *_: False)("ok")) if result else False
+        if ok:
+            return result
+
+        error: str | None = None
+        if isinstance(result, dict):
+            error_value = result.get("error") or result.get("description")
+            if error_value:
+                error = str(error_value)
+        if error is None:
+            error = "telegram_delivery_failed"
+        raise _RetryableTelegramError(error)
+
+    try:
+        return retrying(_wrapped_attempt)
+    except RetryError as exc:
+        attempts = exc.last_attempt.attempt_number
+        error_message = str(exc.last_attempt.exception()) or "telegram_delivery_failed"
+        log(
+            "telegram.delivery_failed",
+            text=text,
+            attempts=attempts,
+            error=error_message,
+        )
+        if last_result is not None:
+            return last_result
+        return {"ok": False, "error": error_message}
 
 
 # Soft rate limiting to respect Telegram Bot API guidance
