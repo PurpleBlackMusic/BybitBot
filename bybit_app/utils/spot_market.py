@@ -343,6 +343,7 @@ _WALLET_AVAILABLE_FIELDS = (
     "free",
     "transferBalance",
     "cashBalance",
+    "cash",
     "availableFunds",
 )
 _WALLET_FALLBACK_FIELDS = ("walletBalance",)
@@ -356,11 +357,14 @@ _WALLET_RESERVED_FIELDS = (
     "lockedBalance",
     "frozenBalance",
     "frozen",
+    "freezed",
     "serviceCash",
     "commission",
     "pendingCommission",
     "pendingFee",
 )
+_BASE_COIN_SYMBOL_FIELDS = ("baseCoin", "baseAsset", "baseCurrency")
+_QUOTE_COIN_SYMBOL_FIELDS = ("quoteCoin", "quoteAsset", "quoteCurrency")
 _KNOWN_QUOTES = (
     "USDT",
     "USDC",
@@ -1363,6 +1367,74 @@ def _extract_available_amount(row: Mapping[str, object]) -> Decimal | None:
     return None
 
 
+def _balance_suffix_candidates(field: str, prefix: str) -> List[str]:
+    if not isinstance(field, str):
+        return []
+
+    text = field.strip()
+    if not text:
+        return []
+
+    pattern = re.compile(rf"^{re.escape(prefix)}[\s_-]*", re.IGNORECASE)
+    suffix = pattern.sub("", text, count=1)
+    if suffix == text:
+        return []
+
+    suffix = suffix.lstrip(" _-" )
+    if not suffix:
+        return []
+
+    candidates: List[str] = []
+    for candidate in (suffix, suffix.lower()):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    if suffix and suffix[0].isupper():
+        lowered_first = suffix[0].lower() + suffix[1:]
+        if lowered_first not in candidates:
+            candidates.append(lowered_first)
+
+    if re.search(r"[_\-\s]", suffix):
+        parts = [part for part in re.split(r"[_\-\s]+", suffix) if part]
+        if parts:
+            camel = parts[0].lower() + "".join(part.capitalize() for part in parts[1:])
+            snake = "_".join(part.lower() for part in parts)
+            for candidate in (camel, snake):
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+
+    return candidates
+
+
+def _extract_base_quote_rows(row: Mapping[str, object]) -> List[Dict[str, object]]:
+    extracted: List[Dict[str, object]] = []
+
+    for prefix, symbol_fields in (
+        ("base", _BASE_COIN_SYMBOL_FIELDS),
+        ("quote", _QUOTE_COIN_SYMBOL_FIELDS),
+    ):
+        symbol: Optional[str] = None
+        for field in symbol_fields:
+            value = row.get(field)
+            if isinstance(value, str) and value.strip():
+                symbol = value.strip().upper()
+                break
+        if not symbol:
+            continue
+
+        derived: Dict[str, object] = {"coin": symbol}
+        for key, value in row.items():
+            if key in symbol_fields:
+                continue
+            for candidate in _balance_suffix_candidates(key, prefix):
+                derived.setdefault(candidate, value)
+
+        if len(derived) > 1:
+            extracted.append(derived)
+
+    return extracted
+
+
 def _iter_wallet_rows(payload: object, *, _seen: Optional[set[int]] = None) -> List[Mapping[str, object]]:
     if _seen is None:
         _seen = set()
@@ -1381,6 +1453,10 @@ def _iter_wallet_rows(payload: object, *, _seen: Optional[set[int]] = None) -> L
             if isinstance(symbol_value, str) and symbol_value.strip():
                 rows.append(payload)  # payload already contains symbol + balances
                 break
+
+        base_quote_rows = _extract_base_quote_rows(payload)
+        if base_quote_rows:
+            rows.extend(base_quote_rows)
 
         containers: List[object] = []
         for key in ("coin", "coins", "details", "assets", "list"):
