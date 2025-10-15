@@ -114,22 +114,26 @@ def test_log_prunes_when_file_exceeds_limit(tmp_path, monkeypatch):
 def test_log_infers_severity_and_thread(tmp_path, monkeypatch):
     log_file = _use_temp_log(tmp_path, monkeypatch)
 
-    log_module.log("guardian.refresh.error", err="boom")
+    log_module.log("guardian.refresh.error", err="boom", link_id="LN-1", qty=2)
 
     record = json.loads(log_file.read_text(encoding="utf-8"))
     assert record["severity"] == "error"
     assert record["thread"]
     assert record["payload"]["err"] == "boom"
+    assert record["context"]["linkId"] == "LN-1"
+    assert record["context"]["qty"] == 2
+    assert record["context"].get("symbol") is None
 
 
 def test_log_respects_explicit_severity(tmp_path, monkeypatch):
     log_file = _use_temp_log(tmp_path, monkeypatch)
 
-    log_module.log("custom.event", severity="WARNING", value=1)
+    log_module.log("custom.event", severity="WARNING", value=1, symbol="BTCUSDT")
 
     record = json.loads(log_file.read_text(encoding="utf-8"))
     assert record["severity"] == "warning"
     assert record["payload"]["value"] == 1
+    assert record["context"]["symbol"] == "BTCUSDT"
 
 
 def test_log_serialises_exception_details(tmp_path, monkeypatch):
@@ -146,6 +150,30 @@ def test_log_serialises_exception_details(tmp_path, monkeypatch):
     assert exception["type"].endswith("RuntimeError")
     assert "kaboom" in exception["message"]
     assert "RuntimeError: kaboom" in exception["traceback"]
+
+
+def test_log_normalises_structured_aliases(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+
+    log_module.log(
+        "trade.execution",
+        orderLinkId="ABC-1",
+        quantity=0.5,
+        meta={"source": "unit"},
+        price=101.5,
+        notional=50.75,
+    )
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    context = record["context"]
+    assert context == {
+        "linkId": "ABC-1",
+        "meta": {"source": "unit"},
+        "notional": 50.75,
+        "price": 101.5,
+        "qty": 0.5,
+    }
+    assert record["payload"] == {}
 
 
 def test_reset_logs_on_start_truncates_existing_file(tmp_path, monkeypatch):

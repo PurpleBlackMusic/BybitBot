@@ -33,6 +33,15 @@ _SEVERITY_KEYWORDS = {
     "warning": "warning",
 }
 
+_STRUCTURED_ALIASES: dict[str, tuple[str, ...]] = {
+    "linkId": ("linkId", "link_id", "orderLinkId", "order_link_id"),
+    "symbol": ("symbol",),
+    "meta": ("meta",),
+    "notional": ("notional",),
+    "price": ("price",),
+    "qty": ("qty", "quantity"),
+}
+
 
 def _normalise_limit(value: int | str | None, fallback: int) -> int:
     """Return a safe integer limit used by :func:`read_tail`."""
@@ -182,6 +191,32 @@ def _normalise_exception(
     }
 
 
+def _split_structured_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return ``(context, remaining)`` with canonical trading metadata keys.
+
+    The context includes the standard identifiers (``linkId``, ``symbol``,
+    ``meta``, ``notional``, ``price`` and ``qty``) whenever they are supplied via
+    any of their supported aliases. Entries that are not part of this
+    structured metadata remain inside ``payload`` so the existing log consumers
+    behave exactly as before.
+    """
+
+    context: dict[str, Any] = {}
+    remaining: dict[str, Any] = {}
+
+    for key, value in payload.items():
+        matched = False
+        for canonical, aliases in _STRUCTURED_ALIASES.items():
+            if key in aliases:
+                context[canonical] = value
+                matched = True
+                break
+        if not matched:
+            remaining[key] = value
+
+    return context, remaining
+
+
 def log(
     event: str,
     *,
@@ -191,12 +226,15 @@ def log(
 ) -> None:
     """Append a JSON record with ``event`` and ``payload`` to the log file."""
 
+    context, remaining_payload = _split_structured_payload(payload)
+
     record: dict[str, Any] = {
         "ts": int(time.time() * 1000),
         "event": event,
         "severity": _derive_severity(event, severity),
         "thread": threading.current_thread().name,
-        "payload": payload,
+        "context": context,
+        "payload": remaining_payload,
     }
 
     exception_payload = _normalise_exception(exc)
