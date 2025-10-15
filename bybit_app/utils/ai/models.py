@@ -8,11 +8,11 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import joblib
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -231,7 +231,14 @@ def build_training_dataset(
     data_dir: Path = DATA_DIR,
     ledger_path: Optional[Path] = None,
     limit: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_metadata: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray] | Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Return feature matrix, labels and recency weights from the execution ledger."""
 
     path = Path(ledger_path) if ledger_path is not None else _default_ledger_path(Path(data_dir))
@@ -240,6 +247,7 @@ def build_training_dataset(
     feature_rows: List[List[float]] = []
     targets: List[int] = []
     timestamps: List[Optional[float]] = []
+    sample_symbols: List[str] = []
 
     for record in records:
         if record.side == "buy":
@@ -256,10 +264,14 @@ def build_training_dataset(
         feature_rows.append(vector)
         targets.append(1 if pnl > 0 else 0)
         timestamps.append(realised_ts.timestamp() if realised_ts is not None else None)
+        sample_symbols.append(record.symbol)
 
     if not feature_rows:
         empty_matrix = np.empty((0, len(MODEL_FEATURES)))
         empty_vector = np.empty((0,))
+        if return_metadata:
+            empty_object = np.empty((0,), dtype=object)
+            return empty_matrix, empty_vector, empty_vector, empty_object, empty_vector
         return empty_matrix, empty_vector, empty_vector
 
     max_ts = max((ts for ts in timestamps if ts is not None), default=None)
@@ -282,7 +294,154 @@ def build_training_dataset(
     matrix = np.array(feature_rows, dtype=float)
     labels = np.array(targets, dtype=int)
     recency_weights = np.array(weights, dtype=float)
-    return matrix, labels, recency_weights
+
+    if not return_metadata:
+        return matrix, labels, recency_weights
+
+    symbols_array = np.array(sample_symbols, dtype=object)
+    ts_array = np.array(
+        [ts if ts is not None else float("nan") for ts in timestamps], dtype=float
+    )
+    return matrix, labels, recency_weights, symbols_array, ts_array
+
+
+def _cross_sectional_weights(symbols: Sequence[object]) -> np.ndarray:
+    """Return weights that equalise contribution of individual symbols."""
+
+    if isinstance(symbols, np.ndarray):
+        values = [symbol for symbol in symbols.tolist()]
+    else:
+        values = list(symbols)
+
+    if not values:
+        return np.ones((0,), dtype=float)
+
+    counts: Dict[str, int] = {}
+    for symbol in values:
+        key = str(symbol)
+        counts[key] = counts.get(key, 0) + 1
+
+    weights = np.array([1.0 / counts[str(symbol)] for symbol in values], dtype=float)
+    return _normalise_sample_weights(weights)
+
+
+def _sorted_indices_by_timestamp(
+    timestamps: Sequence[Optional[float]] | np.ndarray,
+) -> np.ndarray:
+    """Return indices sorted by timestamp, falling back to stable order."""
+
+    if isinstance(timestamps, np.ndarray) and timestamps.dtype != object:
+        values = timestamps
+    else:
+        values = np.array(list(timestamps), dtype=object)
+
+    sortable: List[Tuple[float, int]] = []
+    for index, raw in enumerate(values):
+        if raw is None or (isinstance(raw, float) and not math.isfinite(raw)):
+            key = float(index)
+        else:
+            key = float(raw)
+        sortable.append((key, index))
+
+    sortable.sort(key=lambda item: (item[0], item[1]))
+    return np.array([index for _, index in sortable], dtype=int)
+
+
+def _rolling_out_of_sample_metrics(
+    template_pipeline: Pipeline,
+    matrix: np.ndarray,
+    labels: np.ndarray,
+    base_weights: np.ndarray,
+    timestamps: Sequence[Optional[float]] | np.ndarray,
+    symbols: Sequence[object],
+    *,
+    min_train: int,
+    max_splits: int = 5,
+) -> Optional[Dict[str, object]]:
+    """Evaluate the model on rolling out-of-sample windows."""
+
+    total = len(labels)
+    if total < 3:
+        return None
+
+    order = _sorted_indices_by_timestamp(timestamps)
+    ordered_total = len(order)
+    if ordered_total != total:
+        return None
+
+    test_size = max(int(total * 0.15), 3)
+    if test_size >= total:
+        return None
+
+    effective_train = max(min_train, test_size)
+    if effective_train + test_size > total:
+        effective_train = max(total - test_size, 0)
+    if effective_train <= 0 or effective_train + test_size > total:
+        return None
+
+    windows: List[Dict[str, object]] = []
+    start = effective_train
+    splits = 0
+
+    symbol_array = np.array(list(symbols), dtype=object)
+
+    while start + test_size <= total and splits < max_splits:
+        train_indices = order[:start]
+        test_indices = order[start : start + test_size]
+        train_labels = labels[train_indices]
+        if len(np.unique(train_labels)) < 2:
+            start += max(test_size // 2, 1)
+            continue
+
+        estimator = clone(template_pipeline)
+        train_weights = base_weights[train_indices]
+        estimator.fit(
+            matrix[train_indices],
+            train_labels,
+            classifier__sample_weight=train_weights,
+        )
+
+        test_weights = _normalise_sample_weights(base_weights[test_indices])
+        probabilities = estimator.predict_proba(matrix[test_indices])[:, _positive_index(estimator)]
+        predictions = (probabilities >= 0.5).astype(int)
+        accuracy = _weighted_accuracy(labels[test_indices], predictions, test_weights)
+        log_loss_value = _weighted_log_loss(labels[test_indices], probabilities, test_weights)
+
+        window_ts = [timestamps[index] for index in test_indices]
+        finite_ts = [ts for ts in window_ts if ts is not None and math.isfinite(float(ts))]
+        windows.append(
+            {
+                "samples": int(len(test_indices)),
+                "accuracy": float(accuracy),
+                "log_loss": float(log_loss_value),
+                "weight": float(np.sum(base_weights[test_indices])),
+                "start_ts": float(min(finite_ts)) if finite_ts else None,
+                "end_ts": float(max(finite_ts)) if finite_ts else None,
+                "symbols": len({str(sample) for sample in symbol_array[test_indices]})
+                if len(symbol_array) == total
+                else None,
+            }
+        )
+
+        splits += 1
+        start += test_size
+
+    if not windows:
+        return None
+
+    total_weight = sum(window.get("weight", 0.0) for window in windows)
+    if total_weight <= 0:
+        total_weight = float(len(windows))
+
+    avg_accuracy = sum(window["accuracy"] * (window.get("weight", 1.0) / total_weight) for window in windows)
+    avg_log_loss = sum(window["log_loss"] * (window.get("weight", 1.0) / total_weight) for window in windows)
+
+    return {
+        "splits": len(windows),
+        "avg_accuracy": float(avg_accuracy),
+        "avg_log_loss": float(avg_log_loss),
+        "windows": windows,
+    }
 
 
 class _WeightedLogisticRegression(BaseEstimator, ClassifierMixin):
@@ -409,15 +568,23 @@ def train_market_model(
 ) -> Optional[MarketModel]:
     """Train a logistic regression model and persist it to disk."""
 
-    matrix, labels, recency_weights = build_training_dataset(
-        data_dir=data_dir, ledger_path=ledger_path, limit=limit
+    dataset = build_training_dataset(
+        data_dir=data_dir, ledger_path=ledger_path, limit=limit, return_metadata=True
     )
+    matrix, labels, recency_weights, symbols, realised_ts = dataset
     if len(matrix) < max(min_samples, 1):
         return None
 
     unique = set(int(label) for label in labels)
     if len(recency_weights) == 0:
         recency_weights = np.ones(len(labels), dtype=float)
+
+    cross_weights = _cross_sectional_weights(symbols)
+    if len(cross_weights) == 0:
+        cross_weights = np.ones(len(labels), dtype=float)
+
+    base_weights = recency_weights * cross_weights
+    class_weights: np.ndarray
 
     classifier = _WeightedLogisticRegression(max_iter=600, l2=1e-2)
     pipeline = Pipeline(
@@ -427,27 +594,42 @@ def train_market_model(
         ]
     )
 
-    metrics_weights: np.ndarray
     if len(unique) < 2:
-        metrics_weights = _normalise_sample_weights(recency_weights)
-        pipeline.fit(matrix, labels)
+        class_weights = np.ones(len(labels), dtype=float)
     else:
         class_weights = _balanced_sample_weights(labels)
-        combined_weights = class_weights * recency_weights
-        pipeline.fit(matrix, labels, classifier__sample_weight=combined_weights)
-        metrics_weights = _normalise_sample_weights(combined_weights)
+
+    training_weights = base_weights * class_weights
+    pipeline.fit(
+        matrix,
+        labels,
+        classifier__sample_weight=training_weights,
+    )
+    metrics_weights = _normalise_sample_weights(base_weights)
 
     probabilities = pipeline.predict_proba(matrix)[:, _positive_index(pipeline)]
     predictions = (probabilities >= 0.5).astype(int)
     accuracy = _weighted_accuracy(labels, predictions, metrics_weights)
     log_loss_value = _weighted_log_loss(labels, probabilities, metrics_weights)
 
+    oos_metrics = _rolling_out_of_sample_metrics(
+        pipeline,
+        matrix,
+        labels,
+        base_weights,
+        realised_ts,
+        symbols,
+        min_train=max(int(min_samples), 10),
+    )
+
     log(
         "market_model.training_metrics",
         samples=int(len(labels)),
+        symbols=len(set(str(symbol) for symbol in symbols)),
         accuracy=float(accuracy),
         log_loss=float(log_loss_value),
         positive_rate=float(labels.mean() if len(labels) else 0.0),
+        out_of_sample=oos_metrics,
     )
 
     payload = {

@@ -16,6 +16,8 @@ from bybit_app.utils.ai.models import (
     MarketModel,
     _SymbolState,
     _WeightedLogisticRegression,
+    _cross_sectional_weights,
+    _rolling_out_of_sample_metrics,
     liquidity_feature,
 )
 from bybit_app.utils.trade_analytics import ExecutionRecord
@@ -176,3 +178,52 @@ def test_market_model_predict_proba_handles_zero_std() -> None:
 
     assert math.isfinite(probability)
     assert 0.0 < probability <= 1.0
+
+
+def test_cross_sectional_weights_equalise_symbols() -> None:
+    symbols = ["BTCUSDT", "BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    weights = _cross_sectional_weights(symbols)
+
+    assert weights.shape == (4,)
+    assert weights[0] == pytest.approx(weights[1])
+    assert weights[2] != pytest.approx(weights[0])
+    assert weights.mean() == pytest.approx(1.0)
+    assert weights[2] > weights[0]
+
+
+def test_rolling_out_of_sample_metrics_generates_windows() -> None:
+    samples = 12
+    feature_template = np.linspace(-1.0, 1.0, samples)
+    matrix = np.tile(feature_template.reshape(-1, 1), (1, len(MODEL_FEATURES)))
+    matrix = np.array(matrix, dtype=float)
+    labels = np.array([0, 1] * (samples // 2), dtype=int)
+    base_weights = np.ones(samples, dtype=float)
+    timestamps = np.linspace(1_700_000_000, 1_700_000_000 + samples, samples)
+    symbols = ["BTCUSDT" if index % 2 == 0 else "ETHUSDT" for index in range(samples)]
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", _WeightedLogisticRegression()),
+    ])
+
+    metrics = _rolling_out_of_sample_metrics(
+        pipeline,
+        matrix,
+        labels,
+        base_weights,
+        timestamps,
+        symbols,
+        min_train=4,
+        max_splits=3,
+    )
+
+    assert metrics is not None
+    assert metrics["splits"] >= 1
+    assert metrics["avg_accuracy"] >= 0.0
+    assert metrics["avg_accuracy"] <= 1.0
+    assert metrics["avg_log_loss"] >= 0.0
+    assert metrics["windows"]
+    for window in metrics["windows"]:
+        assert window["samples"] >= 1
+        assert 0.0 <= window["accuracy"] <= 1.0
+        assert window["log_loss"] >= 0.0

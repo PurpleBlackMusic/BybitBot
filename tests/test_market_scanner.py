@@ -341,7 +341,7 @@ def test_train_market_model_logs_metrics_and_uses_weights(
             "execPrice": "10000",
             "execFee": "-0.1",
             "isMaker": True,
-            "execTime": now - 6 * 3600,
+            "execTime": now - 3600,
         },
         {
             "symbol": "BTCUSDT",
@@ -350,32 +350,57 @@ def test_train_market_model_logs_metrics_and_uses_weights(
             "execPrice": "10500",
             "execFee": "0.1",
             "isMaker": False,
-            "execTime": now - 6 * 3600 + 60,
+            "execTime": now - 1800,
         },
         {
             "symbol": "BTCUSDT",
             "side": "buy",
-            "execQty": "0.2",
+            "execQty": "0.1",
             "execPrice": "11000",
-            "execFee": "-0.2",
+            "execFee": "-0.1",
             "isMaker": True,
-            "execTime": now - 900,
+            "execTime": now - 1200,
         },
         {
             "symbol": "BTCUSDT",
             "side": "sell",
-            "execQty": "0.2",
-            "execPrice": "10700",
-            "execFee": "0.2",
+            "execQty": "0.1",
+            "execPrice": "10800",
+            "execFee": "0.1",
             "isMaker": False,
-            "execTime": now - 840,
+            "execTime": now - 600,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "side": "buy",
+            "execQty": "0.2",
+            "execPrice": "2000",
+            "execFee": "-0.02",
+            "isMaker": True,
+            "execTime": now - 900,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "side": "sell",
+            "execQty": "0.2",
+            "execPrice": "2100",
+            "execFee": "0.02",
+            "isMaker": False,
+            "execTime": now - 300,
         },
     ]
     _write_ledger(ledger_path, records)
 
-    matrix, labels, recency = ai_models.build_training_dataset(ledger_path=ledger_path)
+    (
+        matrix,
+        labels,
+        recency,
+        symbols,
+        _timestamps,
+    ) = ai_models.build_training_dataset(ledger_path=ledger_path, return_metadata=True)
     class_weights = ai_models._balanced_sample_weights(labels)
-    expected = class_weights * recency
+    cross_weights = ai_models._cross_sectional_weights(symbols)
+    expected = class_weights * recency * cross_weights
 
     captured_weights: dict[str, np.ndarray] = {}
     original_fit = ai_models._WeightedLogisticRegression.fit
@@ -429,10 +454,12 @@ def test_train_market_model_logs_metrics_and_uses_weights(
     assert logged
     event, payload = logged[-1]
     assert event == "market_model.training_metrics"
-    assert payload["samples"] == 2
+    assert payload["samples"] == 3
+    assert payload["symbols"] == 2
     assert 0.0 <= payload["accuracy"] <= 1.0
     assert payload["log_loss"] >= 0.0
     assert payload["positive_rate"] == pytest.approx(float(labels.mean()))
+    assert "out_of_sample" in payload
 
 
 def test_market_scanner_respects_whitelist(tmp_path: Path) -> None:
