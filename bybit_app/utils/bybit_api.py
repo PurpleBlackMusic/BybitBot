@@ -1,12 +1,22 @@
 from __future__ import annotations
-import hmac, hashlib, json, time
+import hmac, hashlib, json, time, uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 import requests
 from functools import lru_cache
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from tenacity import (
+    RetryCallState,
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
 
 if TYPE_CHECKING:
     from .envs import Settings
@@ -17,6 +27,14 @@ API_TEST = "https://api-testnet.bybit.com"
 from .helpers import ensure_link_id
 from .log import log
 from .time_sync import invalidate_synced_clock, synced_timestamp_ms
+
+
+class _RetryableRequestError(RuntimeError):
+    """Internal marker for retryable network or exchange failures."""
+
+    def __init__(self, message: str, *, meta: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.meta = dict(meta or {})
 
 @dataclass
 class BybitCreds:
@@ -109,10 +127,31 @@ class BybitAPI:
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
         max_attempts = 5 if signed else 3
-        backoff_base = 0.5
-        last_error: RuntimeError | None = None
+        wait_strategy = wait_exponential(multiplier=0.5, max=5.0) + wait_random(0.0, 0.5)
 
-        for attempt in range(1, max_attempts + 1):
+        def _log_retry(retry_state: RetryCallState) -> None:
+            if retry_state.outcome.failed:
+                exc = retry_state.outcome.exception()
+                if isinstance(exc, _RetryableRequestError):
+                    meta = dict(exc.meta)
+                    meta.update(
+                        {
+                            "attempt": retry_state.attempt_number,
+                            "maxAttempts": max_attempts,
+                            "method": method,
+                            "path": path,
+                        }
+                    )
+                    log("bybit.request.retry", **meta)
+
+        @retry(
+            reraise=True,
+            wait=wait_strategy,
+            stop=stop_after_attempt(max_attempts),
+            retry=retry_if_exception_type(_RetryableRequestError),
+            after=_log_retry,
+        )
+        def _execute():
             try:
                 resp = self._req(method, path, params=params, body=body, signed=signed)
             except requests.exceptions.HTTPError as exc:
@@ -137,14 +176,22 @@ class BybitAPI:
                         f" ({message})"
                     ) from exc
 
-                error = RuntimeError(f"HTTP error {status_code or 'unknown'} while calling {path}: {message}")
-                last_error = error
+                meta = {"status": status_code, "message": message}
+                log("bybit.http_error", method=method, path=path, **meta)
 
-                if status_code in {429, 503} and attempt < max_attempts:
-                    time.sleep(backoff_base * (2 ** (attempt - 1)))
-                    continue
+                if status_code in {429, 503}:
+                    raise _RetryableRequestError(
+                        f"HTTP error {status_code or 'unknown'} while calling {path}: {message}",
+                        meta=meta,
+                    ) from exc
 
-                raise error from exc
+                raise RuntimeError(
+                    f"HTTP error {status_code or 'unknown'} while calling {path}: {message}"
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                meta = {"err": str(exc)}
+                log("bybit.network_error", method=method, path=path, **meta)
+                raise _RetryableRequestError(str(exc), meta=meta) from exc
 
             if not isinstance(resp, dict):
                 return resp
@@ -160,25 +207,34 @@ class BybitAPI:
             if numeric_code == 0 or ret_code_str == "0":
                 return resp
 
-            error = RuntimeError(
-                f"Bybit error {resp.get('retCode')}: {resp.get('retMsg')} ({path})"
-            )
-            last_error = error
+            ret_msg = str(
+                resp.get("retMsg")
+                or resp.get("ret_message")
+                or resp.get("message")
+                or ""
+            ).strip()
+            error_meta = {"retCode": ret_code, "retMsg": ret_msg or None, "path": path}
+            log("bybit.exchange_error", method=method, **error_meta)
 
-            if signed and numeric_code == 10002 and attempt < max_attempts:
+            message = f"Bybit error {resp.get('retCode')}: {ret_msg or 'unknown error'} ({path})"
+
+            if signed and numeric_code == 10002:
                 invalidate_synced_clock(self.base)
                 self._timestamp_ms(force_refresh=True)
-                continue
+                raise _RetryableRequestError(message, meta=error_meta)
 
-            if (numeric_code == 10016 or ret_code_str == "10016") and attempt < max_attempts:
-                time.sleep(backoff_base * (2 ** (attempt - 1)))
-                continue
+            if numeric_code == 10016 or ret_code_str == "10016":
+                raise _RetryableRequestError(message, meta=error_meta)
 
-            raise error
+            raise RuntimeError(message)
 
-        if last_error:
-            raise last_error
-        return resp
+        try:
+            return _execute()
+        except RetryError as exc:
+            final = exc.last_attempt.exception()
+            if isinstance(final, BaseException):
+                raise final
+            raise
 
     @staticmethod
     def _normalise_numeric_fields(payload: dict[str, object], numeric_fields: set[str]) -> None:
@@ -220,6 +276,31 @@ class BybitAPI:
             payload.pop(key, None)
         else:
             payload[key] = sanitised
+
+    @staticmethod
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return format(value, "f")
+        if isinstance(value, (list, tuple, set)):
+            return [BybitAPI._json_safe(item) for item in value]
+        if isinstance(value, Mapping):
+            return {str(key): BybitAPI._json_safe(val) for key, val in value.items()}
+        return value
+
+    @staticmethod
+    def _order_log_meta(data: Mapping[str, Any]) -> dict[str, Any]:
+        category = data.get("category")
+        symbol = data.get("symbol")
+        side = data.get("side")
+        order_type = data.get("orderType")
+        order_link = data.get("orderLinkId")
+        return {
+            "category": str(category) if category is not None else None,
+            "symbol": str(symbol).upper() if symbol is not None else None,
+            "side": str(side).capitalize() if isinstance(side, str) else side,
+            "orderType": str(order_type) if order_type is not None else None,
+            "orderLinkId": str(order_link) if order_link is not None else None,
+        }
 
     # --- public market ---
     def server_time(self):
@@ -344,6 +425,10 @@ class BybitAPI:
 
         payload = dict(kwargs)
 
+        existing_link = payload.get("orderLinkId")
+        if not isinstance(existing_link, str) or not existing_link.strip():
+            payload["orderLinkId"] = str(uuid.uuid4())
+
         required_fields = {"category", "symbol", "side", "orderType"}
         missing = [field for field in required_fields if not payload.get(field)]
         if missing:
@@ -377,18 +462,43 @@ class BybitAPI:
             "orderValue",
         }
 
+        pre_normalised = {key: payload.get(key) for key in numeric_fields if key in payload}
+
         self._normalise_numeric_fields(payload, numeric_fields)
         self._sanitise_order_link_id(payload)
 
-        response = self._safe_req(
-            "POST", "/v5/order/create", body=payload, signed=True
-        )
+        log_meta = self._order_log_meta(payload)
+        normalised_changes = {}
+        for key, before in pre_normalised.items():
+            after = payload.get(key)
+            if before != after:
+                normalised_changes[key] = {
+                    "before": self._json_safe(before),
+                    "after": self._json_safe(after),
+                }
+
+        if normalised_changes:
+            log("order.normalise", **log_meta, fields=normalised_changes)
+
+        request_payload = self._json_safe(payload)
+        log("order.request", **log_meta, payload=request_payload)
+
+        try:
+            response = self._safe_req(
+                "POST", "/v5/order/create", body=payload, signed=True
+            )
+        except Exception as exc:
+            log("order.error", **log_meta, err=str(exc))
+            raise
 
         self._self_check_order_action(
             action="place",
             payload=payload,
             response=response,
         )
+
+        response_payload = self._json_safe(response)
+        log("order.response", **log_meta, payload=response_payload)
 
         return response
 
