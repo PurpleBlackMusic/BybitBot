@@ -378,48 +378,25 @@ def test_train_market_model_logs_metrics_and_uses_weights(
     expected = class_weights * recency
 
     captured_weights: dict[str, np.ndarray] = {}
-    original_train = ai_models._train_logistic_regression
+    original_fit = ai_models._WeightedLogisticRegression.fit
 
-    def capture_train(
-        features: np.ndarray,
-        captured_labels: np.ndarray,
-        *,
-        sample_weights: np.ndarray | None = None,
-        **kwargs,
-    ) -> tuple[np.ndarray, float]:
-        if sample_weights is not None:
-            captured_weights["passed"] = np.array(sample_weights, copy=True)
-        return original_train(
-            features,
-            captured_labels,
-            sample_weights=sample_weights,
-            **kwargs,
-        )
+    def capture_fit(self, X, y, sample_weight=None):  # type: ignore[override]
+        if sample_weight is not None:
+            captured_weights["passed"] = np.array(sample_weight, copy=True)
+        return original_fit(self, X, y, sample_weight=sample_weight)
 
-    monkeypatch.setattr(ai_models, "_train_logistic_regression", capture_train)
+    monkeypatch.setattr(ai_models._WeightedLogisticRegression, "fit", capture_fit)
 
     loss_weights: list[np.ndarray] = []
-    original_loss = ai_models._logistic_loss
+    original_loss = ai_models._weighted_log_loss
 
     def capture_loss(
-        weights: np.ndarray,
-        intercept: float,
-        features: np.ndarray,
-        captured_labels: np.ndarray,
-        sample_weights: np.ndarray,
-        l2: float,
+        captured_labels: np.ndarray, probabilities: np.ndarray, weights: np.ndarray
     ) -> float:
-        loss_weights.append(np.array(sample_weights, copy=True))
-        return original_loss(
-            weights,
-            intercept,
-            features,
-            captured_labels,
-            sample_weights,
-            l2,
-        )
+        loss_weights.append(np.array(weights, copy=True))
+        return original_loss(captured_labels, probabilities, weights)
 
-    monkeypatch.setattr(ai_models, "_logistic_loss", capture_loss)
+    monkeypatch.setattr(ai_models, "_weighted_log_loss", capture_loss)
 
     logged: list[tuple[str, dict[str, object]]] = []
 
@@ -434,7 +411,7 @@ def test_train_market_model_logs_metrics_and_uses_weights(
 
     monkeypatch.setattr(ai_models, "log", fake_log)
 
-    model_path = tmp_path / "ai" / "model.json"
+    model_path = tmp_path / "ai" / "model.joblib"
     model = ai_models.train_market_model(
         data_dir=tmp_path,
         ledger_path=ledger_path,
