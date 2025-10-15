@@ -736,6 +736,188 @@ class SignalExecutor:
 
         return None
 
+    def _resolve_orderbook_top(
+        self,
+        api: Optional[object],
+        symbol: Optional[str],
+        *,
+        limit: int = 1,
+    ) -> Optional[Dict[str, float]]:
+        if api is None or not symbol:
+            return None
+
+        cleaned_symbol = symbol.strip().upper()
+        if not cleaned_symbol:
+            return None
+
+        try:
+            payload = api.orderbook(category="spot", symbol=cleaned_symbol, limit=max(limit, 1))
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log(
+                "guardian.auto.liquidity_guard.orderbook_error",
+                symbol=cleaned_symbol,
+                err=str(exc),
+            )
+            return None
+
+        result = payload.get("result") if isinstance(payload, Mapping) else None
+        asks_raw = result.get("a") if isinstance(result, Mapping) else None
+        bids_raw = result.get("b") if isinstance(result, Mapping) else None
+
+        best_ask = best_ask_qty = best_bid = best_bid_qty = None
+
+        if isinstance(asks_raw, Sequence):
+            for entry in asks_raw:
+                if not isinstance(entry, Sequence) or len(entry) < 2:
+                    continue
+                price = self._decimal_from(entry[0])
+                qty = self._decimal_from(entry[1])
+                if price > 0 and qty > 0:
+                    best_ask = price
+                    best_ask_qty = qty
+                    break
+
+        if isinstance(bids_raw, Sequence):
+            for entry in bids_raw:
+                if not isinstance(entry, Sequence) or len(entry) < 2:
+                    continue
+                price = self._decimal_from(entry[0])
+                qty = self._decimal_from(entry[1])
+                if price > 0 and qty > 0:
+                    best_bid = price
+                    best_bid_qty = qty
+                    break
+
+        best_ask_float = self._decimal_to_float(best_ask)
+        best_bid_float = self._decimal_to_float(best_bid)
+        best_ask_qty_float = self._decimal_to_float(best_ask_qty)
+        best_bid_qty_float = self._decimal_to_float(best_bid_qty)
+
+        if not any(
+            value is not None
+            for value in (best_ask_float, best_bid_float, best_ask_qty_float, best_bid_qty_float)
+        ):
+            return None
+
+        spread_bps: Optional[float] = None
+        if best_ask_float and best_bid_float and best_ask_float > 0:
+            spread_bps = max(((best_ask_float - best_bid_float) / best_ask_float) * 10_000.0, 0.0)
+
+        snapshot: Dict[str, float] = {}
+        if best_ask_float:
+            snapshot["best_ask"] = best_ask_float
+        if best_bid_float:
+            snapshot["best_bid"] = best_bid_float
+        if best_ask_qty_float:
+            snapshot["best_ask_qty"] = best_ask_qty_float
+        if best_bid_qty_float:
+            snapshot["best_bid_qty"] = best_bid_qty_float
+        if spread_bps is not None:
+            snapshot["spread_bps"] = spread_bps
+
+        return snapshot
+
+    def _apply_liquidity_guard(
+        self,
+        side: str,
+        notional_quote: float,
+        orderbook_top: Mapping[str, float],
+        *,
+        settings: Settings,
+        price_hint: Optional[float] = None,
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        if notional_quote <= 0:
+            return None
+
+        context: Dict[str, object] = {"side": side}
+
+        best_ask = _safe_float(orderbook_top.get("best_ask"))
+        best_bid = _safe_float(orderbook_top.get("best_bid"))
+        best_ask_qty = _safe_float(orderbook_top.get("best_ask_qty"))
+        best_bid_qty = _safe_float(orderbook_top.get("best_bid_qty"))
+        spread_bps = _safe_float(orderbook_top.get("spread_bps"))
+
+        if spread_bps is not None:
+            context["spread_bps"] = spread_bps
+            try:
+                max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                max_spread = 0.0
+            if max_spread > 0 and spread_bps > max_spread:
+                context["max_spread_bps"] = max_spread
+                reason = (
+                    "ждём восстановления ликвидности — спред {spread:.1f} б.п. превышает лимит {limit:.1f} б.п."
+                ).format(spread=spread_bps, limit=max_spread)
+                return reason, context
+
+        top_price = best_ask if side == "Buy" else best_bid
+        top_qty = best_ask_qty if side == "Buy" else best_bid_qty
+
+        if top_price is None or top_price <= 0 or top_qty is None or top_qty <= 0:
+            reason = "ждём восстановления ликвидности — первый уровень стакана пуст."
+            if top_price is not None and top_price > 0:
+                context["top_price"] = top_price
+            if top_qty is not None and top_qty > 0:
+                context["top_qty"] = top_qty
+            return reason, context
+
+        context["top_price"] = top_price
+        context["top_qty"] = top_qty
+
+        required_quote = max(float(notional_quote), 0.0)
+        available_quote = top_price * top_qty
+        context["required_quote"] = required_quote
+        context["available_quote"] = available_quote
+
+        if price_hint is not None and price_hint > 0 and top_price > 0:
+            deviation_bps = (top_price / price_hint - 1.0) * 10_000.0
+            context["price_deviation_bps"] = deviation_bps
+
+        coverage_ratio = available_quote / required_quote if required_quote > 0 else 1.0
+        context["coverage_ratio"] = coverage_ratio
+
+        try:
+            coverage_threshold = float(
+                getattr(settings, "ai_top_depth_coverage", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            coverage_threshold = 0.0
+        coverage_threshold = max(min(coverage_threshold, 0.99), 0.0)
+
+        shortfall_quote = required_quote - available_quote
+        context["shortfall_quote"] = shortfall_quote
+
+        try:
+            shortfall_limit = float(
+                getattr(settings, "ai_top_depth_shortfall_usd", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            shortfall_limit = 0.0
+        shortfall_limit = max(shortfall_limit, 0.0)
+        if shortfall_limit > 0:
+            context["shortfall_limit_quote"] = shortfall_limit
+
+        if (
+            required_quote > 0
+            and coverage_threshold > 0
+            and coverage_ratio + 1e-9 < coverage_threshold
+        ):
+            context["coverage_threshold"] = coverage_threshold
+            reason = (
+                "ждём восстановления ликвидности — на первом уровне доступно ≈{available:.2f} USDT,"
+                " требуется ≈{required:.2f} USDT."
+            ).format(available=available_quote, required=required_quote)
+            return reason, context
+
+        if required_quote > 0 and shortfall_limit > 0 and shortfall_quote > shortfall_limit:
+            reason = (
+                "ждём восстановления ликвидности — дефицит первого уровня ≈{shortfall:.2f} USDT превышает"
+                " лимит {limit:.2f} USDT."
+            ).format(shortfall=shortfall_quote, limit=shortfall_limit)
+            return reason, context
+
+        return None
+
     def _resolve_summary_update_meta(
         self, summary: Mapping[str, object], now: float
     ) -> Tuple[Optional[float], Optional[float]]:
@@ -2032,6 +2214,30 @@ class SignalExecutor:
                     allowed_quote = min(allowed_quote, cap_for_min_buy)
                 if max_quote is None or allowed_quote > max_quote:
                     max_quote = allowed_quote
+
+        orderbook_top = self._resolve_orderbook_top(api, symbol)
+        if orderbook_top:
+            order_context["orderbook_top"] = orderbook_top
+            best_price = orderbook_top.get("best_ask") if side == "Buy" else orderbook_top.get("best_bid")
+            best_price_float = _safe_float(best_price)
+            if best_price_float and best_price_float > 0:
+                order_context.setdefault("price_snapshot", best_price_float)
+            guard_result = self._apply_liquidity_guard(
+                side,
+                adjusted_notional,
+                orderbook_top,
+                settings=settings,
+                price_hint=summary_price_snapshot,
+            )
+            if guard_result is not None:
+                reason_text, guard_context = guard_result
+                if guard_context:
+                    order_context["liquidity_guard"] = guard_context
+                return self._decision(
+                    "skipped",
+                    reason=reason_text,
+                    context=order_context,
+                )
 
         ledger_before, last_exec_id = self._ledger_rows_snapshot(settings=settings)
 
@@ -3633,6 +3839,18 @@ class SignalExecutor:
             return Decimal(str(value))
         except (InvalidOperation, ValueError, TypeError):
             return default
+
+    @staticmethod
+    def _decimal_to_float(value: Optional[Decimal]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isfinite(candidate):
+            return candidate
+        return None
 
     @classmethod
     def _parse_decimal_sequence(cls, raw: object) -> list[Decimal]:

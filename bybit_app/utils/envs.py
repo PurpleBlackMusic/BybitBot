@@ -135,6 +135,8 @@ class Settings:
     ai_universe_preset: str = "Стандарт"
     ai_max_spread_bps: float = 75.0
     ai_min_turnover_usd: float = 250_000.0
+    ai_top_depth_coverage: float = 0.9
+    ai_top_depth_shortfall_usd: float = 5.0
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
