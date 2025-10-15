@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import pandas as pd
@@ -6,6 +5,7 @@ import streamlit as st
 from utils.dataframe import arrow_safe
 
 from utils.envs import get_api_client, get_settings
+from utils.spot_market import wallet_balance_payload
 
 st.title("📊 Портфель — Дашборд")
 
@@ -16,7 +16,7 @@ if not (s.api_key and s.api_secret):
 
 api = get_api_client()
 try:
-    wb = api.wallet_balance()
+    wb = wallet_balance_payload(api)
     raw_list = ((wb.get("result") or {}).get("list") or [{}])
     first_entry = raw_list[0] if raw_list else {}
     coins_raw = first_entry.get("coin") or []

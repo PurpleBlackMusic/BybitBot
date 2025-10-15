@@ -117,6 +117,10 @@ def _balance_cache_key(api: BybitAPI, account_type: str) -> str:
     return f"{network}:{account}"
 
 
+def _balance_payload_cache_key(api: BybitAPI, account_type: str) -> str:
+    return f"{_balance_cache_key(api, account_type)}#payload:{id(api)}"
+
+
 def _symbol_cache_key(api: BybitAPI) -> str:
     """Return a cache key that incorporates the API's active network."""
 
@@ -1269,6 +1273,7 @@ def _wallet_available_balances(
             if cached_amount is None or cached_amount <= 0:
                 if cached:
                     _BALANCE_CACHE.invalidate(cache_key)
+                    _BALANCE_CACHE.invalidate(_balance_payload_cache_key(api, account_key))
                 else:
                     return cached
             else:
@@ -1338,6 +1343,41 @@ def _format_decimal(value: Decimal) -> str:
 
     text = format(normalised, "f")
     return text if text else "0"
+
+
+def _build_wallet_payload_from_balances(
+    account_type: str, balances: Mapping[str, Decimal]
+) -> Dict[str, object]:
+    coins: List[Dict[str, object]] = []
+    for asset, amount in sorted(balances.items()):
+        value = _format_decimal(amount)
+        coins.append(
+            {
+                "coin": asset,
+                "walletBalance": value,
+                "equity": value,
+                "balance": value,
+                "availableBalance": value,
+                "availableToWithdraw": value,
+                "available": value,
+                "availableMargin": value,
+                "cashBalance": value,
+                "transferBalance": value,
+                "totalAvailableBalance": value,
+            }
+        )
+
+    return {
+        "result": {
+            "list": [
+                {
+                    "accountType": account_type,
+                    "account": account_type,
+                    "coin": coins,
+                }
+            ]
+        }
+    }
 
 
 @dataclass(frozen=True)
@@ -1523,10 +1563,77 @@ def prepare_spot_trade_snapshot(
     if include_balances:
         account_key = (account_type or "UNIFIED").upper() or "UNIFIED"
         if force_refresh:
-            _BALANCE_CACHE.invalidate(_balance_cache_key(api, account_key))
+            cache_key = _balance_cache_key(api, account_key)
+            _BALANCE_CACHE.invalidate(cache_key)
+            _BALANCE_CACHE.invalidate(_balance_payload_cache_key(api, account_key))
         balances = _wallet_available_balances(api, account_type=account_type)
 
     return SpotTradeSnapshot(symbol=key, price=price, balances=balances, limits=limits)
+
+
+def wallet_available_balances(
+    api: BybitAPI,
+    account_type: str = "UNIFIED",
+    *,
+    required_asset: str | None = None,
+) -> Dict[str, Decimal]:
+    """Public wrapper for cached wallet balance lookups with graceful fallbacks."""
+
+    return _wallet_available_balances(
+        api,
+        account_type=account_type,
+        required_asset=required_asset,
+    )
+
+
+def wallet_balance_payload(api: BybitAPI, account_type: str = "UNIFIED") -> Dict[str, object]:
+    """Return the raw wallet payload, applying spot fallbacks for unsupported accounts."""
+
+    account_key = (account_type or "UNIFIED").upper() or "UNIFIED"
+    cache_key = _balance_payload_cache_key(api, account_key)
+    cached = _BALANCE_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    try:
+        payload = api.wallet_balance(accountType=account_key)
+    except TypeError as exc:
+        message = str(exc)
+        if "accountType" in message or "unexpected" in message:
+            payload = api.wallet_balance()
+        else:  # pragma: no cover - propagate unrelated type errors
+            raise
+    except Exception as exc:  # pragma: no cover - network/runtime errors
+        if account_key != "UNIFIED" and _is_unsupported_wallet_account_type_error(exc):
+            message = str(exc)
+            log(
+                "wallet_balance_unsupported_account_type",
+                account_type=account_key,
+                error=message,
+            )
+            fallback_balances = _load_spot_exchange_balances(api)
+            if fallback_balances:
+                log(
+                    "wallet_balance_spot_exchange_fallback_used",
+                    account_type=account_key,
+                    coins=len(fallback_balances),
+                )
+            payload_map = _build_wallet_payload_from_balances(account_key, fallback_balances)
+            _BALANCE_CACHE.set(cache_key, dict(payload_map))
+            return payload_map
+        if account_key == "UNIFIED":
+            raise
+        raise RuntimeError(f"Не удалось получить баланс кошелька: {exc}") from exc
+
+    if isinstance(payload, Mapping):
+        payload_map = dict(payload)
+    elif payload is None:
+        payload_map = {}
+    else:
+        payload_map = {"result": payload}
+
+    _BALANCE_CACHE.set(cache_key, dict(payload_map))
+    return payload_map
 
 
 _MIN_PERCENT_TOLERANCE = Decimal("0.05")

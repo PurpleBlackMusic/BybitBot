@@ -30,6 +30,7 @@ from .spot_market import (
     _instrument_limits,
     _resolve_slippage_tolerance,
     _wallet_available_balances,
+    wallet_balance_payload,
     parse_price_limit_error_details,
     place_spot_market_with_tolerance,
     prepare_spot_trade_snapshot,
@@ -3863,7 +3864,7 @@ class SignalExecutor:
             return None, (0.0, 0.0), None, metadata
 
         try:
-            payload = api.wallet_balance()
+            payload = wallet_balance_payload(api)
         except Exception:
             if require_success:
                 raise
