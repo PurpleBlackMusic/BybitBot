@@ -213,3 +213,116 @@ def test_dispatcher_marks_failed_after_max_attempts(monkeypatch: pytest.MonkeyPa
     assert failure["text"] == "explode"
     assert failure["attempts"] == 3
     assert failure["error"] == "boom"
+
+
+def test_heartbeat_emits_periodic_messages(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_settings(monkeypatch)
+
+    fake_now = {"value": 0.0}
+
+    def fake_time() -> float:
+        return fake_now["value"]
+
+    sent: list[str] = []
+    recorded_logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_send(text: str) -> None:
+        sent.append(text)
+        telegram_notify._record_activity(ts=fake_now["value"])
+
+    def fake_log(event: str, **payload: object) -> None:
+        recorded_logs.append((event, payload))
+
+    def fake_settings() -> SimpleNamespace:
+        return SimpleNamespace(
+            heartbeat_enabled=True,
+            heartbeat_minutes=1,
+            heartbeat_interval_min=1,
+            telegram_token="token",
+            telegram_chat_id="chat",
+        )
+
+    heartbeat = telegram_notify.TelegramHeartbeat(
+        send=fake_send,
+        get_settings_func=fake_settings,
+        log_func=fake_log,
+        time_func=fake_time,
+        silence_threshold=60.0,
+        min_poll_interval=5.0,
+    )
+
+    telegram_notify._record_activity(ts=fake_now["value"])
+
+    heartbeat.run_cycle()
+    assert sent and "Heartbeat" in sent[0]
+
+    fake_now["value"] += 30.0
+    heartbeat.run_cycle()
+    assert len(sent) == 1
+
+    fake_now["value"] += 31.0
+    heartbeat.run_cycle()
+    assert len(sent) == 2
+
+    events = [event for event, _ in recorded_logs]
+    assert events.count("telegram.heartbeat.sent") >= 2
+
+
+def test_heartbeat_alerts_on_silence(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_settings(monkeypatch)
+
+    fake_now = {"value": 0.0}
+
+    def fake_time() -> float:
+        return fake_now["value"]
+
+    sent: list[str] = []
+    recorded_logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_send(text: str) -> None:
+        sent.append(text)
+
+    def fake_log(event: str, **payload: object) -> None:
+        recorded_logs.append((event, payload))
+
+    def fake_settings() -> SimpleNamespace:
+        return SimpleNamespace(
+            heartbeat_enabled=True,
+            heartbeat_minutes=1,
+            heartbeat_interval_min=1,
+            telegram_token="token",
+            telegram_chat_id="chat",
+        )
+
+    heartbeat = telegram_notify.TelegramHeartbeat(
+        send=fake_send,
+        get_settings_func=fake_settings,
+        log_func=fake_log,
+        time_func=fake_time,
+        silence_threshold=60.0,
+        min_poll_interval=5.0,
+    )
+
+    telegram_notify._record_activity(ts=fake_now["value"])
+
+    # Advance past threshold to trigger alert.
+    fake_now["value"] += 61.0
+    heartbeat.run_cycle()
+
+    def events() -> list[str]:
+        return [event for event, _ in recorded_logs]
+
+    assert "telegram.heartbeat.silence" in events()
+    assert "telegram.heartbeat.alert" in events()
+    assert any(text.startswith("⚠️ Telegram heartbeat silence") for text in sent)
+
+    # Subsequent cycles without new activity should not spam alerts.
+    fake_now["value"] += 10.0
+    heartbeat.run_cycle()
+    assert events().count("telegram.heartbeat.alert") == 1
+
+    # Fresh activity resets the alert guard.
+    telegram_notify._record_activity(ts=fake_now["value"])
+    fake_now["value"] += 61.0
+    heartbeat.run_cycle()
+    assert events().count("telegram.heartbeat.alert") == 2
