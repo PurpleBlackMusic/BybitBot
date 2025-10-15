@@ -141,6 +141,7 @@ class Settings:
     ai_min_turnover_usd: float = 250_000.0
     ai_top_depth_coverage: float = 0.9
     ai_top_depth_shortfall_usd: float = 5.0
+    ai_min_top_quote_usd: float = 15.0
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
@@ -337,6 +338,7 @@ _ENV_MAP = {
     "heartbeat_interval_min": "TG_HEARTBEAT_INTERVAL_MIN",
     "ws_autostart": "WS_AUTOSTART",
     "execution_watchdog_max_age_sec": "EXECUTION_WATCHDOG_MAX_AGE_SEC",
+    "ai_min_top_quote_usd": "AI_MIN_TOP_QUOTE_USD",
 }
 
 
@@ -442,6 +444,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
     m["ai_max_hold_minutes"] = _cast_float(m.get("ai_max_hold_minutes"))
     m["ai_min_exit_bps"] = _cast_float(m.get("ai_min_exit_bps"))
+    m["ai_min_top_quote_usd"] = _cast_float(m.get("ai_min_top_quote_usd"))
 
     for csv_field in ("ai_symbols", "ai_whitelist"):
         cleaned = _normalise_symbol_csv(m.get(csv_field))
