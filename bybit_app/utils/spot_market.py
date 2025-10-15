@@ -15,6 +15,7 @@ from . import validators
 from .envs import Settings
 from .paths import CACHE_DIR
 from .precision import ceil_qty_to_min_notional, format_to_step
+from .bybit_errors import parse_bybit_error_message
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -28,7 +29,6 @@ _DEFAULT_MARK_DEVIATION = Decimal("0.01")
 _TWAP_DEFAULT_MAX_SLICES = 10
 _TOLERANCE_MARGIN = Decimal("0.00000001")
 
-_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
 _PRICE_LIMIT_FIELDS = re.compile(
     r"(?P<key>price[\s_-]?(?:cap|floor)|max[\s_-]?price|min[\s_-]?price|"
     r"upper[\s_-]?(?:limit|price)|lower[\s_-]?(?:limit|price)|priceLimit(?:Upper|Lower)?)"
@@ -278,9 +278,10 @@ class OrderValidationError(RuntimeError):
 
 
 def _extract_bybit_error_code_from_message(message: str) -> Optional[str]:
-    match = _BYBIT_ERROR.search(message)
-    if match:
-        return match.group("code")
+    parsed = parse_bybit_error_message(message)
+    if parsed:
+        code, _ = parsed
+        return code
     return None
 
 

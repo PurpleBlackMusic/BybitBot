@@ -25,6 +25,12 @@ API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
 
 from .helpers import ensure_link_id
+from .bybit_errors import (
+    BybitErrorPolicy,
+    extract_ret_message,
+    normalise_ret_code,
+    resolve_error_policy,
+)
 from .log import log
 from .time_sync import invalidate_synced_clock, synced_timestamp_ms
 
@@ -196,34 +202,27 @@ class BybitAPI:
             if not isinstance(resp, dict):
                 return resp
 
-            ret_code = resp.get("retCode", 0)
-            ret_code_str = str(ret_code)
-            numeric_code: int | None = None
-            try:
-                numeric_code = int(ret_code_str)
-            except (TypeError, ValueError):
-                pass
+            ret_code_value = resp.get("retCode", 0)
+            numeric_code, ret_code_text = normalise_ret_code(ret_code_value)
 
-            if numeric_code == 0 or ret_code_str == "0":
+            if numeric_code == 0 or ret_code_text == "0":
                 return resp
 
-            ret_msg = str(
-                resp.get("retMsg")
-                or resp.get("ret_message")
-                or resp.get("message")
-                or ""
-            ).strip()
-            error_meta = {"retCode": ret_code, "retMsg": ret_msg or None, "path": path}
+            ret_msg = extract_ret_message(resp)
+            error_meta = {"retCode": ret_code_value, "retMsg": ret_msg or None, "path": path}
             log("bybit.exchange_error", method=method, **error_meta)
 
-            message = f"Bybit error {resp.get('retCode')}: {ret_msg or 'unknown error'} ({path})"
+            code_for_message = ret_code_text or str(ret_code_value)
+            message = f"Bybit error {code_for_message}: {ret_msg or 'unknown error'} ({path})"
 
-            if signed and numeric_code == 10002:
+            policy = resolve_error_policy(numeric_code)
+            if policy.requires_signed and not signed:
+                policy = BybitErrorPolicy()
+
+            if policy.invalidate_clock and signed:
                 invalidate_synced_clock(self.base)
                 self._timestamp_ms(force_refresh=True)
-                raise _RetryableRequestError(message, meta=error_meta)
-
-            if numeric_code == 10016 or ret_code_str == "10016":
+            if policy.retryable:
                 raise _RetryableRequestError(message, meta=error_meta)
 
             raise RuntimeError(message)

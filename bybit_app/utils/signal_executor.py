@@ -25,6 +25,7 @@ from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
 from .log import log
+from .bybit_errors import parse_bybit_error_message
 from .spot_market import (
     OrderValidationError,
     _instrument_limits,
@@ -101,24 +102,23 @@ class _LadderStep:
     def profit_fraction(self) -> Decimal:
         return self.profit_bps / Decimal("10000")
 
-_BYBIT_ERROR = re.compile(r"Bybit error (?P<code>-?\d+): (?P<message>.+)")
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
 def _format_bybit_error(exc: Exception) -> str:
     text = str(exc)
-    match = _BYBIT_ERROR.search(text)
-    if match:
-        code = match.group("code")
-        message = match.group("message").strip()
+    parsed = parse_bybit_error_message(text)
+    if parsed:
+        code, message = parsed
         return f"Bybit отказал ({code}): {message}"
     return f"Не удалось отправить ордер: {text}"
 
 
 def _extract_bybit_error_code(exc: Exception) -> Optional[str]:
-    match = _BYBIT_ERROR.search(str(exc))
-    if match:
-        return match.group("code")
+    parsed = parse_bybit_error_message(str(exc))
+    if parsed:
+        code, _ = parsed
+        return code
     return None
 
 
