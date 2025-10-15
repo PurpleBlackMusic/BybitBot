@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings, active_api_key, active_api_secret, active_dry_run
+from .spot_market import wallet_balance_payload
 from .time_sync import extract_server_epoch
 
 
@@ -395,7 +396,7 @@ def api_key_status(
         client = api
 
     try:
-        wallet_payload = client.wallet_balance()
+        wallet_payload = wallet_balance_payload(client)
     except Exception as exc:  # pragma: no cover - network errors only in production
         error_text = str(exc) or exc.__class__.__name__
         return {
@@ -758,7 +759,7 @@ def bybit_realtime_status(
 
     started = time.perf_counter()
     try:
-        wallet = client.wallet_balance()
+        wallet = wallet_balance_payload(client)
     except Exception as exc:  # pragma: no cover - network errors in production only
         return {
             "title": title,

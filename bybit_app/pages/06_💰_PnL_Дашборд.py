@@ -8,6 +8,7 @@ import streamlit as st
 from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 from utils.paths import DATA_DIR
+from utils.spot_market import wallet_balance_payload
 from utils.ui import safe_set_page_config
 
 safe_set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
@@ -59,7 +60,7 @@ def _iter_coin_rows(raw: object):
 
 colA, colB, colC = st.columns(3)
 try:
-    wal = api.wallet_balance(accountType="UNIFIED")
+    wal = wallet_balance_payload(api, account_type="UNIFIED")
     lst = (wal.get("result") or {}).get("list") or []
     ava = bal = 0.0
     for account in _iter_accounts(lst):
