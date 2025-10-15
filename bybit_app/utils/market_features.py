@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional, Sequence
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -161,6 +161,17 @@ def compute_volume_impulse(row: Mapping[str, object]) -> Dict[str, Optional[floa
     }
 
 
+def _first_float(row: Mapping[str, object], keys: Sequence[str]) -> Optional[float]:
+    """Return the first valid float from ``row`` among ``keys``."""
+
+    for key in keys:
+        value = row.get(key)
+        numeric = _safe_float(value)
+        if numeric is not None:
+            return numeric
+    return None
+
+
 def compute_orderbook_depth_signal(row: Mapping[str, object]) -> Optional[float]:
     """Evaluate orderbook imbalance using best bid/ask size when available."""
 
@@ -170,6 +181,111 @@ def compute_orderbook_depth_signal(row: Mapping[str, object]) -> Optional[float]
         return None
     imbalance = (bid_size - ask_size) / (bid_size + ask_size)
     return float(imbalance)
+
+
+def compute_order_flow_metrics(row: Mapping[str, object]) -> Dict[str, object]:
+    """Extract order-flow ratios and top-of-book liquidity metrics."""
+
+    buy_turnover = _first_float(
+        row,
+        (
+            "buyTurnover24h",
+            "takerBuyQuoteVolume",
+            "buyQuoteVolume24h",
+            "buyVolumeQuote24h",
+            "buyNotional24h",
+        ),
+    )
+    sell_turnover = _first_float(
+        row,
+        (
+            "sellTurnover24h",
+            "takerSellQuoteVolume",
+            "sellQuoteVolume24h",
+            "sellVolumeQuote24h",
+            "sellNotional24h",
+        ),
+    )
+
+    order_flow_ratio: Optional[float] = None
+    if (
+        buy_turnover is not None
+        and sell_turnover is not None
+        and buy_turnover >= 0
+        and sell_turnover >= 0
+        and buy_turnover + sell_turnover > 0
+    ):
+        order_flow_ratio = (buy_turnover - sell_turnover) / (buy_turnover + sell_turnover)
+
+    window_templates = {
+        "1h": ("buyVolume1h", "sellVolume1h"),
+        "4h": ("buyVolume4h", "sellVolume4h"),
+        "24h": ("buyVolume24h", "sellVolume24h"),
+    }
+
+    cvd_windows: Dict[str, Optional[float]] = {}
+    cvd_score: Optional[float] = None
+
+    for window, (buy_key, sell_key) in window_templates.items():
+        buy_volume = _first_float(
+            row,
+            (buy_key, buy_key.replace("Volume", "BaseVolume"), buy_key.replace("Volume", "Qty")),
+        )
+        sell_volume = _first_float(
+            row,
+            (
+                sell_key,
+                sell_key.replace("Volume", "BaseVolume"),
+                sell_key.replace("Volume", "Qty"),
+            ),
+        )
+
+        if buy_volume is None and sell_volume is None:
+            cvd_windows[window] = None
+            continue
+
+        buy_volume = max(buy_volume or 0.0, 0.0)
+        sell_volume = max(sell_volume or 0.0, 0.0)
+        total = buy_volume + sell_volume
+        if total <= 0:
+            cvd_value = None
+        else:
+            cvd_value = (buy_volume - sell_volume) / total
+            if cvd_score is None or abs(cvd_value) > abs(cvd_score):
+                cvd_score = cvd_value
+        cvd_windows[window] = cvd_value
+
+    bid_price = _safe_float(row.get("bestBidPrice") or row.get("bid1Price"))
+    ask_price = _safe_float(row.get("bestAskPrice") or row.get("ask1Price"))
+    bid_size = _safe_float(row.get("bid1Size") or row.get("bidSize"))
+    ask_size = _safe_float(row.get("ask1Size") or row.get("askSize"))
+
+    bid_quote = bid_price * bid_size if bid_price and bid_size and bid_price > 0 and bid_size > 0 else None
+    ask_quote = ask_price * ask_size if ask_price and ask_size and ask_price > 0 and ask_size > 0 else None
+
+    top_total_quote: Optional[float] = None
+    if bid_quote is not None or ask_quote is not None:
+        top_total_quote = (bid_quote or 0.0) + (ask_quote or 0.0)
+
+    top_imbalance: Optional[float] = None
+    if (
+        bid_quote is not None
+        and ask_quote is not None
+        and bid_quote + ask_quote > 0
+    ):
+        top_imbalance = (bid_quote - ask_quote) / (bid_quote + ask_quote)
+
+    return {
+        "order_flow_ratio": order_flow_ratio,
+        "cvd_score": cvd_score,
+        "cvd_windows": cvd_windows,
+        "top_depth_quote": {
+            "bid": bid_quote,
+            "ask": ask_quote,
+            "total": top_total_quote,
+        },
+        "top_depth_imbalance": top_imbalance,
+    }
 
 
 def compute_cross_market_correlation(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
@@ -205,6 +321,7 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
     volatility = compute_volatility_windows(row)
     volume = compute_volume_impulse(row)
     depth_signal = compute_orderbook_depth_signal(row)
+    order_flow = compute_order_flow_metrics(row)
     correlation = compute_cross_market_correlation(row)
 
     blended_change = momentum["blended_change_pct"]
@@ -220,6 +337,11 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
         "volume_spike_score": volume["spike_score"],
         "volume_impulse": volume["impulses"],
         "depth_imbalance": depth_signal,
+        "order_flow_ratio": order_flow["order_flow_ratio"],
+        "cvd_score": order_flow["cvd_score"],
+        "cvd_windows": order_flow["cvd_windows"],
+        "top_depth_quote": order_flow["top_depth_quote"],
+        "top_depth_imbalance": order_flow["top_depth_imbalance"],
         "correlations": correlation["correlations"],
         "correlation_strength": correlation["avg_abs"],
     }

@@ -216,6 +216,11 @@ class LiveSignalFetcher:
         testnet = bool(getattr(settings, "testnet", False))
 
         try:
+            min_top_quote = float(getattr(settings, "ai_min_top_quote_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            min_top_quote = 0.0
+
+        try:
             opportunities = scan_market_opportunities(
                 api,
                 data_dir=self.data_dir,
@@ -228,6 +233,7 @@ class LiveSignalFetcher:
                 cache_ttl=0.0 if self.live_only else max(self.cache_ttl, 0.0),
                 settings=settings,
                 testnet=testnet,
+                min_top_quote=min_top_quote,
             )
         except Exception as exc:
             raise LiveSignalError(str(exc)) from exc

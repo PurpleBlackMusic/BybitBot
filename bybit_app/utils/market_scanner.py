@@ -204,6 +204,26 @@ def _weighted_opportunity_model(
     else:
         components["orderbook"] = 0.0
 
+    order_flow_ratio = features.get("order_flow_ratio")
+    if isinstance(order_flow_ratio, (int, float)) and direction != 0:
+        flow_component = float(order_flow_ratio) * direction * 1.1
+        components["order_flow"] = max(min(flow_component, 1.8), -1.8)
+    else:
+        components["order_flow"] = 0.0
+
+    cvd_score = features.get("cvd_score")
+    if isinstance(cvd_score, (int, float)) and direction != 0:
+        cvd_component = float(cvd_score) * direction * 1.0
+        components["cvd"] = max(min(cvd_component, 1.5), -1.5)
+    else:
+        components["cvd"] = 0.0
+
+    top_depth_imbalance = features.get("top_depth_imbalance")
+    if isinstance(top_depth_imbalance, (int, float)) and direction != 0:
+        components["top_depth"] = max(min(float(top_depth_imbalance) * direction * 0.9, 1.2), -1.2)
+    else:
+        components["top_depth"] = 0.0
+
     correlation_strength = features.get("correlation_strength")
     if isinstance(correlation_strength, (int, float)):
         components["correlation"] = -float(correlation_strength) * 0.6
@@ -374,6 +394,7 @@ def scan_market_opportunities(
     cache_ttl: float = DEFAULT_CACHE_TTL,
     settings: Optional["Settings"] = None,
     testnet: Optional[bool] = None,
+    min_top_quote: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """Rank spot symbols by liquidity and momentum to surface opportunities.
 
@@ -412,6 +433,20 @@ def scan_market_opportunities(
             max_spread_bps = 120.0
         else:
             max_spread_bps = max(max_spread_bps, 120.0)
+
+    if min_top_quote is None and settings is not None:
+        try:
+            min_top_quote = float(getattr(settings, "ai_min_top_quote_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            min_top_quote = 0.0
+    elif min_top_quote is None:
+        min_top_quote = 0.0
+    else:
+        try:
+            min_top_quote = float(min_top_quote)
+        except (TypeError, ValueError):
+            min_top_quote = 0.0
+    min_top_quote = max(min_top_quote or 0.0, 0.0)
 
     if cache_ttl is None:
         ttl_value = DEFAULT_CACHE_TTL
@@ -497,6 +532,11 @@ def scan_market_opportunities(
         volume_spike_score = feature_bundle.get("volume_spike_score")
         volume_impulse = feature_bundle.get("volume_impulse")
         depth_imbalance = feature_bundle.get("depth_imbalance")
+        order_flow_ratio = feature_bundle.get("order_flow_ratio")
+        cvd_score = feature_bundle.get("cvd_score")
+        cvd_windows = feature_bundle.get("cvd_windows")
+        top_depth_quote = feature_bundle.get("top_depth_quote")
+        top_depth_imbalance = feature_bundle.get("top_depth_imbalance")
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
 
@@ -505,6 +545,25 @@ def scan_market_opportunities(
             turnover_ok = False
         else:
             turnover_ok = True
+
+        top_bid_quote = None
+        top_ask_quote = None
+        top_total_quote = None
+        if isinstance(top_depth_quote, Mapping):
+            top_bid_quote = _safe_float(top_depth_quote.get("bid"))
+            top_ask_quote = _safe_float(top_depth_quote.get("ask"))
+            total_hint = _safe_float(top_depth_quote.get("total"))
+            if total_hint is None and (
+                top_bid_quote is not None or top_ask_quote is not None
+            ):
+                total_hint = (top_bid_quote or 0.0) + (top_ask_quote or 0.0)
+            top_total_quote = total_hint
+
+        liquidity_ok = True
+        if not force_include and min_top_quote > 0:
+            available_quote = top_total_quote if top_total_quote is not None else 0.0
+            if available_quote < min_top_quote:
+                liquidity_ok = False
 
         if change_pct is None:
             trend = "wait"
@@ -522,7 +581,7 @@ def scan_market_opportunities(
 
         if trend in {"buy", "sell"}:
             change_ok = change_pct is not None and abs(change_pct) >= effective_change
-            actionable = turnover_ok and spread_ok and change_ok
+            actionable = turnover_ok and spread_ok and change_ok and liquidity_ok
 
         if not actionable and not force_include:
             strength = _strength_from_change(change_pct)
@@ -598,6 +657,16 @@ def scan_market_opportunities(
             imbalance_pct = depth_imbalance * 100.0
             side = "покупателей" if imbalance_pct > 0 else "продавцов"
             note_parts.append(f"преимущество {side} {abs(imbalance_pct):.1f}%")
+        if isinstance(order_flow_ratio, (int, float)) and direction != 0:
+            flow_pct = float(order_flow_ratio) * 100.0 * direction
+            if abs(flow_pct) >= 5.0:
+                side = "покупателей" if flow_pct > 0 else "продавцов"
+                note_parts.append(f"поток ордеров за {side} {abs(flow_pct):.1f}%")
+        if isinstance(cvd_score, (int, float)):
+            cvd_pct = float(cvd_score) * 100.0
+            if abs(cvd_pct) >= 5.0:
+                side = "покупателей" if cvd_pct > 0 else "продавцов"
+                note_parts.append(f"CVD на стороне {side} {abs(cvd_pct):.1f}%")
         if correlation_strength is not None and correlation_strength > 0:
             note_parts.append(f"корреляция {correlation_strength * 100:.0f}%")
         if isinstance(volume_impulse, Mapping):
@@ -611,6 +680,14 @@ def scan_market_opportunities(
                     best_value = float(value)
             if best_window is not None and best_value > 0:
                 note_parts.append(f"импульс объёма {best_window} ×{math.exp(best_value):.2f}")
+        if not liquidity_ok and min_top_quote > 0:
+            available_quote = top_total_quote if top_total_quote is not None else 0.0
+            note_parts.append(
+                "тонкий стакан {available:.1f} USDT (< {required:.1f})".format(
+                    available=available_quote,
+                    required=min_top_quote,
+                )
+            )
 
         entry = {
             "symbol": symbol,
@@ -628,12 +705,23 @@ def scan_market_opportunities(
             "volume_spike_score": volume_spike_score,
             "volume_impulse": volume_impulse,
             "depth_imbalance": depth_imbalance,
+            "order_flow_ratio": order_flow_ratio,
+            "cvd_score": cvd_score,
+            "cvd_windows": cvd_windows,
+            "top_depth_quote": {
+                "bid": top_bid_quote,
+                "ask": top_ask_quote,
+                "total": top_total_quote,
+            },
+            "top_depth_imbalance": top_depth_imbalance,
             "blended_change_pct": blended_change,
             "correlations": correlations,
             "correlation_strength": correlation_strength,
             "model_metrics": model_metrics,
             "source": "market_scanner",
             "actionable": actionable,
+            "liquidity_ok": liquidity_ok,
+            "min_top_quote_usd": min_top_quote if min_top_quote > 0 else None,
         }
         if quote_source == "USDC" and upper_source:
             entry["quote_conversion"] = {"from": "USDC", "to": "USDT", "original": upper_source}

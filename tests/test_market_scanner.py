@@ -59,6 +59,14 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "prevVolume24h": "300",
             "bid1Size": "150",
             "ask1Size": "120",
+            "buyTurnover24h": "5200000",
+            "sellTurnover24h": "2800000",
+            "buyVolume24h": "2100",
+            "sellVolume24h": "1400",
+            "buyVolume4h": "950",
+            "sellVolume4h": "520",
+            "buyVolume1h": "240",
+            "sellVolume1h": "160",
             "corr_btc": "0.45",
             "corr_market": "0.35",
         },
@@ -88,6 +96,14 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "prevVolume24h": "900",
             "bid1Size": "90",
             "ask1Size": "95",
+            "buyTurnover24h": "3200000",
+            "sellTurnover24h": "2800000",
+            "buyVolume24h": "1500",
+            "sellVolume24h": "1400",
+            "buyVolume4h": "620",
+            "sellVolume4h": "580",
+            "buyVolume1h": "180",
+            "sellVolume1h": "170",
             "corr_btc": "0.92",
             "corr_market": "0.88",
         },
@@ -117,6 +133,10 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
             "prevVolume24h": "650000",
             "bid1Size": "4000000",
             "ask1Size": "5000000",
+            "buyTurnover24h": "900000",
+            "sellTurnover24h": "1100000",
+            "buyVolume24h": "2400000",
+            "sellVolume24h": "2600000",
             "corr_btc": "0.28",
             "corr_market": "0.31",
         },
@@ -160,6 +180,11 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert top["score"] > 0
     assert "волатильность" in top["note"]
     assert "импульс объёма" in top["note"]
+    assert top["order_flow_ratio"] and top["order_flow_ratio"] > 0
+    assert top["cvd_score"] and top["cvd_score"] > 0
+    assert top["top_depth_quote"]["bid"] and top["top_depth_quote"]["bid"] > 0
+    assert top["top_depth_imbalance"] and top["top_depth_imbalance"] > 0
+    assert "поток ордеров" in top["note"]
 
     ada = next(entry for entry in opportunities if entry["symbol"] == "ADAUSDT")
     assert ada["probability"] is not None
@@ -167,6 +192,45 @@ def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
     assert ada["probability"] < opportunities[1]["probability"]
     assert ada["depth_imbalance"] is not None and ada["depth_imbalance"] < 0
     assert ada["model_metrics"]["correlation"] >= -0.5
+
+
+def test_market_scanner_enforces_top_liquidity_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        {
+            "symbol": "THINUSDT",
+            "turnover24h": "1500000",
+            "price24hPcnt": "2.0",
+            "bestBidPrice": "1.0",
+            "bestAskPrice": "1.01",
+            "volume24h": "120000",
+            "bid1Size": "10",
+            "ask1Size": "5",
+        }
+    ]
+
+    _write_snapshot(tmp_path, rows)
+
+    monkeypatch.setattr(ai_models, "ensure_market_model", lambda **_: None)
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=0.0,
+        min_change_pct=0.5,
+        max_spread_bps=60.0,
+        min_top_quote=80.0,
+    )
+
+    assert opportunities
+    thin = opportunities[0]
+    assert thin["liquidity_ok"] is False
+    assert thin["actionable"] is False
+    assert thin["top_depth_quote"]["total"] < 80.0
+    assert thin["min_top_quote_usd"] == 80.0
+    assert thin["order_flow_ratio"] is None
+    assert "тонкий стакан" in thin["note"]
 
 
 def _write_ledger(path: Path, rows: list[dict[str, object]]) -> None:
