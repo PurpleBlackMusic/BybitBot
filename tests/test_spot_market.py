@@ -1030,6 +1030,47 @@ def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
     assert Decimal(audit_live.get("order_notional")) <= tolerance_cap
 
 
+def test_prepare_spot_market_buy_quote_uses_best_ask_for_qty():
+    limits = {
+        "min_order_amt": "10",
+        "quote_step": "0.01",
+        "min_order_qty": "0",
+        "qty_step": "0.00000001",
+        "quote_coin": "USDT",
+        "base_coin": "BTC",
+        "tick_size": "0.1",
+    }
+    orderbook = {
+        "result": {
+            "a": [["100.03", "5"], ["100.05", "5"]],
+            "b": [["99.5", "5"], ["99.4", "5"]],
+        }
+    }
+    api = DummyAPI({}, orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("10"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=1,
+        price_snapshot=Decimal("100.02"),
+        balances={"USDT": Decimal("25")},
+        limits=limits,
+    )
+
+    audit = prepared.audit
+    assert audit.get("validator_ok") is True
+    assert "validator_reasons" not in audit
+    assert Decimal(audit.get("order_notional")) >= Decimal("10")
+    consumed_levels = audit.get("consumed_levels") or []
+    assert consumed_levels
+    best_level_price = Decimal(consumed_levels[0]["price"])
+    assert best_level_price == Decimal("100.03")
+
+
 def test_place_spot_market_clamps_quote_after_quantization():
     payload = _universe_payload(
         [

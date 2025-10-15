@@ -14,7 +14,7 @@ from .log import log
 from . import validators
 from .envs import Settings
 from .paths import CACHE_DIR
-from .precision import ceil_qty_to_min_notional, format_to_step
+from .precision import ceil_qty_to_min_notional, format_to_step, quantize_to_step
 
 _MIN_QUOTE = Decimal("5")
 _PRICE_CACHE_TTL = 5.0
@@ -2283,8 +2283,19 @@ def prepare_spot_market_order(
 
     price_used = limit_price
     qty_base_raw = qty_base
-    if target_quote is not None and price_used > 0:
-        qty_base_raw = target_quote / price_used
+    best_consumed_price: Optional[Decimal] = consumed_levels[0][0] if consumed_levels else None
+    if target_quote is not None:
+        price_for_quote = price_used
+        if side_normalised == "buy" and best_consumed_price is not None and best_consumed_price > 0:
+            price_for_quote = best_consumed_price
+        if price_for_quote > 0:
+            qty_base_raw = target_quote / price_for_quote
+            if qty_step > 0:
+                quantized_candidate = quantize_to_step(qty_base_raw, qty_step, rounding=ROUND_DOWN)
+                if quantized_candidate > 0:
+                    qty_base_raw = quantized_candidate
+        elif price_used > 0:
+            qty_base_raw = target_quote / price_used
     elif target_base is not None:
         qty_base_raw = target_base
 
