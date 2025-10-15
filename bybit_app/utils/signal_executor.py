@@ -138,14 +138,28 @@ class SignalExecutor:
         self._spot_inventory_snapshot: Optional[
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
+        self._tp_sweeper_last_run: float = 0.0
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
+        sweeper_last_run = 0.0
+        if self._tp_sweeper_last_run > 0.0:
+            now_wall = self._current_time()
+            try:
+                age = time.monotonic() - float(self._tp_sweeper_last_run)
+            except (TypeError, ValueError):
+                age = float("nan")
+            if math.isfinite(age) and age >= 0.0:
+                sweeper_last_run = max(now_wall - age, 0.0)
+            else:
+                sweeper_last_run = max(min(float(self._tp_sweeper_last_run), now_wall), 0.0)
+
         return {
             "validation_penalties": copy.deepcopy(self._validation_penalties),
             "symbol_quarantine": copy.deepcopy(self._symbol_quarantine),
             "price_limit_backoff": copy.deepcopy(self._price_limit_backoff),
+            "tp_sweeper": {"last_run": sweeper_last_run},
         }
 
     def restore_state(self, state: Optional[Mapping[str, Any]]) -> None:
@@ -231,6 +245,28 @@ class SignalExecutor:
                     restored_backoff[symbol] = cleaned
             if restored_backoff:
                 self._price_limit_backoff = restored_backoff
+
+        sweeper_state = (
+            state.get("tp_sweeper")
+            if isinstance(state, Mapping)
+            else None
+        )
+        if isinstance(sweeper_state, Mapping):
+            last_run = sweeper_state.get("last_run")
+            try:
+                last_run_value = float(last_run) if last_run is not None else 0.0
+            except (TypeError, ValueError):
+                last_run_value = 0.0
+            if math.isfinite(last_run_value) and last_run_value > 0.0:
+                now_wall = self._current_time()
+                now_monotonic = time.monotonic()
+                if last_run_value > now_wall:
+                    last_run_value = now_wall
+                if now_wall >= last_run_value:
+                    elapsed = now_wall - last_run_value
+                    self._tp_sweeper_last_run = max(now_monotonic - elapsed, 0.0)
+                else:
+                    self._tp_sweeper_last_run = now_monotonic
 
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
