@@ -2373,6 +2373,9 @@ def prepare_spot_market_order(
     if side_normalised == "sell" and not bids:
         bids = _with_synthetic_depth(bids)
 
+    best_ask_price: Decimal | None = asks[0][0] if asks else None
+    quote_affordable_qty: Decimal | None = None
+
     quote_shortfall_tolerance = Decimal("0")
     if target_quote is not None:
         reference_levels = asks if side_normalised == "buy" else bids
@@ -2656,8 +2659,17 @@ def prepare_spot_market_order(
     else:
         market_unit = "baseCoin"
 
-    if side_normalised == "buy" and target_quote is not None and limit_price > 0:
-        affordable_qty = _round_down(target_quote / limit_price, qty_step)
+    if side_normalised == "buy" and target_quote is not None:
+        reference_price = best_ask_price if best_ask_price and best_ask_price > 0 else limit_price
+        if reference_price <= 0:
+            reference_price = limit_price
+        if reference_price <= 0:
+            raise OrderValidationError(
+                "Не удалось определить справедливую цену для расчёта количества.",
+                code="price_invalid",
+                details={"limit_price": _format_decimal(limit_price)},
+            )
+        affordable_qty = quantize_to_step(target_quote / reference_price, qty_step, rounding=ROUND_DOWN)
         if affordable_qty <= 0:
             raise OrderValidationError(
                 "Расчётное количество меньше шага инструмента.",
@@ -2680,13 +2692,7 @@ def prepare_spot_market_order(
                     "unit": "base",
                 },
             )
-        if affordable_qty < qty_base:
-            if min_amount > 0 and (affordable_qty * limit_price) < min_amount:
-                pass
-            else:
-                qty_base = affordable_qty
-                limit_notional = qty_base * limit_price
-                _recalculate_effective_notional()
+        quote_affordable_qty = affordable_qty
 
     tolerance_compare_margin = _TOLERANCE_MARGIN
     if market_unit == "quoteCoin":
@@ -2815,6 +2821,29 @@ def prepare_spot_market_order(
     if limit_notional > guard_notional:
         guard_notional = limit_notional
     tolerance_adjusted = guard_notional * tolerance_multiplier
+
+    if (
+        side_normalised == "buy"
+        and target_quote is not None
+        and quote_affordable_qty is not None
+        and limit_price > 0
+    ):
+        affordable_qty = quote_affordable_qty
+        if tolerance_adjusted > 0:
+            notional_candidate = affordable_qty * limit_price
+            if notional_candidate - tolerance_adjusted > tolerance_compare_margin:
+                affordable_cap = tolerance_adjusted / limit_price if limit_price > 0 else Decimal("0")
+                affordable_qty = quantize_to_step(affordable_cap, qty_step, rounding=ROUND_DOWN)
+        if affordable_qty < qty_base:
+            if min_amount > 0 and (affordable_qty * limit_price) < min_amount:
+                pass
+            else:
+                qty_base = affordable_qty
+                limit_notional = qty_base * limit_price
+                if planned_quote_reference is not None and limit_notional > 0:
+                    if limit_notional < planned_quote_reference:
+                        planned_quote_reference = limit_notional
+                _recalculate_effective_notional()
 
     quote_ceiling: Decimal | None = None
     quote_ceiling_raw: Decimal | None = None
@@ -2981,6 +3010,9 @@ def prepare_spot_market_order(
         "qty_payload": qty_text,
         "price_payload": price_text,
     }
+
+    if best_ask_price and best_ask_price > 0:
+        audit["quote_reference_price"] = _format_decimal(best_ask_price)
 
     audit["validator_ok"] = validated.ok
     if validated.reasons:

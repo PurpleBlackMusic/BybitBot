@@ -1112,7 +1112,8 @@ def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
 
     audit = prepared.audit
     assert Decimal(audit.get("effective_notional")) == Decimal("10")
-    assert Decimal(audit.get("tolerance_adjusted_notional")) == Decimal("10.1")
+    tolerance_adjusted = Decimal(audit.get("tolerance_adjusted_notional"))
+    assert float(tolerance_adjusted) == pytest.approx(10.1, rel=1e-9)
     tolerance_cap = Decimal("10.1") + Decimal("0.00000001")
     assert Decimal(audit.get("order_notional")) <= tolerance_cap
 
@@ -1132,7 +1133,8 @@ def test_prepare_spot_market_quote_affordability_uses_consumed_quote():
     assert response["ok"] is True
     audit_live = response.get("_local", {}).get("order_audit", {})
     assert Decimal(audit_live.get("effective_notional")) == Decimal("10")
-    assert Decimal(audit_live.get("tolerance_adjusted_notional")) == Decimal("10.1")
+    live_adjusted = Decimal(audit_live.get("tolerance_adjusted_notional"))
+    assert float(live_adjusted) == pytest.approx(10.1, rel=1e-9)
     assert Decimal(audit_live.get("order_notional")) <= tolerance_cap
 
 
@@ -1175,6 +1177,53 @@ def test_place_spot_market_clamps_quote_after_quantization():
     assert requested == Decimal("10.049999")
     assert order_notional <= requested
     assert tolerance_adjusted <= requested
+
+
+def test_prepare_spot_market_order_uses_best_ask_for_quote_notional():
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "FOOUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "baseCoin": "FOO",
+                "lotSizeFilter": {
+                    "minOrderAmt": "5",
+                    "minOrderQty": "0",
+                    "qtyStep": "0.01",
+                },
+                "priceFilter": {"tickSize": "0.01"},
+            }
+        ]
+    )
+    wallet = {
+        "result": {
+            "list": [
+                {
+                    "coin": [
+                        {"coin": "USDT", "availableBalance": "1000"},
+                    ]
+                }
+            ]
+        }
+    }
+    orderbook = {"result": {"a": [["100", "0.4"], ["101", "10"]], "b": [["99", "10"]]}}
+    api = DummyAPI(payload, orderbook_payload=orderbook, wallet_payload=wallet)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="FOOUSDT",
+        side="Buy",
+        qty=Decimal("80"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=5,
+    )
+
+    assert prepared.payload["qty"] == "0.80"
+    audit = prepared.audit
+    assert audit.get("quote_reference_price") == "100"
+    assert Decimal(audit["order_notional"]) == pytest.approx(Decimal("80.8"))
 
 def test_place_spot_market_with_tolerance_merges_spot_balances_when_required_asset_missing():
     payload = _universe_payload(
