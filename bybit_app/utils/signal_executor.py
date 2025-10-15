@@ -24,6 +24,7 @@ from .settings_loader import call_get_settings
 from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
+from .time_sync import check_time_drift_seconds
 from .log import log
 from .bybit_errors import parse_bybit_error_message
 from .spot_market import (
@@ -110,6 +111,18 @@ class _LadderStep:
         return self.profit_bps / Decimal("10000")
 
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
+
+
+@dataclass(frozen=True)
+class _PreflightReport:
+    """Snapshot of system health collected before attempting execution."""
+
+    api: Optional[object]
+    wallet_totals: Tuple[float, float]
+    quote_wallet_cap: Optional[float]
+    wallet_meta: Dict[str, object]
+    instrument_limits: Optional[Mapping[str, object]]
+    context: Dict[str, object]
 
 
 def _format_bybit_error(exc: Exception) -> str:
@@ -1947,20 +1960,28 @@ class SignalExecutor:
             ):
                 summary_price_snapshot = None
 
-        try:
-            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
-                require_success=not active_dry_run(settings)
-            )
-        except Exception as exc:
-            reason_text = f"Не удалось получить баланс: {exc}"
-            if not creds_ok(settings) and not active_dry_run(settings):
-                reason_text = (
-                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
-                )
-            return self._decision(
-                "error",
-                reason=reason_text,
-            )
+        preflight = self._preflight_healthcheck(
+            settings,
+            summary,
+            symbol,
+            symbol_meta=symbol_meta,
+            require_wallet=not active_dry_run(settings),
+        )
+        if isinstance(preflight, ExecutionResult):
+            return preflight
+
+        api = preflight.api
+        wallet_totals = preflight.wallet_totals
+        quote_wallet_cap = preflight.quote_wallet_cap
+        wallet_meta = preflight.wallet_meta
+        instrument_limits = preflight.instrument_limits
+        preflight_context: Dict[str, object] = {}
+        if isinstance(preflight.context, Mapping):
+            root_context = preflight.context.get("preflight", preflight.context)
+            if isinstance(root_context, Mapping):
+                preflight_context = copy.deepcopy(root_context)
+        else:
+            preflight_context = {}
         total_equity, available_equity = wallet_totals
         if not math.isfinite(total_equity):
             total_equity = 0.0
@@ -1977,18 +1998,6 @@ class SignalExecutor:
         self._maybe_flush_dust(api, settings, now=now)
 
         min_notional = 5.0
-        instrument_limits: Optional[Mapping[str, object]] = None
-        if api is not None:
-            try:
-                instrument_limits = _instrument_limits(api, symbol)
-            except Exception as exc:  # pragma: no cover - defensive logging
-                log(
-                    "guardian.auto.instrument_limits.error",
-                    symbol=symbol,
-                    err=str(exc),
-                )
-                instrument_limits = None
-
         if instrument_limits:
             min_candidate = _safe_float(instrument_limits.get("min_order_amt"))
             if min_candidate is not None and min_candidate > 0:
@@ -1996,6 +2005,8 @@ class SignalExecutor:
 
         sizing_factor = self._signal_sizing_factor(summary, settings)
         risk_context: Dict[str, object] = {}
+        if preflight_context:
+            risk_context["preflight"] = preflight_context
 
         vol_scale, vol_meta = self._volatility_scaling_factor(summary, settings)
         if vol_meta is not None:
@@ -5013,6 +5024,193 @@ class SignalExecutor:
             exposures[symbol] = float(notional)
             total += float(notional)
         return exposures, total
+
+    def _api_quota_snapshot(self, api: Optional[object], settings: Settings) -> Dict[str, object]:
+        snapshot: Dict[str, object] = {}
+        if api is None:
+            snapshot["ok"] = False
+            snapshot["reason"] = "api_unavailable"
+            return snapshot
+
+        recv_window = getattr(api, "recv_window", None)
+        try:
+            if recv_window is not None:
+                snapshot["recv_window_ms"] = int(recv_window)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            pass
+
+        offset = getattr(api, "clock_offset_ms", None)
+        latency = getattr(api, "clock_latency_ms", None)
+        if offset is not None:
+            try:
+                snapshot["clock_offset_ms"] = float(offset)
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
+        if latency is not None:
+            try:
+                snapshot["clock_latency_ms"] = float(latency)
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
+
+        limit_seconds = _safe_float(getattr(settings, "server_time_max_drift_sec", None))
+        limit_ms = None
+        if limit_seconds is not None and limit_seconds > 0.0:
+            limit_ms = limit_seconds * 1000.0
+
+        ok = True
+        if (
+            limit_ms is not None
+            and isinstance(offset, (int, float))
+            and math.isfinite(float(offset))
+            and abs(float(offset)) > limit_ms
+        ):
+            snapshot["reason"] = "clock_offset_exceeded"
+            ok = False
+
+        snapshot["ok"] = ok
+        return snapshot
+
+    def _preflight_healthcheck(
+        self,
+        settings: Settings,
+        summary: Mapping[str, object],
+        symbol: str,
+        *,
+        symbol_meta: Mapping[str, object] | None = None,
+        require_wallet: bool,
+    ) -> _PreflightReport | ExecutionResult:
+        context: Dict[str, object] = {"preflight": {}}
+        preflight_context = context["preflight"]
+
+        drift_seconds = check_time_drift_seconds()
+        drift_limit = _safe_float(getattr(settings, "server_time_max_drift_sec", None))
+        if drift_limit is None or drift_limit <= 0:
+            drift_limit = 5.0
+        time_ok = abs(drift_seconds) <= drift_limit
+        preflight_context["time"] = {
+            "drift_seconds": drift_seconds,
+            "limit_seconds": drift_limit,
+            "ok": time_ok,
+        }
+        if not time_ok:
+            return self._decision(
+                "disabled",
+                reason="Серверное время Bybit рассинхронизировано — синхронизируйте часы перед стартом.",
+                context=context,
+            )
+
+        try:
+            ws_status = ws_manager.status()
+        except Exception as exc:  # pragma: no cover - defensive
+            ws_status = {"error": str(exc)}
+
+        ws_snapshot: Dict[str, object]
+        if isinstance(ws_status, Mapping):
+            ws_snapshot = copy.deepcopy(dict(ws_status))
+        else:
+            ws_snapshot = {"raw": ws_status}
+
+        public_info = ws_status.get("public") if isinstance(ws_status, Mapping) else None
+        private_info = ws_status.get("private") if isinstance(ws_status, Mapping) else None
+
+        public_running = bool(public_info.get("running")) if isinstance(public_info, Mapping) else False
+        private_running = bool(private_info.get("running")) if isinstance(private_info, Mapping) else False
+        private_connected = bool(private_info.get("connected")) if isinstance(private_info, Mapping) else False
+
+        subscriptions: Sequence[str] | None = None
+        if isinstance(public_info, Mapping):
+            subs = public_info.get("subscriptions")
+            if isinstance(subs, Sequence) and not isinstance(subs, (str, bytes)):
+                subscriptions = [str(entry) for entry in subs]
+
+        symbol_upper = symbol.strip().upper()
+        subscribed_symbol = False
+        if subscriptions:
+            subscribed_symbol = any(symbol_upper in sub.upper() for sub in subscriptions)
+
+        ws_snapshot.update(
+            {
+                "public_ok": public_running,
+                "private_ok": private_running and private_connected,
+                "subscribed_symbol": subscribed_symbol,
+            }
+        )
+        preflight_context["ws"] = ws_snapshot
+
+        if not public_running:
+            return self._decision(
+                "disabled",
+                reason="Публичный WebSocket не активен — дождитесь подключения перед стартом.",
+                context=context,
+            )
+        if not (private_running and private_connected):
+            return self._decision(
+                "disabled",
+                reason="Приватный WebSocket не активен — восстановите подписку для ордеров.",
+                context=context,
+            )
+
+        try:
+            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
+                require_success=require_wallet
+            )
+        except Exception as exc:
+            preflight_context["balance"] = {"error": str(exc)}
+            reason_text = f"Не удалось получить баланс: {exc}"
+            if not creds_ok(settings) and not active_dry_run(settings):
+                reason_text = (
+                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
+                )
+            return self._decision("error", reason=reason_text, context=context)
+
+        total_equity, available_equity = wallet_totals
+        balance_snapshot: Dict[str, object] = {
+            "total_equity": total_equity,
+            "available_equity": available_equity,
+        }
+        if quote_wallet_cap is not None:
+            balance_snapshot["quote_wallet_cap"] = quote_wallet_cap
+        preflight_context["balance"] = balance_snapshot
+
+        metadata_snapshot: Dict[str, object] = {}
+        if symbol_meta:
+            metadata_snapshot["symbol"] = copy.deepcopy(dict(symbol_meta))
+        if wallet_meta:
+            metadata_snapshot["wallet"] = copy.deepcopy(wallet_meta)
+        if metadata_snapshot:
+            preflight_context["metadata"] = metadata_snapshot
+
+        instrument_limits: Optional[Mapping[str, object]] = None
+        if api is not None:
+            try:
+                instrument_limits = _instrument_limits(api, symbol)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "guardian.auto.instrument_limits.error",
+                    symbol=symbol,
+                    err=str(exc),
+                )
+                preflight_context["limits"] = {"error": str(exc)}
+            else:
+                if isinstance(instrument_limits, Mapping):
+                    preflight_context["limits"] = copy.deepcopy(dict(instrument_limits))
+                else:
+                    preflight_context["limits"] = instrument_limits
+        else:
+            preflight_context["limits"] = None
+
+        quota_snapshot = self._api_quota_snapshot(api, settings)
+        if quota_snapshot:
+            preflight_context["api_quota"] = quota_snapshot
+
+        return _PreflightReport(
+            api=api,
+            wallet_totals=(float(total_equity), float(available_equity)),
+            quote_wallet_cap=quote_wallet_cap,
+            wallet_meta=dict(wallet_meta),
+            instrument_limits=instrument_limits,
+            context=context,
+        )
 
     def _resolve_volatility_percent(
         self, summary: Mapping[str, object]

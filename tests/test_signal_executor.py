@@ -5,6 +5,7 @@ from typing import Dict, Mapping, Optional, Tuple, Union
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -220,6 +221,149 @@ def test_signal_executor_respects_disabled_ai(monkeypatch: pytest.MonkeyPatch) -
     executor = SignalExecutor(bot)
     result = executor.execute_once()
     assert result.status == "disabled"
+
+
+def test_preflight_blocks_on_time_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "probability": 0.9,
+        "ev_bps": 120.0,
+    }
+    settings = Settings(
+        ai_enabled=True,
+        server_time_max_drift_sec=0.5,
+        ws_autostart=False,
+        ai_risk_per_trade_pct=100.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=0.0,
+    )
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    monkeypatch.setattr(signal_executor_module, "check_time_drift_seconds", lambda: 10.0)
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "status",
+        lambda: {
+            "public": {"running": True, "subscriptions": ["tickers.BTCUSDT"]},
+            "private": {"running": True, "connected": True},
+        },
+    )
+
+    def fake_resolve_wallet(self, *, require_success: bool):
+        api = SimpleNamespace(recv_window=15000, clock_offset_ms=0.0, clock_latency_ms=12.0)
+        return api, (1000.0, 1000.0), 1000.0, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+    monkeypatch.setattr(signal_executor_module, "_instrument_limits", lambda api_obj, symbol: {})
+
+    result = executor.execute_once()
+
+    assert result.status == "disabled"
+    assert "время" in (result.reason or "").lower()
+    assert result.context["preflight"]["time"]["drift_seconds"] == 10.0
+
+
+def test_preflight_blocks_when_private_ws_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "probability": 0.9,
+        "ev_bps": 80.0,
+    }
+    settings = Settings(ai_enabled=True, ws_autostart=False)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    monkeypatch.setattr(signal_executor_module, "check_time_drift_seconds", lambda: 0.1)
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "status",
+        lambda: {
+            "public": {"running": True, "subscriptions": ["tickers.BTCUSDT"]},
+            "private": {"running": False, "connected": False},
+        },
+    )
+
+    def fake_resolve_wallet(self, *, require_success: bool):
+        api = SimpleNamespace(recv_window=15000, clock_offset_ms=0.0, clock_latency_ms=8.0)
+        return api, (500.0, 500.0), 500.0, {}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+    monkeypatch.setattr(signal_executor_module, "_instrument_limits", lambda api_obj, symbol: {})
+
+    result = executor.execute_once()
+
+    assert result.status == "disabled"
+    assert "websocket" in (result.reason or "").lower()
+    assert result.context["preflight"]["ws"]["public_ok"] is True
+    assert result.context["preflight"]["ws"]["private_ok"] is False
+
+
+def test_preflight_collects_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "probability": 0.9,
+        "ev_bps": 90.0,
+    }
+    settings = Settings(ai_enabled=True)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    monkeypatch.setattr(signal_executor_module, "check_time_drift_seconds", lambda: 0.05)
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "status",
+        lambda: {
+            "public": {"running": True, "subscriptions": ["tickers.BTCUSDT"]},
+            "private": {"running": True, "connected": True},
+        },
+    )
+
+    api = SimpleNamespace(recv_window=15000, clock_offset_ms=25.0, clock_latency_ms=7.5)
+
+    def fake_resolve_wallet(self, *, require_success: bool):
+        return api, (1200.0, 800.0), 600.0, {"quote_wallet_cap_error": "wallet_balance_unavailable"}
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        fake_resolve_wallet,
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "_instrument_limits",
+        lambda api_obj, symbol: {"min_order_amt": 15.0},
+    )
+
+    report = executor._preflight_healthcheck(
+        settings,
+        summary,
+        "BTCUSDT",
+        symbol_meta={"source": "summary"},
+        require_wallet=True,
+    )
+
+    assert isinstance(report, signal_executor_module._PreflightReport)
+    preflight_context = report.context["preflight"]
+    assert preflight_context["time"]["ok"] is True
+    assert preflight_context["balance"]["total_equity"] == 1200.0
+    assert preflight_context["metadata"]["symbol"]["source"] == "summary"
+    assert preflight_context["limits"]["min_order_amt"] == 15.0
+    assert preflight_context["api_quota"]["recv_window_ms"] == 15000
 
 
 def test_signal_executor_dry_run_preview(monkeypatch: pytest.MonkeyPatch) -> None:
