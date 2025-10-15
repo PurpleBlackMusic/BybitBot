@@ -886,3 +886,93 @@ def test_stateful_market_scanner_enriches_candidates(tmp_path: Path) -> None:
     assert cached == results
     assert len(scan_calls) == 1
     assert len(api.kline_calls) == 8
+
+
+def test_normalise_candles_filters_outliers() -> None:
+    base = 1_700_000_000_000
+    rows: list[list[object]] = []
+    for index in range(30):
+        start = base + index * 60_000
+        price = 100.0 + index * 0.05
+        volume = 1_000.0 + index * 10.0
+        rows.append(
+            [
+                start,
+                f"{price - 0.1}",
+                f"{price + 0.2}",
+                f"{price - 0.2}",
+                f"{price}",
+                f"{volume}",
+                f"{volume * price}",
+            ]
+        )
+
+    spike_start = base + 15 * 60_000
+    rows.insert(
+        15,
+        [
+            spike_start,
+            "50.0",
+            "950.0",
+            "45.0",
+            "900.0",
+            "5000000",
+            "4500000000",
+        ],
+    )
+
+    payload = {"result": {"list": rows}}
+    cleaned = market_scanner_module._normalise_candles(payload)
+
+    assert len(cleaned) == len(rows) - 1
+    closes = [entry["close"] for entry in cleaned]
+    assert max(closes) < 500.0
+    assert cleaned[0]["start"] == base
+
+
+def test_market_scanner_skips_maintenance_and_delisted(tmp_path: Path) -> None:
+    now = time.time()
+    maintenance_row = {
+        "symbol": "MAINTUSDT",
+        "turnover24h": "8000000",
+        "price24hPcnt": "1.2",
+        "bestBidPrice": "10.0",
+        "bestAskPrice": "10.01",
+        "volume24h": "1000000",
+        "maintenanceStartTime": int((now - 60) * 1000),
+        "maintenanceEndTime": int((now + 600) * 1000),
+        "status": "Trading",
+    }
+    delisted_row = {
+        "symbol": "DELSTUSDT",
+        "turnover24h": "5000000",
+        "price24hPcnt": "1.0",
+        "bestBidPrice": "2.0",
+        "bestAskPrice": "2.01",
+        "volume24h": "900000",
+        "status": "Delisted",
+    }
+    healthy_row = {
+        "symbol": "GOODUSDT",
+        "turnover24h": "6000000",
+        "price24hPcnt": "1.5",
+        "bestBidPrice": "3.0",
+        "bestAskPrice": "3.01",
+        "volume24h": "1200000",
+    }
+
+    snapshot = {"ts": now, "rows": [maintenance_row, delisted_row, healthy_row]}
+    path = tmp_path / "ai" / "market_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=1_000_000.0,
+        min_change_pct=0.5,
+        max_spread_bps=100.0,
+    )
+
+    assert [entry["symbol"] for entry in opportunities] == ["GOODUSDT"]

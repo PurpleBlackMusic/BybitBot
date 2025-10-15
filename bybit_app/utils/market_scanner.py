@@ -4,7 +4,9 @@ import copy
 import json
 import math
 import random
+import statistics
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import (
@@ -45,6 +47,37 @@ DEFAULT_CACHE_TTL = 300.0
 _TRADE_COST_SAMPLE = 600
 _DEFAULT_MAKER_RATIO = 0.25
 _DEFAULT_TAKER_FEE_BPS = 5.0
+_MAINTENANCE_GRACE_SECONDS = 180.0
+_MIN_CANDLE_SAMPLES = 12
+_PRICE_Z_THRESHOLD = 3.5
+_PRICE_IQR_MULTIPLIER = 3.0
+_VOLUME_Z_THRESHOLD = 4.0
+_VOLUME_IQR_MULTIPLIER = 3.5
+
+_MAINTENANCE_KEYWORDS: Tuple[str, ...] = (
+    "maint",
+    "suspend",
+    "halt",
+    "upgrade",
+    "pause",
+    "offline",
+)
+
+_DELIST_KEYWORDS: Tuple[str, ...] = (
+    "delist",
+    "terminated",
+    "expired",
+    "cease",
+    "settled",
+    "closed",
+)
+
+
+@dataclass(frozen=True)
+class _SymbolHealth:
+    maintenance: bool
+    delisted: bool
+    reason: Optional[str] = None
 
 
 def _ledger_path_for_costs(data_dir: Path, testnet: Optional[bool]) -> Path:
@@ -628,6 +661,10 @@ def scan_market_opportunities(
         else:
             rows = []
 
+    snapshot_ts = _safe_float(snapshot.get("ts"))
+    if snapshot_ts is None:
+        snapshot_ts = now
+
     def _normalise_symbol_set(symbols: Iterable[object]) -> Set[str]:
         normalised: Set[str] = set()
         for item in symbols:
@@ -659,6 +696,10 @@ def scan_market_opportunities(
             continue
         upper_source = str(raw_symbol).strip().upper() if isinstance(raw_symbol, str) else None
         if bset and symbol in bset:
+            continue
+
+        health = _assess_symbol_health(raw, now=snapshot_ts)
+        if health.delisted or health.maintenance:
             continue
 
         turnover = _safe_float(raw.get("turnover24h"))
@@ -865,6 +906,268 @@ def _safe_int(value: object) -> Optional[int]:
         return None
 
 
+def _coerce_bool(value: object) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return None
+        if lowered in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+    return None
+
+
+def _parse_timestamp(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    candidate: Optional[float]
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            candidate = float(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    abs_value = abs(candidate)
+    if abs_value >= 1e18:
+        candidate /= 1_000_000_000.0
+    elif abs_value >= 1e15:
+        candidate /= 1_000_000.0
+    elif abs_value >= 1e12:
+        candidate /= 1_000.0
+    return candidate
+
+
+def _quartiles(sorted_values: Sequence[float]) -> Tuple[float, float]:
+    count = len(sorted_values)
+    if count == 0:
+        return 0.0, 0.0
+    midpoint = count // 2
+    if count % 2 == 0:
+        lower_half = sorted_values[:midpoint]
+        upper_half = sorted_values[midpoint:]
+    else:
+        lower_half = sorted_values[:midpoint]
+        upper_half = sorted_values[midpoint + 1 :]
+    if not lower_half:
+        lower_half = sorted_values[:1]
+    if not upper_half:
+        upper_half = sorted_values[-1:]
+    q1 = statistics.median(lower_half)
+    q3 = statistics.median(upper_half)
+    return float(q1), float(q3)
+
+
+def _detect_outlier_indices(
+    values: Sequence[float],
+    *,
+    z_threshold: float,
+    iqr_multiplier: float,
+) -> Set[int]:
+    size = len(values)
+    if size < 4:
+        return set()
+
+    flagged: Set[int] = set()
+
+    mean_value = statistics.mean(values)
+    stdev = statistics.pstdev(values)
+    if stdev > 1e-9:
+        for idx, value in enumerate(values):
+            z_score = abs((value - mean_value) / stdev)
+            if z_score >= z_threshold:
+                flagged.add(idx)
+
+    sorted_values = sorted(values)
+    q1, q3 = _quartiles(sorted_values)
+    iqr = q3 - q1
+    if iqr > 1e-9:
+        lower = q1 - iqr_multiplier * iqr
+        upper = q3 + iqr_multiplier * iqr
+        for idx, value in enumerate(values):
+            if value < lower or value > upper:
+                flagged.add(idx)
+
+    if flagged:
+        return flagged
+
+    median_value = statistics.median(values)
+    deviations = [abs(value - median_value) for value in values]
+    mad = statistics.median(deviations)
+    if mad <= 1e-9:
+        return set()
+    for idx, deviation in enumerate(deviations):
+        modified_z = 0.6745 * deviation / mad
+        if modified_z >= z_threshold:
+            flagged.add(idx)
+    return flagged
+
+
+def _coalesce_price(entry: Mapping[str, object]) -> Optional[float]:
+    for key in ("close", "open", "high", "low"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _filter_outlier_candles(candles: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    total = len(candles)
+    if total < _MIN_CANDLE_SAMPLES:
+        return list(candles)
+
+    price_samples: List[Tuple[int, float]] = []
+    volume_samples: List[Tuple[int, float]] = []
+    for idx, entry in enumerate(candles):
+        price = _coalesce_price(entry)
+        if price is not None and math.isfinite(price):
+            price_samples.append((idx, float(price)))
+        volume = entry.get("volume")
+        if isinstance(volume, (int, float)) and math.isfinite(volume):
+            volume_samples.append((idx, float(volume)))
+
+    flagged_indices: Set[int] = set()
+
+    if len(price_samples) >= _MIN_CANDLE_SAMPLES:
+        price_values = [value for _, value in price_samples]
+        price_outliers = _detect_outlier_indices(
+            price_values,
+            z_threshold=_PRICE_Z_THRESHOLD,
+            iqr_multiplier=_PRICE_IQR_MULTIPLIER,
+        )
+        if price_outliers:
+            flagged_indices.update(price_samples[idx][0] for idx in price_outliers)
+
+    if len(volume_samples) >= _MIN_CANDLE_SAMPLES:
+        volume_values = [value for _, value in volume_samples]
+        volume_outliers = _detect_outlier_indices(
+            volume_values,
+            z_threshold=_VOLUME_Z_THRESHOLD,
+            iqr_multiplier=_VOLUME_IQR_MULTIPLIER,
+        )
+        if volume_outliers:
+            flagged_indices.update(volume_samples[idx][0] for idx in volume_outliers)
+
+    if not flagged_indices:
+        return list(candles)
+
+    remaining = total - len(flagged_indices)
+    if remaining < max(_MIN_CANDLE_SAMPLES // 2, 4):
+        return list(candles)
+
+    cleaned = [entry for idx, entry in enumerate(candles) if idx not in flagged_indices]
+    return cleaned
+
+
+def _assess_symbol_health(
+    row: Mapping[str, object],
+    *,
+    now: Optional[float] = None,
+) -> _SymbolHealth:
+    text_fragments: List[str] = []
+    for key in (
+        "status",
+        "symbolStatus",
+        "state",
+        "listStatus",
+        "suspendDesc",
+        "note",
+        "message",
+    ):
+        value = row.get(key)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                text_fragments.append(cleaned)
+
+    text_blob = " ".join(text_fragments).lower()
+    maintenance = False
+    delisted = False
+    reason: Optional[str] = None
+
+    for keyword in _DELIST_KEYWORDS:
+        if keyword in text_blob:
+            delisted = True
+            reason = f"status:{keyword}"
+            break
+
+    if not delisted:
+        for keyword in _MAINTENANCE_KEYWORDS:
+            if keyword in text_blob:
+                maintenance = True
+                reason = f"status:{keyword}"
+                break
+
+    if not delisted:
+        for key in ("isTrading", "trading", "tradeAvailable", "tradeSwitch", "is_trading"):
+            value = row.get(key)
+            if value is None:
+                continue
+            flag = _coerce_bool(value)
+            if flag is None:
+                continue
+            if not flag:
+                maintenance = True
+                if reason is None:
+                    reason = f"{key}:off"
+                break
+
+    reference_now = float(now) if now is not None else time.time()
+
+    start = None
+    end = None
+    for key in (
+        "maintenanceStartTime",
+        "maintenanceStart",
+        "maintainStartTime",
+        "maintainStartTs",
+        "maintenance_window_start",
+    ):
+        start = _parse_timestamp(row.get(key))
+        if start is not None:
+            break
+    for key in (
+        "maintenanceEndTime",
+        "maintenanceEnd",
+        "maintainEndTime",
+        "maintainEndTs",
+        "maintenance_window_end",
+    ):
+        end = _parse_timestamp(row.get(key))
+        if end is not None:
+            break
+    if start is not None and end is not None:
+        if start > end:
+            start, end = end, start
+        if reference_now >= start - _MAINTENANCE_GRACE_SECONDS and reference_now <= end + _MAINTENANCE_GRACE_SECONDS:
+            maintenance = True
+            if reason is None:
+                reason = "maintenance_window"
+
+    if not delisted:
+        for key in ("delistingTime", "delistTime", "expiryTime", "settleTime", "closeTime"):
+            marker = _parse_timestamp(row.get(key))
+            if marker is None:
+                continue
+            if marker <= reference_now:
+                delisted = True
+                reason = key
+                break
+
+    return _SymbolHealth(maintenance=maintenance, delisted=delisted, reason=reason)
+
+
 def _extract_kline_rows(payload: object) -> Sequence[object]:
     if isinstance(payload, Mapping):
         result = payload.get("result")
@@ -932,7 +1235,8 @@ def _normalise_candles(payload: object) -> List[Dict[str, object]]:
         candles.append(record)
 
     candles.sort(key=lambda row: row.get("start") or 0)
-    return candles
+    cleaned = _filter_outlier_candles(candles)
+    return cleaned
 
 
 class _CandleCache:
