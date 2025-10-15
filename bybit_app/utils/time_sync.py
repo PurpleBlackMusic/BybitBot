@@ -7,6 +7,7 @@ import threading
 import time
 
 import requests
+from datetime import datetime, timezone
 
 from .envs import get_api_client
 from .log import log
@@ -65,6 +66,15 @@ def extract_server_epoch(payload: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def extract_server_datetime(payload: Dict[str, Any]) -> Optional[datetime]:
+    """Return server time as an aware ``datetime`` in UTC."""
+
+    epoch = extract_server_epoch(payload)
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
 def check_time_drift_seconds() -> float:
     """Return ``local_time - server_time`` in seconds.
 
@@ -84,8 +94,9 @@ def check_time_drift_seconds() -> float:
         log("time.drift.error", err="invalid payload", payload=payload)
         return 0.0
 
-    local_epoch = time.time()
-    return local_epoch - server_epoch
+    local_dt = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+    server_dt = datetime.fromtimestamp(server_epoch, tz=timezone.utc)
+    return (local_dt - server_dt).total_seconds()
 
 
 class _SyncedClock:
@@ -214,6 +225,7 @@ _extract_server_epoch = extract_server_epoch
 
 __all__ = [
     "extract_server_epoch",
+    "extract_server_datetime",
     "check_time_drift_seconds",
     "synced_timestamp_ms",
     "invalidate_synced_clock",

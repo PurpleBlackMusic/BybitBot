@@ -335,6 +335,8 @@ def test_bybit_realtime_status_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["wallet_assets"][1]["coin"] == "BTC"
     assert result["wallet_assets"][0]["total"] == pytest.approx(110.1)
     assert result["server_time_epoch"] == pytest.approx(now - 2)
+    assert result["server_time_utc"].tzinfo is not None
+    assert result["server_time_utc"].timestamp() == pytest.approx(now - 2)
     assert result["server_time_diff_sec"] == pytest.approx(2.0)
     assert result["server_time_diff_human"] == "2 сек"
     assert not result["server_time_error"]

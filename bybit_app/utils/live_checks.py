@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from .bybit_api import BybitAPI, creds_from_settings, get_api
 from .envs import Settings, active_api_key, active_api_secret, active_dry_run
 from .spot_market import wallet_balance_payload
-from .time_sync import extract_server_epoch
+from .time_sync import extract_server_datetime, extract_server_epoch
 
 
 def _safe_float(value: object) -> Optional[float]:
@@ -746,14 +746,17 @@ def bybit_realtime_status(
 
     server_time_payload: Optional[Dict[str, object]] = None
     server_time_epoch: Optional[float] = None
+    server_time_utc: Optional[datetime] = None
     server_time_diff: Optional[float] = None
     server_time_error: Optional[str] = None
 
     try:
         server_time_payload = client.server_time()
-        server_time_epoch = _extract_server_epoch(server_time_payload)
-        if server_time_epoch is not None:
-            server_time_diff = abs(time.time() - server_time_epoch)
+        server_time_utc = extract_server_datetime(server_time_payload)
+        if server_time_utc is not None:
+            server_time_epoch = server_time_utc.timestamp()
+            local_utc = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+            server_time_diff = abs((local_utc - server_time_utc).total_seconds())
     except Exception as exc:  # pragma: no cover - network errors only in production
         server_time_error = str(exc)
 
@@ -1121,6 +1124,7 @@ def bybit_realtime_status(
         "ws_public_age_human": ws_public_age_human,
         "ws_private_age_human": ws_private_age_human,
         "server_time_epoch": server_time_epoch,
+        "server_time_utc": server_time_utc,
         "server_time_diff_sec": server_time_diff,
         "server_time_diff_human": server_time_diff_human,
         "server_time_error": server_time_error,

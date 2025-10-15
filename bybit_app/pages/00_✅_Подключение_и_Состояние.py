@@ -3,6 +3,7 @@ from __future__ import annotations
 import streamlit as st
 from utils.envs import get_api_client, get_settings, update_settings, creds_ok
 from utils.log import log
+from utils.time_sync import extract_server_datetime
 
 st.title("✅ Подключение и состояние")
 
@@ -139,7 +140,12 @@ if creds_ok():
     api = get_api_client()
     try:
         t = api.server_time()
-        st.success(f"Связь с API есть. Серверное время: {t.get('result',{}).get('timeSecond', '—')}")
+        server_dt = extract_server_datetime(t)
+        if server_dt is not None:
+            server_time_text = server_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            server_time_text = t.get("result", {}).get("timeSecond", "—")
+        st.success(f"Связь с API есть. Серверное время: {server_time_text}")
     except Exception as e:
         st.error(f"Ошибка запроса: {e}")
 
