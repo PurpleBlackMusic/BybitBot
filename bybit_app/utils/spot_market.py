@@ -23,6 +23,7 @@ _BALANCE_CACHE_TTL = 5.0
 _INSTRUMENT_CACHE_TTL = 600.0
 _INSTRUMENT_DYNAMIC_TTL = 30.0
 _INSTRUMENT_PERSIST_TTL = 6 * 3600.0
+_INSTRUMENT_HARD_REFRESH_INTERVAL = 24 * 3600.0
 _SYMBOL_CACHE_TTL = 300.0
 _ORDERBOOK_LIMIT = 200
 _DEFAULT_MARK_DEVIATION = Decimal("0.01")
@@ -54,6 +55,8 @@ _PRICE_LIMIT_KEY_ALIASES = {
     "price_cap": {"pricecap", "maxprice", "upperlimit", "upperprice", "pricelimitupper"},
     "price_floor": {"pricefloor", "minprice", "lowerlimit", "lowerprice", "pricelimitlower"},
 }
+
+_PRECISION_ERROR_CODE_PATTERN = re.compile(r"(?<!\d)(170\d{3})(?!\d)")
 
 
 _DECIMAL_LIMIT_FIELDS = {
@@ -260,6 +263,36 @@ def _instrument_cache_key(api: BybitAPI, symbol: str) -> str:
 
     network = _network_label(api)
     return f"{network}:{(symbol or '').upper()}"
+
+
+def _extract_limits_timestamp(limits: Mapping[str, object]) -> Optional[float]:
+    raw = limits.get("_dynamic_ts") if isinstance(limits, Mapping) else None
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _limits_snapshot_stale(limits: Mapping[str, object], *, now: Optional[float] = None) -> bool:
+    if not isinstance(limits, Mapping):
+        return True
+    ts = _extract_limits_timestamp(limits)
+    if ts is None:
+        return False
+    reference = now if now is not None else time.time()
+    return (
+        _INSTRUMENT_HARD_REFRESH_INTERVAL > 0
+        and reference - ts >= _INSTRUMENT_HARD_REFRESH_INTERVAL
+    )
+
+
+def _is_precision_error_code(code: Optional[str]) -> bool:
+    if not code:
+        return False
+    cleaned = str(code).strip()
+    if not cleaned or not cleaned.replace("-", "", 1).isdigit():
+        return False
+    return cleaned.lstrip("-").startswith("170")
 
 
 class OrderValidationError(RuntimeError):
@@ -3013,6 +3046,63 @@ def place_spot_market_with_tolerance(
     settings: Settings | None = None,
 ):
     """Создать маркет-ордер со строгой валидацией объёма и балансов."""
+    key = symbol.upper()
+    instrument_cache_key = _instrument_cache_key(api, key)
+    now = time.time()
+
+    limits_snapshot: Mapping[str, object] | None = limits if isinstance(limits, Mapping) else None
+    refresh_reason: Optional[str] = None
+    if limits_snapshot is not None and _limits_snapshot_stale(limits_snapshot, now=now):
+        refresh_reason = "stale_snapshot"
+        limits_snapshot = None
+
+    def _ensure_limits(
+        *,
+        force: bool = False,
+        reason: Optional[str] = None,
+        code: Optional[str] = None,
+    ) -> Mapping[str, object]:
+        nonlocal limits_snapshot
+
+        if force:
+            _INSTRUMENT_CACHE.invalidate(instrument_cache_key)
+            limits_snapshot = None
+
+        if limits_snapshot is not None:
+            return limits_snapshot
+
+        try:
+            refreshed = _instrument_limits(api, key)
+        except Exception as refresh_exc:
+            if reason:
+                log(
+                    "spot.market.instrument_limits_refresh_failed",
+                    symbol=symbol,
+                    reason=reason,
+                    code=code,
+                    error=str(refresh_exc),
+                )
+            raise
+
+        limits_snapshot = refreshed
+
+        if reason:
+            ts = _extract_limits_timestamp(refreshed)
+            age = None
+            if ts is not None:
+                age = max(0.0, time.time() - ts)
+            payload = {"symbol": symbol, "reason": reason, "status": "ok"}
+            if code:
+                payload["code"] = code
+            if age is not None:
+                payload["age_sec"] = age
+            log("spot.market.instrument_limits_refresh", **payload)
+
+        return refreshed
+
+    if refresh_reason:
+        limits_snapshot = _ensure_limits(force=True, reason=refresh_reason)
+
     unit_normalised = (unit or "quoteCoin").strip().lower()
     original_qty = _to_decimal(qty)
     if original_qty <= 0:
@@ -3129,9 +3219,13 @@ def place_spot_market_with_tolerance(
                 max_quote=remaining_cap,
                 price_snapshot=price_snapshot if attempt == 0 else None,
                 balances=balances,
-                limits=limits,
+                limits=limits_snapshot,
                 settings=settings,
             )
+            if limits_snapshot is None:
+                cached_limits = _INSTRUMENT_CACHE.get(instrument_cache_key)
+                if isinstance(cached_limits, dict):
+                    limits_snapshot = cached_limits
         except OrderValidationError as exc:
             if twap_cfg.enabled and exc.code == "price_deviation":
                 adjustment: Dict[str, object] = {
@@ -3243,12 +3337,27 @@ def place_spot_market_with_tolerance(
             error_text = str(exc)
             error_code = _extract_bybit_error_code_from_message(error_text)
             if error_code is None:
+                match = _PRECISION_ERROR_CODE_PATTERN.search(error_text)
+                if match:
+                    error_code = match.group(1)
+            if error_code is None:
                 if "170193" in error_text:
                     error_code = "170193"
                 elif "170194" in error_text:
                     error_code = "170194"
 
+            refreshed_for_precision = False
+            if _is_precision_error_code(error_code):
+                try:
+                    limits_snapshot = _ensure_limits(force=True, reason="precision_error", code=error_code)
+                except Exception:
+                    pass
+                else:
+                    refreshed_for_precision = True
+
             if error_code not in {"170193", "170194"}:
+                if refreshed_for_precision:
+                    continue
                 raise
 
             details = parse_price_limit_error_details(error_text)

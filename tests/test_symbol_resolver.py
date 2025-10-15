@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
+import bybit_app.utils.symbol_resolver as symbol_resolver_module
 from bybit_app.utils.symbol_resolver import InstrumentMetadata, SymbolResolver
 
 
@@ -139,4 +142,39 @@ def test_symbol_resolver_prefers_canonical_listing_over_alias() -> None:
     btc = resolver.resolve_symbol("btc")
     assert btc is not None
     assert btc.symbol == "BTCUSDT"
+
+
+def test_symbol_resolver_auto_refreshes_after_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = _sample_rows()
+    api = DummyAPI(rows)
+    resolver = SymbolResolver(api=api, refresh=True, auto_refresh_interval=10.0)
+
+    initial_refresh = resolver.last_refresh
+    assert api.calls == 1
+
+    current_time = [initial_refresh + 5.0]
+
+    monkeypatch.setattr(symbol_resolver_module.time, "time", lambda: current_time[0])
+
+    # Calls before the interval elapses should not trigger an additional refresh.
+    resolver.metadata("BBSOLUSDT")
+    assert api.calls == 1
+
+    rows.append(
+        {
+            "symbol": "APTUSDT",
+            "baseCoin": "APT",
+            "quoteCoin": "USDT",
+            "status": "Trading",
+            "lotSizeFilter": {"minOrderQty": "1", "basePrecision": "1", "minOrderAmt": "1"},
+            "priceFilter": {"tickSize": "0.01"},
+        }
+    )
+
+    current_time[0] = initial_refresh + 15.0
+
+    meta = resolver.resolve_symbol("APTUSDT")
+    assert api.calls == 2
+    assert meta is not None
+    assert meta.symbol == "APTUSDT"
 
