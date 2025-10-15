@@ -132,6 +132,39 @@ class WSManager:
         self._pub_fallback_timestamp = time.time()
         log("ws.public.testnet.network_error", reason=reason)
 
+    def force_public_fallback(
+        self,
+        reason: str,
+        *,
+        min_interval: float = 10.0,
+        **context: object,
+    ) -> bool:
+        """Request switching the public channel to the mainnet fallback."""
+
+        if not getattr(self.s, "testnet", False):
+            return False
+
+        now = time.time()
+        if (
+            isinstance(min_interval, (int, float))
+            and min_interval > 0
+            and self._pub_fallback_timestamp is not None
+            and now - self._pub_fallback_timestamp < float(min_interval)
+        ):
+            return False
+
+        previous_override = self._pub_url_override
+        self._pub_url_override = "wss://stream.bybit.com/v5/public/spot"
+        self._pub_fallback_timestamp = now
+
+        payload = {"reason": reason}
+        payload.update(context)
+        if previous_override == self._pub_url_override:
+            log("ws.public.fallback.renewed", **payload)
+        else:
+            log("ws.public.fallback.forced", **payload)
+        return True
+
     @staticmethod
     def _is_network_error(error: object) -> bool:
         if isinstance(error, OSError):
