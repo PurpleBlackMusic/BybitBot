@@ -714,3 +714,80 @@ def test_bybit_realtime_status_warns_when_execution_stale(monkeypatch: pytest.Mo
     assert result["ok"] is False
     assert "последняя сделка была слишком давно" in result["message"].lower()
     assert result["execution_age_sec"] and result["execution_age_sec"] > 1000
+
+
+def test_bybit_realtime_status_paginates_orders_and_executions(monkeypatch: pytest.MonkeyPatch) -> None:
+    live_checks._ORDER_PAGINATION_STATE.update({"since_id": None, "since_ts": None})  # type: ignore[attr-defined]
+    live_checks._EXECUTION_PAGINATION_STATE.update({"since_id": None, "since_ts": None})  # type: ignore[attr-defined]
+
+    now = 1_111_111.0
+    monkeypatch.setattr(live_checks.time, "time", lambda: now)
+    monkeypatch.setattr(live_checks.time, "perf_counter", lambda: 50.0)
+
+    wallet_payload = {"result": {"list": [{"totalEquity": "12", "availableBalance": "10"}]}}
+
+    orders_pages = [
+        {
+            "result": {
+                "list": [
+                    {"orderId": "ORD-NEW", "updatedTime": str((now - 5) * 1000)},
+                ],
+                "nextPageCursor": "cursor-1",
+            }
+        },
+        {
+            "result": {
+                "list": [
+                    {"orderId": "ORD-OLD", "orderStatus": "Filled", "updatedTime": str((now - 60) * 1000)}
+                ],
+            }
+        },
+    ]
+
+    execution_pages = [
+        {
+            "result": {
+                "list": [
+                    {"execId": "EXEC-NEW", "execTime": str((now - 3) * 1000)},
+                ],
+                "nextPageCursor": "cursor-1",
+            }
+        },
+        {
+            "result": {
+                "list": [
+                    {"execId": "EXEC-OLD", "execTime": str((now - 120) * 1000)},
+                ],
+            }
+        },
+    ]
+
+    class PaginatedAPI(DummyAPI):
+        def __init__(self):
+            super().__init__(wallet_payload, orders_pages[0], execution_pages[0])
+
+        def open_orders(self, **params):  # type: ignore[override]
+            self.open_calls.append(params)
+            cursor = params.get("cursor")
+            if cursor == "cursor-1":
+                return orders_pages[1]
+            return orders_pages[0]
+
+        def execution_list(self, **params):  # type: ignore[override]
+            self.execution_calls.append(params)
+            cursor = params.get("cursor")
+            if cursor == "cursor-1":
+                return execution_pages[1]
+            return execution_pages[0]
+
+    api = PaginatedAPI()
+    settings = Settings(api_key="key", api_secret="secret", dry_run=False)
+
+    result = bybit_realtime_status(settings, api=api, ws_status={})
+
+    assert result["order_count"] == 2
+    assert result["execution_count"] == 2
+    assert len(api.open_calls) == 2
+    assert len(api.execution_calls) == 2
+    assert live_checks._ORDER_PAGINATION_STATE["since_id"] == "ORD-NEW"  # type: ignore[index]
+    assert live_checks._EXECUTION_PAGINATION_STATE["since_id"] == "EXEC-NEW"  # type: ignore[index]
