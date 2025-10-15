@@ -1933,6 +1933,99 @@ class SignalExecutor:
                 min_notional = max(min_notional, min_candidate)
 
         sizing_factor = self._signal_sizing_factor(summary, settings)
+        risk_context: Dict[str, object] = {}
+
+        vol_scale, vol_meta = self._volatility_scaling_factor(summary, settings)
+        if vol_meta is not None:
+            risk_context["volatility"] = vol_meta
+        sizing_factor = max(0.0, min(sizing_factor * vol_scale, 1.0))
+
+        portfolio_exposure: Dict[str, float] = {}
+        total_portfolio_exposure = 0.0
+        symbol_cap_available: Optional[float] = None
+        portfolio_cap_available: Optional[float] = None
+        cap_limit_value: Optional[float] = None
+        cap_limit_source: Optional[str] = None
+        symbol_exposure = 0.0
+
+        if side == "Buy":
+            exposures, exposure_total = self._portfolio_quote_exposure(
+                settings,
+                summary,
+                current_time=now,
+                summary_meta=summary_meta,
+                price_meta=price_meta,
+            )
+            portfolio_exposure = exposures
+            total_portfolio_exposure = exposure_total
+            symbol_key = symbol.strip().upper()
+            symbol_exposure = portfolio_exposure.get(symbol_key, 0.0)
+
+            portfolio_snapshot: Dict[str, object] = {
+                "total_exposure": total_portfolio_exposure,
+                "symbol_exposure": symbol_exposure,
+            }
+            if portfolio_exposure:
+                top_symbols = sorted(
+                    portfolio_exposure.items(), key=lambda item: item[1], reverse=True
+                )[:5]
+                portfolio_snapshot["top_symbols"] = [
+                    {"symbol": sym, "exposure": value} for sym, value in top_symbols
+                ]
+            if portfolio_snapshot["total_exposure"] or portfolio_snapshot["symbol_exposure"]:
+                risk_context["portfolio"] = portfolio_snapshot
+
+            symbol_cap_pct = _safe_float(
+                getattr(settings, "spot_max_cap_per_symbol_pct", None)
+            )
+            if (
+                symbol_cap_pct is not None
+                and symbol_cap_pct > 0
+                and total_equity > 0
+            ):
+                symbol_cap_limit = (total_equity * symbol_cap_pct) / 100.0
+                symbol_cap_available = max(symbol_cap_limit - symbol_exposure, 0.0)
+                risk_context["symbol_cap"] = {
+                    "pct": symbol_cap_pct,
+                    "limit": symbol_cap_limit,
+                    "used": symbol_exposure,
+                    "available": symbol_cap_available,
+                }
+
+            portfolio_cap_pct = _safe_float(
+                getattr(settings, "spot_max_portfolio_pct", None)
+            )
+            if (
+                portfolio_cap_pct is not None
+                and portfolio_cap_pct > 0
+                and total_equity > 0
+            ):
+                portfolio_cap_limit = (total_equity * portfolio_cap_pct) / 100.0
+                portfolio_cap_available = max(
+                    portfolio_cap_limit - total_portfolio_exposure, 0.0
+                )
+                risk_context["portfolio_cap"] = {
+                    "pct": portfolio_cap_pct,
+                    "limit": portfolio_cap_limit,
+                    "used": total_portfolio_exposure,
+                    "available": portfolio_cap_available,
+                }
+
+            cap_candidates: List[Tuple[float, str]] = []
+            if symbol_cap_available is not None:
+                cap_candidates.append((symbol_cap_available, "symbol_cap"))
+            if portfolio_cap_available is not None:
+                cap_candidates.append((portfolio_cap_available, "portfolio_cap"))
+
+            if cap_candidates:
+                cap_candidates.sort(key=lambda item: item[0])
+                cap_limit_value, cap_limit_source = cap_candidates[0]
+                risk_context["cap_adjustment"] = {
+                    "limit": cap_limit_value,
+                    "source": cap_limit_source,
+                    "applied": False,
+                }
+
         quote_balance_cap = quote_wallet_cap_value if side == "Buy" else None
         quote_wallet_limited_available: Optional[float] = None
         if quote_balance_cap is not None:
@@ -1952,6 +2045,27 @@ class SignalExecutor:
             min_notional=min_notional,
             quote_balance_cap=quote_balance_cap,
         )
+
+        if side == "Buy" and cap_limit_value is not None:
+            cap_applied = False
+            if cap_limit_value <= 0:
+                notional = 0.0
+                cap_applied = True
+            elif notional > cap_limit_value:
+                notional = cap_limit_value
+                cap_applied = True
+            min_notional = min(min_notional, cap_limit_value)
+            cap_entry = risk_context.get("cap_adjustment")
+            if cap_entry is not None:
+                cap_entry["applied"] = cap_applied
+                cap_entry["final_notional"] = notional
+            elif cap_applied:
+                risk_context["cap_adjustment"] = {
+                    "limit": cap_limit_value,
+                    "source": cap_limit_source,
+                    "applied": True,
+                    "final_notional": notional,
+                }
 
         fallback_context: Optional[Dict[str, object]] = None
         fallback_applied_notional: Optional[float] = None
@@ -2189,6 +2303,8 @@ class SignalExecutor:
                 )
             ):
                 order_context["risk_limited_notional_quote"] = risk_limited_notional
+        if risk_context:
+            order_context["risk_controls"] = risk_context
         elif risk_limited_notional is not None and side == "Sell":
             order_context["risk_limited_notional_quote"] = risk_limited_notional
         if not math.isclose(adjusted_notional, notional, rel_tol=1e-9, abs_tol=1e-9):
@@ -4579,6 +4695,144 @@ class SignalExecutor:
                     quote_balance = quote_value
 
         return api, totals, quote_balance, metadata
+
+    def _portfolio_quote_exposure(
+        self,
+        settings: Settings,
+        summary: Mapping[str, object],
+        *,
+        current_time: float,
+        summary_meta: Tuple[Optional[float], Optional[float]],
+        price_meta: Tuple[Optional[float], Optional[float]],
+    ) -> Tuple[Dict[str, float], float]:
+        try:
+            positions = self._collect_open_positions(
+                settings,
+                summary,
+                current_time=current_time,
+                summary_meta=summary_meta,
+                price_meta=price_meta,
+            )
+        except Exception:  # pragma: no cover - defensive guard
+            return {}, 0.0
+
+        exposures: Dict[str, float] = {}
+        total = 0.0
+        for raw_symbol, payload in positions.items():
+            if not isinstance(raw_symbol, str) or not isinstance(payload, Mapping):
+                continue
+            symbol = raw_symbol.strip().upper()
+            if not symbol:
+                continue
+            notional = _safe_float(payload.get("quote_notional"))
+            if notional is None or notional <= 0:
+                continue
+            exposures[symbol] = float(notional)
+            total += float(notional)
+        return exposures, total
+
+    def _resolve_volatility_percent(
+        self, summary: Mapping[str, object]
+    ) -> Tuple[Optional[float], Optional[str]]:
+        if not isinstance(summary, Mapping):
+            return None, None
+
+        candidates: List[Tuple[float, str]] = []
+
+        def _add_candidate(value: object, source: str) -> None:
+            try:
+                number = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return
+            if not math.isfinite(number):
+                return
+            number = abs(number)
+            if number <= 0:
+                return
+            candidates.append((number, source))
+
+        def _lookup_path(root: Mapping[str, object], path: Sequence[str]) -> None:
+            current: object = root
+            for part in path:
+                if isinstance(current, Mapping):
+                    current = current.get(part)
+                else:
+                    current = None
+                    break
+            if current is not None:
+                _add_candidate(current, ".".join(path))
+
+        direct_paths: Tuple[Tuple[str, ...], ...] = (
+            ("volatility_pct",),
+            ("volatilityPercent",),
+            ("volatility_percent",),
+            ("volatility",),
+            ("metrics", "volatility_pct"),
+            ("features", "volatility_pct"),
+            ("market_features", "volatility_pct"),
+            ("summary", "volatility_pct"),
+            ("meta", "volatility_pct"),
+            ("stats", "volatility_pct"),
+            ("technical", "volatility_pct"),
+            ("volatility", "pct"),
+            ("volatility", "percent"),
+        )
+
+        for path in direct_paths:
+            _lookup_path(summary, path)
+
+        window_paths: Tuple[Tuple[str, ...], ...] = (
+            ("volatility_windows",),
+            ("volatility", "windows"),
+            ("market_features", "volatility_windows"),
+        )
+
+        for path in window_paths:
+            current: object = summary
+            for part in path:
+                if isinstance(current, Mapping):
+                    current = current.get(part)
+                else:
+                    current = None
+                    break
+            if isinstance(current, Mapping):
+                for window_key, window_value in current.items():
+                    _add_candidate(window_value, ".".join((*path, str(window_key))))
+
+        if not candidates:
+            return None, None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        value, source = candidates[0]
+        return value, source
+
+    def _volatility_scaling_factor(
+        self, summary: Mapping[str, object], settings: Settings
+    ) -> Tuple[float, Optional[Dict[str, object]]]:
+        volatility_pct, source = self._resolve_volatility_percent(summary)
+        if volatility_pct is None:
+            return 1.0, None
+
+        target_pct = _safe_float(getattr(settings, "spot_vol_target_pct", None))
+        if target_pct is None or target_pct <= 0:
+            target_pct = 5.0
+
+        min_scale = _safe_float(getattr(settings, "spot_vol_min_scale", None))
+        if min_scale is None or min_scale <= 0 or min_scale >= 1.0:
+            min_scale = 0.25
+
+        ratio = target_pct / volatility_pct if volatility_pct > 0 else 1.0
+        scale = max(min_scale, min(ratio, 1.0))
+
+        metadata = {
+            "volatility_pct": volatility_pct,
+            "target_pct": target_pct,
+            "scale": scale,
+        }
+        if source:
+            metadata["source"] = source
+
+        return scale, metadata
 
     def _compute_notional(
         self,
