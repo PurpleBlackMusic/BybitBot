@@ -3,11 +3,11 @@ from __future__ import annotations
 import copy
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from .envs import get_api_client, get_settings, creds_ok
 from .guardian_bot import GuardianBot
-from .hygiene import cancel_twap_leftovers
+from .hygiene import cancel_stale_orders, cancel_twap_leftovers
 from .log import log
 from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
 from .ws_manager import manager as ws_manager
@@ -53,6 +53,7 @@ class BackgroundServices:
         self._automation_restart_count: int = 0
         self._automation_stale_after = max(float(automation_stale_after), 0.0)
         self._executor_state: Dict[str, Any] = {}
+        self._automation_sweeper: Dict[str, Any] = {}
 
         self._bot_factory: BotFactory = bot_factory or GuardianBot
         self._executor_factory: ExecutorFactory = executor_factory or (
@@ -65,6 +66,13 @@ class BackgroundServices:
 
         self._hygiene_lock = threading.Lock()
         self._hygiene_performed = False
+
+        self._order_sweep_interval = 60.0  # sweep idle orders once per minute
+        self._order_sweep_stale_after = 600.0  # cancel GTC orders older than 10 minutes
+        self._order_sweep_batch_size = 20
+        self._order_sweep_last = 0.0
+        self._order_sweep_lock = threading.Lock()
+        self._order_sweep_prefixes: tuple[str, ...] = ("AI-",)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -379,6 +387,8 @@ class BackgroundServices:
             state["executor"] = executor
             self._automation_state = state
             self._automation_executor = executor
+            self._automation_sweeper = {}
+            self._order_sweep_last = 0.0
 
             thread = threading.Thread(
                 target=self._run_automation_loop,
@@ -400,6 +410,8 @@ class BackgroundServices:
         self,
         executor: SignalExecutor,
         on_cycle: Callable[[ExecutionResult, Optional[str], Tuple[bool, bool, bool]], None],
+        *,
+        sweeper: Callable[[], bool] | None = None,
     ) -> AutomationLoop:
         if self._loop_factory is not None:
             return self._loop_factory(executor, on_cycle)
@@ -409,6 +421,7 @@ class BackgroundServices:
             success_cooldown=self._automation_success_cooldown,
             error_backoff=self._automation_error_backoff,
             on_cycle=on_cycle,
+            sweeper=sweeper,
         )
 
     def _run_automation_loop(
@@ -455,7 +468,10 @@ class BackgroundServices:
                 self._automation_state = state
                 self._automation_last_cycle = ts
 
-        loop = self._create_loop(executor, handle_cycle)
+        def sweep_orders() -> bool:
+            return self._maybe_sweep_orders()
+
+        loop = self._create_loop(executor, handle_cycle, sweeper=sweep_orders)
 
         current_thread = threading.current_thread()
         try:
@@ -483,6 +499,7 @@ class BackgroundServices:
             last_cycle = self._automation_last_cycle
             restart_count = self._automation_restart_count
             stale_after = self._automation_stale_after
+            sweeper_snapshot = copy.deepcopy(self._automation_sweeper)
 
         snapshot: Dict[str, Any] = {
             "thread_alive": bool(thread and thread.is_alive()),
@@ -501,6 +518,8 @@ class BackgroundServices:
                     "last_run_at": state.get("ts"),
                 }
             )
+        if sweeper_snapshot:
+            snapshot["sweeper"] = sweeper_snapshot
         last_ts = snapshot.get("last_run_at")
         if not last_ts and last_cycle:
             last_ts = last_cycle
@@ -518,6 +537,87 @@ class BackgroundServices:
             is_stale = age > stale_after
         snapshot["stale"] = is_stale
         return snapshot
+
+    def _should_sweep_orders(self) -> bool:
+        if self._order_sweep_interval <= 0 or self._order_sweep_stale_after <= 0:
+            return False
+        now = time.time()
+        with self._order_sweep_lock:
+            if now - self._order_sweep_last < self._order_sweep_interval:
+                return False
+            self._order_sweep_last = now
+        return True
+
+    def _maybe_sweep_orders(self) -> bool:
+        if not self._should_sweep_orders():
+            return False
+
+        try:
+            api = get_api_client()
+        except Exception as exc:
+            log("background.automation.sweeper.api_unavailable", err=str(exc))
+            with self._automation_lock:
+                self._automation_sweeper = {
+                    "last_error": str(exc),
+                    "last_run_at": time.time(),
+                    "interval": self._order_sweep_interval,
+                    "stale_after": self._order_sweep_stale_after,
+                }
+            return False
+
+        try:
+            result = cancel_stale_orders(
+                api,
+                category="spot",
+                older_than_sec=int(self._order_sweep_stale_after),
+                batch_size=self._order_sweep_batch_size,
+                time_in_force="GTC",
+                order_types="limit",
+                link_prefixes=self._order_sweep_prefixes,
+            )
+        except Exception as exc:
+            log("background.automation.sweeper.error", err=str(exc))
+            with self._automation_lock:
+                self._automation_sweeper = {
+                    "last_error": str(exc),
+                    "last_run_at": time.time(),
+                    "interval": self._order_sweep_interval,
+                    "stale_after": self._order_sweep_stale_after,
+                }
+            return False
+
+        total = 0
+        batches = 0
+        if isinstance(result, Mapping):
+            try:
+                total = int(result.get("total", 0))
+            except Exception:
+                total = 0
+            batches_payload = result.get("batches")
+            if isinstance(batches_payload, Sequence):
+                batches = len(batches_payload)
+
+        now = time.time()
+        sweeper_snapshot = {
+            "last_run_at": now,
+            "interval": self._order_sweep_interval,
+            "stale_after": self._order_sweep_stale_after,
+            "cancelled": total,
+            "batches": batches,
+        }
+
+        with self._automation_lock:
+            self._automation_sweeper = sweeper_snapshot
+
+        if total > 0:
+            log(
+                "background.automation.sweeper.cancelled",
+                total=total,
+                batches=batches,
+            )
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # WebSocket helpers
