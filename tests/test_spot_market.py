@@ -1698,6 +1698,93 @@ def test_place_spot_market_wraps_price_floor_runtime_error(monkeypatch: pytest.M
     assert "available_quote" in details
 
 
+def test_place_spot_market_refreshes_stale_limits_snapshot() -> None:
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "lotSizeFilter": {
+                    "minOrderQty": "0.1",
+                    "basePrecision": "0.1",
+                    "minOrderAmt": "10",
+                },
+                "priceFilter": {"tickSize": "0.5"},
+            }
+        ]
+    )
+    api = DummyAPI(payload)
+
+    stale_limits = _basic_limits()
+    stale_limits["_dynamic_ts"] = time.time() - (25 * 3600)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("20"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=Decimal("1.0"),
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("1000")},
+        limits=stale_limits,
+    )
+
+    assert api.info_calls == 1
+    assert api.place_calls
+    audit = response.get("_local", {}).get("order_audit", {})
+    assert audit.get("qty_step") == "0.1"
+
+
+def test_place_spot_market_retries_after_precision_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = _universe_payload(
+        [
+            {
+                "symbol": "BTCUSDT",
+                "quoteCoin": "USDT",
+                "status": "Trading",
+                "lotSizeFilter": {
+                    "minOrderQty": "0.001",
+                    "basePrecision": "0.001",
+                    "minOrderAmt": "10",
+                },
+                "priceFilter": {"tickSize": "0.5"},
+            }
+        ]
+    )
+    api = DummyAPI(payload)
+
+    call_state = {"count": 0}
+
+    def flaky_place_order(**kwargs):
+        call_state["count"] += 1
+        if call_state["count"] == 1:
+            raise RuntimeError("Bybit error 170221: qty precision invalid")
+        api.place_calls.append(kwargs)
+        return {"ok": True, "body": kwargs}
+
+    monkeypatch.setattr(api, "place_order", flaky_place_order)
+
+    response = place_spot_market_with_tolerance(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("20"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=Decimal("1.0"),
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("1000")},
+    )
+
+    assert call_state["count"] == 2
+    assert api.info_calls == 2
+    assert response.get("ok") is True
+    assert len(api.place_calls) == 1
+
+
 def test_price_limit_backoff_scales_notional_when_liquidity_is_capped() -> None:
     orderbook = {"result": {"a": [["100.05", "2"]], "b": [["99.5", "2"]]}}
     api = DummyAPI({}, orderbook_payload=orderbook)

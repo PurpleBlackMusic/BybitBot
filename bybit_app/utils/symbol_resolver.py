@@ -25,6 +25,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from .bybit_api import BybitAPI
+from .log import log
 
 COMMON_QUOTES: Tuple[str, ...] = (
     "USDT",
@@ -95,6 +96,7 @@ class SymbolResolver:
         category: str = "spot",
         refresh: bool = True,
         bootstrap_rows: Optional[Sequence[Mapping[str, object]]] = None,
+        auto_refresh_interval: float = 24 * 3600.0,
     ) -> None:
         self.api = api
         self.category = category
@@ -102,6 +104,9 @@ class SymbolResolver:
         self._by_symbol: Dict[str, InstrumentMetadata] = {}
         self._last_refresh: float = 0.0
         self._lock = threading.Lock()
+        self._auto_refresh_interval = max(float(auto_refresh_interval), 0.0)
+        self._next_auto_refresh_attempt: float = 0.0
+        self._auto_refresh_lock = threading.Lock()
 
         if bootstrap_rows is not None:
             self._build_index(bootstrap_rows)
@@ -131,6 +136,8 @@ class SymbolResolver:
     def resolve(self, base: object, quote: object) -> Optional[InstrumentMetadata]:
         """Return metadata for ``base``/``quote`` if the pair is listed."""
 
+        self._auto_refresh_if_needed()
+
         base_key = _normalise_asset(base)
         quote_key = _normalise_asset(quote)
         if not base_key or not quote_key:
@@ -145,6 +152,8 @@ class SymbolResolver:
         default_quote: Optional[str] = "USDT",
     ) -> Optional[InstrumentMetadata]:
         """Resolve a combined symbol string (``"SOLUSDT"``, ``"SOL/USDC"``, ...)."""
+
+        self._auto_refresh_if_needed()
 
         cleaned = _clean_symbol(symbol)
         if not cleaned:
@@ -170,6 +179,8 @@ class SymbolResolver:
     def metadata(self, symbol: object) -> Optional[InstrumentMetadata]:
         """Return cached metadata by canonical Bybit symbol."""
 
+        self._auto_refresh_if_needed()
+
         cleaned = _clean_symbol(symbol)
         if not cleaned:
             return None
@@ -179,11 +190,61 @@ class SymbolResolver:
     def all_metadata(self) -> Tuple[InstrumentMetadata, ...]:
         """Return a snapshot of all cached instruments."""
 
+        self._auto_refresh_if_needed()
+
         with self._lock:
             return tuple(self._by_symbol.values())
 
     # ------------------------------------------------------------------
     # internal helpers
+    def _auto_refresh_if_needed(self) -> None:
+        interval = self._auto_refresh_interval
+        if interval <= 0 or self.api is None:
+            return
+
+        now = time.time()
+        last_refresh = self._last_refresh
+        if last_refresh and now - last_refresh < interval:
+            return
+
+        next_attempt = self._next_auto_refresh_attempt
+        if next_attempt and now < next_attempt:
+            return
+
+        if not self._auto_refresh_lock.acquire(blocking=False):
+            return
+
+        try:
+            # Double-check inside the guard to avoid redundant refreshes when
+            # multiple callers race to trigger the update.
+            last_refresh = self._last_refresh
+            if last_refresh and time.time() - last_refresh < interval:
+                return
+
+            try:
+                self.refresh()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                backoff = max(interval * 0.1, 60.0)
+                backoff = min(backoff, 3600.0)
+                self._next_auto_refresh_attempt = time.time() + backoff
+                log(
+                    "symbol_resolver.auto_refresh_failed",
+                    error=str(exc),
+                    interval=interval,
+                    backoff=backoff,
+                )
+            else:
+                self._next_auto_refresh_attempt = 0.0
+                with self._lock:
+                    entry_count = len(self._by_symbol)
+                log(
+                    "symbol_resolver.auto_refreshed",
+                    interval=interval,
+                    entries=entry_count,
+                )
+        finally:
+            self._auto_refresh_lock.release()
+
     def _build_index(self, rows: Sequence[Mapping[str, object]]) -> None:
         index: Dict[Tuple[str, str], InstrumentMetadata] = {}
         by_symbol: Dict[str, InstrumentMetadata] = {}
