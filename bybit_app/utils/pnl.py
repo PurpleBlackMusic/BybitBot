@@ -7,11 +7,13 @@ import time
 import threading
 from collections import deque
 from collections.abc import Mapping, MutableMapping
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 from .envs import get_settings
 from .helpers import ensure_link_id
+from .instruments import get_listed_spot_symbols
 from .log import log
 from .paths import DATA_DIR
 from . import symbol_resolver
@@ -43,11 +45,13 @@ def _normalise_network_marker(value: object | None) -> Optional[str]:
     return None
 
 
-def _ledger_path_for(
+def _resolve_network_marker(
     settings: object | None = None,
     *,
     network: object | None = None,
-) -> Path:
+) -> str:
+    """Return the active network marker (``testnet`` or ``mainnet``)."""
+
     marker = _normalise_network_marker(network)
     candidate_settings: object | None = settings
 
@@ -66,8 +70,65 @@ def _ledger_path_for(
     if marker is None:
         marker = "testnet"
 
+    return marker
+
+
+def _ledger_path_for(
+    settings: object | None = None,
+    *,
+    network: object | None = None,
+) -> Path:
+    marker = _resolve_network_marker(settings, network=network)
     filename = f"executions.{marker}.jsonl"
     return _LEDGER_DIR / filename
+
+
+def _is_testnet(settings: object | None = None, *, network: object | None = None) -> bool:
+    return _resolve_network_marker(settings, network=network) != "mainnet"
+
+
+@lru_cache(maxsize=4)
+def _listed_spot_symbols(testnet: bool) -> frozenset[str]:
+    try:
+        listed = get_listed_spot_symbols(testnet=testnet)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        log("pnl.spot_symbols.fetch_error", testnet=testnet, err=str(exc))
+        return frozenset()
+
+    cleaned = [str(symbol).strip().upper() for symbol in listed]
+    return frozenset(symbol for symbol in cleaned if symbol)
+
+
+def _is_listed_spot_symbol(
+    symbol: str,
+    *,
+    settings: object | None = None,
+    network: object | None = None,
+) -> bool:
+    cleaned = str(symbol or "").strip().upper()
+    if not cleaned:
+        return False
+
+    listed = _listed_spot_symbols(_is_testnet(settings, network=network))
+    if not listed:
+        return False
+
+    return cleaned in listed
+
+
+def _normalise_category(value: object | None) -> str | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        return cleaned or None
+
+    if isinstance(value, (int, float)):
+        cleaned = str(value).strip().lower()
+        return cleaned or None
+
+    return None
 
 
 def _normalise_id(value) -> str | None:
@@ -227,6 +288,27 @@ def add_execution(
         else:
             quote = None
 
+    raw_category = _normalise_category(ev.get("category"))
+    if not raw_category:
+        raw_category = _normalise_category(ev.get("orderCategory"))
+
+    if raw_category == "spot":
+        resolved_category = "spot"
+    elif symbol_text and _is_listed_spot_symbol(
+        symbol_text,
+        settings=settings,
+        network=network,
+    ):
+        if raw_category and raw_category != "spot":
+            log(
+                "pnl.exec.category_corrected",
+                symbol=symbol_text,
+                category=raw_category,
+            )
+        resolved_category = "spot"
+    else:
+        resolved_category = raw_category or "spot"
+
     rec = {
         "ts": int(time.time() * 1000),
         "symbol": ev.get("symbol"),
@@ -237,7 +319,7 @@ def add_execution(
         "execQty": qty,
         "execFee": fee_value,
         "execTime": ev.get("execTime") or ev.get("transactionTime") or ev.get("ts"),
-        "category": ev.get("category") or ev.get("orderCategory") or "spot",
+        "category": resolved_category,
     }
     fee_currency = _extract_fee_currency(ev)
     resolved_currency, inferred_currency = _resolve_fee_currency_with_inference(
