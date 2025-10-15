@@ -245,7 +245,7 @@ class SignalExecutor:
             except (TypeError, ValueError):
                 last_run_value = 0.0
             if math.isfinite(last_run_value) and last_run_value >= 0:
-                self._tp_sweeper_last_run = last_run_value
+                self._tp_sweeper_last_run = min(last_run_value, self._current_time())
 
         self._purge_validation_penalties()
         self._purge_price_limit_backoff()
@@ -2581,7 +2581,7 @@ class SignalExecutor:
         if interval <= 0.0:
             return
 
-        now = time.monotonic()
+        now = self._current_time()
         if self._tp_sweeper_last_run and now - self._tp_sweeper_last_run < interval:
             return
 

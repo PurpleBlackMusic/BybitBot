@@ -598,7 +598,7 @@ def test_signal_executor_runs_tp_sweeper_even_when_skipped(monkeypatch: pytest.M
         "sweep_tp_ladder_orders",
         lambda **kwargs: (sweeps.append(kwargs) or {"cancelled": 0}),
     )
-    monkeypatch.setattr(signal_executor_module.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setattr(signal_executor_module.time, "time", lambda: 1_000.0)
 
     executor = SignalExecutor(bot)
     executor._tp_sweeper_last_run = 0.0
@@ -5094,6 +5094,9 @@ def test_automation_loop_retries_transient_status_after_cooldown(
         def monotonic(self) -> float:
             return self.value
 
+        def time(self) -> float:
+            return self.value
+
         def advance(self, seconds: float) -> None:
             self.value += seconds
 
@@ -5148,6 +5151,9 @@ def test_automation_loop_retries_disabled_status_after_cooldown(
             self.value = 0.0
 
         def monotonic(self) -> float:
+            return self.value
+
+        def time(self) -> float:
             return self.value
 
         def advance(self, seconds: float) -> None:
