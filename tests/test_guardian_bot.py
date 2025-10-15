@@ -2680,10 +2680,34 @@ def test_guardian_status_summary_marks_stale_signal(tmp_path: Path) -> None:
     assert summary["actionable"] is False
     assert summary["staleness"]["state"] == "stale"
     assert any("устар" in reason.lower() for reason in summary["actionable_reasons"])
+    assert any("тик" in reason.lower() for reason in summary["actionable_reasons"])
 
     health = bot.data_health()
     assert health["ai_signal"]["ok"] is False
     assert "15 минут" in health["ai_signal"]["message"] or "статус" in health["ai_signal"]["message"].lower()
+
+
+def test_guardian_status_summary_rejects_slow_tick(tmp_path: Path) -> None:
+    status = {
+        "symbol": "BTCUSDT",
+        "probability": 0.7,
+        "ev_bps": 18.0,
+        "side": "buy",
+        "last_tick_ts": time.time() - 5.0,
+    }
+    status_path = tmp_path / "ai" / STATUS_FILE_TESTNET
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    bot = _make_bot(tmp_path, Settings(ai_live_only=False, ai_buy_threshold=0.6, ai_min_ev_bps=10.0))
+    summary = bot.status_summary()
+
+    assert summary["actionable"] is False
+    reasons = " ".join(str(reason).lower() for reason in summary["actionable_reasons"])
+    assert "тик" in reasons
+    assert summary["tick_fresh"] is False
+    assert summary["tick_stale_after"] == pytest.approx(3.0)
+    assert summary["tick_age_seconds"] >= 5.0
 
 
 def test_guardian_status_refreshes_stale_signal_with_live_fetch(

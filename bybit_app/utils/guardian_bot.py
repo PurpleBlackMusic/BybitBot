@@ -17,6 +17,7 @@ from statistics import StatisticsError, median, quantiles
 
 WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
+LIVE_TICK_STALE_SECONDS = 3.0
 
 DEFAULT_SYMBOL_UNIVERSE: Tuple[str, ...] = (
     "BTCUSDT",
@@ -2927,6 +2928,25 @@ class GuardianBot:
         ev_bps = float(context.get("ev_bps") or 0.0)
         last_tick = status.get("last_tick_ts") or status.get("timestamp")
 
+        now = time.time()
+        tick_ts = self._coerce_float(last_tick)
+        tick_age = None
+        if tick_ts is not None and tick_ts > 0:
+            tick_age = max(0.0, now - tick_ts)
+        elif brief.status_age is not None:
+            tick_age = max(0.0, float(brief.status_age))
+
+        try:
+            tick_guard = float(getattr(settings, "ai_tick_stale_seconds", LIVE_TICK_STALE_SECONDS))
+        except (TypeError, ValueError):
+            tick_guard = LIVE_TICK_STALE_SECONDS
+        if not math.isfinite(tick_guard):
+            tick_guard = LIVE_TICK_STALE_SECONDS
+        tick_guard = max(tick_guard, 0.0)
+        tick_fresh = True
+        if tick_age is not None and tick_guard > 0:
+            tick_fresh = tick_age <= tick_guard
+
         (
             buy_threshold,
             sell_threshold,
@@ -2944,6 +2964,8 @@ class GuardianBot:
             effective_sell_threshold,
             min_ev,
             staleness_state,
+            tick_age,
+            tick_guard,
         )
 
         if not getattr(settings, "ai_enabled", False):
@@ -2967,6 +2989,9 @@ class GuardianBot:
             "updated_text": brief.updated_text,
             "age_seconds": brief.status_age,
             "last_update": self._format_timestamp(last_tick),
+            "tick_age_seconds": round(tick_age, 3) if tick_age is not None else None,
+            "tick_stale_after": tick_guard if tick_guard > 0 else None,
+            "tick_fresh": tick_fresh,
             "actionable": actionable,
             "actionable_reasons": reasons,
             "symbol_source": context.get("symbol_source"),
@@ -3066,6 +3091,8 @@ class GuardianBot:
         sell_threshold: float,
         min_ev: float,
         staleness_state: str,
+        tick_age: Optional[float],
+        tick_guard: float,
     ) -> Tuple[bool, List[str]]:
         reasons: List[str] = []
 
@@ -3078,6 +3105,18 @@ class GuardianBot:
         if staleness_state == "stale":
             reasons.append(
                 f"Сигнал устарел — обновите {self._status_file_hint()} перед тем, как открывать сделки."
+            )
+
+        if (
+            tick_guard > 0
+            and tick_age is not None
+            and tick_age > tick_guard
+        ):
+            reasons.append(
+                (
+                    "Котировка устарела — последний тик был {age:.1f} с назад, "
+                    "ждём обновление стакана (лимит {limit:.1f} с)."
+                ).format(age=tick_age, limit=tick_guard)
             )
 
         if mode == "buy":
