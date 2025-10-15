@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import threading
-from typing import Iterable, List, Set
+from typing import Iterable, List, Mapping, Set
 
 import requests
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
 
 from .log import log
 
@@ -17,6 +18,14 @@ _LOCK = threading.Lock()
 _IN_FLIGHT: dict[str, threading.Event] = {}
 
 
+class _InstrumentRetryError(RuntimeError):
+    """Internal marker for retryable instrument catalogue failures."""
+
+    def __init__(self, message: str, *, meta: Mapping[str, object] | None = None):
+        super().__init__(message)
+        self.meta = dict(meta or {})
+
+
 def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[str]:
     url = _TESTNET_URL if testnet else _MAINNET_URL
 
@@ -25,14 +34,81 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
         seen_cursors: Set[str] = set()
         symbols: Set[str] = set()
 
+        max_attempts = 3
+        wait_strategy = wait_random_exponential(multiplier=0.5, max=5.0)
+
+        def _log_retry(retry_state: RetryCallState) -> None:
+            if retry_state.outcome.failed:
+                exc = retry_state.outcome.exception()
+                meta: dict[str, object] = {
+                    "attempt": retry_state.attempt_number,
+                    "maxAttempts": max_attempts,
+                    "scope": "spot",
+                    "url": url,
+                }
+                if isinstance(exc, _InstrumentRetryError):
+                    meta.update(exc.meta)
+                else:
+                    meta["err"] = str(exc)
+                log("instruments.fetch.retry", **meta)
+
+        @retry(
+            reraise=True,
+            wait=wait_strategy,
+            stop=stop_after_attempt(max_attempts),
+            retry=retry_if_exception_type((_InstrumentRetryError, requests.exceptions.RequestException)),
+            after=_log_retry,
+        )
+        def _request_page(query: Mapping[str, object]) -> dict[str, object]:
+            try:
+                response = requests.get(url, params=query, timeout=timeout)
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                log(
+                    "instruments.fetch.http_error",
+                    scope="spot",
+                    url=url,
+                    status=status_code,
+                    err=str(exc),
+                )
+                raise
+            except requests.exceptions.RequestException as exc:
+                log("instruments.fetch.network_error", scope="spot", url=url, err=str(exc))
+                raise
+
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                meta = {"status": response.status_code, "err": "invalid_json"}
+                log("instruments.fetch.invalid_json", scope="spot", url=url, **meta)
+                raise _InstrumentRetryError("invalid JSON response", meta=meta) from exc
+
+            ret_code_raw = payload.get("retCode")
+            ret_code_text = str(ret_code_raw).strip() if ret_code_raw is not None else ""
+            if ret_code_text and ret_code_text != "0":
+                ret_msg = str(
+                    payload.get("retMsg")
+                    or payload.get("ret_message")
+                    or payload.get("retMessage")
+                    or payload.get("message")
+                    or ""
+                ).strip()
+                meta = {"retCode": ret_code_text, "retMsg": ret_msg or None}
+                log("instruments.fetch.retcode_error", scope="spot", url=url, **meta)
+                raise _InstrumentRetryError(
+                    f"retCode {ret_code_text}: {ret_msg or 'unknown error'}",
+                    meta=meta,
+                )
+
+            return payload
+
         while True:
             params = {"category": "spot"}
             if cursor:
                 params["cursor"] = cursor
 
-            response = requests.get(url, params=params, timeout=timeout)
-            response.raise_for_status()
-            payload = response.json()
+            payload = _request_page(params)
             result = payload.get("result") or {}
             rows = result.get("list") or []
             for item in rows:
@@ -59,12 +135,17 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
 
     try:
         return _fetch(url)
-    except requests.exceptions.RequestException as exc:
+    except (_InstrumentRetryError, requests.exceptions.RequestException) as exc:
+        root_exc = exc.__cause__ if isinstance(exc, _InstrumentRetryError) and exc.__cause__ else exc
         if not testnet:
+            if isinstance(exc, _InstrumentRetryError):
+                if root_exc is not exc:
+                    raise RuntimeError(str(exc)) from root_exc
+                raise RuntimeError(str(exc))
             raise
 
-        if isinstance(exc, requests.exceptions.HTTPError):
-            log("instruments.fetch.testnet_http_error", scope="spot", err=str(exc))
+        if isinstance(root_exc, requests.exceptions.HTTPError):
+            log("instruments.fetch.testnet_http_error", scope="spot", err=str(root_exc))
             try:
                 fallback_symbols = _fetch(_MAINNET_URL)
             except requests.exceptions.RequestException as fallback_exc:
@@ -89,7 +170,7 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
                 "instruments.fetch.testnet_mainnet_fallback",
                 scope="spot",
                 count=len(fallback_symbols),
-                err=str(exc),
+                err=str(root_exc),
             )
             return fallback_symbols
 
