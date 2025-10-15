@@ -5,11 +5,13 @@ import math
 import pandas as pd
 import streamlit as st
 
+from utils.ui import safe_set_page_config
+
 from utils.dataframe import arrow_safe
 from utils.guardian_bot import GuardianBot
 from utils.pnl import _ledger_path_for
 
-st.set_page_config(page_title="Мониторинг сделок", page_icon="📈", layout="wide")
+safe_set_page_config(page_title="Мониторинг сделок", page_icon="📈", layout="wide")
 
 st.title("📈 Мониторинг сделок")
 st.caption("Следим, какие сделки открыл спотовый бот, каков результат и нет ли задержек в данных.")
