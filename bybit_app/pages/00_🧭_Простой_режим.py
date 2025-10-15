@@ -19,7 +19,7 @@ from utils.background import (
 from utils.dataframe import arrow_safe
 from utils.envs import active_dry_run, creds_ok
 from utils.guardian_bot import GuardianBot
-from utils.ui import auto_refresh, rerun
+from utils.ui import auto_refresh, rerun, safe_set_page_config
 
 
 def _format_age(seconds: float) -> str:
@@ -330,7 +330,7 @@ def _format_order_caption(order: dict[str, object]) -> str:
     return f"{symbol} · {side} · Нотионал {amount_text}{slippage_text}"
 
 
-st.set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
+safe_set_page_config(page_title="Простой режим", page_icon="🧭", layout="wide")
 
 DEFAULT_REFRESH_SECONDS = 30
 previous_refresh_ts = float(st.session_state.get("simple_mode_last_refresh") or 0.0)

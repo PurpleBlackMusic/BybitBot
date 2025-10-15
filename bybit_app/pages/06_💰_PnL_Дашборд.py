@@ -5,11 +5,12 @@ from collections.abc import Iterable, Mapping, Sequence
 
 import pandas as pd
 import streamlit as st
+from utils.dataframe import arrow_safe
 from utils.envs import get_api_client, get_settings
 from utils.paths import DATA_DIR
-from utils.dataframe import arrow_safe
+from utils.ui import safe_set_page_config
 
-st.set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
+safe_set_page_config(page_title="PnL Дашборд", page_icon="💰", layout="wide")
 st.title("💰 PnL Дашборд")
 
 s = get_settings()

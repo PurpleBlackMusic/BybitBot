@@ -14,10 +14,10 @@ from utils.background import (
     restart_websockets,
 )
 from utils.envs import active_dry_run, get_settings
-from utils.ui import auto_refresh
+from utils.ui import auto_refresh, safe_set_page_config
 
 
-st.set_page_config(page_title="Здоровье и статус", layout="wide")
+safe_set_page_config(page_title="Здоровье и статус", layout="wide")
 auto_refresh(15, key="health-status-refresh")
 ensure_background_services()
 

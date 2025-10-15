@@ -4,8 +4,9 @@ import streamlit as st
 
 from utils.envs import get_settings, update_settings
 from utils.telegram_notify import send_telegram
+from utils.ui import safe_set_page_config
 
-st.set_page_config(page_title="Telegram бот", page_icon="🤖", layout="centered")
+safe_set_page_config(page_title="Telegram бот", page_icon="🤖", layout="centered")
 
 st.title("🤖 Telegram-бот для уведомлений")
 st.caption(

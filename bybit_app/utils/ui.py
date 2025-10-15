@@ -267,10 +267,47 @@ def set_query_params(params: Mapping[str, Iterable[str] | str]) -> None:
 
 
 def safe_set_page_config(**kwargs):
-    key = "_page_configured"
-    if not st.session_state.get(key, False):
+    """Best-effort wrapper around :func:`st.set_page_config`.
+
+    Streamlit raises an exception if ``set_page_config`` is executed more than
+    once during a single script run.  This helper inspects the current script
+    context and quietly skips duplicate calls instead of bubbling the error to
+    the UI.  When running outside of Streamlit (for example, during tests) the
+    call is ignored as well.
+    """
+
+    try:  # Streamlit 1.25+ provides the runtime helper
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+    except Exception:  # pragma: no cover - fallback for older Streamlit
+        get_script_run_ctx = None  # type: ignore[assignment]
+
+    ctx = get_script_run_ctx() if callable(get_script_run_ctx) else None
+    already_configured = False
+
+    if ctx is not None:
+        already_configured = bool(getattr(ctx, "_page_configured", False))
+    else:  # pragma: no cover - Streamlit-less environments (tests)
+        sentinel = "_bybit_page_configured"
+        try:
+            already_configured = bool(st.session_state.get(sentinel, False))
+        except Exception:
+            already_configured = False
+
+    if already_configured:
+        return
+
+    try:
         st.set_page_config(**kwargs)
-        st.session_state[key] = True
+    except Exception:  # pragma: no cover - Streamlit raises StreamlitAPIException
+        return
+
+    if ctx is not None:
+        setattr(ctx, "_page_configured", True)
+    else:  # pragma: no cover - see the matching branch above
+        try:
+            st.session_state[sentinel] = True
+        except Exception:
+            pass
 
 
 def page_slug_from_path(page: str) -> str:

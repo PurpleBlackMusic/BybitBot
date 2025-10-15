@@ -1,11 +1,17 @@
 
 from __future__ import annotations
-import streamlit as st, pandas as pd, json
+
+import json
+
+import pandas as pd
+import streamlit as st
+
 from utils.dataframe import arrow_safe
 from utils.pnl import daily_pnl, read_ledger
 from utils.paths import DATA_DIR
+from utils.ui import safe_set_page_config
 
-st.set_page_config(page_title="PnL Мониторинг (Beta)", page_icon="💰", layout="wide")
+safe_set_page_config(page_title="PnL Мониторинг (Beta)", page_icon="💰", layout="wide")
 st.title("💰 PnL Мониторинг (Beta)")
 
 col1, col2 = st.columns(2)
