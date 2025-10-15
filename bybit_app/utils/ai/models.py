@@ -117,6 +117,11 @@ class _SymbolState:
             self._remember(record.price, abs(record.qty))
             return None
 
+        prior_price = self._last_observed_price()
+        feature_price = prior_price if prior_price > 1e-9 else self.avg_cost
+        if feature_price <= 1e-9:
+            feature_price = record.price
+
         fee_share = 0.0
         total_qty = abs(record.qty)
         if total_qty > 1e-9:
@@ -127,7 +132,7 @@ class _SymbolState:
 
         change_pct = 0.0
         if self.avg_cost > 1e-9:
-            change_pct = (record.price - self.avg_cost) / self.avg_cost * 100.0
+            change_pct = (feature_price - self.avg_cost) / self.avg_cost * 100.0
 
         volatility_pct = 0.0
         if self.recent_prices:
@@ -139,7 +144,7 @@ class _SymbolState:
 
         avg_qty = sum(self.recent_qtys) / len(self.recent_qtys) if self.recent_qtys else 0.0
         if avg_qty > 1e-9:
-            volume_impulse = math.log((abs(record.qty) + 1e-9) / (avg_qty + 1e-9))
+            volume_impulse = math.log((qty_to_close + 1e-9) / (avg_qty + 1e-9))
         else:
             volume_impulse = 0.0
 
@@ -147,12 +152,14 @@ class _SymbolState:
         if self.price_history:
             long_term_ref = sum(self.price_history) / len(self.price_history)
             if long_term_ref > 1e-9:
-                multiframe_change_pct = (record.price - long_term_ref) / long_term_ref * 100.0
+                multiframe_change_pct = (
+                    feature_price - long_term_ref
+                ) / long_term_ref * 100.0
 
         feature_map = initialise_feature_map()
         feature_map["directional_change_pct"] = change_pct
         feature_map["multiframe_change_pct"] = multiframe_change_pct
-        feature_map["turnover_log"] = liquidity_feature(record.notional)
+        feature_map["turnover_log"] = liquidity_feature(feature_price * qty_to_close)
         feature_map["volatility_pct"] = volatility_pct
         feature_map["volume_impulse"] = volume_impulse
 
@@ -174,6 +181,13 @@ class _SymbolState:
         if len(self.recent_qtys) > 50:
             self.recent_qtys.pop(0)
         self.price_history.append(price)
+
+    def _last_observed_price(self) -> float:
+        if self.recent_prices:
+            return self.recent_prices[-1]
+        if self.price_history:
+            return self.price_history[-1]
+        return 0.0
 
 
 def _default_ledger_path(data_dir: Path) -> Path:

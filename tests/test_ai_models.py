@@ -72,9 +72,17 @@ def test_sell_vector_contains_expected_metrics() -> None:
     features = dict(zip(MODEL_FEATURES, vector))
 
     avg_cost = (2.0 * 100.0 + 1.0 * 102.0) / 3.0
-    assert features["directional_change_pct"] == pytest.approx((110.0 - avg_cost) / avg_cost * 100.0)
+    last_seen_price = 102.0  # последняя цена до продажи
+    history_avg = (100.0 + 102.0) / 2.0
+    expected_change = (last_seen_price - avg_cost) / avg_cost * 100.0
+    assert features["directional_change_pct"] == pytest.approx(expected_change)
+    assert features["multiframe_change_pct"] == pytest.approx(
+        (last_seen_price - history_avg) / history_avg * 100.0
+    )
     assert features["volume_impulse"] > 0.0
-    assert features["turnover_log"] == pytest.approx(liquidity_feature(sell_record.notional))
+    assert features["turnover_log"] == pytest.approx(
+        liquidity_feature(last_seen_price * 2.5)
+    )
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)
@@ -104,8 +112,9 @@ def test_multiframe_change_differs_from_directional() -> None:
     directional = features["directional_change_pct"]
     multiframe = features["multiframe_change_pct"]
 
-    assert directional == pytest.approx((120.0 - 104.0) / 104.0 * 100.0, rel=1e-4)
-    assert multiframe == pytest.approx((120.0 - 80.0) / 80.0 * 100.0, rel=1e-4)
+    last_seen_price = 110.0
+    assert directional == pytest.approx((last_seen_price - 104.0) / 104.0 * 100.0, rel=1e-4)
+    assert multiframe == pytest.approx((last_seen_price - 80.0) / 80.0 * 100.0, rel=1e-4)
     assert abs(multiframe - directional) > 1.0
 
 
