@@ -6,6 +6,15 @@ import threading
 from typing import Iterable, List, Set
 
 import requests
+from tenacity import (
+    RetryCallState,
+    RetryError,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
 
 from .log import log
 
@@ -17,10 +26,100 @@ _LOCK = threading.Lock()
 _IN_FLIGHT: dict[str, threading.Event] = {}
 
 
+class _InstrumentFetchError(RuntimeError):
+    """Internal marker for instrument catalogue retrieval issues."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ret_code: int | str | None = None,
+        ret_msg: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.ret_code = ret_code
+        self.ret_msg = ret_msg
+
+
 def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[str]:
     url = _TESTNET_URL if testnet else _MAINNET_URL
 
     def _fetch(url: str) -> Set[str]:
+        wait_strategy = wait_exponential(multiplier=0.5, min=0.5, max=5.0) + wait_random(
+            0.0, 0.5
+        )
+
+        def _log_retry(retry_state: RetryCallState) -> None:
+            if retry_state.outcome.failed:
+                exc = retry_state.outcome.exception()
+                meta = {
+                    "attempt": retry_state.attempt_number,
+                    "url": url,
+                    "scope": "spot",
+                }
+                if isinstance(exc, _InstrumentFetchError):
+                    if exc.ret_code is not None:
+                        meta["retCode"] = exc.ret_code
+                    if exc.ret_msg:
+                        meta["retMsg"] = exc.ret_msg
+                else:
+                    meta["err"] = str(exc)
+                log("instruments.fetch.retry", **meta)
+
+        def _should_retry_exception(exc: BaseException) -> bool:
+            if isinstance(exc, _InstrumentFetchError):
+                return True
+            if isinstance(exc, requests.exceptions.HTTPError):
+                status = exc.response.status_code if exc.response is not None else None
+                return status in {408, 425, 429, 500, 502, 503, 504}
+            if isinstance(exc, requests.exceptions.RequestException):
+                return True
+            return False
+
+        @retry(
+            reraise=True,
+            wait=wait_strategy,
+            stop=stop_after_attempt(3),
+            retry=retry_if_exception(_should_retry_exception),
+            after=_log_retry,
+        )
+        def _request_page(params: dict[str, object]) -> dict[str, object]:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                log(
+                    "instruments.fetch.invalid_json",
+                    scope="spot",
+                    url=url,
+                    err=str(exc),
+                )
+                raise _InstrumentFetchError("invalid JSON response") from exc
+
+            ret_code = payload.get("retCode")
+            if ret_code not in (None, 0, "0"):
+                ret_msg_raw = (
+                    payload.get("retMsg")
+                    or payload.get("ret_message")
+                    or payload.get("message")
+                )
+                ret_msg = str(ret_msg_raw).strip() if ret_msg_raw else ""
+                log(
+                    "instruments.fetch.retcode_error",
+                    scope="spot",
+                    url=url,
+                    retCode=ret_code,
+                    retMsg=ret_msg or None,
+                )
+                raise _InstrumentFetchError(
+                    f"Bybit returned retCode {ret_code}: {ret_msg or 'unknown error'}",
+                    ret_code=ret_code,
+                    ret_msg=ret_msg or None,
+                )
+
+            return payload
+
         cursor: str | None = None
         seen_cursors: Set[str] = set()
         symbols: Set[str] = set()
@@ -30,9 +129,14 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
             if cursor:
                 params["cursor"] = cursor
 
-            response = requests.get(url, params=params, timeout=timeout)
-            response.raise_for_status()
-            payload = response.json()
+            try:
+                payload = _request_page(params)
+            except RetryError as exc:
+                final_exc = exc.last_attempt.exception()
+                if isinstance(final_exc, BaseException):
+                    raise final_exc
+                raise
+
             result = payload.get("result") or {}
             rows = result.get("list") or []
             for item in rows:
@@ -59,15 +163,21 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
 
     try:
         return _fetch(url)
-    except requests.exceptions.RequestException as exc:
+    except (requests.exceptions.RequestException, _InstrumentFetchError) as exc:
         if not testnet:
             raise
 
         if isinstance(exc, requests.exceptions.HTTPError):
-            log("instruments.fetch.testnet_http_error", scope="spot", err=str(exc))
+            status = exc.response.status_code if exc.response is not None else None
+            log(
+                "instruments.fetch.testnet_http_error",
+                scope="spot",
+                err=str(exc),
+                status=status,
+            )
             try:
                 fallback_symbols = _fetch(_MAINNET_URL)
-            except requests.exceptions.RequestException as fallback_exc:
+            except (requests.exceptions.RequestException, _InstrumentFetchError) as fallback_exc:
                 log(
                     "instruments.fetch.catalogue_unavailable",
                     scope="spot",
@@ -90,6 +200,44 @@ def _fetch_spot_symbols(*, testnet: bool = True, timeout: float = 5.0) -> Set[st
                 scope="spot",
                 count=len(fallback_symbols),
                 err=str(exc),
+            )
+            return fallback_symbols
+
+        if isinstance(exc, _InstrumentFetchError) and exc.ret_code is not None:
+            log(
+                "instruments.fetch.testnet_retcode_error",
+                scope="spot",
+                retCode=exc.ret_code,
+                retMsg=exc.ret_msg,
+            )
+            try:
+                fallback_symbols = _fetch(_MAINNET_URL)
+            except (requests.exceptions.RequestException, _InstrumentFetchError) as fallback_exc:
+                log(
+                    "instruments.fetch.catalogue_unavailable",
+                    scope="spot",
+                    testnet=True,
+                    retCode=exc.ret_code,
+                    retMsg=exc.ret_msg,
+                    err=str(fallback_exc),
+                )
+                with _LOCK:
+                    cached = set(_CACHE.get("spot_testnet") or set())
+                if cached:
+                    log(
+                        "instruments.fetch.testnet_cache_fallback",
+                        scope="spot",
+                        count=len(cached),
+                    )
+                    return cached
+                return set()
+
+            log(
+                "instruments.fetch.testnet_mainnet_fallback",
+                scope="spot",
+                count=len(fallback_symbols),
+                retCode=exc.ret_code,
+                retMsg=exc.ret_msg,
             )
             return fallback_symbols
 

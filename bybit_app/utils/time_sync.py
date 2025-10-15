@@ -8,6 +8,15 @@ import time
 
 import requests
 from datetime import datetime, timezone
+from tenacity import (
+    RetryCallState,
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
 
 from .envs import get_api_client
 from .http_client import configure_http_session
@@ -26,6 +35,21 @@ _SERVER_TIME_KEYS: tuple[str, ...] = (
 
 _CLOCKS: dict[tuple[str, bool], "_SyncedClock"] = {}
 _CLOCK_LOCK = threading.Lock()
+
+
+class _TimeSyncRequestError(RuntimeError):
+    """Internal marker signalling a retryable time-sync failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        ret_code: int | str | None = None,
+        ret_msg: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.ret_code = ret_code
+        self.ret_msg = ret_msg
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -148,13 +172,84 @@ class _SyncedClock:
                 close_http = True
             else:
                 http = session
-            start = time.time()
-            try:
+            start = 0.0
+            wait_strategy = wait_exponential(multiplier=0.5, min=0.5, max=5.0) + wait_random(
+                0.0, 0.5
+            )
+
+            def _log_retry(retry_state: RetryCallState) -> None:
+                if retry_state.outcome.failed:
+                    exc = retry_state.outcome.exception()
+                    meta = {
+                        "attempt": retry_state.attempt_number,
+                        "base": url,
+                    }
+                    if isinstance(exc, _TimeSyncRequestError):
+                        if exc.ret_code is not None:
+                            meta["retCode"] = exc.ret_code
+                        if exc.ret_msg:
+                            meta["retMsg"] = exc.ret_msg
+                    else:
+                        meta["err"] = str(exc)
+                    log("time.sync.retry", **meta)
+
+            @retry(
+                reraise=True,
+                wait=wait_strategy,
+                stop=stop_after_attempt(3),
+                retry=retry_if_exception_type(
+                    (_TimeSyncRequestError, requests.exceptions.RequestException)
+                ),
+                after=_log_retry,
+            )
+            def _request_payload() -> dict[str, object]:
+                nonlocal start
+                start = time.time()
                 response = http.get(url, timeout=timeout, verify=verify)
                 response.raise_for_status()
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    log("time.sync.invalid_json", err=str(exc), base=url)
+                    raise _TimeSyncRequestError("invalid JSON response") from exc
+
+                ret_code = payload.get("retCode")
+                if ret_code not in (None, 0, "0"):
+                    ret_msg_raw = (
+                        payload.get("retMsg")
+                        or payload.get("ret_message")
+                        or payload.get("message")
+                    )
+                    ret_msg = str(ret_msg_raw).strip() if ret_msg_raw else ""
+                    log(
+                        "time.sync.retcode_error",
+                        base=url,
+                        retCode=ret_code,
+                        retMsg=ret_msg or None,
+                    )
+                    raise _TimeSyncRequestError(
+                        f"Bybit returned retCode {ret_code}: {ret_msg or 'unknown error'}",
+                        ret_code=ret_code,
+                        ret_msg=ret_msg or None,
+                    )
+
+                return payload
+
+            try:
+                payload = _request_payload()
+            except RetryError as exc:
+                final_exc = exc.last_attempt.exception()
+                if isinstance(final_exc, BaseException):
+                    raise final_exc
+                raise
             except Exception as exc:  # pragma: no cover - defensive guard
-                log("time.sync.error", err=str(exc), base=url)
+                meta = {"err": str(exc), "base": url}
+                if isinstance(exc, _TimeSyncRequestError):
+                    if exc.ret_code is not None:
+                        meta["retCode"] = exc.ret_code
+                    if exc.ret_msg:
+                        meta["retMsg"] = exc.ret_msg
+                log("time.sync.error", **meta)
                 self._expiry = time.time() + 5.0
                 return
             finally:
