@@ -11,6 +11,9 @@ _EMPTY_RESULT = {
     "mid": None,
 }
 
+_TOLERANCE_SCALE = 1e-4
+_TOLERANCE_MIN = 1e-12
+
 
 def _extract_levels(levels: Iterable[Tuple[str, str]]) -> list[Tuple[float, float]]:
     extracted: list[Tuple[float, float]] = []
@@ -20,6 +23,20 @@ def _extract_levels(levels: Iterable[Tuple[str, str]]) -> list[Tuple[float, floa
             continue
         extracted.append((float(price), qty_f))
     return extracted
+
+
+def _apply_tolerance(value: float, tolerance: float) -> float:
+    """Clamp small *value* deviations within ``±tolerance`` to zero."""
+
+    if tolerance <= 0.0 or value == 0.0:
+        return value
+
+    if abs(value) <= tolerance:
+        return 0.0
+
+    if value > 0.0:
+        return value - tolerance
+    return value + tolerance
 
 
 def _validate_mode(qty_base: float | None, notional_quote: float | None) -> Tuple[float | None, float | None]:
@@ -76,13 +93,30 @@ def estimate_vwap_from_orderbook(
     if filled_qty <= 0 or spent <= 0:
         result = _EMPTY_RESULT.copy()
         result["mid"] = mid
+        result["best"] = {"bid": best_bid, "ask": best_ask}
         return result
 
     vwap = spent / filled_qty
+    reference_price = best_ask if side == "Buy" else best_bid
+    if reference_price <= 0:
+        result = _EMPTY_RESULT.copy()
+        result["vwap"] = vwap
+        result["filled_qty"] = filled_qty
+        result["notional"] = spent
+        result["mid"] = mid
+        result["best"] = {"bid": best_bid, "ask": best_ask}
+        return result
+
     if side == "Buy":
-        impact = (vwap / mid - 1.0) * 10000.0
+        impact_ratio = vwap / reference_price - 1.0
     else:
-        impact = (1.0 - vwap / mid) * 10000.0
+        impact_ratio = 1.0 - vwap / reference_price
+
+    spread = abs(best_ask - best_bid)
+    tolerance = spread / reference_price * _TOLERANCE_SCALE if reference_price > 0 else 0.0
+    tolerance = max(tolerance, _TOLERANCE_MIN)
+    adjusted_ratio = _apply_tolerance(impact_ratio, tolerance)
+    impact = adjusted_ratio * 10000.0
 
     return {
         "vwap": vwap,
