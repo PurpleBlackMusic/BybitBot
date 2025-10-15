@@ -10,6 +10,7 @@ import requests
 from datetime import datetime, timezone
 
 from .envs import get_api_client
+from .http_client import configure_http_session
 from .log import log
 
 _SERVER_TIME_KEYS: tuple[str, ...] = (
@@ -143,6 +144,7 @@ class _SyncedClock:
             close_http = False
             if session is None:
                 http = requests.Session()
+                configure_http_session(http)
                 close_http = True
             else:
                 http = session

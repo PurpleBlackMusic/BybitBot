@@ -3,6 +3,7 @@ import hmac, hashlib, json, time, uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
+import threading
 import requests
 from functools import lru_cache
 from collections import OrderedDict
@@ -27,6 +28,7 @@ API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
 
 from .helpers import ensure_link_id
+from .http_client import create_http_session
 from .bybit_errors import (
     BybitErrorPolicy,
     extract_ret_message,
@@ -100,8 +102,29 @@ class BybitAPI:
         self.recv_window = int(recv_window)
         self.timeout = int(timeout)
         self.verify_ssl = bool(verify_ssl)
-        self.session = requests.Session()
+        self._http_local: threading.local = threading.local()
         self._order_registry = _LocalOrderRegistry()
+
+    def _thread_local_session(self) -> requests.Session:
+        session = getattr(self._http_local, "session", None)
+        if session is None:
+            session = create_http_session()
+            self._http_local.session = session
+        return session
+
+    @property
+    def session(self) -> requests.Session:
+        """Return the thread-local HTTP client used for REST calls."""
+
+        return self._thread_local_session()
+
+    @session.setter
+    def session(self, value: requests.Session | None) -> None:
+        if value is None:
+            if hasattr(self._http_local, "session"):
+                delattr(self._http_local, "session")
+            return
+        self._http_local.session = value
 
     @property
     def base(self) -> str:
