@@ -1994,6 +1994,8 @@ def prepare_spot_market_order(
 
 
     limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
+    effective_tick_size = limit_map_tick
+    effective_qty_step = qty_step
     limit_price = _apply_tick(
         worst_price,
         limit_map_tick,
@@ -2155,7 +2157,8 @@ def prepare_spot_market_order(
             )
 
     def _apply_validation_result(result: validators.SpotValidationResult) -> None:
-        nonlocal validated, limit_price, qty_base, limit_notional
+        nonlocal validated, limit_price, qty_base, limit_notional, limit_map_tick, qty_step
+        nonlocal effective_tick_size, effective_qty_step
 
         price_candidate = result.price
         qty_candidate = result.qty
@@ -2173,6 +2176,13 @@ def prepare_spot_market_order(
         limit_price = price_candidate
         qty_base = qty_candidate
         limit_notional = result.notional
+
+        if result.tick_size > 0:
+            effective_tick_size = result.tick_size
+            limit_map_tick = result.tick_size
+        if result.qty_step > 0:
+            effective_qty_step = result.qty_step
+            qty_step = result.qty_step
 
         _recalculate_effective_notional()
 
@@ -2470,12 +2480,13 @@ def prepare_spot_market_order(
         _ensure_balance(base_coin or "", qty_base)
 
     qty_value = qty_base
-    qty_step_for_payload = qty_step
+    qty_step_for_payload = effective_qty_step if effective_qty_step > 0 else qty_step
 
     if qty_step_for_payload > 0:
         qty_value = _round_down(_to_decimal(qty_value), qty_step_for_payload)
     qty_text = _format_step_decimal(qty_value, qty_step_for_payload)
-    price_text = _format_step_decimal(limit_price, limit_map_tick)
+    price_step_for_payload = effective_tick_size if effective_tick_size > 0 else limit_map_tick
+    price_text = _format_step_decimal(limit_price, price_step_for_payload)
     if not qty_text:
         qty_text = "0"
     if not price_text:
@@ -2513,6 +2524,9 @@ def prepare_spot_market_order(
         "accountType": "UNIFIED",
     }
 
+    audit_qty_step = effective_qty_step if effective_qty_step > 0 else qty_step
+    audit_tick_size = effective_tick_size if effective_tick_size > 0 else limit_map_tick
+
     audit: Dict[str, object] = {
         "symbol": symbol.upper(),
         "side": side.capitalize(),
@@ -2523,7 +2537,8 @@ def prepare_spot_market_order(
         "min_order_amt": _format_decimal(min_amount),
         "min_order_qty": _format_decimal(min_qty),
         "quote_step": _format_decimal(quote_step),
-        "qty_step": _format_decimal(qty_step),
+        "qty_step": _format_decimal(audit_qty_step),
+        "tick_size": _format_decimal(audit_tick_size),
         "tolerance_multiplier": _format_decimal(tolerance_multiplier),
         "tolerance_value": tolerance_value,
         "tolerance_type": tolerance_type,
