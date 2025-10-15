@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import hashlib
 import json
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 from .envs import get_settings
+from .fees import fee_rate_for_symbol
 from .helpers import ensure_link_id
 from .instruments import get_listed_spot_symbols
 from .log import log
@@ -454,6 +456,33 @@ def _resolve_fee_currency_with_inference(
     return None, False
 
 
+def _estimate_fee_from_rate(
+    *,
+    symbol: Optional[str],
+    price: Optional[float],
+    qty: Optional[float],
+    is_maker: Optional[bool],
+) -> Optional[float]:
+    if not symbol or price is None or qty is None:
+        return None
+
+    if not math.isfinite(price) or not math.isfinite(qty):
+        return None
+
+    if price <= 0 or qty <= 0:
+        return None
+
+    snapshot = fee_rate_for_symbol(category="spot", symbol=symbol)
+    if snapshot is None:
+        return None
+
+    rate = snapshot.maker_rate if is_maker else snapshot.taker_rate
+    if rate is None:
+        return None
+
+    return float(price * qty * rate)
+
+
 def execution_fee_in_quote(
     execution: Mapping[str, object] | dict,
     *,
@@ -472,8 +501,6 @@ def execution_fee_in_quote(
         fee_raw = execution.get("fee")
 
     fee = _f(fee_raw)
-    if fee is None:
-        return 0.0
 
     symbol_value = execution.get("symbol") or execution.get("ticker")
     symbol = str(symbol_value or "").strip().upper()
@@ -496,6 +523,33 @@ def execution_fee_in_quote(
 
     fee_currency = _extract_fee_currency(execution)
     qty = _f(execution.get("execQty"))
+
+    maker_flag = execution.get("isMaker")
+    if isinstance(maker_flag, bool):
+        is_maker: Optional[bool] = maker_flag
+    elif isinstance(maker_flag, str):
+        token = maker_flag.strip().lower()
+        if token in {"true", "1", "yes", "y"}:
+            is_maker = True
+        elif token in {"false", "0", "no", "n"}:
+            is_maker = False
+        else:
+            is_maker = None
+    else:
+        is_maker = None
+
+    if fee is None:
+        estimated_fee = _estimate_fee_from_rate(
+            symbol=symbol,
+            price=resolved_price,
+            qty=qty,
+            is_maker=is_maker,
+        )
+        if estimated_fee is not None:
+            fee = estimated_fee
+        else:
+            return 0.0
+
     fee_currency, inferred = _resolve_fee_currency_with_inference(
         execution,
         explicit_currency=fee_currency,

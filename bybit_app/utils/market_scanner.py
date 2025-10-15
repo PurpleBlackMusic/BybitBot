@@ -27,6 +27,7 @@ from .ai.models import (
     initialise_feature_map,
     liquidity_feature,
 )
+from .fees import fee_rate_for_symbol
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -197,6 +198,7 @@ def _cached_cost_profile(
         "round_trip_fee_bps": round_trip_fee,
         "slippage_bps": slippage,
         "sample_size": maker_samples + taker_samples,
+        "fee_source": "history",
     }
 
 
@@ -682,8 +684,13 @@ def scan_market_opportunities(
         model = None
 
     cost_profile = _resolve_trade_cost_profile(data_dir, settings, testnet)
-    fee_round_trip_bps = float(cost_profile.get("round_trip_fee_bps", 0.0) or 0.0)
+    base_maker_fee_bps = float(cost_profile.get("maker_fee_bps", 0.0) or 0.0)
+    base_taker_fee_bps = float(
+        cost_profile.get("taker_fee_bps", _DEFAULT_TAKER_FEE_BPS) or _DEFAULT_TAKER_FEE_BPS
+    )
+    maker_ratio_hint = float(cost_profile.get("maker_ratio", _DEFAULT_MAKER_RATIO) or _DEFAULT_MAKER_RATIO)
     slippage_cost_bps = float(cost_profile.get("slippage_bps", 0.0) or 0.0)
+    historical_fee_source = str(cost_profile.get("fee_source") or "history")
 
     for raw in rows:
         if not isinstance(raw, dict):
@@ -819,6 +826,29 @@ def scan_market_opportunities(
         total_cost_bps: Optional[float] = None
         spread_component = max(float(spread_bps or 0.0), 0.0)
 
+        maker_fee_bps = base_maker_fee_bps
+        taker_fee_bps = base_taker_fee_bps
+        maker_ratio = maker_ratio_hint
+        fee_source = historical_fee_source
+
+        snapshot = fee_rate_for_symbol(category="spot", symbol=symbol)
+        if snapshot is not None:
+            snapshot_taker = snapshot.taker_fee_bps
+            snapshot_maker = snapshot.maker_fee_bps
+            if snapshot_taker is not None:
+                taker_fee_bps = _clamp(float(snapshot_taker), -100.0, 100.0)
+                fee_source = "api"
+            if snapshot_maker is not None:
+                maker_fee_bps = _clamp(float(snapshot_maker), -100.0, 100.0)
+                fee_source = "api"
+
+        maker_fee_bps = _clamp(float(maker_fee_bps), -100.0, 100.0)
+        taker_fee_bps = _clamp(float(taker_fee_bps), -100.0, 100.0)
+        maker_ratio = _clamp(float(maker_ratio), 0.0, 1.0)
+
+        effective_fee_bps = maker_fee_bps * maker_ratio + taker_fee_bps * (1.0 - maker_ratio)
+        fee_round_trip_bps = effective_fee_bps * 2.0
+
         if change_pct is not None:
             directional_change = float(change_pct)
             if direction != 0:
@@ -891,6 +921,10 @@ def scan_market_opportunities(
                 "fees": fee_round_trip_bps,
                 "slippage": slippage_cost_bps,
                 "spread": spread_component,
+                "maker_fee_bps": maker_fee_bps,
+                "taker_fee_bps": taker_fee_bps,
+                "maker_ratio": maker_ratio,
+                "fee_source": fee_source,
             }
             if total_cost_bps is not None
             else None,

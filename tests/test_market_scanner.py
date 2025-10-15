@@ -1,15 +1,110 @@
 import json
 import os
+import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import numpy as np
 
+if "joblib" not in sys.modules:  # pragma: no cover - test shim for optional dependency
+    _JOBLIB_STORE: dict[str, object] = {}
+
+    def _joblib_dump(obj, path, *args, **kwargs):
+        _JOBLIB_STORE[str(path)] = obj
+        return path
+
+    def _joblib_load(path, *args, **kwargs):
+        return _JOBLIB_STORE.get(str(path))
+
+    sys.modules["joblib"] = types.SimpleNamespace(load=_joblib_load, dump=_joblib_dump)
+
+if "sklearn" not in sys.modules:  # pragma: no cover - test shim for optional dependency
+    sklearn_stub = types.ModuleType("sklearn")
+    base_module = types.ModuleType("sklearn.base")
+
+    class _DummyBaseEstimator:
+        pass
+
+    class _DummyClassifierMixin:
+        pass
+
+    base_module.BaseEstimator = _DummyBaseEstimator
+    base_module.ClassifierMixin = _DummyClassifierMixin
+
+    linear_module = types.ModuleType("sklearn.linear_model")
+
+    class _DummyLogisticRegression:
+        def __init__(self, *_, **__):
+            pass
+
+        def fit(self, *_args, sample_weight=None, **_kwargs):  # pragma: no cover - dummy implementation
+            self.classes_ = np.array([0, 1], dtype=int)
+            return self
+
+        def predict_proba(self, X):  # pragma: no cover - dummy implementation
+            rows = len(X) if hasattr(X, "__len__") else 1
+            return np.full((rows, 2), 0.5, dtype=float)
+
+    linear_module.LogisticRegression = _DummyLogisticRegression
+
+    pipeline_module = types.ModuleType("sklearn.pipeline")
+
+    class _DummyPipeline:
+        def __init__(self, steps=None):
+            self.steps = steps or []
+            self.named_steps = {name: step for name, step in self.steps}
+
+        def _classifier(self):
+            for name, step in self.steps:
+                if name == "classifier":
+                    return step
+            return None
+
+        def fit(self, X, y, **kwargs):  # pragma: no cover - dummy implementation
+            classifier = self._classifier()
+            if classifier is not None:
+                sample_weight = kwargs.get("classifier__sample_weight")
+                classifier.fit(X, y, sample_weight=sample_weight)
+            return self
+
+        def predict_proba(self, X):  # pragma: no cover - dummy implementation
+            classifier = self._classifier()
+            if classifier is not None:
+                return classifier.predict_proba(X)
+            rows = len(X) if hasattr(X, "__len__") else 1
+            return np.full((rows, 2), 0.5, dtype=float)
+
+    pipeline_module.Pipeline = _DummyPipeline
+
+    preprocessing_module = types.ModuleType("sklearn.preprocessing")
+
+    class _DummyStandardScaler:
+        def fit(self, X, y=None):  # pragma: no cover - dummy implementation
+            return self
+
+        def transform(self, X):  # pragma: no cover - dummy implementation
+            return X
+
+    preprocessing_module.StandardScaler = _DummyStandardScaler
+
+    sklearn_stub.base = base_module
+    sklearn_stub.linear_model = linear_module
+    sklearn_stub.pipeline = pipeline_module
+    sklearn_stub.preprocessing = preprocessing_module
+
+    sys.modules["sklearn"] = sklearn_stub
+    sys.modules["sklearn.base"] = base_module
+    sys.modules["sklearn.linear_model"] = linear_module
+    sys.modules["sklearn.pipeline"] = pipeline_module
+    sys.modules["sklearn.preprocessing"] = preprocessing_module
+
 import bybit_app.utils.market_scanner as market_scanner_module
 from bybit_app.utils.ai import models as ai_models
 from bybit_app.utils.envs import Settings
+from bybit_app.utils.fees import FeeRateSnapshot
 from bybit_app.utils.market_scanner import (
     MarketScanner,
     MarketScannerError,
@@ -343,6 +438,64 @@ def test_scan_market_opportunities_includes_trade_costs(
     assert entry["note"] and "издержки" in entry["note"]
 
 
+def test_scan_market_opportunities_uses_api_fee_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_rows = [
+        {
+            "symbol": "ETHUSDT",
+            "turnover24h": 5_000_000.0,
+            "price24hPcnt": 1.5,
+            "bestBidPrice": 2000.0,
+            "bestAskPrice": 2001.0,
+            "volume24h": 500_000.0,
+        }
+    ]
+    _write_snapshot(tmp_path, snapshot_rows)
+
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+
+    def fake_fee_rate_for_symbol(*_, **__):
+        return FeeRateSnapshot(
+            maker_rate=0.0006,
+            taker_rate=0.0012,
+            symbol="ETHUSDT",
+            category="spot",
+            fetched_at=time.time(),
+        )
+
+    monkeypatch.setattr(market_scanner_module, "fee_rate_for_symbol", fake_fee_rate_for_symbol)
+
+    settings = Settings(
+        testnet=False,
+        ai_live_only=False,
+        ai_fee_bps=0.0,
+        ai_slippage_bps=0.0,
+    )
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=1,
+        min_turnover=0.0,
+        min_change_pct=0.5,
+        max_spread_bps=200.0,
+        settings=settings,
+        testnet=False,
+    )
+
+    assert opportunities, "scanner should produce an opportunity"
+    entry = opportunities[0]
+    costs = entry.get("costs_bps")
+    assert costs is not None
+
+    expected_fee_round_trip = (0.25 * 6.0 + 0.75 * 12.0) * 2.0
+    assert costs["fees"] == pytest.approx(expected_fee_round_trip, rel=1e-6)
+    assert costs["maker_fee_bps"] == pytest.approx(6.0, rel=1e-6)
+    assert costs["taker_fee_bps"] == pytest.approx(12.0, rel=1e-6)
+    assert costs["fee_source"] == "api"
+
+
 def test_training_dataset_prorates_fee_for_oversized_sell(tmp_path: Path) -> None:
     state = ai_models._SymbolState()
     timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -579,6 +732,16 @@ def test_train_market_model_logs_metrics_and_uses_weights(
         logged.append((event, payload))
 
     monkeypatch.setattr(ai_models, "log", fake_log)
+
+    def fake_load_model(path=None, *, data_dir=tmp_path):
+        return ai_models.MarketModel(
+            feature_names=tuple(ai_models.MODEL_FEATURES),
+            pipeline=ai_models.Pipeline([]),
+            trained_at=time.time(),
+            samples=len(labels),
+        )
+
+    monkeypatch.setattr(ai_models, "load_model", fake_load_model)
 
     model_path = tmp_path / "ai" / "model.joblib"
     model = ai_models.train_market_model(
