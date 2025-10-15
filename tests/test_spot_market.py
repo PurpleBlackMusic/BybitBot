@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from decimal import Decimal
 from typing import Mapping
 
@@ -14,6 +15,7 @@ from bybit_app.utils.spot_market import (
     prepare_spot_trade_snapshot,
     resolve_trade_symbol,
 )
+from bybit_app.utils.cache_kv import TTLKV
 
 
 class DummyAPI:
@@ -99,6 +101,7 @@ def setup_function(_):
     spot_market_module._PRICE_CACHE.clear()
     spot_market_module._BALANCE_CACHE.clear()
     spot_market_module._SYMBOL_CACHE.clear()
+    spot_market_module._INSTRUMENT_KV.clear()
 
 
 def _universe_payload(entries: list[dict]) -> dict:
@@ -297,6 +300,134 @@ def test_resolve_trade_symbol_prefers_canonical_symbol_for_alias():
 
     assert resolved == "PEPEUSDT"
     assert meta["reason"] == "alias_match"
+
+
+def test_instrument_limits_restores_missing_filters_from_persistent_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        spot_market_module,
+        "_INSTRUMENT_KV",
+        TTLKV(tmp_path / "instrument_limits.json"),
+    )
+    spot_market_module._INSTRUMENT_CACHE.clear()
+
+    base_payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "Trading",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                    },
+                    "priceFilter": {"tickSize": "0.1"},
+                }
+            ]
+        }
+    }
+    api = DummyAPI(base_payload)
+    limits = spot_market_module._instrument_limits(api, "BTCUSDT")
+    assert limits["tick_size"] == Decimal("0.1")
+    assert limits["qty_step"] == Decimal("0.001")
+    assert limits["min_order_amt"] == Decimal("5")
+
+    degraded_payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "Trading",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {},
+                    "priceFilter": {"tickSize": "0"},
+                }
+            ]
+        }
+    }
+    degraded_api = DummyAPI(degraded_payload)
+    spot_market_module._INSTRUMENT_CACHE.clear()
+
+    fallback_limits = spot_market_module._instrument_limits(degraded_api, "BTCUSDT")
+    assert fallback_limits["tick_size"] == Decimal("0.1")
+    assert fallback_limits["qty_step"] == Decimal("0.001")
+    assert fallback_limits["min_order_amt"] == Decimal("5")
+
+
+def test_instrument_limits_uses_defaults_when_filters_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        spot_market_module,
+        "_INSTRUMENT_KV",
+        TTLKV(tmp_path / "instrument_limits.json"),
+    )
+    spot_market_module._INSTRUMENT_CACHE.clear()
+
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "Trading",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {},
+                    "priceFilter": {"tickSize": "0"},
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+    limits = spot_market_module._instrument_limits(api, "BTCUSDT")
+
+    assert limits["tick_size"] == Decimal("0.00000001")
+    assert limits["qty_step"] == Decimal("0.00000001")
+    assert limits["min_order_amt"] == Decimal("5")
+
+
+def test_instrument_limits_uses_cache_on_request_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        spot_market_module,
+        "_INSTRUMENT_KV",
+        TTLKV(tmp_path / "instrument_limits.json"),
+    )
+    spot_market_module._INSTRUMENT_CACHE.clear()
+
+    payload = {
+        "result": {
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "status": "Trading",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "lotSizeFilter": {
+                        "minOrderAmt": "5",
+                        "qtyStep": "0.001",
+                        "minOrderQty": "0.001",
+                    },
+                    "priceFilter": {"tickSize": "0.1"},
+                }
+            ]
+        }
+    }
+    api = DummyAPI(payload)
+    spot_market_module._instrument_limits(api, "BTCUSDT")
+
+    class FailingAPI(DummyAPI):
+        def instruments_info(self, category="spot", symbol: str | None = None, **kwargs):
+            self.info_calls += 1
+            raise RuntimeError("boom")
+
+    failing_api = FailingAPI(payload)
+    spot_market_module._INSTRUMENT_CACHE.clear()
+
+    limits = spot_market_module._instrument_limits(failing_api, "BTCUSDT")
+
+    assert limits["min_order_amt"] == Decimal("5")
+    assert failing_api.info_calls == 1
 
 
 def test_place_spot_market_enforces_min_notional():
