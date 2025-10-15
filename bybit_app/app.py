@@ -24,10 +24,12 @@ from bybit_app.utils.ui import (
     safe_set_page_config,
     auto_refresh,
 )
-from bybit_app.utils.background import ensure_background_services, get_ws_snapshot
+from bybit_app.utils.background import (
+    ensure_background_services,
+    get_guardian_state,
+    get_ws_snapshot,
+)
 from bybit_app.utils.envs import active_api_key, active_api_secret, active_dry_run, get_settings
-from bybit_app.utils.guardian_bot import GuardianBot, GuardianBrief
-from bybit_app.utils.log import log
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
 ensure_background_services()
@@ -76,20 +78,40 @@ MINIMAL_CSS = """
 inject_css(MINIMAL_CSS)
 
 
-@st.cache_resource(show_spinner=False)
-def _load_guardian_bot() -> GuardianBot:
-    return GuardianBot()
-
-
-def get_bot() -> GuardianBot:
-    """Return a cached GuardianBot instance."""
-
-    bot = _load_guardian_bot()
+def _safe_float(value: object, default: float | None = 0.0) -> float | None:
     try:
-        bot.refresh()
-    except Exception as exc:  # pragma: no cover - defensive guard for UI runtime
-        log("guardian.refresh.error", err=str(exc))
-    return bot
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalise_brief(raw: Mapping[str, object] | None) -> dict[str, object]:
+    if not isinstance(raw, Mapping):
+        raw = {}
+
+    def _text(key: str, fallback: str = "") -> str:
+        value = raw.get(key)
+        if value is None:
+            return fallback
+        return str(value)
+
+    mode = _text("mode", "wait").lower() or "wait"
+    status_age = _safe_float(raw.get("status_age"), None)
+
+    return {
+        "mode": mode,
+        "symbol": _text("symbol", "—"),
+        "headline": _text("headline"),
+        "action_text": _text("action_text"),
+        "confidence_text": _text("confidence_text"),
+        "ev_text": _text("ev_text"),
+        "caution": _text("caution"),
+        "updated_text": _text("updated_text"),
+        "analysis": _text("analysis"),
+        "status_age": status_age,
+    }
 
 
 def render_navigation_grid(shortcuts: list[tuple[str, str, str]], *, columns: int = 2) -> None:
@@ -283,11 +305,30 @@ def _mode_meta(mode: str) -> tuple[str, str, str]:
     return mapping.get(mode, ("Наблюдаем", "⏸", "neutral"))
 
 
-def render_signal_brief(bot: GuardianBot) -> GuardianBrief:
-    brief = bot.generate_brief()
-    score = bot.signal_scorecard(brief)
-    settings = bot.settings
-    mode_label, mode_icon, tone = _mode_meta(brief.mode)
+def render_signal_brief(
+    brief_raw: Mapping[str, object] | None,
+    score: Mapping[str, object] | None,
+    *,
+    settings,
+) -> dict[str, object]:
+    brief = _normalise_brief(brief_raw)
+    probability_pct = _safe_float(
+        score.get("probability_pct") if isinstance(score, Mapping) else None, 0.0
+    )
+    buy_threshold = _safe_float(
+        score.get("buy_threshold") if isinstance(score, Mapping) else None, 0.0
+    )
+    ev_bps = _safe_float(
+        score.get("ev_bps") if isinstance(score, Mapping) else None, 0.0
+    )
+    min_ev_bps = _safe_float(
+        score.get("min_ev_bps") if isinstance(score, Mapping) else None, 0.0
+    )
+    last_update = (
+        score.get("last_update") if isinstance(score, Mapping) else None
+    ) or "—"
+
+    mode_label, mode_icon, tone = _mode_meta(brief.get("mode", "wait"))
 
     st.subheader("Сводка сигнала")
     with st.container(border=True):
@@ -298,49 +339,39 @@ def render_signal_brief(bot: GuardianBot) -> GuardianBrief:
             </div>
             """.format(
                 pill=build_pill(mode_label, icon=mode_icon, tone=tone),
-                symbol=brief.symbol,
+                symbol=brief.get("symbol", "—"),
             ),
             unsafe_allow_html=True,
         )
-        st.markdown(
-            f"<div class='signal-card__headline'>{brief.headline}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='signal-card__body'>{brief.analysis}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='signal-card__body'>{brief.action_text}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='signal-card__body'>{brief.confidence_text}</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"<div class='signal-card__body'>{brief.ev_text}</div>",
-            unsafe_allow_html=True,
-        )
+        for key in ("headline", "analysis", "action_text", "confidence_text", "ev_text"):
+            text = str(brief.get(key) or "").strip()
+            if not text:
+                continue
+            st.markdown(
+                f"<div class='signal-card__body'>{text}</div>",
+                unsafe_allow_html=True,
+            )
 
         metric_cols = st.columns(3)
         metric_cols[0].metric(
             "Вероятность",
-            f"{score['probability_pct']:.1f}%",
-            f"Порог {score['buy_threshold']:.0f}%",
+            f"{probability_pct or 0.0:.1f}%",
+            f"Порог {buy_threshold or 0.0:.0f}%",
         )
         metric_cols[1].metric(
             "Потенциал",
-            f"{score['ev_bps']:.1f} б.п.",
-            f"Мин. {score['min_ev_bps']:.1f} б.п.",
+            f"{ev_bps or 0.0:.1f} б.п.",
+            f"Мин. {min_ev_bps or 0.0:.1f} б.п.",
         )
         trade_mode = "DRY-RUN" if active_dry_run(settings) else "Live"
         metric_cols[2].metric("Тактика", mode_label, trade_mode)
-        st.caption(f"Обновление: {score['last_update']}")
+        st.caption(f"Обновление: {last_update}")
 
-    if brief.caution:
-        st.warning(brief.caution)
-    if brief.status_age and brief.status_age > 300:
+    caution = str(brief.get("caution") or "").strip()
+    if caution:
+        st.warning(caution)
+    status_age = _safe_float(brief.get("status_age"), None)
+    if status_age is not None and status_age > 300:
         st.error(
             "Сигнал не обновлялся более пяти минут — проверьте соединение с данными или перезапустите источник."
         )
@@ -390,7 +421,7 @@ def _normalise_watchlist(watchlist: object) -> list[Mapping[str, object] | objec
 
 def collect_user_actions(
     settings,
-    brief: GuardianBrief,
+    brief: Mapping[str, object] | None,
     health: dict[str, dict[str, object]] | None,
     watchlist: Sequence[object] | None,
 ) -> list[dict[str, object]]:
@@ -399,6 +430,10 @@ def collect_user_actions(
     actions: list[dict[str, object]] = []
     seen: dict[tuple[str, str], dict[str, object]] = {}
     order_counter = 0
+
+    brief_map = dict(brief) if isinstance(brief, Mapping) else {}
+    brief_caution = str(brief_map.get("caution") or "").strip()
+    brief_status_age = _safe_float(brief_map.get("status_age"), None)
 
     def _next_order() -> int:
         nonlocal order_counter
@@ -598,17 +633,17 @@ def collect_user_actions(
             page_label="Настроить резерв",
         )
 
-    if brief.caution:
+    if brief_caution:
         add(
             "Проверка сигнала",
-            brief.caution,
+            brief_caution,
             icon="🛟",
             tone="warning",
             page="pages/00_🧭_Простой_режим.py",
             page_label="Изучить сигнал",
         )
 
-    if brief.status_age and brief.status_age > 300:
+    if brief_status_age is not None and brief_status_age > 300:
         add(
             "Сигнал устарел",
             "Данные не обновлялись более пяти минут — перезапустите источник или обновите пайплайн сигналов.",
@@ -719,7 +754,7 @@ def collect_user_actions(
 
 def render_user_actions(
     settings,
-    brief: GuardianBrief,
+    brief: Mapping[str, object] | None,
     health: dict[str, dict[str, object]] | None,
     watchlist: Sequence[object] | None,
 ) -> None:
@@ -906,9 +941,13 @@ def render_hidden_tools() -> None:
                 render_navigation_grid(items)
 
 
-def render_action_plan(bot: GuardianBot, brief: GuardianBrief) -> None:
-    steps = bot.plan_steps(brief)
-    notes = bot.safety_notes()
+def render_action_plan(
+    plan_steps: Sequence[object] | None,
+    safety_notes: Sequence[object] | None,
+    risk_summary: str | None,
+) -> None:
+    steps = [str(step) for step in plan_steps or [] if str(step).strip()]
+    notes = [str(note) for note in safety_notes or [] if str(note).strip()]
 
     plan_html = "".join(f"<li>{step}</li>" for step in steps)
     safety_html = "".join(f"<li>{note}</li>" for note in notes)
@@ -921,15 +960,23 @@ def render_action_plan(bot: GuardianBot, brief: GuardianBrief) -> None:
     with cols[1]:
         st.markdown("#### Памятка безопасности")
         st.markdown(f"<ul class='safety-list'>{safety_html}</ul>", unsafe_allow_html=True)
-        st.caption(bot.risk_summary().replace("\n", "  \n"))
+        summary_text = str(risk_summary or "").replace("\n", "  \n")
+        if summary_text.strip():
+            st.caption(summary_text)
 
 
-def render_guides(settings, bot: GuardianBot, brief: GuardianBrief) -> None:
+def render_guides(
+    settings,
+    plan_steps: Sequence[object] | None,
+    safety_notes: Sequence[object] | None,
+    risk_summary: str | None,
+    brief: Mapping[str, object] | None,
+) -> None:
     st.subheader("Поддержка и советы")
     plan_tab, onboarding_tab, tips_tab = st.tabs(["План действий", "Первые шаги", "Подсказки"])
 
     with plan_tab:
-        render_action_plan(bot, brief)
+        render_action_plan(plan_steps, safety_notes, risk_summary)
 
     with onboarding_tab:
         render_onboarding()
@@ -938,7 +985,7 @@ def render_guides(settings, bot: GuardianBot, brief: GuardianBrief) -> None:
         render_tips(settings, brief)
 
 
-def render_tips(settings, brief: GuardianBrief) -> None:
+def render_tips(settings, brief: Mapping[str, object] | None) -> None:
     with st.container(border=True):
         st.markdown("### Быстрые подсказки")
         st.markdown(
@@ -953,7 +1000,8 @@ def render_tips(settings, brief: GuardianBrief) -> None:
             st.info("DRY-RUN активен: безопасно тестируйте стратегии перед реальной торговлей.")
         else:
             st.warning("DRY-RUN выключен. Проверьте лимиты риска перед запуском торговых сценариев.")
-        if brief.status_age and brief.status_age > 300:
+        status_age = _safe_float(brief.get("status_age") if isinstance(brief, Mapping) else None, None)
+        if status_age is not None and status_age > 300:
             st.error("Данные сигнала устарели. Проверьте, что пайплайн сигналов работает корректно.")
         if not (active_api_key(settings) and active_api_secret(settings)):
             st.warning("API ключи не добавлены: без них торговля невозможна.")
@@ -961,17 +1009,41 @@ def render_tips(settings, brief: GuardianBrief) -> None:
 
 def main() -> None:
     settings = get_settings()
-    bot = get_bot()
     ws_snapshot = get_ws_snapshot()
+    guardian_snapshot = get_guardian_state()
+    guardian_state = (
+        guardian_snapshot.get("state")
+        if isinstance(guardian_snapshot, Mapping)
+        else None
+    )
+    guardian_state = guardian_state if isinstance(guardian_state, Mapping) else {}
+    report = guardian_state.get("report")
+    if not isinstance(report, Mapping):
+        report = {}
+
+    brief_payload = guardian_state.get("brief")
+    if not isinstance(brief_payload, Mapping):
+        brief_payload = report.get("brief") if isinstance(report.get("brief"), Mapping) else {}
+    scorecard = guardian_state.get("scorecard")
+    if not isinstance(scorecard, Mapping):
+        scorecard = {}
+    plan_steps = guardian_state.get("plan_steps")
+    safety_notes = guardian_state.get("safety_notes")
+    risk_summary = guardian_state.get("risk_summary")
 
     render_header()
     st.divider()
     render_status(settings)
     render_ws_telemetry(ws_snapshot)
     st.divider()
-    health = _normalise_health(bot.data_health())
-    watchlist = _normalise_watchlist(bot.market_watchlist())
-    brief = render_signal_brief(bot)
+    if not guardian_state:
+        st.info(
+            "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
+        )
+
+    health = _normalise_health(report.get("health"))
+    watchlist = _normalise_watchlist(report.get("watchlist"))
+    brief = render_signal_brief(brief_payload, scorecard, settings=settings)
     st.divider()
     render_user_actions(settings, brief, health, watchlist)
     st.divider()
@@ -981,7 +1053,7 @@ def main() -> None:
     st.divider()
     render_market_watchlist(watchlist)
     st.divider()
-    render_guides(settings, bot, brief)
+    render_guides(settings, plan_steps, safety_notes, risk_summary, brief)
     st.divider()
     render_hidden_tools()
 
