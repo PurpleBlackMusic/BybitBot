@@ -94,7 +94,10 @@ class Settings:
     spot_limit_tif: str = 'GTC'
     spot_max_cap_per_symbol_pct: float = 20.0
     spot_max_cap_per_trade_pct: float = 5.0
+    spot_max_portfolio_pct: float = 70.0
     spot_cash_reserve_pct: float = 10.0
+    spot_vol_target_pct: float = 5.0
+    spot_vol_min_scale: float = 0.25
     spot_tp_ladder_bps: str = '35,70,110'
     spot_tp_ladder_split_pct: str = '50,30,20'
     spot_tp_reprice_threshold_bps: float = 5.0
@@ -309,6 +312,9 @@ _ENV_MAP = {
     "spot_cash_reserve_pct": "SPOT_CASH_RESERVE_PCT",
     "spot_max_cap_per_trade_pct": "SPOT_MAX_CAP_PER_TRADE_PCT",
     "spot_max_cap_per_symbol_pct": "SPOT_MAX_CAP_PER_SYMBOL_PCT",
+    "spot_max_portfolio_pct": "SPOT_MAX_PORTFOLIO_PCT",
+    "spot_vol_target_pct": "SPOT_VOL_TARGET_PCT",
+    "spot_vol_min_scale": "SPOT_VOL_MIN_SCALE",
     "spot_limit_tif": "SPOT_LIMIT_TIF",
     "spot_tp_ladder_bps": "SPOT_TP_LADDER_BPS",
     "spot_tp_ladder_split_pct": "SPOT_TP_LADDER_SPLIT_PCT",
@@ -461,6 +467,9 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_cash_reserve_pct"] = _cast_float(m.get("spot_cash_reserve_pct", 10.0))
     m["spot_max_cap_per_trade_pct"] = _cast_float(m.get("spot_max_cap_per_trade_pct", 5.0))
     m["spot_max_cap_per_symbol_pct"] = _cast_float(m.get("spot_max_cap_per_symbol_pct", 20.0))
+    m["spot_max_portfolio_pct"] = _cast_float(m.get("spot_max_portfolio_pct", 70.0))
+    m["spot_vol_target_pct"] = _cast_float(m.get("spot_vol_target_pct", 5.0))
+    m["spot_vol_min_scale"] = _cast_float(m.get("spot_vol_min_scale", 0.25))
     m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
     m["spot_tp_ladder_bps"] = m.get("spot_tp_ladder_bps") or "35,70,110"
     m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "50,30,20"

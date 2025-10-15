@@ -1371,6 +1371,159 @@ def test_signal_executor_scales_buy_notional_for_slippage(
     assert captured["max_quote"] == pytest.approx(usable_after_reserve)
 
 
+def test_signal_executor_applies_volatility_scaling(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT", "volatility_pct": 20.0}
+    settings = Settings(
+        ai_enabled=True,
+        ai_risk_per_trade_pct=10.0,
+        spot_vol_target_pct=5.0,
+        spot_vol_min_scale=0.2,
+    )
+    bot = StubBot(summary, settings)
+
+    total_equity = 1_000.0
+    available_equity = 1_000.0
+
+    api = StubAPI(total=total_equity, available=available_equity)
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(signal_executor_module, "_instrument_limits", lambda api_obj, symbol: {})
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        lambda self, require_success: (api, (total_equity, available_equity), None, {}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_portfolio_quote_exposure",
+        lambda self, settings, summary, **_: ({}, 0.0),
+    )
+
+    recorded: dict[str, float] = {}
+
+    def fake_compute(
+        self,
+        settings: Settings,
+        total_equity_value: float,
+        available_equity_value: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> tuple[float, float, bool, bool]:
+        recorded["sizing_factor"] = sizing_factor
+        return 100.0, available_equity_value, False, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute,
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", lambda *args, **kwargs: {}
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert recorded["sizing_factor"] == pytest.approx(0.25, rel=1e-6)
+    assert result.context is not None
+    volatility_meta = result.context.get("risk_controls", {}).get("volatility")
+    assert isinstance(volatility_meta, dict)
+    assert volatility_meta.get("scale") == pytest.approx(0.25, rel=1e-6)
+    assert result.status == "dry_run"
+
+
+def test_signal_executor_caps_notional_by_symbol_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_risk_per_trade_pct=50.0,
+        spot_cash_reserve_pct=0.0,
+        spot_max_cap_per_trade_pct=100.0,
+        spot_max_cap_per_symbol_pct=20.0,
+        spot_max_portfolio_pct=90.0,
+        ai_max_slippage_bps=0,
+    )
+    bot = StubBot(summary, settings)
+
+    total_equity = 1_000.0
+    available_equity = 1_000.0
+    existing_symbol_exposure = 180.0
+    other_exposure = 50.0
+
+    api = StubAPI(total=total_equity, available=available_equity)
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(signal_executor_module, "_instrument_limits", lambda api_obj, symbol: {})
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_resolve_wallet",
+        lambda self, require_success: (api, (total_equity, available_equity), None, {}),
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_portfolio_quote_exposure",
+        lambda self, settings, summary, **_: (
+            {"BTCUSDT": existing_symbol_exposure, "ETHUSDT": other_exposure},
+            existing_symbol_exposure + other_exposure,
+        ),
+    )
+
+    def fake_compute(
+        self,
+        settings: Settings,
+        total_equity_value: float,
+        available_equity_value: float,
+        sizing_factor: float = 1.0,
+        *,
+        min_notional: float | None = None,
+        quote_balance_cap: float | None = None,
+    ) -> tuple[float, float, bool, bool]:
+        return 150.0, available_equity_value, False, False
+
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_compute_notional",
+        fake_compute,
+    )
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", lambda *args, **kwargs: {}
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "dry_run"
+    assert result.order is not None
+    assert result.order["notional_quote"] == pytest.approx(20.0)
+    assert result.context is not None
+    risk_controls = result.context.get("risk_controls")
+    assert isinstance(risk_controls, dict)
+    assert risk_controls["symbol_cap"]["available"] == pytest.approx(20.0)
+    cap_info = risk_controls.get("cap_adjustment")
+    assert isinstance(cap_info, dict)
+    assert cap_info.get("applied") is True
+    assert cap_info.get("final_notional") == pytest.approx(20.0)
+
+
 def test_signal_executor_sell_ignores_max_quote(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {
         "actionable": True,
