@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Callable, Iterable, Mapping, Optional
@@ -558,6 +559,69 @@ def test_regenerate_tp_ladder_preserves_existing_on_total_failure(
     current_plan = manager._tp_ladder_plan.get("BTCUSDT") or {}
     assert current_plan.get("signature") == previous_signature
     assert current_plan.get("updated_ts") == before_plan.get("updated_ts")
+
+
+def test_sweep_tp_ladder_orders_cancels_and_replans(monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = WSManager()
+
+    now_ts = time.time()
+    old_ms = int((now_ts - 600) * 1000)
+
+    class DummyAPI:
+        def __init__(self) -> None:
+            self.cancelled: list[list[dict[str, object]]] = []
+
+        def open_orders(self, *, category: str, openOnly: int):
+            assert category == "spot"
+            assert openOnly == 1
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "orderId": "order-1",
+                            "orderLinkId": "AI-TP-BTC-LEGACY",
+                            "createdTime": str(old_ms),
+                        }
+                    ]
+                }
+            }
+
+        def cancel_batch(self, *, category: str, request: list[dict[str, object]]):
+            assert category == "spot"
+            self.cancelled.append(request)
+
+    api = DummyAPI()
+
+    monkeypatch.setattr(manager, "_prime_inventory_snapshot", lambda: None)
+    manager._inventory_snapshot = {
+        "BTCUSDT": {
+            "position_qty": Decimal("1"),
+            "avg_cost": Decimal("100"),
+            "realized_pnl": Decimal("0"),
+        }
+    }
+
+    monkeypatch.setattr(
+        manager,
+        "_resolve_tp_config",
+        lambda settings: [(Decimal("50"), Decimal("0.5"))],
+    )
+
+    regenerate_calls: list[str] = []
+
+    def _capture_regenerate(row, inventory, **kwargs):
+        regenerate_calls.append(row.get("symbol"))
+
+    monkeypatch.setattr(manager, "_regenerate_tp_ladder", _capture_regenerate)
+
+    result = manager.sweep_tp_ladder_orders(api=api, older_than_sec=60, now=now_ts)
+
+    assert api.cancelled, "expected stale orders to be cancelled"
+    assert regenerate_calls == ["BTCUSDT"]
+    assert result["cancelled"] == 1
+    assert tuple(result["symbols"]) == ("BTCUSDT",)
+    assert result["replanned"] == 1
 
 
 def test_ws_manager_respects_executor_registered_plan(monkeypatch: pytest.MonkeyPatch) -> None:

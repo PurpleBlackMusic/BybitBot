@@ -99,6 +99,8 @@ class Settings:
     spot_tp_ladder_split_pct: str = '50,30,20'
     spot_tp_reprice_threshold_bps: float = 5.0
     spot_tp_reprice_qty_buffer: float = 0.0
+    spot_tp_sweep_interval_sec: float = 120.0
+    spot_tp_sweep_age_sec: float = 900.0
 
     # AI — общие
     ai_enabled: bool = True
@@ -313,6 +315,8 @@ _ENV_MAP = {
     "spot_tpsl_tp_order_type": "SPOT_TPSL_TP_ORDER_TYPE",
     "spot_tpsl_sl_order_type": "SPOT_TPSL_SL_ORDER_TYPE",
     "spot_cash_only": "SPOT_CASH_ONLY",
+    "spot_tp_sweep_interval_sec": "SPOT_TP_SWEEP_INTERVAL_SEC",
+    "spot_tp_sweep_age_sec": "SPOT_TP_SWEEP_AGE_SEC",
     "order_time_in_force": "ORDER_TIME_IN_FORCE",
     "allow_partial_fills": "ALLOW_PARTIAL_FILLS",
     "reprice_unfilled_after_sec": "REPRICE_UNFILLED_AFTER_SEC",
@@ -472,6 +476,18 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
         m["spot_tp_reprice_qty_buffer"] = buffer_val
     else:
         m.pop("spot_tp_reprice_qty_buffer", None)
+
+    sweep_interval = _cast_float(m.get("spot_tp_sweep_interval_sec"))
+    if sweep_interval is not None:
+        m["spot_tp_sweep_interval_sec"] = sweep_interval
+    else:
+        m.pop("spot_tp_sweep_interval_sec", None)
+
+    sweep_age = _cast_float(m.get("spot_tp_sweep_age_sec"))
+    if sweep_age is not None:
+        m["spot_tp_sweep_age_sec"] = sweep_age
+    else:
+        m.pop("spot_tp_sweep_age_sec", None)
 
     tif_raw = m.get("order_time_in_force")
     if isinstance(tif_raw, str):

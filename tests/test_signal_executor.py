@@ -5242,3 +5242,63 @@ def test_automation_loop_emits_results_via_callback(monkeypatch: pytest.MonkeyPa
     assert loop._last_result is not None
     assert loop._last_result.status == "dry_run"
 
+
+def test_signal_executor_sweeper_throttling(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings()
+    settings.spot_tp_sweep_interval_sec = 10.0
+    settings.spot_tp_sweep_age_sec = 60.0
+
+    class DummyBot:
+        def __init__(self, settings: Settings) -> None:
+            self.settings = settings
+
+    bot = DummyBot(settings)
+    executor = SignalExecutor(bot, settings=settings)
+
+    fake_time = {"value": 0.0}
+    monkeypatch.setattr(
+        signal_executor_module.time,
+        "monotonic",
+        lambda: fake_time["value"],
+    )
+
+    monkeypatch.setattr(signal_executor_module, "creds_ok", lambda _: True)
+    dummy_api = object()
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: dummy_api)
+
+    calls: list[dict[str, object]] = []
+
+    class StubManager:
+        def sweep_tp_ladder_orders(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "cancelled": 2,
+                "checked": 5,
+                "replanned": 1,
+                "symbols": ("BTCUSDT",),
+            }
+
+    stub_manager = StubManager()
+    monkeypatch.setattr(signal_executor_module, "ws_manager", stub_manager)
+
+    logs: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        signal_executor_module,
+        "log",
+        lambda event, **payload: logs.append((event, payload)),
+    )
+
+    executor.sweep_orphan_orders()
+
+    assert calls, "expected sweeper to call ws_manager"
+    assert logs and logs[-1][0] == "guardian.auto.tp_sweeper"
+    first_run = executor._tp_sweeper_last_run
+    assert first_run == pytest.approx(fake_time["value"])
+
+    executor.sweep_orphan_orders()
+    assert len(calls) == 1, "sweeper should throttle subsequent calls"
+
+    fake_time["value"] += 11.0
+    executor.sweep_orphan_orders()
+    assert len(calls) == 2
+

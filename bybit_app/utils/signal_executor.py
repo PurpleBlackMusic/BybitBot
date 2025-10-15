@@ -134,6 +134,7 @@ class SignalExecutor:
         self._spot_inventory_snapshot: Optional[
             Tuple[Dict[str, Mapping[str, object]], Dict[str, Dict[str, object]]]
         ] = None
+        self._tp_sweeper_last_run: Optional[float] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -477,6 +478,72 @@ class SignalExecutor:
         self._validation_penalties.pop(symbol, None)
         self._symbol_quarantine.pop(symbol, None)
         self._price_limit_backoff.pop(symbol, None)
+
+    def sweep_orphan_orders(self) -> None:
+        """Cancel stale AI ladder orders if they linger without fills."""
+
+        try:
+            settings = self._resolve_settings()
+        except Exception as exc:  # pragma: no cover - defensive
+            log("guardian.auto.tp_sweeper.settings_error", err=str(exc))
+            return
+
+        try:
+            interval = float(getattr(settings, "spot_tp_sweep_interval_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            interval = 0.0
+        if interval <= 0.0:
+            return
+
+        try:
+            age_limit = float(getattr(settings, "spot_tp_sweep_age_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            age_limit = 0.0
+        if age_limit <= 0.0:
+            return
+
+        now = time.monotonic()
+        last_run = self._tp_sweeper_last_run
+        if last_run is not None and now - last_run < interval:
+            return
+
+        if not creds_ok(settings):
+            return
+
+        try:
+            api = get_api_client()
+        except Exception as exc:  # pragma: no cover - defensive
+            log("guardian.auto.tp_sweeper.api_error", err=str(exc))
+            return
+
+        if api is None:
+            return
+
+        self._tp_sweeper_last_run = now
+
+        try:
+            result = ws_manager.sweep_tp_ladder_orders(
+                api=api,
+                older_than_sec=age_limit,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log("guardian.auto.tp_sweeper.sweep_error", err=str(exc))
+            return
+
+        cancelled = int(result.get("cancelled", 0)) if isinstance(result, Mapping) else 0
+        if cancelled <= 0:
+            return
+
+        payload: Dict[str, object] = {
+            "cancelled": cancelled,
+            "checked": int(result.get("checked", 0)) if isinstance(result, Mapping) else 0,
+            "replanned": int(result.get("replanned", 0)) if isinstance(result, Mapping) else 0,
+            "age_limit_sec": age_limit,
+        }
+        symbols = result.get("symbols") if isinstance(result, Mapping) else None
+        if isinstance(symbols, (list, tuple, set)):
+            payload["symbols"] = sorted(str(symbol) for symbol in symbols if symbol)
+        log("guardian.auto.tp_sweeper", **payload)
 
     def _filter_quarantined_candidates(
         self, candidates: List[Tuple[str, Optional[Dict[str, object]]]]
@@ -4587,6 +4654,11 @@ class AutomationLoop:
         return now >= self._next_retry_ts
 
     def _tick(self) -> float:
+        try:
+            self.executor.sweep_orphan_orders()
+        except Exception as exc:  # pragma: no cover - defensive safeguard
+            log("guardian.auto.tp_sweeper.error", err=str(exc))
+
         signature = self.executor.current_signature()
         settings_marker = self.executor.settings_marker()
         key = (signature, settings_marker)

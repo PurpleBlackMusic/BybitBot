@@ -2006,6 +2006,192 @@ class WSManager:
                     count=len(chunk),
                 )
 
+    def sweep_tp_ladder_orders(
+        self,
+        *,
+        api=None,
+        older_than_sec: float = 900.0,
+        batch_size: int = 10,
+        now: Optional[float] = None,
+    ) -> dict[str, object]:
+        """Cancel stale AI take-profit orders and trigger a replan."""
+
+        try:
+            threshold = float(older_than_sec)
+        except (TypeError, ValueError):
+            threshold = 0.0
+        if threshold <= 0.0:
+            return {"checked": 0, "cancelled": 0, "symbols": tuple(), "replanned": 0}
+
+        timestamp_now = time.time() if now is None else now
+        try:
+            now_ms = int(float(timestamp_now) * 1000)
+        except (TypeError, ValueError):
+            now_ms = int(time.time() * 1000)
+
+        client = api
+        if client is None:
+            try:
+                client = get_api_client()
+            except Exception as exc:
+                log("ws.private.tp_ladder.sweep.api_error", err=str(exc))
+                return {
+                    "checked": 0,
+                    "cancelled": 0,
+                    "symbols": tuple(),
+                    "replanned": 0,
+                    "error": str(exc),
+                }
+        if client is None:
+            return {"checked": 0, "cancelled": 0, "symbols": tuple(), "replanned": 0}
+
+        try:
+            response = client.open_orders(category="spot", openOnly=1)
+        except Exception as exc:
+            log("ws.private.tp_ladder.sweep.open_orders_error", err=str(exc))
+            return {
+                "checked": 0,
+                "cancelled": 0,
+                "symbols": tuple(),
+                "replanned": 0,
+                "error": str(exc),
+            }
+
+        rows = ((response.get("result") or {}).get("list") or []) if isinstance(response, dict) else []
+
+        def _timestamp_from_row(entry: Mapping[str, object]) -> Optional[int]:
+            for key in (
+                "updatedTime",
+                "updateTime",
+                "updated_time",
+                "createdTime",
+                "createTime",
+                "created_time",
+                "orderCreateTime",
+            ):
+                value = entry.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if not text:
+                    continue
+                try:
+                    return int(float(text))
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        checked = 0
+        stale_entries: list[dict[str, object]] = []
+        stale_symbols: set[str] = set()
+        threshold_ms = int(threshold * 1000)
+
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            link = str(row.get("orderLinkId") or row.get("orderLinkID") or "").strip()
+            if not link or not link.upper().startswith("AI-TP-"):
+                continue
+            checked += 1
+            created_ts = _timestamp_from_row(row)
+            if created_ts is None or now_ms - created_ts < threshold_ms:
+                continue
+            payload = {
+                "symbol": row.get("symbol"),
+                "orderId": row.get("orderId"),
+                "orderLinkId": ensure_link_id(link),
+            }
+            if payload["orderId"] is None and payload["orderLinkId"] is None:
+                continue
+            stale_entries.append(payload)
+            symbol_text = str(row.get("symbol") or "").strip().upper()
+            if symbol_text:
+                stale_symbols.add(symbol_text)
+
+        cancelled = 0
+        errors: list[str] = []
+        for idx in range(0, len(stale_entries), max(int(batch_size) or 1, 1)):
+            chunk = stale_entries[idx : idx + max(int(batch_size) or 1, 1)]
+            request = [
+                {
+                    "symbol": entry.get("symbol"),
+                    "orderId": entry.get("orderId"),
+                    "orderLinkId": ensure_link_id(entry.get("orderLinkId")),
+                }
+                for entry in chunk
+            ]
+            try:
+                client.cancel_batch(category="spot", request=request)
+            except Exception as exc:
+                err_text = str(exc)
+                log(
+                    "ws.private.tp_ladder.sweep.cancel_error",
+                    err=err_text,
+                    count=len(request),
+                )
+                errors.append(err_text)
+            else:
+                cancelled += len(request)
+                log(
+                    "ws.private.tp_ladder.sweep.cancelled",
+                    count=len(request),
+                    older_than=threshold,
+                )
+
+        replanned = 0
+        if cancelled > 0 and stale_symbols:
+            self._prime_inventory_snapshot()
+            with self._fill_lock:
+                inventory = {
+                    symbol: dict(stats)
+                    for symbol, stats in self._inventory_snapshot.items()
+                    if isinstance(symbol, str) and isinstance(stats, Mapping)
+                }
+            config = self._resolve_tp_config(self.s)
+            if config:
+                limits_cache: dict[str, dict[str, object]] = {}
+                for symbol in sorted(stale_symbols):
+                    stats = inventory.get(symbol)
+                    if not isinstance(stats, Mapping):
+                        continue
+                    position_qty = self._decimal_from(stats.get("position_qty"))
+                    if position_qty <= 0:
+                        continue
+                    try:
+                        self._regenerate_tp_ladder(
+                            {"symbol": symbol, "side": "Buy"},
+                            inventory,
+                            config=config,
+                            api=client,
+                            limits_cache=limits_cache,
+                            settings=self.s,
+                        )
+                    except Exception as exc:
+                        err_text = str(exc)
+                        log(
+                            "ws.private.tp_ladder.sweep.replan_error",
+                            symbol=symbol,
+                            err=err_text,
+                        )
+                        errors.append(err_text)
+                    else:
+                        replanned += 1
+            else:
+                log(
+                    "ws.private.tp_ladder.sweep.skip_replan",
+                    reason="no_config",
+                )
+
+        result: dict[str, object] = {
+            "checked": checked,
+            "cancelled": cancelled,
+            "symbols": tuple(sorted(stale_symbols)) if stale_symbols else tuple(),
+            "replanned": replanned,
+        }
+        if errors:
+            result["errors"] = errors
+        return result
+
     def _apply_price_band(
         self,
         price: Decimal,
