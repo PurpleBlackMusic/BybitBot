@@ -230,6 +230,43 @@ def test_order_sweeper_cancels_old_orders(monkeypatch: pytest.MonkeyPatch) -> No
     assert sweeper_info
     assert sweeper_info["cancelled"] == 1
     assert sweeper_info["batches"] == 1
+    assert sweeper_info["stale_total"] == 2
+    assert sweeper_info["triggered_retry"] is True
+    assert sweeper_info["stale_symbols"] == ("BTCUSDT",)
+
+
+def test_order_sweeper_uses_reprice_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+
+    class _FakeTime:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+        def time(self) -> float:
+            return self.value
+
+    fake_time = _FakeTime(5_000.0)
+    monkeypatch.setattr(background_module, "time", fake_time)
+    monkeypatch.setattr(hygiene_module, "time", fake_time)
+
+    class _Settings:
+        def __init__(self) -> None:
+            self.reprice_unfilled_after_sec = 180
+            self.execution_watchdog_max_age_sec = 180
+
+    monkeypatch.setattr(background_module, "get_settings", lambda: _Settings())
+
+    class _Api:
+        def open_orders(self, *, category: str, symbol: str | None = None, openOnly: int = 1):
+            del category, symbol, openOnly
+            return {"result": {"list": []}}
+
+    monkeypatch.setattr(background_module, "get_api_client", lambda: _Api())
+    monkeypatch.setattr(background_module, "log", lambda *_, **__: None)
+
+    svc._order_sweep_last = 0.0
+    assert svc._maybe_sweep_orders() is False
+    assert svc._order_sweep_stale_after == pytest.approx(180.0)
 
 
 def test_private_ws_stale_triggers_targeted_restart(
