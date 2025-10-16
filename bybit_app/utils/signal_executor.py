@@ -58,7 +58,7 @@ _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
 
 _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
-_PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
+_PRICE_LIMIT_LIQUIDITY_TTL = 150.0  # shorter cooldown after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _SUMMARY_PRICE_EXECUTION_MAX_AGE = 9.0
@@ -131,6 +131,23 @@ def _extract_bybit_error_code(exc: Exception) -> Optional[str]:
         code, _ = parsed
         return code
     return None
+
+
+def _price_limit_quarantine_ttl_for_retries(retries: int) -> float:
+    """Return the adaptive quarantine window for price-limit rejections."""
+
+    safe_retries = max(int(retries), 1)
+    exponent = safe_retries - 1
+    multiplier = min(2.0 ** exponent, 4.0)
+    ttl = _PRICE_LIMIT_LIQUIDITY_TTL * multiplier
+    return max(ttl, _PRICE_LIMIT_LIQUIDITY_TTL)
+
+
+def _price_limit_backoff_expiry(now: float, ttl: float) -> float:
+    """Calculate how long we should retain liquidity hints."""
+
+    buffer = max(ttl * 3.0, _PRICE_LIMIT_LIQUIDITY_TTL * 2.0)
+    return now + buffer
 
 
 class SignalExecutor:
@@ -496,10 +513,9 @@ class SignalExecutor:
                 if value is not None and math.isfinite(value):
                     payload[key] = value
 
-        multiplier = min(1.0 + 0.5 * max(retries - 1, 0), 4.0)
-        quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL * multiplier, _VALIDATION_PENALTY_TTL)
+        quarantine_ttl = _price_limit_quarantine_ttl_for_retries(retries)
         payload["quarantine_ttl"] = quarantine_ttl
-        payload["expires_at"] = now + max(quarantine_ttl * 2.0, _PRICE_LIMIT_LIQUIDITY_TTL)
+        payload["expires_at"] = _price_limit_backoff_expiry(now, quarantine_ttl)
 
         self._price_limit_backoff[symbol] = payload
         return payload
@@ -577,7 +593,7 @@ class SignalExecutor:
         expires_at = state.get("quarantine_ttl")
         ttl = _safe_float(expires_at)
         if ttl is not None and ttl > 0:
-            state["expires_at"] = now + max(ttl * 2.0, _PRICE_LIMIT_LIQUIDITY_TTL)
+            state["expires_at"] = _price_limit_backoff_expiry(now, ttl)
         self._price_limit_backoff[symbol] = state
 
         if not adjustments:
@@ -2233,6 +2249,32 @@ class SignalExecutor:
                 context={"symbol_meta": symbol_meta} if symbol_meta else None,
             )
 
+        backoff_state = self._price_limit_backoff.get(symbol)
+        if isinstance(backoff_state, Mapping):
+            cooldown_ttl = _safe_float(backoff_state.get("quarantine_ttl"))
+            last_updated = _safe_float(backoff_state.get("last_updated"))
+            if (
+                cooldown_ttl is not None
+                and cooldown_ttl > 0
+                and last_updated is not None
+                and math.isfinite(last_updated)
+            ):
+                cooldown_expires = last_updated + cooldown_ttl
+                if math.isfinite(cooldown_expires) and now < cooldown_expires:
+                    remaining = max(cooldown_expires - now, 0.0)
+                    minutes = remaining / 60.0
+                    context = {
+                        "validation_code": "price_limit_backoff",
+                        "price_limit_backoff": dict(backoff_state),
+                        "quarantine_ttl": cooldown_ttl,
+                        "quarantine_until": cooldown_expires,
+                    }
+                    reason = (
+                        "Ордер пропущен (price_limit_backoff): "
+                        "ждём восстановления ликвидности ≈{duration:.1f} мин"
+                    ).format(duration=minutes)
+                    return self._decision("skipped", reason=reason, context=context)
+
         side = "Buy" if mode == "buy" else "Sell"
         summary_price_snapshot = self._extract_market_price(summary, symbol)
         summary_age = summary_meta[1] if summary_meta is not None else None
@@ -3051,8 +3093,15 @@ class SignalExecutor:
 
                         quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl")) if backoff_state else None
                         if quarantine_ttl is None or quarantine_ttl <= 0:
-                            quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
-                        self._quarantine_symbol(symbol, ttl=quarantine_ttl)
+                            quarantine_ttl = _price_limit_quarantine_ttl_for_retries(1)
+                        quarantine_now = (
+                            _safe_float(backoff_state.get("last_updated"))
+                            if backoff_state
+                            else None
+                        )
+                        if quarantine_now is None or quarantine_now <= 0:
+                            quarantine_now = self._current_time()
+                        self._quarantine_symbol(symbol, now=quarantine_now, ttl=quarantine_ttl)
                         quarantine_until = self._symbol_quarantine.get(symbol)
                         if quarantine_until is not None:
                             validation_context["quarantine_until"] = quarantine_until
@@ -3182,8 +3231,11 @@ class SignalExecutor:
                 )
                 quarantine_ttl = _safe_float(backoff_state.get("quarantine_ttl")) if backoff_state else None
                 if quarantine_ttl is None or quarantine_ttl <= 0:
-                    quarantine_ttl = max(_PRICE_LIMIT_LIQUIDITY_TTL, _VALIDATION_PENALTY_TTL)
-                self._quarantine_symbol(symbol, ttl=quarantine_ttl)
+                    quarantine_ttl = _price_limit_quarantine_ttl_for_retries(1)
+                quarantine_now = _safe_float(backoff_state.get("last_updated")) if backoff_state else None
+                if quarantine_now is None or quarantine_now <= 0:
+                    quarantine_now = self._current_time()
+                self._quarantine_symbol(symbol, now=quarantine_now, ttl=quarantine_ttl)
                 quarantine_until = self._symbol_quarantine.get(symbol)
                 if quarantine_until is not None:
                     validation_context["quarantine_until"] = quarantine_until
