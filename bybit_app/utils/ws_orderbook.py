@@ -5,7 +5,8 @@ import json
 import threading
 import time
 import ssl
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .bybit_api import BybitAPI
 from .log import log
@@ -21,6 +22,7 @@ class LiveOrderbook:
         self.category = category
         self.books: dict[str, dict] = {}  # symbol -> {"ts":ms,"b":[(px,qty),],"a":[]}
         self._tops: dict[str, dict[str, float]] = {}
+        self._spread_history: dict[str, Deque[Tuple[float, float]]] = {}
         self.lock = threading.Lock()
         self.ws_thread: Optional[threading.Thread] = None
         self._stop = False
@@ -337,6 +339,84 @@ class LiveOrderbook:
             if existing and existing.get("ts", 0) > payload.get("ts", 0):
                 return
             self._tops[symbol] = payload
+            self._record_spread_history_locked(symbol, payload)
+
+    _SPREAD_HISTORY_MAX_MS = 60_000.0
+
+    def _record_spread_history_locked(self, symbol: str, payload: Dict[str, float]) -> None:
+        ts = float(payload.get("ts", time.time() * 1000))
+        ask = payload.get("best_ask")
+        bid = payload.get("best_bid")
+        if not ask or not bid or ask <= 0:
+            return
+        spread_bps = max(((ask - bid) / ask) * 10_000.0, 0.0)
+        history = self._spread_history.setdefault(symbol, deque())
+        history.append((ts, spread_bps))
+        cutoff = ts - self._SPREAD_HISTORY_MAX_MS
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def spread_window_stats(self, symbol: str, window_sec: float) -> Optional[Dict[str, float]]:
+        if window_sec <= 0:
+            return None
+
+        cleaned_symbol = self._normalise_symbol(symbol)
+        if not cleaned_symbol:
+            return None
+
+        now_ms = time.time() * 1000.0
+        cutoff = now_ms - max(window_sec, 0.0) * 1000.0
+        cutoff_history = now_ms - self._SPREAD_HISTORY_MAX_MS
+
+        with self.lock:
+            history = self._spread_history.get(cleaned_symbol)
+            if not history:
+                return None
+            while history and history[0][0] < cutoff_history:
+                history.popleft()
+            recent_values: list[float] = [spread for ts, spread in history if ts >= cutoff]
+            latest_ts = history[-1][0] if history else 0.0
+            latest_bps = history[-1][1] if history else 0.0
+
+        if not recent_values:
+            return {
+                "window_sec": float(window_sec),
+                "observations": 0,
+                "max_bps": 0.0,
+                "min_bps": 0.0,
+                "avg_bps": 0.0,
+                "latest_bps": float(latest_bps),
+                "age_ms": max(now_ms - latest_ts, 0.0),
+            }
+
+        observations = len(recent_values)
+        max_bps = max(recent_values)
+        min_bps = min(recent_values)
+        avg_bps = sum(recent_values) / len(recent_values)
+
+        return {
+            "window_sec": float(window_sec),
+            "observations": observations,
+            "max_bps": float(max_bps),
+            "min_bps": float(min_bps),
+            "avg_bps": float(avg_bps),
+            "latest_bps": float(latest_bps),
+            "age_ms": max(now_ms - latest_ts, 0.0),
+        }
+
+    def record_top(self, symbol: str, top: Mapping[str, float], *, source: str = "external") -> None:
+        cleaned_symbol = self._normalise_symbol(symbol)
+        if not cleaned_symbol:
+            return
+
+        entry: Dict[str, float] = {"ts": float(top.get("ts", time.time() * 1000.0))}
+        for key in ("best_bid", "best_bid_qty", "best_ask", "best_ask_qty"):
+            value = top.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                entry[key] = float(value)
+
+        if len(entry) > 1:
+            self._update_top(cleaned_symbol, entry, source=source)
 
     @staticmethod
     def _coerce_float(value: object) -> Optional[float]:
