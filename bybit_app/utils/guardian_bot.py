@@ -3377,8 +3377,10 @@ class GuardianBot:
             using_watchlist_symbol = allow_watchlist_symbol or same_symbol_as_status
 
             if allow_watchlist_symbol and isinstance(primary_entry.get("symbol"), str):
-                symbol = primary_entry["symbol"]
-                symbol_source = "watchlist"
+                candidate_symbol = primary_entry["symbol"].strip().upper()
+                if candidate_symbol:
+                    symbol = candidate_symbol
+                    symbol_source = "watchlist"
 
             if using_watchlist_symbol and watchlist_hint and (
                 not side_hint or side_hint == "wait"
@@ -3399,6 +3401,15 @@ class GuardianBot:
                 if candidate_ev is not None and candidate_ev != 0.0:
                     ev_value = candidate_ev
                     ev_source = "watchlist"
+
+            if using_watchlist_symbol:
+                holding_symbol = symbol in holding_symbols if symbol else False
+                buy_decision_threshold = thresholds.decision_threshold(
+                    "buy", holding_symbol
+                )
+                sell_decision_threshold = thresholds.decision_threshold(
+                    "sell", holding_symbol
+                )
         else:
             side_hint = status_side_hint
 
