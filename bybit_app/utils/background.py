@@ -68,7 +68,7 @@ class BackgroundServices:
         self._hygiene_lock = threading.Lock()
         self._hygiene_performed = False
 
-        self._order_sweep_interval = 60.0  # sweep idle orders once per minute
+        self._order_sweep_interval = 20.0  # sweep idle orders roughly every 20s
         self._order_sweep_stale_after = 600.0  # cancel GTC orders older than 10 minutes
         self._order_sweep_batch_size = 20
         self._order_sweep_last = 0.0
