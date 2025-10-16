@@ -195,6 +195,53 @@ def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
     ]
     assert len(stored_after_third) == 2
 
+
+def test_pair_trades_skips_placeholder_links_on_mainnet(
+    pnl_dir: Path,
+) -> None:
+    decisions_path = pnl_dir / "decisions.jsonl"
+    ledger_path = pnl_dir / "executions.mainnet.jsonl"
+    trades_path = pnl_dir / "trades.jsonl"
+
+    decisions_path.write_text("", encoding="utf-8")
+
+    events = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "orderLinkId": "abc",
+            "execTime": 1000,
+            "execPrice": 10,
+            "execQty": 1,
+            "execFee": 0.01,
+        },
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderLinkId": "abc",
+            "execTime": 2000,
+            "execPrice": 11,
+            "execQty": 1,
+            "execFee": 0.01,
+        },
+    ]
+
+    ledger_path.write_text(
+        "\n".join(json.dumps(entry) for entry in events),
+        encoding="utf-8",
+    )
+
+    trade_pairs.LED = ledger_path
+    trade_pairs.pair_trades(network="mainnet")
+
+    assert (
+        not trades_path.exists()
+        or trades_path.read_text(encoding="utf-8").strip() == ""
+    )
+
+
 def test_pair_trades_prefers_matching_order_link_id(pnl_dir: Path):
     decisions = [
         {"symbol": "ETHUSDT", "ts": 90, "decision_mid": "mid-a", "sl": 90, "rr": 2},

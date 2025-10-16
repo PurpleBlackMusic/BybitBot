@@ -7,16 +7,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Iterable
 from .paths import DATA_DIR
-from .pnl import _ledger_path_for, execution_fee_in_quote
+from .pnl import (
+    _ledger_path_for,
+    _resolve_network_marker,
+    execution_fee_in_quote,
+    PLACEHOLDER_ORDER_LINK_IDS,
+)
 from .file_io import tail_lines
 from .log import log
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
 LED: Path | None = None
-TRD = DATA_DIR / "pnl" / "trades.jsonl"
+TRD: Path | None = None
 
 FileSignature = Tuple[int, int]
 CacheSignature = Tuple[FileSignature, FileSignature, int]
+
+
+def _resolve_trades_path(
+    *, settings: object | None = None, network: object | None = None
+) -> Path:
+    if TRD is not None:
+        return Path(TRD)
+
+    marker = _resolve_network_marker(settings, network=network)
+    filename = f"trades.{marker}.jsonl"
+    return DATA_DIR / "pnl" / filename
 
 
 @dataclass
@@ -192,8 +208,10 @@ def _trade_identity(trade: Dict[str, Any]) -> Tuple:
     )
 
 
-def _merge_trade_history(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    existing = _read_jsonl(TRD, window_ms=None)
+def _merge_trade_history(
+    trades: List[Dict[str, Any]], *, path: Path
+) -> List[Dict[str, Any]]:
+    existing = _read_jsonl(path, window_ms=None)
     merged: Dict[Tuple, Dict[str, Any]] = {}
 
     for record in existing:
@@ -217,7 +235,7 @@ def _merge_trade_history(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ),
     )
 
-    _write_jsonl(TRD, ordered)
+    _write_jsonl(path, ordered)
 
     for trade in new_records:
         log(
@@ -258,6 +276,8 @@ def pair_trades(
     window = _normalise_window(window_ms)
     has_window = window_ms is not None
     ledger_path = _resolve_ledger_path(settings=settings, network=network)
+    marker = _resolve_network_marker(settings, network=network)
+    is_mainnet = marker == "mainnet"
     cache_key = _cache_key(DEC, ledger_path, window)
     signature = _cache_signature(DEC, ledger_path, window)
 
@@ -360,13 +380,18 @@ def pair_trades(
         fee = execution_fee_in_quote(e)
         if not sym or px <= 0 or qty <= 0:
             continue
+        raw_link = e.get("orderLinkId")
+        link_value = raw_link.strip() if isinstance(raw_link, str) else ""
+        if is_mainnet and link_value.lower() in PLACEHOLDER_ORDER_LINK_IDS:
+            continue
+
         events[sym].append({
             "type": side,
             "ts": ts,
             "px": px,
             "qty": qty,
             "fee": fee,
-            "link": e.get("orderLinkId") or None,
+            "link": link_value or None,
         })
 
     required_links_per_symbol: dict[str, set[str]] = {}
@@ -378,6 +403,11 @@ def pair_trades(
                 if ev.get("link")
                 and ev.get("type") == "sell"
                 and (ev.get("ts") or 0) >= cutoff_ts
+                and (
+                    not is_mainnet
+                    or str(ev.get("link")).strip().lower()
+                    not in PLACEHOLDER_ORDER_LINK_IDS
+                )
             }
             if links:
                 required_links_per_symbol[sym] = set(links)
@@ -700,7 +730,8 @@ def pair_trades(
             # остальные типы игнорируем
 
     # записываем
-    _merge_trade_history(trades)
+    trades_path = _resolve_trades_path(settings=settings, network=network)
+    _merge_trade_history(trades, path=trades_path)
     cached_payload = tuple(deepcopy(trade) for trade in trades)
     _PAIR_CACHE[cache_key] = _PairTradeCacheEntry(signature=signature, trades=cached_payload)
 
