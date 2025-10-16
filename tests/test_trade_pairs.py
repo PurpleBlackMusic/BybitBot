@@ -108,6 +108,93 @@ def test_pair_trades_preserves_fee_signs(pnl_dir: Path) -> None:
     assert trade["fees"] == pytest.approx(-0.07)
 
 
+def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
+    decisions_path = pnl_dir / "decisions.jsonl"
+    ledger_path = pnl_dir / "executions.testnet.jsonl"
+    trades_path = pnl_dir / "trades.jsonl"
+
+    decisions_path.write_text("", encoding="utf-8")
+
+    first_wave = [
+        {
+            "category": "spot",
+            "symbol": "SOLUSDT",
+            "side": "Buy",
+            "orderLinkId": "SOL-1",
+            "execTime": 1000,
+            "execPrice": 20,
+            "execQty": 1,
+            "execFee": 0.02,
+        },
+        {
+            "category": "spot",
+            "symbol": "SOLUSDT",
+            "side": "Sell",
+            "orderLinkId": "SOL-1",
+            "execTime": 2000,
+            "execPrice": 25,
+            "execQty": 1,
+            "execFee": 0.03,
+        },
+    ]
+
+    ledger_path.write_text(
+        "\n".join(json.dumps(entry) for entry in first_wave),
+        encoding="utf-8",
+    )
+
+    trades_a = trade_pairs.pair_trades()
+    assert len(trades_a) == 1
+
+    stored_after_first = [json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(stored_after_first) == 1
+
+    second_wave = [
+        {
+            "category": "spot",
+            "symbol": "SOLUSDT",
+            "side": "Buy",
+            "orderLinkId": "SOL-2",
+            "execTime": 3000,
+            "execPrice": 18,
+            "execQty": 2,
+            "execFee": 0.04,
+        },
+        {
+            "category": "spot",
+            "symbol": "SOLUSDT",
+            "side": "Sell",
+            "orderLinkId": "SOL-2",
+            "execTime": 4000,
+            "execPrice": 22,
+            "execQty": 2,
+            "execFee": 0.05,
+        },
+    ]
+
+    with ledger_path.open("a", encoding="utf-8") as handle:
+        for entry in second_wave:
+            handle.write("\n" + json.dumps(entry))
+
+    trades_b = trade_pairs.pair_trades()
+    assert len(trades_b) == 2
+
+    stored_after_second = [
+        json.loads(line)
+        for line in trades_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(stored_after_second) == 2
+    assert {row["orderLinkId"] for row in stored_after_second} == {"SOL-1", "SOL-2"}
+
+    trade_pairs.pair_trades()
+    stored_after_third = [
+        json.loads(line)
+        for line in trades_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(stored_after_third) == 2
+
 def test_pair_trades_prefers_matching_order_link_id(pnl_dir: Path):
     decisions = [
         {"symbol": "ETHUSDT", "ts": 90, "decision_mid": "mid-a", "sl": 90, "rr": 2},
@@ -1084,7 +1171,10 @@ def test_pair_trades_uses_cache_for_repeated_calls(
 
     assert first is not second
     assert first == second
-    assert len(read_calls) == 2
+    assert len(read_calls) == 3
+    assert read_calls.count(ledger_path) == 1
+    assert read_calls.count(pnl_dir / "decisions.jsonl") == 1
+    assert read_calls.count(trade_pairs.TRD) == 1
 
     # Modify ledger to invalidate cache and force another read
     extra_buy = {
@@ -1111,7 +1201,7 @@ def test_pair_trades_uses_cache_for_repeated_calls(
     )
 
     third = trade_pairs.pair_trades()
-    assert len(read_calls) == 4
+    assert len(read_calls) == 6
     assert len(third) == len(first) + 1
 
 
