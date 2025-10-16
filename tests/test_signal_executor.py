@@ -4563,6 +4563,81 @@ def test_signal_executor_skips_on_wide_spread(monkeypatch: pytest.MonkeyPatch) -
     assert guard_meta.get("spread_bps") > guard_meta.get("max_spread_bps", 0.0)
 
 
+def test_signal_executor_enforces_spread_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        ai_max_spread_bps=40.0,
+        ai_spread_cooldown_sec=5.0,
+    )
+    bot = StubBot(summary, settings)
+
+    wide_orderbook = {
+        "result": {
+            "a": [["110.0", "50"]],
+            "b": [["100.0", "50"]],
+        }
+    }
+
+    tight_orderbook = {
+        "result": {
+            "a": [["100.02", "50"]],
+            "b": [["100.0", "50"]],
+        }
+    }
+
+    api = StubAPI(total=1000.0, available=800.0, orderbook_payload=wide_orderbook)
+
+    class FakeMonotonic:
+        def __init__(self) -> None:
+            self._now = 1000.0
+
+        def advance(self, delta: float) -> None:
+            self._now += float(delta)
+
+        def __call__(self) -> float:
+            # keep a tiny forward drift to satisfy monotonic contract
+            self._now += 1e-6
+            return self._now
+
+    fake_clock = FakeMonotonic()
+
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    monkeypatch.setattr(
+        signal_executor_module,
+        "place_spot_market_with_tolerance",
+        lambda *args, **kwargs: pytest.fail("liquidity guard should skip before order placement"),
+    )
+    monkeypatch.setattr(signal_executor_module.time, "monotonic", fake_clock)
+
+    executor = SignalExecutor(bot)
+
+    first = executor.execute_once()
+    assert first.status == "skipped"
+    assert first.reason is not None and "спред" in first.reason
+
+    api._orderbook_payload = tight_orderbook
+    fake_clock.advance(0.2)
+
+    second = executor.execute_once()
+    assert second.status == "skipped"
+    assert second.reason is not None and "стабилизации ликвидности" in second.reason
+    assert second.context is not None
+    guard_meta = second.context.get("liquidity_guard")
+    assert isinstance(guard_meta, dict)
+    assert guard_meta.get("spread_cooldown_sec") == pytest.approx(5.0)
+    assert guard_meta.get("spread_cooldown_elapsed_sec", 0.0) < 5.0
+
+
 def test_signal_executor_skips_on_thin_top_of_book(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(

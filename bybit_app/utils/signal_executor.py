@@ -149,6 +149,7 @@ class SignalExecutor:
         self._dust_last_flush: float = 0.0
         self._active_stop_orders: Dict[str, Dict[str, object]] = {}
         self._last_daily_pnl_log_day: Optional[str] = None
+        self._spread_state: Dict[str, Dict[str, float]] = {}
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -958,6 +959,34 @@ class SignalExecutor:
 
         return snapshot
 
+    def _update_spread_state(
+        self,
+        symbol: Optional[str],
+        spread_bps: Optional[float],
+        threshold: float,
+    ) -> Dict[str, float]:
+        if not symbol:
+            return {}
+
+        state = self._spread_state.setdefault(
+            symbol,
+            {"last_observation": 0.0, "last_wide": 0.0, "last_narrow": 0.0},
+        )
+
+        now = time.monotonic()
+        state["last_observation"] = now
+
+        if spread_bps is None or not math.isfinite(spread_bps):
+            return state
+
+        spread_value = float(spread_bps)
+        if threshold > 0 and spread_value > threshold:
+            state["last_wide"] = now
+        else:
+            state["last_narrow"] = now
+
+        return state
+
     def _apply_liquidity_guard(
         self,
         side: str,
@@ -965,6 +994,7 @@ class SignalExecutor:
         orderbook_top: Mapping[str, float],
         *,
         settings: Settings,
+        symbol: Optional[str] = None,
         price_hint: Optional[float] = None,
     ) -> Optional[Tuple[str, Dict[str, object]]]:
         if notional_quote <= 0:
@@ -978,18 +1008,42 @@ class SignalExecutor:
         best_bid_qty = _safe_float(orderbook_top.get("best_bid_qty"))
         spread_bps = _safe_float(orderbook_top.get("spread_bps"))
 
+        try:
+            max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            max_spread = 0.0
+
+        try:
+            spread_cooldown = float(getattr(settings, "ai_spread_cooldown_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            spread_cooldown = 0.0
+
+        spread_state: Dict[str, float] = {}
+        if symbol:
+            spread_state = self._update_spread_state(symbol, spread_bps, max_spread)
+
         if spread_bps is not None:
             context["spread_bps"] = spread_bps
-            try:
-                max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                max_spread = 0.0
             if max_spread > 0 and spread_bps > max_spread:
                 context["max_spread_bps"] = max_spread
                 reason = (
                     "ждём восстановления ликвидности — спред {spread:.1f} б.п. превышает лимит {limit:.1f} б.п."
                 ).format(spread=spread_bps, limit=max_spread)
                 return reason, context
+
+            if max_spread > 0 and spread_cooldown > 0 and spread_state:
+                last_wide = spread_state.get("last_wide", 0.0)
+                if last_wide > 0.0:
+                    observed_at = spread_state.get("last_observation", time.monotonic())
+                    cooldown_elapsed = observed_at - last_wide
+                    if cooldown_elapsed < spread_cooldown:
+                        context["max_spread_bps"] = max_spread
+                        context["spread_cooldown_sec"] = spread_cooldown
+                        context["spread_cooldown_elapsed_sec"] = max(cooldown_elapsed, 0.0)
+                        reason = (
+                            "ждём стабилизации ликвидности — спред держится ниже лимита всего {elapsed:.1f} с (нужно ≥ {window:.1f} с)."
+                        ).format(elapsed=cooldown_elapsed, window=spread_cooldown)
+                        return reason, context
 
         top_price = best_ask if side == "Buy" else best_bid
         top_qty = best_ask_qty if side == "Buy" else best_bid_qty
@@ -2613,6 +2667,7 @@ class SignalExecutor:
                 adjusted_notional,
                 orderbook_top,
                 settings=settings,
+                symbol=symbol,
                 price_hint=summary_price_snapshot,
             )
             if guard_result is not None:
