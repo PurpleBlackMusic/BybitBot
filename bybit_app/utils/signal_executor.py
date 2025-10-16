@@ -20,6 +20,7 @@ from .envs import (
     get_settings,
     creds_ok,
 )
+from .bybit_api import BybitAPI
 from .settings_loader import call_get_settings
 from .helpers import ensure_link_id
 from .precision import format_to_step, quantize_to_step
@@ -51,6 +52,7 @@ from .telegram_notify import enqueue_telegram_message
 from .tp_targets import resolve_fee_guard_fraction, target_multiplier
 from .trade_notifications import format_sell_close_message
 from .ws_manager import manager as ws_manager
+from .ws_orderbook import LiveOrderbook
 
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
@@ -149,6 +151,7 @@ class SignalExecutor:
         self._dust_last_flush: float = 0.0
         self._active_stop_orders: Dict[str, Dict[str, object]] = {}
         self._last_daily_pnl_log_day: Optional[str] = None
+        self._live_orderbook: Optional[LiveOrderbook] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -877,6 +880,15 @@ class SignalExecutor:
 
         return None
 
+    def _live_orderbook_for_api(self, api: Optional[object]) -> Optional[LiveOrderbook]:
+        if api is None or not isinstance(api, BybitAPI):
+            return None
+        instance = self._live_orderbook
+        if instance is None or instance.api is not api:
+            instance = LiveOrderbook(api, category="spot")
+            self._live_orderbook = instance
+        return instance
+
     def _resolve_orderbook_top(
         self,
         api: Optional[object],
@@ -890,6 +902,48 @@ class SignalExecutor:
         cleaned_symbol = symbol.strip().upper()
         if not cleaned_symbol:
             return None
+
+        snapshot: Optional[Dict[str, float]] = None
+
+        live_orderbook = self._live_orderbook_for_api(api)
+        if live_orderbook is not None:
+            try:
+                live_orderbook.start_ws([cleaned_symbol])
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log(
+                    "guardian.auto.liquidity_guard.orderbook_ws_start_error",
+                    symbol=cleaned_symbol,
+                    err=str(exc),
+                )
+            else:
+                ws_top = live_orderbook.get_top_ws(cleaned_symbol, max_age_ms=1500)
+                if ws_top:
+                    snapshot = {}
+                    for key in (
+                        "best_ask",
+                        "best_bid",
+                        "best_ask_qty",
+                        "best_bid_qty",
+                        "spread_bps",
+                    ):
+                        value = ws_top.get(key)
+                        if isinstance(value, (int, float)):
+                            snapshot[key] = float(value)
+                    if snapshot:
+                        best_ask_val = snapshot.get("best_ask")
+                        best_bid_val = snapshot.get("best_bid")
+                        if (
+                            "spread_bps" not in snapshot
+                            and best_ask_val
+                            and best_bid_val
+                            and best_ask_val > 0
+                        ):
+                            snapshot["spread_bps"] = max(
+                                ((best_ask_val - best_bid_val) / best_ask_val) * 10_000.0,
+                                0.0,
+                            )
+        if snapshot:
+            return snapshot
 
         try:
             payload = api.orderbook(category="spot", symbol=cleaned_symbol, limit=max(limit, 1))
@@ -944,7 +998,7 @@ class SignalExecutor:
         if best_ask_float and best_bid_float and best_ask_float > 0:
             spread_bps = max(((best_ask_float - best_bid_float) / best_ask_float) * 10_000.0, 0.0)
 
-        snapshot: Dict[str, float] = {}
+        snapshot = {}
         if best_ask_float:
             snapshot["best_ask"] = best_ask_float
         if best_bid_float:
