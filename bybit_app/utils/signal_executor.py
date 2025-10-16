@@ -146,6 +146,8 @@ class SignalExecutor:
         self._tp_sweeper_last_run: float = 0.0
         self._dust_positions: Dict[str, Dict[str, object]] = {}
         self._dust_last_flush: float = 0.0
+        self._active_stop_orders: Dict[str, Dict[str, object]] = {}
+        self._last_daily_pnl_log_day: Optional[str] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -383,6 +385,44 @@ class SignalExecutor:
             invalidate_daily_pnl_cache()
         except Exception:
             pass
+
+    def _maybe_log_daily_pnl(
+        self,
+        settings: Settings,
+        *,
+        force: bool = False,
+        now: Optional[float] = None,
+    ) -> None:
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(now or self._current_time()))
+        if (
+            not force
+            and self._last_daily_pnl_log_day == day_key
+            and not self._daily_pnl_force_refresh
+        ):
+            return
+
+        try:
+            aggregated = daily_pnl(
+                force_refresh=force or self._daily_pnl_force_refresh
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "guardian.auto.daily_pnl.error",
+                err=str(exc),
+            )
+            return
+
+        net_result = self._extract_spot_daily_net(aggregated, day_key)
+        if net_result is None:
+            return
+
+        log(
+            "guardian.auto.daily_pnl",
+            day=day_key,
+            spot=float(round(net_result, 2)),
+        )
+        self._last_daily_pnl_log_day = day_key
+        self._daily_pnl_force_refresh = False
 
     def _quarantine_symbol(
         self,
@@ -1937,6 +1977,7 @@ class SignalExecutor:
         summary = self._fetch_summary()
         settings = self._resolve_settings()
         now = self._current_time()
+        self._maybe_log_daily_pnl(settings, now=now)
         summary_meta = self._resolve_summary_update_meta(summary, now)
         price_meta = self._resolve_price_update_meta(summary, now)
         guard = self._kill_switch_guard()
@@ -1975,6 +2016,12 @@ class SignalExecutor:
             equity_for_limits = float(total_equity)
         else:
             equity_for_limits = None
+
+        self._update_trailing_stops(
+            api,
+            settings,
+            summary if isinstance(summary, Mapping) else None,
+        )
 
         forced_summary, forced_meta = self._maybe_force_exit(
             summary,
@@ -3079,7 +3126,7 @@ class SignalExecutor:
             settings=settings, last_exec_id=last_exec_id
         )
 
-        ladder_orders, execution_stats = self._place_tp_ladder(
+        ladder_orders, execution_stats, stop_orders = self._place_tp_ladder(
             api,
             settings,
             symbol,
@@ -3094,6 +3141,9 @@ class SignalExecutor:
         if ladder_orders:
             order_context["take_profit_orders"] = copy.deepcopy(ladder_orders)
             order["take_profit_orders"] = copy.deepcopy(ladder_orders)
+        if stop_orders:
+            order_context["stop_loss_orders"] = copy.deepcopy(stop_orders)
+            order["stop_loss_orders"] = copy.deepcopy(stop_orders)
         self._maybe_notify_trade(
             settings=settings,
             symbol=symbol,
@@ -3107,10 +3157,58 @@ class SignalExecutor:
         )
         self._clear_symbol_penalties(symbol)
         self._mark_daily_pnl_stale()
+        self._maybe_log_daily_pnl(settings, force=True)
         return ExecutionResult(status="filled", order=order, response=response, context=order_context)
 
     # ------------------------------------------------------------------
     # helpers
+    def _cancel_existing_stop_orders(
+        self,
+        symbol: str,
+        api: object,
+        settings: Settings | None = None,
+    ) -> None:
+        if not symbol:
+            return
+
+        symbol_upper = symbol.upper()
+        state = self._active_stop_orders.pop(symbol_upper, None)
+        if not state:
+            return
+
+        if settings is not None and active_dry_run(settings):
+            return
+
+        order_id = state.get("order_id")
+        order_link_id = state.get("order_link_id")
+        if not order_id and not order_link_id:
+            return
+
+        if api is None or not hasattr(api, "cancel_order"):
+            return
+
+        payload: Dict[str, object] = {"category": "spot"}
+        if order_id:
+            payload["orderId"] = order_id
+        if order_link_id:
+            payload["orderLinkId"] = order_link_id
+
+        try:
+            api.cancel_order(**payload)  # type: ignore[call-arg]
+        except Exception as exc:  # pragma: no cover - network/runtime errors
+            log(
+                "guardian.auto.stop_loss.cancel.error",
+                symbol=symbol_upper,
+                err=str(exc),
+            )
+        else:
+            log(
+                "guardian.auto.stop_loss.cancel",
+                symbol=symbol_upper,
+                orderLinkId=order_link_id,
+                orderId=order_id,
+            )
+
     def _place_tp_ladder(
         self,
         api: object,
@@ -3121,21 +3219,21 @@ class SignalExecutor:
         *,
         ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
         private_snapshot: Mapping[str, object] | None = None,
-    ) -> tuple[list[Dict[str, object]], Dict[str, str]]:
+    ) -> tuple[list[Dict[str, object]], Dict[str, str], list[Dict[str, object]]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
         if side.lower() != "buy":
-            return [], {}
+            return [], {}, []
         if api is None or not hasattr(api, "place_order"):
-            return [], {}
+            return [], {}, []
 
         steps = self._resolve_tp_ladder(settings)
         if not steps:
-            return [], {}
+            return [], {}, []
 
         executed_base_raw, executed_quote = self._extract_execution_totals(response)
         if executed_base_raw <= 0 or executed_quote <= 0:
-            return [], {}
+            return [], {}, []
 
         order_id, order_link_id = self._extract_order_identifiers(response)
         execution_rows = ws_manager.realtime_private_rows(
@@ -3159,12 +3257,12 @@ class SignalExecutor:
             ledger_rows=ledger_rows,
         )
         if filled_base_total <= 0:
-            return [], {}
+            return [], {}, []
 
         executed_base = filled_base_total
         avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
         if avg_price <= 0:
-            return [], {}
+            return [], {}, []
 
         audit: Mapping[str, object] | None = None
         if isinstance(response, Mapping):
@@ -3242,6 +3340,7 @@ class SignalExecutor:
         sell_budget_base = self._round_to_step(available_base, qty_step, rounding=ROUND_DOWN)
         total_qty = sell_budget_base if sell_budget_base > 0 else Decimal("0")
         if total_qty <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
             execution_stats = self._build_tp_execution_stats(
                 executed_base=executed_base,
                 executed_quote=executed_quote,
@@ -3253,7 +3352,7 @@ class SignalExecutor:
                 open_sell_reserved=open_sell_reserved,
                 filled_base_total=filled_base_total,
             )
-            return [], execution_stats
+            return [], execution_stats, []
 
         remaining = total_qty
         allocations: list[tuple[_LadderStep, Decimal]] = []
@@ -3301,7 +3400,8 @@ class SignalExecutor:
             allocations = [(step_cfg, qty) for step_cfg, qty in adjusted if qty > 0]
 
         if not allocations:
-            return [], {}
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return [], {}, []
 
         tif_candidate = getattr(settings, "spot_limit_tif", None) or getattr(settings, "order_time_in_force", None) or "GTC"
         time_in_force = "GTC"
@@ -3364,7 +3464,8 @@ class SignalExecutor:
             )
 
         if not plan_entries:
-            return [], {}
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return [], {}, []
 
         plan_signature = tuple(
             (entry["price_text"], entry["qty_text"]) for entry in plan_entries
@@ -3500,8 +3601,344 @@ class SignalExecutor:
             filled_base_total=filled_base_total,
         )
 
+        stop_orders = self._place_stop_loss_orders(
+            api,
+            settings,
+            symbol,
+            side,
+            avg_price=avg_price,
+            qty_step=qty_step,
+            price_step=price_step,
+            sell_budget=total_qty,
+            min_qty=min_qty,
+            price_band_min=price_band_min,
+            price_band_max=price_band_max,
+        )
+
         execution_payload = execution_stats if execution_stats else {}
-        return placed, execution_payload
+        return placed, execution_payload, stop_orders
+
+    def _place_stop_loss_orders(
+        self,
+        api: object,
+        settings: Settings,
+        symbol: str,
+        side: str,
+        *,
+        avg_price: Decimal,
+        qty_step: Decimal,
+        price_step: Decimal,
+        sell_budget: Decimal,
+        min_qty: Decimal,
+        price_band_min: Decimal,
+        price_band_max: Decimal,
+    ) -> list[Dict[str, object]]:
+        symbol_upper = symbol.upper()
+        if sell_budget <= 0 or qty_step <= 0 or avg_price <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        if active_dry_run(settings):
+            self._active_stop_orders.pop(symbol_upper, None)
+            return []
+
+        if api is None or not hasattr(api, "place_order"):
+            return []
+
+        exit_side = "Sell" if side.lower() == "buy" else "Buy"
+        trigger_direction = 2 if exit_side == "Sell" else 1
+
+        qty = self._round_to_step(sell_budget, qty_step, rounding=ROUND_DOWN)
+        if qty <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+        if min_qty > 0 and qty < min_qty:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        qty_text = self._format_decimal_step(qty, qty_step)
+        try:
+            qty_decimal = Decimal(qty_text)
+        except (InvalidOperation, ValueError):
+            qty_decimal = Decimal("0")
+        if qty_decimal <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        stop_loss_bps = _safe_float(getattr(settings, "spot_stop_loss_bps", None)) or 0.0
+        trailing_bps = _safe_float(
+            getattr(settings, "spot_trailing_stop_distance_bps", None)
+        ) or 0.0
+        activation_bps = _safe_float(
+            getattr(settings, "spot_trailing_stop_activation_bps", None)
+        ) or 0.0
+
+        if stop_loss_bps <= 0 and trailing_bps <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        base_bps = stop_loss_bps if stop_loss_bps > 0 else trailing_bps
+        base_fraction = Decimal(base_bps) / Decimal("10000")
+        if exit_side == "Sell":
+            stop_price = avg_price * (Decimal("1") - base_fraction)
+        else:
+            stop_price = avg_price * (Decimal("1") + base_fraction)
+
+        if stop_price <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        if price_band_min > 0 and stop_price < price_band_min:
+            stop_price = price_band_min
+        if price_band_max > 0 and stop_price > price_band_max:
+            stop_price = price_band_max
+
+        rounding_mode = ROUND_DOWN if exit_side == "Sell" else ROUND_UP
+        stop_price = self._round_to_step(stop_price, price_step, rounding=rounding_mode)
+        if stop_price <= 0:
+            self._cancel_existing_stop_orders(symbol, api, settings)
+            return []
+
+        stop_price_text = format_to_step(stop_price, price_step, rounding=rounding_mode)
+
+        order_type_raw = getattr(settings, "spot_tpsl_sl_order_type", "Market") or "Market"
+        order_type = str(order_type_raw).capitalize()
+
+        payload: Dict[str, object] = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": exit_side,
+            "qty": qty_text,
+            "orderType": order_type,
+            "triggerDirection": trigger_direction,
+            "triggerPrice": stop_price_text,
+            "orderFilter": "tpslOrder",
+            "orderLinkId": ensure_link_id(
+                f"AI-SL-{symbol_upper}-{int(time.time() * 1000)}"
+            ),
+        }
+
+        if order_type == "Limit":
+            limit_rounding = ROUND_DOWN if exit_side == "Sell" else ROUND_UP
+            limit_price = stop_price
+            adjust_step = price_step if price_step > 0 else Decimal("0")
+            if adjust_step > 0:
+                if exit_side == "Sell":
+                    candidate = stop_price - adjust_step
+                    if candidate > 0:
+                        limit_price = self._round_to_step(
+                            candidate, price_step, rounding=limit_rounding
+                        )
+                else:
+                    limit_price = self._round_to_step(
+                        stop_price + adjust_step, price_step, rounding=limit_rounding
+                    )
+            payload["price"] = format_to_step(
+                limit_price, price_step, rounding=limit_rounding
+            )
+            payload["timeInForce"] = "GTC"
+
+        response_payload: Mapping[str, object] | None = None
+        try:
+            response_payload = api.place_order(**payload)  # type: ignore[call-arg]
+        except Exception as exc:  # pragma: no cover - network/runtime errors
+            log(
+                "guardian.auto.stop_loss.error",
+                symbol=symbol_upper,
+                err=str(exc),
+            )
+            return []
+
+        order_id, order_link_id = self._extract_order_identifiers(response_payload)
+        if not order_link_id:
+            raw_link = payload.get("orderLinkId")
+            if isinstance(raw_link, str):
+                order_link_id = raw_link
+
+        trailing_state: Dict[str, object] = {
+            "symbol": symbol_upper,
+            "side": exit_side,
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+            "qty_step": qty_step,
+            "price_step": price_step,
+            "current_stop": stop_price,
+            "avg_price": avg_price,
+            "qty": qty,
+            "trailing_bps": trailing_bps,
+            "activation_bps": activation_bps,
+        }
+        if exit_side == "Sell":
+            trailing_state["highest_price"] = avg_price
+        else:
+            trailing_state["lowest_price"] = avg_price
+
+        self._active_stop_orders[symbol_upper] = trailing_state
+
+        log(
+            "guardian.auto.stop_loss.create",
+            symbol=symbol_upper,
+            side=exit_side,
+            qty=qty_text,
+            trigger=stop_price_text,
+            orderType=order_type,
+            trailing=bool(trailing_bps > 0),
+        )
+
+        order_entry: Dict[str, object] = {
+            "qty": qty_text,
+            "triggerPrice": stop_price_text,
+            "orderType": order_type,
+        }
+        if order_link_id:
+            order_entry["orderLinkId"] = order_link_id
+        if order_id:
+            order_entry["orderId"] = order_id
+        if trailing_bps > 0:
+            order_entry["trailingDistanceBps"] = trailing_bps
+            if activation_bps > 0:
+                order_entry["activationBps"] = activation_bps
+
+        return [order_entry]
+
+    def _update_trailing_stops(
+        self,
+        api: object,
+        settings: Settings,
+        summary: Mapping[str, object] | None,
+    ) -> None:
+        if not self._active_stop_orders:
+            return
+        if active_dry_run(settings):
+            return
+        if api is None or not hasattr(api, "amend_order"):
+            return
+
+        price_map: Dict[str, Decimal] = {}
+        if isinstance(summary, Mapping):
+            prices = summary.get("prices")
+            if isinstance(prices, Mapping):
+                for key, value in prices.items():
+                    price_value = _safe_float(value)
+                    if price_value is None or price_value <= 0:
+                        continue
+                    price_map[str(key).upper()] = Decimal(str(price_value))
+
+        if not price_map:
+            return
+
+        trailing_updated = False
+        for symbol_upper, state in list(self._active_stop_orders.items()):
+            current_price = price_map.get(symbol_upper)
+            if current_price is None:
+                continue
+
+            trailing_bps = _safe_float(state.get("trailing_bps")) or 0.0
+            if trailing_bps <= 0:
+                continue
+
+            activation_bps = _safe_float(state.get("activation_bps")) or 0.0
+            price_step = state.get("price_step")
+            if not isinstance(price_step, Decimal) or price_step <= 0:
+                continue
+
+            current_stop = state.get("current_stop")
+            if not isinstance(current_stop, Decimal):
+                try:
+                    current_stop = Decimal(str(current_stop))
+                except (InvalidOperation, ValueError):
+                    continue
+
+            avg_price = state.get("avg_price")
+            if not isinstance(avg_price, Decimal):
+                try:
+                    avg_price = Decimal(str(avg_price))
+                except (InvalidOperation, ValueError):
+                    continue
+
+            fraction = Decimal(trailing_bps) / Decimal("10000")
+            activation_fraction = Decimal(activation_bps) / Decimal("10000")
+            exit_side = str(state.get("side") or "").capitalize() or "Sell"
+
+            if exit_side == "Sell":
+                highest = state.get("highest_price")
+                if isinstance(highest, Decimal):
+                    highest_price = highest
+                else:
+                    try:
+                        highest_price = Decimal(str(highest))
+                    except (InvalidOperation, ValueError):
+                        highest_price = avg_price
+                if current_price > highest_price:
+                    highest_price = current_price
+                state["highest_price"] = highest_price
+                if activation_fraction > 0:
+                    activation_price = avg_price * (Decimal("1") + activation_fraction)
+                    if highest_price < activation_price:
+                        continue
+                target_price = highest_price * (Decimal("1") - fraction)
+                rounding_mode = ROUND_DOWN
+                comparison = target_price > current_stop
+            else:
+                lowest = state.get("lowest_price")
+                if isinstance(lowest, Decimal):
+                    lowest_price = lowest
+                else:
+                    try:
+                        lowest_price = Decimal(str(lowest))
+                    except (InvalidOperation, ValueError):
+                        lowest_price = avg_price
+                if current_price < lowest_price:
+                    lowest_price = current_price
+                state["lowest_price"] = lowest_price
+                if activation_fraction > 0:
+                    activation_price = avg_price * (Decimal("1") - activation_fraction)
+                    if lowest_price > activation_price:
+                        continue
+                target_price = lowest_price * (Decimal("1") + fraction)
+                rounding_mode = ROUND_UP
+                comparison = target_price < current_stop
+
+            if target_price <= 0 or not comparison:
+                continue
+
+            new_stop = self._round_to_step(target_price, price_step, rounding=rounding_mode)
+            if exit_side == "Sell" and new_stop <= current_stop:
+                continue
+            if exit_side != "Sell" and new_stop >= current_stop:
+                continue
+
+            trigger_text = format_to_step(new_stop, price_step, rounding=rounding_mode)
+            payload: Dict[str, object] = {"category": "spot", "triggerPrice": trigger_text}
+            order_id = state.get("order_id")
+            order_link_id = state.get("order_link_id")
+            if order_id:
+                payload["orderId"] = order_id
+            if order_link_id:
+                payload["orderLinkId"] = order_link_id
+
+            try:
+                api.amend_order(**payload)  # type: ignore[call-arg]
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "guardian.auto.stop_loss.trail.error",
+                    symbol=symbol_upper,
+                    err=str(exc),
+                )
+                continue
+
+            state["current_stop"] = new_stop
+            log(
+                "guardian.auto.stop_loss.trail",
+                symbol=symbol_upper,
+                trigger=trigger_text,
+            )
+            trailing_updated = True
+
+        if trailing_updated:
+            self._active_stop_orders = {
+                symbol: state for symbol, state in self._active_stop_orders.items()
+            }
 
     @staticmethod
     def _extract_order_identifiers(
@@ -3802,6 +4239,14 @@ class SignalExecutor:
                     if sold_amount > 0 and sold_amount != executed_base
                     else None
                 ),
+            )
+            log(
+                "guardian.auto.trade.close",
+                symbol=symbol_upper,
+                qty=str(executed_base),
+                price=str(avg_price),
+                pnl=str(pnl_display),
+                sold=str(sold_amount),
             )
         log(
             "telegram.trade.notify",
@@ -4985,39 +5430,9 @@ class SignalExecutor:
             context["kill_switch_until"] = kill_until
         return message, context
 
-    def _daily_loss_guard(
-        self, settings: Settings, *, total_equity: Optional[float] = None
-    ) -> Optional[Tuple[str, Dict[str, object]]]:
-        try:
-            limit_pct = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            limit_pct = 0.0
-
-        if limit_pct <= 0.0:
-            return None
-
-        force_refresh = self._daily_pnl_force_refresh
-        try:
-            if force_refresh:
-                aggregated = daily_pnl(force_refresh=True)
-            else:
-                aggregated = daily_pnl()
-        except TypeError:
-            aggregated = daily_pnl()
-            if force_refresh:
-                self._daily_pnl_force_refresh = False
-        except Exception:
-            if force_refresh:
-                self._daily_pnl_force_refresh = True
-            return None
-        else:
-            if force_refresh:
-                self._daily_pnl_force_refresh = False
-
-        if not isinstance(aggregated, Mapping):
-            return None
-
-        day_key = time.strftime("%Y-%m-%d", time.gmtime(self._current_time()))
+    def _extract_spot_daily_net(
+        self, aggregated: Mapping[str, object], day_key: str
+    ) -> Optional[float]:
         day_bucket = aggregated.get(day_key)
         if not isinstance(day_bucket, Mapping):
             return None
@@ -5052,6 +5467,45 @@ class SignalExecutor:
 
             fees = _safe_float(payload.get("fees")) or 0.0
             net_result += (spot_pnl or 0.0) - fees
+
+        return net_result
+
+    def _daily_loss_guard(
+        self, settings: Settings, *, total_equity: Optional[float] = None
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        try:
+            limit_pct = float(getattr(settings, "ai_daily_loss_limit_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            limit_pct = 0.0
+
+        if limit_pct <= 0.0:
+            return None
+
+        force_refresh = self._daily_pnl_force_refresh
+        try:
+            if force_refresh:
+                aggregated = daily_pnl(force_refresh=True)
+            else:
+                aggregated = daily_pnl()
+        except TypeError:
+            aggregated = daily_pnl()
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
+        except Exception:
+            if force_refresh:
+                self._daily_pnl_force_refresh = True
+            return None
+        else:
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
+
+        if not isinstance(aggregated, Mapping):
+            return None
+
+        day_key = time.strftime("%Y-%m-%d", time.gmtime(self._current_time()))
+        net_result = self._extract_spot_daily_net(aggregated, day_key)
+        if net_result is None:
+            return None
 
         if net_result >= 0.0:
             return None
