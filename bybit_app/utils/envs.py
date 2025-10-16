@@ -127,7 +127,7 @@ class Settings:
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
-    ai_min_ev_bps: float = 0.0
+    ai_min_ev_bps: float = 80.0
     ai_retrain_minutes: int = 60
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25

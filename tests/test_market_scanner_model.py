@@ -16,6 +16,7 @@ from bybit_app.utils.ai.models import (
     _WeightedLogisticRegression,
     liquidity_feature,
 )
+from bybit_app.utils.envs import Settings
 from bybit_app.utils.market_scanner import (
     TURNOVER_AVG_TRADES_PER_DAY,
     scan_market_opportunities,
@@ -187,6 +188,7 @@ def test_turnover_feature_consistency(tmp_path: Path) -> None:
         cache_ttl=9999.0,
         min_turnover=0.0,
         max_spread_bps=120.0,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     assert entries, "scanner should produce entries"

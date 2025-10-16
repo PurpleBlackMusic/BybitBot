@@ -189,7 +189,7 @@ class LiveSignalFetcher:
             max_spread = 0.0
 
         try:
-            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0)
+            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0)
         except (TypeError, ValueError):
             min_change_pct = 0.0
 
@@ -315,7 +315,7 @@ class LiveSignalFetcher:
         if analysis:
             status["analysis"] = analysis
 
-        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0), 0.0)
+        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0), 0.0)
         if min_ev > 0:
             status["risk"] = {
                 "min_ev_bps": min_ev,

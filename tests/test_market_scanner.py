@@ -289,6 +289,7 @@ def test_market_scanner_enforces_top_liquidity_threshold(
         min_change_pct=0.5,
         max_spread_bps=60.0,
         min_top_quote=80.0,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     assert opportunities
@@ -911,6 +912,7 @@ def test_market_scanner_honors_blacklist(tmp_path: Path) -> None:
         min_turnover=1_000_000.0,
         min_change_pct=0.5,
         max_spread_bps=40.0,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
@@ -950,6 +952,7 @@ def test_market_scanner_converts_usdc_symbols(tmp_path: Path) -> None:
         min_change_pct=0.5,
         max_spread_bps=100.0,
         limit=5,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     assert [entry["symbol"] for entry in opportunities] == ["SOLUSDT"]
@@ -1089,6 +1092,7 @@ def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
         max_spread_bps=100.0,
         limit=5,
         testnet=False,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     testnet_opps = scan_market_opportunities(
@@ -1099,6 +1103,7 @@ def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
         max_spread_bps=100.0,
         limit=5,
         testnet=True,
+        settings=Settings(testnet=False, ai_min_ev_bps=0.0),
     )
 
     assert [entry["symbol"] for entry in mainnet_opps] == ["MAINUSDT"]

@@ -876,7 +876,7 @@ def scan_market_opportunities(
         min_turnover = 50_000.0
 
     min_ev_bps_threshold = max(
-        _safe_setting_float(settings, "ai_min_ev_bps", 0.0),
+        _safe_setting_float(settings, "ai_min_ev_bps", 80.0),
         0.0,
     )
 
