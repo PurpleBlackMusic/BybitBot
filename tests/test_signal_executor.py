@@ -2725,6 +2725,82 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
 
 
+def test_signal_executor_tp_ladder_uses_fallback_for_small_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50,100",
+        spot_tp_ladder_split_pct="60,40",
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=500.0, available=450.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.15"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.15",
+            "cumExecValue": "15",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.1",
+                "min_order_qty": "0.1",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", lambda *a, **k: response_payload
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "register_tp_ladder_plan",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "clear_tp_ladder_plan",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "realtime_private_rows",
+        lambda *a, **k: [],
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "resolve_tp_handshake",
+        lambda *a, **k: (),
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "filled"
+    assert len(api.orders) == 2
+    tp_order = api.orders[0]
+    assert tp_order["orderType"] == "Limit"
+    assert Decimal(tp_order["qty"]) == Decimal("0.1")
+    assert any(order.get("orderFilter") == "tpslOrder" for order in api.orders)
+
+
 def test_signal_executor_trails_stop_loss(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(
