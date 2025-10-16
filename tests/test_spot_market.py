@@ -1521,7 +1521,7 @@ def test_buy_tick_and_validation_ceiling_respects_worst_ask():
     min_qty = Decimal("0.01")
     tick_size = Decimal("0.1")
 
-    worst_price, qty_base, _, consumed = spot_market_module._plan_limit_ioc_order(
+    worst_price, qty_base, _, consumed, _ = spot_market_module._plan_limit_ioc_order(
         asks=asks,
         bids=bids,
         side="buy",
@@ -1565,7 +1565,7 @@ def test_sell_tick_and_validation_floor_retained():
     min_qty = Decimal("0.01")
     tick_size = Decimal("0.1")
 
-    worst_price, qty_base, _, consumed = spot_market_module._plan_limit_ioc_order(
+    worst_price, qty_base, _, consumed, _ = spot_market_module._plan_limit_ioc_order(
         asks=asks,
         bids=bids,
         side="sell",
@@ -1648,6 +1648,72 @@ def test_prepare_spot_market_blocks_price_outside_mark_tolerance():
     details = getattr(err, "details", {}) or {}
     assert details.get("price_cap") == "101"
     assert details.get("price_limit_hit") is True
+
+
+def test_prepare_spot_market_allows_partial_liquidity_shortfall():
+    orderbook = {
+        "result": {
+            "a": [["100.5", "1"], ["100.6", "1"]],
+            "b": [["99.9", "1"]],
+        }
+    }
+    api = DummyAPI(_universe_payload([]), orderbook_payload=orderbook)
+
+    prepared = spot_market_module.prepare_spot_market_order(
+        api,
+        symbol="BTCUSDT",
+        side="Buy",
+        qty=Decimal("400"),
+        unit="quoteCoin",
+        tol_type="Percent",
+        tol_value=Decimal("1.0"),
+        price_snapshot=Decimal("100"),
+        balances={"USDT": Decimal("1000")},
+        limits=_basic_limits(),
+    )
+
+    audit = prepared.audit
+    assert Decimal(audit.get("order_notional")) == Decimal("201.2")
+    assert Decimal(audit.get("order_qty_base")) == Decimal("2")
+    shortfall = audit.get("liquidity_shortfall") or {}
+    assert shortfall
+    assert shortfall.get("price_limit_hit") is False
+    assert shortfall.get("side") == "buy"
+    assert Decimal(shortfall.get("requested_quote", "0")) == Decimal("400")
+    assert Decimal(shortfall.get("available_quote", "0")) == Decimal("201.2")
+    assert Decimal(audit.get("requested_quote_notional")) == Decimal("400")
+
+
+def test_prepare_spot_market_partial_liquidity_respects_toggle():
+    orderbook = {
+        "result": {
+            "a": [["100.5", "1"], ["100.6", "1"]],
+            "b": [["99.9", "1"]],
+        }
+    }
+    api = DummyAPI(_universe_payload([]), orderbook_payload=orderbook)
+    settings = Settings(allow_partial_fills=False)
+
+    with pytest.raises(OrderValidationError) as excinfo:
+        spot_market_module.prepare_spot_market_order(
+            api,
+            symbol="BTCUSDT",
+            side="Buy",
+            qty=Decimal("400"),
+            unit="quoteCoin",
+            tol_type="Percent",
+            tol_value=Decimal("1.0"),
+            price_snapshot=Decimal("100"),
+            balances={"USDT": Decimal("1000")},
+            limits=_basic_limits(),
+            settings=settings,
+        )
+
+    err = excinfo.value
+    assert getattr(err, "code", None) == "insufficient_liquidity"
+    details = getattr(err, "details", {}) or {}
+    assert Decimal(details.get("requested_quote", "0")) == Decimal("400")
+    assert Decimal(details.get("available_quote", "0")) == Decimal("201.1")
 
 
 def test_prepare_spot_market_clamps_price_at_instrument_cap():
