@@ -823,7 +823,14 @@ def _plan_limit_ioc_order(
     max_price: Decimal | None = None,
     min_price: Decimal | None = None,
     quote_shortfall_tolerance: Decimal = Decimal("0"),
-) -> tuple[Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
+    allow_partial: bool = False,
+) -> tuple[
+    Decimal,
+    Decimal,
+    Decimal,
+    list[tuple[Decimal, Decimal]],
+    Optional[Dict[str, object]],
+]:
     side_normalised = side
     levels = asks if side_normalised == "buy" else bids
     if not levels:
@@ -901,63 +908,90 @@ def _plan_limit_ioc_order(
             accumulated_quote += level_quote
             consumed.append((price, qty))
 
-    if target_base is not None and accumulated_base < target_base:
-        raise OrderValidationError(
-            "Недостаточная глубина стакана для заданного количества.",
-            code="insufficient_liquidity",
-            details={
-                "requested_base": _format_decimal(target_base),
-                "available_base": _format_decimal(accumulated_base),
+    partial_details: Dict[str, object] | None = None
+
+    def _ensure_partial_details() -> Dict[str, object]:
+        nonlocal partial_details
+        if partial_details is None:
+            partial_details = {
                 "side": side_normalised,
-                **(
-                    {
-                        "price_cap": _format_decimal(max_price),
-                        "price_limit_hit": True,
-                    }
-                    if price_limit_hit and side_normalised == "buy" and max_price is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "price_floor": _format_decimal(min_price),
-                        "price_limit_hit": True,
-                    }
-                    if price_limit_hit and side_normalised == "sell" and min_price is not None
-                    else {}
-                ),
-            },
-        )
+                "price_limit_hit": bool(price_limit_hit),
+            }
+        return partial_details
+
+    if target_base is not None and accumulated_base < target_base:
+        if not allow_partial or accumulated_base <= 0:
+            raise OrderValidationError(
+                "Недостаточная глубина стакана для заданного количества.",
+                code="insufficient_liquidity",
+                details={
+                    "requested_base": _format_decimal(target_base),
+                    "available_base": _format_decimal(accumulated_base),
+                    "side": side_normalised,
+                    **(
+                        {
+                            "price_cap": _format_decimal(max_price),
+                            "price_limit_hit": True,
+                        }
+                        if price_limit_hit and side_normalised == "buy" and max_price is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "price_floor": _format_decimal(min_price),
+                            "price_limit_hit": True,
+                        }
+                        if price_limit_hit and side_normalised == "sell" and min_price is not None
+                        else {}
+                    ),
+                },
+            )
+        meta = _ensure_partial_details()
+        meta["requested_base"] = target_base
+        meta["available_base"] = accumulated_base
+        if price_limit_hit and side_normalised == "buy" and max_price is not None:
+            meta["price_cap"] = max_price
+        if price_limit_hit and side_normalised == "sell" and min_price is not None:
+            meta["price_floor"] = min_price
 
     effective_shortfall_tolerance = quote_shortfall_tolerance
     if rounding_shortfall > effective_shortfall_tolerance:
         effective_shortfall_tolerance = rounding_shortfall
 
     if target_quote is not None and accumulated_quote + effective_shortfall_tolerance < target_quote:
-        raise OrderValidationError(
-            "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
-            code="insufficient_liquidity",
-            details={
-                "requested_quote": _format_decimal(target_quote),
-                "available_quote": _format_decimal(accumulated_quote),
-                "side": side_normalised,
-                **(
-                    {
-                        "price_cap": _format_decimal(max_price),
-                        "price_limit_hit": True,
-                    }
-                    if price_limit_hit and side_normalised == "buy" and max_price is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "price_floor": _format_decimal(min_price),
-                        "price_limit_hit": True,
-                    }
-                    if price_limit_hit and side_normalised == "sell" and min_price is not None
-                    else {}
-                ),
-            },
-        )
+        if not allow_partial or accumulated_quote <= 0:
+            raise OrderValidationError(
+                "Недостаточная глубина стакана для заданного объёма в котировочной валюте.",
+                code="insufficient_liquidity",
+                details={
+                    "requested_quote": _format_decimal(target_quote),
+                    "available_quote": _format_decimal(accumulated_quote),
+                    "side": side_normalised,
+                    **(
+                        {
+                            "price_cap": _format_decimal(max_price),
+                            "price_limit_hit": True,
+                        }
+                        if price_limit_hit and side_normalised == "buy" and max_price is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "price_floor": _format_decimal(min_price),
+                            "price_limit_hit": True,
+                        }
+                        if price_limit_hit and side_normalised == "sell" and min_price is not None
+                        else {}
+                    ),
+                },
+            )
+        meta = _ensure_partial_details()
+        meta["requested_quote"] = target_quote
+        meta["available_quote"] = accumulated_quote
+        if price_limit_hit and side_normalised == "buy" and max_price is not None:
+            meta.setdefault("price_cap", max_price)
+        if price_limit_hit and side_normalised == "sell" and min_price is not None:
+            meta.setdefault("price_floor", min_price)
 
     rounding_fn = _round_up
     if side_normalised != "buy" or target_quote is not None:
@@ -985,7 +1019,12 @@ def _plan_limit_ioc_order(
         )
 
     quote_total = qty_rounded * worst_price
-    return worst_price, qty_rounded, quote_total, consumed
+    if partial_details is not None:
+        if "available_base" in partial_details:
+            partial_details["available_base"] = qty_rounded
+        if "available_quote" in partial_details:
+            partial_details["available_quote"] = quote_total
+    return worst_price, qty_rounded, quote_total, consumed, partial_details
 
 
 def _max_mark_price(
@@ -2402,7 +2441,33 @@ def prepare_spot_market_order(
                 if rounding_allowance > quote_shortfall_tolerance:
                     quote_shortfall_tolerance = rounding_allowance
 
-    worst_price, qty_base, quote_total, consumed_levels = _plan_limit_ioc_order(
+    time_in_force = "GTC"
+    allow_partial_fills = True
+    reprice_after_sec: int | None = None
+    max_amendments_setting: int | None = None
+    if isinstance(settings, Settings):
+        tif_candidate = getattr(settings, "order_time_in_force", None)
+        if not tif_candidate:
+            tif_candidate = getattr(settings, "spot_limit_tif", None)
+        if isinstance(tif_candidate, str) and tif_candidate.strip():
+            tif_upper = tif_candidate.strip().upper()
+            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
+            time_in_force = mapping.get(tif_upper, tif_upper)
+        allow_partial_fills = bool(getattr(settings, "allow_partial_fills", True))
+        reprice_after_raw = getattr(settings, "reprice_unfilled_after_sec", None)
+        if isinstance(reprice_after_raw, (int, float)) and reprice_after_raw >= 0:
+            reprice_after_sec = int(reprice_after_raw)
+        max_amendments_raw = getattr(settings, "max_amendments", None)
+        if isinstance(max_amendments_raw, int) and max_amendments_raw >= 0:
+            max_amendments_setting = max_amendments_raw
+
+    (
+        worst_price,
+        qty_base,
+        quote_total,
+        consumed_levels,
+        liquidity_shortfall,
+    ) = _plan_limit_ioc_order(
         asks=asks,
         bids=bids,
         side=side_normalised,
@@ -2413,7 +2478,18 @@ def prepare_spot_market_order(
         max_price=max_price_allowed,
         min_price=min_price_allowed,
         quote_shortfall_tolerance=quote_shortfall_tolerance,
+        allow_partial=allow_partial_fills,
     )
+
+    original_target_quote = target_quote
+    original_target_base = target_base
+    if liquidity_shortfall:
+        available_quote = liquidity_shortfall.get("available_quote")
+        if isinstance(available_quote, Decimal) and available_quote > 0:
+            target_quote = available_quote
+        available_base = liquidity_shortfall.get("available_base")
+        if isinstance(available_base, Decimal) and available_base > 0:
+            target_base = available_base
 
 
     limit_map_tick = _to_decimal(limit_map.get("tick_size") or Decimal("0"))
@@ -3040,10 +3116,19 @@ def prepare_spot_market_order(
     audit["limit_price"] = _format_decimal(limit_price)
     audit["order_qty_base"] = _format_decimal(qty_base)
     audit["order_notional"] = _format_decimal(limit_notional)
+    if liquidity_shortfall:
+        shortfall_payload: Dict[str, object] = {}
+        for key, value in liquidity_shortfall.items():
+            if isinstance(value, Decimal):
+                shortfall_payload[key] = _format_decimal(value)
+            else:
+                shortfall_payload[key] = value
+        audit["liquidity_shortfall"] = shortfall_payload
     if tolerance_guard_reduction is not None:
         audit["tolerance_guard_reduction"] = _format_decimal(tolerance_guard_reduction)
-    if target_quote is not None:
-        audit["requested_quote_notional"] = _format_decimal(target_quote)
+    requested_quote_for_audit = original_target_quote if original_target_quote is not None else target_quote
+    if requested_quote_for_audit is not None:
+        audit["requested_quote_notional"] = _format_decimal(requested_quote_for_audit)
         if quote_ceiling_raw is not None:
             audit["quote_tolerance_core"] = _format_decimal(quote_ceiling_raw)
         if rounding_allowance > 0:
