@@ -6,11 +6,10 @@ from urllib.parse import urlencode
 import threading
 import requests
 from functools import lru_cache
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
-import time
 
 from tenacity import (
     RetryCallState,
@@ -46,6 +45,86 @@ class _RetryableRequestError(RuntimeError):
     def __init__(self, message: str, *, meta: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.meta = dict(meta or {})
+
+
+class _TTLCache:
+    """Thread-safe TTL cache for JSON serialisable API responses."""
+
+    def __init__(self) -> None:
+        self._entries: dict[object, tuple[float | None, object]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: object) -> object | None:
+        now = time.monotonic()
+        with self._lock:
+            record = self._entries.get(key)
+            if record is None:
+                return None
+            expires_at, payload = record
+            if expires_at is not None and expires_at < now:
+                self._entries.pop(key, None)
+                return None
+            return deepcopy(payload)
+
+    def set(self, key: object, value: object, ttl: float | int | None) -> None:
+        expires_at: float | None
+        if ttl is None:
+            expires_at = None
+        else:
+            ttl_float = float(ttl)
+            expires_at = time.monotonic() + ttl_float if ttl_float > 0 else None
+        with self._lock:
+            self._entries[key] = (expires_at, deepcopy(value))
+
+    def invalidate(self, key: object) -> None:
+        with self._lock:
+            self._entries.pop(key, None)
+
+
+class _APINanny:
+    """Co-operative rate limiter for REST requests."""
+
+    def __init__(self, *, default_window: float = 1.0, default_burst: int = 20) -> None:
+        self._default_window = max(float(default_window), 0.01)
+        self._default_burst = max(int(default_burst), 1)
+        self._limits: dict[str, tuple[int, float]] = {}
+        self._records: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def set_limit(self, key: str, *, burst: int, window: float) -> None:
+        burst = max(int(burst), 1)
+        window = max(float(window), 0.01)
+        with self._lock:
+            self._limits[key] = (burst, window)
+            self._records.setdefault(key, deque())
+
+    def _resolve_limit(self, key: str, fallback: str | None) -> tuple[int, float]:
+        if key in self._limits:
+            return self._limits[key]
+        if fallback and fallback in self._limits:
+            return self._limits[fallback]
+        return self._default_burst, self._default_window
+
+    def guard(self, key: str, *, fallback: str | None = None) -> None:
+        burst, window = self._resolve_limit(key, fallback)
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                queue = self._records.setdefault(key, deque())
+                while queue and now - queue[0] >= window:
+                    queue.popleft()
+
+                if len(queue) < burst:
+                    queue.append(now)
+                    return
+
+                wait_time = window - (now - queue[0]) if queue else window
+
+            if wait_time > 0:
+                time.sleep(min(wait_time, window))
+            else:
+                time.sleep(0)
 
 @dataclass
 class BybitCreds:
@@ -109,6 +188,13 @@ class BybitAPI:
         self._clock_latency_ms: float = 0.0
         self._quota_lock = threading.Lock()
         self._last_quota: dict[str, object] = {}
+        self._response_cache = _TTLCache()
+        self._api_nanny = _APINanny(default_window=1.0, default_burst=25)
+        self._api_nanny.set_limit("signed", burst=12, window=1.0)
+        self._api_nanny.set_limit("public", burst=25, window=1.0)
+        # Fee lookups are particularly chatty during analytics; constrain harder.
+        self._api_nanny.set_limit("signed:/v5/account/fee-rate", burst=4, window=1.0)
+        self._cache_ttl: dict[str, float] = {"signed:/v5/account/fee-rate": 300.0}
 
     def _thread_local_session(self) -> requests.Session:
         session = getattr(self._http_local, "session", None)
@@ -249,6 +335,7 @@ class BybitAPI:
             after=_log_retry,
         )
         def _execute():
+            self._guard_quota(path, signed=signed)
             try:
                 resp = self._req(method, path, params=params, body=body, signed=signed)
             except requests.exceptions.HTTPError as exc:
@@ -325,6 +412,14 @@ class BybitAPI:
             if isinstance(final, BaseException):
                 raise final
             raise
+
+    def _guard_quota(self, path: str, *, signed: bool) -> None:
+        nanny = getattr(self, "_api_nanny", None)
+        if nanny is None:
+            return
+        bucket = "signed" if signed else "public"
+        key = f"{bucket}:{path}" if path else bucket
+        nanny.guard(key, fallback=bucket)
 
     def _record_quota_headers(self, response: requests.Response | None) -> None:
         if response is None:
@@ -558,7 +653,20 @@ class BybitAPI:
             params["symbol"] = symbol
         if baseCoin:
             params["baseCoin"] = baseCoin
-        return self._safe_req("GET", "/v5/account/fee-rate", params=params, signed=True)
+        cache_key = (
+            "fee_rate",
+            self.base,
+            self.creds.key,
+            tuple(sorted(params.items())),
+        )
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        response = self._safe_req("GET", "/v5/account/fee-rate", params=params, signed=True)
+        ttl = self._cache_ttl.get("signed:/v5/account/fee-rate")
+        self._response_cache.set(cache_key, response, ttl)
+        return response
 
     def place_order(self, **kwargs):
         """Submit a single signed order with basic validation and normalisation."""

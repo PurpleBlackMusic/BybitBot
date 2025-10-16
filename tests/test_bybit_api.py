@@ -91,6 +91,40 @@ def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch
     assert api.clock_latency_ms == pytest.approx(12.0)
 
 
+def test_fee_rate_responses_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    session = _RecordingSession()
+    api = BybitAPI(BybitCreds(key="k", secret="s", testnet=True))
+    api.session = session
+
+    guard_calls: list[tuple[str, str | None]] = []
+
+    def fake_guard(key: str, *, fallback: str | None = None) -> None:
+        guard_calls.append((key, fallback))
+
+    api._api_nanny.guard = fake_guard  # type: ignore[assignment]
+
+    monkeypatch.setattr(
+        bybit_api_module,
+        "synced_timestamp",
+        lambda *args, **kwargs: SyncedTimestamp(
+            value_ms=1_700_000_000_000,
+            offset_ms=0.0,
+            latency_ms=0.0,
+        ),
+    )
+
+    first = api.fee_rate(category="spot", symbol="ETHUSDT")
+    second = api.fee_rate(category="spot", symbol="ETHUSDT")
+
+    assert len(session.calls) == 1, "Expected second call to use cache"
+    assert first is not second
+    assert first == second
+    assert guard_calls, "API nanny should have been invoked"
+    key, fallback = guard_calls[-1]
+    assert key.endswith("/v5/account/fee-rate")
+    assert fallback == "signed"
+
+
 def test_batch_cancel_accepts_requests_payload() -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
     payload = [{"orderId": "1"}]
