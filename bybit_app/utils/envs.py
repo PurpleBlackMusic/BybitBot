@@ -99,7 +99,10 @@ class Settings:
     spot_vol_target_pct: float = 5.0
     spot_vol_min_scale: float = 0.25
     spot_tp_ladder_bps: str = '35,70,110'
-    spot_tp_ladder_split_pct: str = '50,30,20'
+    spot_tp_ladder_split_pct: str = '60,25,15'
+    spot_stop_loss_bps: float = 80.0
+    spot_trailing_stop_activation_bps: float = 35.0
+    spot_trailing_stop_distance_bps: float = 25.0
     spot_tp_reprice_threshold_bps: float = 5.0
     spot_tp_reprice_qty_buffer: float = 0.0
     spot_tp_fee_guard_bps: float = 20.0
@@ -325,6 +328,9 @@ _ENV_MAP = {
     "spot_limit_tif": "SPOT_LIMIT_TIF",
     "spot_tp_ladder_bps": "SPOT_TP_LADDER_BPS",
     "spot_tp_ladder_split_pct": "SPOT_TP_LADDER_SPLIT_PCT",
+    "spot_stop_loss_bps": "SPOT_STOP_LOSS_BPS",
+    "spot_trailing_stop_activation_bps": "SPOT_TRAILING_STOP_ACTIVATION_BPS",
+    "spot_trailing_stop_distance_bps": "SPOT_TRAILING_STOP_DISTANCE_BPS",
     "spot_server_tpsl": "SPOT_SERVER_TPSL",
     "spot_tpsl_tp_order_type": "SPOT_TPSL_TP_ORDER_TYPE",
     "spot_tpsl_sl_order_type": "SPOT_TPSL_SL_ORDER_TYPE",
@@ -488,7 +494,14 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["spot_vol_min_scale"] = _cast_float(m.get("spot_vol_min_scale", 0.25))
     m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
     m["spot_tp_ladder_bps"] = m.get("spot_tp_ladder_bps") or "35,70,110"
-    m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "50,30,20"
+    m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "60,25,15"
+    m["spot_stop_loss_bps"] = _cast_float(m.get("spot_stop_loss_bps", 80.0))
+    m["spot_trailing_stop_activation_bps"] = _cast_float(
+        m.get("spot_trailing_stop_activation_bps", 35.0)
+    )
+    m["spot_trailing_stop_distance_bps"] = _cast_float(
+        m.get("spot_trailing_stop_distance_bps", 25.0)
+    )
     m["spot_tp_fee_guard_bps"] = _cast_float(m.get("spot_tp_fee_guard_bps", 20.0))
     m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"

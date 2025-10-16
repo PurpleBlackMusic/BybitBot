@@ -1,5 +1,5 @@
 import copy
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple, Union
 
@@ -111,6 +111,8 @@ class StubAPI:
         self._total = total
         self._available = available
         self.orders: list[dict[str, object]] = []
+        self.amendments: list[dict[str, object]] = []
+        self.cancellations: list[dict[str, object]] = []
         self._orderbook_payload = orderbook_payload or {
             "result": {
                 "a": [["100.0", "25"]],
@@ -148,6 +150,14 @@ class StubAPI:
                 "orderId": order_id,
             },
         }
+
+    def amend_order(self, **payload: object) -> dict[str, object]:
+        self.amendments.append(dict(payload))
+        return {"retCode": 0, "result": {}}
+
+    def cancel_order(self, **payload: object) -> dict[str, object]:
+        self.cancellations.append(dict(payload))
+        return {"retCode": 0, "result": {}}
 
     def orderbook(
         self,
@@ -1803,7 +1813,7 @@ def test_signal_executor_sell_scales_on_insufficient_balance(
     monkeypatch.setattr(
         SignalExecutor,
         "_place_tp_ladder",
-        lambda *args, **kwargs: ([], {}),
+        lambda *args, **kwargs: ([], {}, []),
     )
     monkeypatch.setattr(
         SignalExecutor,
@@ -2023,7 +2033,7 @@ def test_signal_executor_sell_combines_unified_and_spot_balances(
     monkeypatch.setattr(
         SignalExecutor,
         "_place_tp_ladder",
-        lambda *args, **kwargs: ([], {}),
+        lambda *args, **kwargs: ([], {}, []),
     )
     monkeypatch.setattr(
         SignalExecutor,
@@ -2679,8 +2689,8 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     result = executor.execute_once()
 
     assert result.status == "filled"
-    assert len(api.orders) == 2
-    first, second = api.orders
+    assert len(api.orders) == 3
+    first, second, stop = api.orders
     assert first["side"] == "Sell"
     assert second["side"] == "Sell"
     assert first["orderType"] == "Limit"
@@ -2689,11 +2699,21 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert Decimal(second["qty"]) == Decimal("0.30")
     assert Decimal(first["price"]) == Decimal("100.7")
     assert Decimal(second["price"]) == Decimal("101.2")
+    assert stop["orderFilter"] == "tpslOrder"
+    assert stop["orderType"] == "Market"
+    assert stop["side"] == "Sell"
+    assert stop["qty"] == "0.75"
+    assert Decimal(stop["triggerPrice"]) == Decimal("99.2")
     assert result.order is not None
     assert result.order.get("take_profit_orders")
+    stop_orders = result.order.get("stop_loss_orders")
+    assert stop_orders and len(stop_orders) == 1
+    assert Decimal(stop_orders[0]["triggerPrice"]) == Decimal("99.2")
     assert result.context is not None
     execution_payload = result.context.get("execution", {})
     assert Decimal(execution_payload.get("avg_price")) == Decimal("100")
+    stop_context = result.context.get("stop_loss_orders")
+    assert stop_context and stop_context[0]["orderType"] == "Market"
 
     assert [call["status"] for call in register_calls] == ["pending", "active"]
     assert all(call["symbol"] == "BTCUSDT" for call in register_calls)
@@ -2702,6 +2722,79 @@ def test_signal_executor_places_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> No
     assert cancel_calls == []
 
     signal_executor_module.ws_manager.clear_tp_ladder_plan("BTCUSDT")
+
+
+def test_signal_executor_trails_stop_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_tp_ladder_bps="50",
+        spot_tp_ladder_split_pct="100",
+        spot_trailing_stop_activation_bps=10.0,
+        spot_trailing_stop_distance_bps=20.0,
+    )
+    bot = StubBot(summary, settings)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: api)
+    monkeypatch.setattr(
+        signal_executor_module,
+        "resolve_trade_symbol",
+        lambda symbol, api, allow_nearest=True: (symbol, {"reason": "exact"}),
+    )
+    patch_tp_sources(monkeypatch, Decimal("0.5"))
+
+    response_payload = {
+        "retCode": 0,
+        "result": {
+            "orderId": "primary",
+            "avgPrice": "100",
+            "cumExecQty": "0.50",
+            "cumExecValue": "50",
+        },
+        "_local": {
+            "order_audit": {
+                "qty_step": "0.01",
+                "min_order_qty": "0.01",
+                "quote_step": "0.01",
+                "limit_price": "100.00",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module, "place_spot_market_with_tolerance", lambda *_, **__: response_payload
+    )
+    monkeypatch.setattr(
+        signal_executor_module.ws_manager,
+        "register_tp_ladder_plan",
+        lambda *_, **__: None,
+    )
+
+    executor = SignalExecutor(bot)
+    first = executor.execute_once()
+    assert first.status == "filled"
+    assert any(order.get("orderFilter") == "tpslOrder" for order in api.orders)
+
+    bot._summary = {
+        "actionable": False,
+        "mode": "wait",
+        "symbol": "BTCUSDT",
+        "prices": {"BTCUSDT": 101.5},
+    }
+
+    second = executor.execute_once()
+    assert second.status == "skipped"
+    assert api.amendments, "trailing stop was not amended"
+    amended = api.amendments[-1]
+    new_trigger = Decimal(amended["triggerPrice"])
+    expected_trigger = (Decimal("101.5") * (Decimal("1") - Decimal("0.002"))).quantize(
+        Decimal("0.0001"), rounding=ROUND_DOWN
+    )
+    assert new_trigger == expected_trigger
 
 
 def test_executor_and_ws_manager_share_tp_ladder(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2787,7 +2880,7 @@ def test_executor_and_ws_manager_share_tp_ladder(monkeypatch: pytest.MonkeyPatch
     }
 
     executor = SignalExecutor(bot)
-    placed_orders, _ = executor._place_tp_ladder(
+    placed_orders, _, stop_orders = executor._place_tp_ladder(
         api,
         settings,
         "BTCUSDT",
@@ -2798,6 +2891,7 @@ def test_executor_and_ws_manager_share_tp_ladder(monkeypatch: pytest.MonkeyPatch
     )
 
     assert placed_orders
+    assert stop_orders
     plan_state = manager._tp_ladder_plan.get("BTCUSDT") or {}
     stored_signature = plan_state.get("signature")
     stored_ladder = plan_state.get("ladder")
@@ -2912,16 +3006,21 @@ def test_signal_executor_coalesces_tp_levels(monkeypatch: pytest.MonkeyPatch) ->
     result = executor.execute_once()
 
     assert result.status == "filled"
-    assert len(api.orders) == 1
+    assert len(api.orders) == 2
     order = api.orders[0]
     assert order["qty"] == "1.0"
     assert order["price"] == "100.3"
+    stop_order = api.orders[1]
+    assert stop_order["orderFilter"] == "tpslOrder"
+    assert stop_order["qty"] == "1.0"
     assert result.order is not None
     ladder = result.order.get("take_profit_orders")
     assert ladder is not None
     assert ladder[0]["profit_bps"] == "5,9"
     assert ladder[0]["orderId"] == "stub-1"
     assert result.order["execution"]["sell_budget_base"] == "1.0"
+    stop_info = result.order.get("stop_loss_orders")
+    assert stop_info and stop_info[0]["orderType"] == "Market"
 
 
 def test_signal_executor_tp_ladder_respects_reserved(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3128,10 +3227,11 @@ def test_signal_executor_tp_ladder_falls_back_to_execution_totals(
     result = executor.execute_once()
 
     assert result.status == "filled"
-    assert len(api.orders) == 2
-    first, second = api.orders
+    assert len(api.orders) == 3
+    first, second, stop = api.orders
     assert Decimal(first["qty"]) == Decimal("0.45")
     assert Decimal(second["qty"]) == Decimal("0.30")
+    assert stop["orderFilter"] == "tpslOrder"
 
 
 def test_signal_executor_tp_ladder_respects_price_band(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3200,10 +3300,11 @@ def test_signal_executor_tp_ladder_respects_price_band(monkeypatch: pytest.Monke
     result = executor.execute_once()
 
     assert result.status == "filled"
-    assert len(api.orders) == 1
+    assert len(api.orders) == 2
     order = api.orders[0]
     assert Decimal(order["price"]) == Decimal("105")
     assert Decimal(order["qty"]) == Decimal("0.2")
+    assert api.orders[1]["orderFilter"] == "tpslOrder"
 
 
 def test_signal_executor_open_sell_reserved_prefers_latest(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3314,11 +3415,33 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
     result = executor.execute_once()
 
     assert result.status == "filled"
-    assert len(api.orders) == 3
-    qtys = [Decimal(order["qty"]) for order in api.orders]
-    prices = [Decimal(order["price"]) for order in api.orders]
-    assert qtys == [Decimal("0.37"), Decimal("0.22"), Decimal("0.16")]
+    assert len(api.orders) == 4
+    limit_orders = api.orders[:-1]
+    stop_order = api.orders[-1]
+    qtys = [Decimal(order["qty"]) for order in limit_orders]
+    prices = [Decimal(order["price"]) for order in limit_orders]
+    total_qty = Decimal("0.75")
+    fractions = [Decimal("0.60"), Decimal("0.25"), Decimal("0.15")]
+    step = Decimal("0.01")
+    expected_qtys: list[Decimal] = []
+    remaining = total_qty
+    for idx, frac in enumerate(fractions):
+        if idx == len(fractions) - 1:
+            qty = remaining
+        else:
+            qty = (total_qty * frac).quantize(step, rounding=ROUND_DOWN)
+            if qty > remaining:
+                qty = remaining
+        qty = qty.quantize(step, rounding=ROUND_DOWN)
+        expected_qtys.append(qty)
+        remaining -= qty
+    if remaining > Decimal("0"):
+        expected_qtys[-1] = (expected_qtys[-1] + remaining).quantize(
+            step, rounding=ROUND_DOWN
+        )
+    assert qtys == expected_qtys
     assert prices == [Decimal("100.55"), Decimal("100.9"), Decimal("101.3")]
+    assert stop_order["orderFilter"] == "tpslOrder"
     assert result.order is not None
     execution = result.order.get("execution")
     assert execution is not None
@@ -3431,7 +3554,7 @@ def test_signal_executor_follows_up_partial_fill(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         SignalExecutor,
         "_place_tp_ladder",
-        lambda *args, **kwargs: ([], {}),
+        lambda *args, **kwargs: ([], {}, []),
     )
     monkeypatch.setattr(
         SignalExecutor,
@@ -3559,7 +3682,7 @@ def test_signal_executor_records_dust_after_partial_fill(
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
         "_place_tp_ladder",
-        lambda *args, **kwargs: ([], {}),
+        lambda *args, **kwargs: ([], {}, []),
     )
     monkeypatch.setattr(
         signal_executor_module.SignalExecutor,
@@ -3843,6 +3966,7 @@ def test_signal_executor_sends_telegram_summary(monkeypatch: pytest.MonkeyPatch)
                 "avg_price": "101.0",
                 "sell_budget_base": "0.3",
             },
+            [{"orderType": "Market", "triggerPrice": "98.0"}],
         )
 
     monkeypatch.setattr(SignalExecutor, "_place_tp_ladder", fake_tp)
@@ -3939,7 +4063,11 @@ def test_signal_executor_uses_execution_stats_for_notifications(
         "filled_base_total": "0.25",
     }
 
-    monkeypatch.setattr(SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], exec_stats))
+    monkeypatch.setattr(
+        SignalExecutor,
+        "_place_tp_ladder",
+        lambda *args, **kwargs: ([], exec_stats, []),
+    )
 
     def empty_snapshot(
         n: int | None = 2000,
@@ -4694,7 +4822,7 @@ def test_signal_executor_rotates_symbol_after_repeated_price_deviation(
     monkeypatch.setattr(signal_executor_module, "read_ledger", empty_read)
     monkeypatch.setattr(signal_executor_module, "spot_inventory_and_pnl", empty_inventory)
     monkeypatch.setattr(
-        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], None)
+        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], None, [])
     )
 
     executor = SignalExecutor(bot)
@@ -5073,7 +5201,7 @@ def test_signal_executor_retries_price_limit_price_deviation_with_hints(
 
     monkeypatch.setattr(signal_executor_module, "read_ledger", fake_read_ledger)
     monkeypatch.setattr(
-        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], {})
+        SignalExecutor, "_place_tp_ladder", lambda *args, **kwargs: ([], {}, [])
     )
     monkeypatch.setattr(signal_executor_module.ws_manager, "private_snapshot", lambda: {})
 

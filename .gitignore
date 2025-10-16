@@ -13,3 +13,6 @@ bybit_app/_data/ws/
 bybit_app/_data/cache/
 .runtime/
 
+
+bybit_app/_data/logs/
+bybit_app/_data/pnl/
