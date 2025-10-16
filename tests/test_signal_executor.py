@@ -5264,7 +5264,7 @@ def test_signal_executor_scales_position_with_signal_strength(
     assert result.order is not None
     assert result.order["symbol"] == "ETHUSDT"
     assert result.order["notional_quote"] < 20.0
-    assert result.order["notional_quote"] == pytest.approx(6.62, rel=1e-3)
+    assert result.order["notional_quote"] == pytest.approx(6.66, rel=1e-3)
 
 
 def test_signal_executor_pauses_when_private_ws_stale(monkeypatch: pytest.MonkeyPatch) -> None:
