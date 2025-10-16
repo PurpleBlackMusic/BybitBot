@@ -6382,6 +6382,7 @@ class SignalExecutor:
             return max(0.05, min(override, 1.0))
 
         contributions: List[float] = []
+        stability_components: List[float] = []
 
         mode = str(summary.get("mode") or "wait").lower()
         probability = _safe_float(summary.get("probability"))
@@ -6421,6 +6422,7 @@ class SignalExecutor:
             edge_score = _safe_float(primary.get("edge_score"))
             if edge_score is not None and edge_score > 0:
                 contributions.append(math.tanh(edge_score / 6.0))
+                stability_components.append(min(1.0, math.tanh(edge_score / 4.0)))
 
             # Normalise performance metrics from the guardian watch to gently
             # bias allocations.  The thresholds are intentionally broad to
@@ -6444,12 +6446,18 @@ class SignalExecutor:
                 normalised = _normalise(win_rate, 42.0, 65.0)
                 if normalised is not None:
                     contributions.append(normalised)
+                stability_win = _normalise(win_rate, 50.0, 70.0)
+                if stability_win is not None:
+                    stability_components.append(stability_win)
 
             realised = _safe_float(primary.get("realized_bps_avg"))
             if realised is not None:
                 normalised = _normalise(realised, -10.0, 20.0)
                 if normalised is not None:
                     contributions.append(normalised)
+                stability_realised = _normalise(realised, 0.0, 30.0)
+                if stability_realised is not None:
+                    stability_components.append(stability_realised)
 
             median_hold = _safe_float(primary.get("median_hold_sec"))
             if median_hold is not None and median_hold > 0:
@@ -6462,15 +6470,59 @@ class SignalExecutor:
                 else:
                     span = slow_ceiling - fast_floor
                     contributions.append(1.0 - ((median_hold - fast_floor) / span))
+                # Для стабильности предпочтительны умеренные удержания — слишком долгие или
+                # слишком быстрые сделки считаем менее устойчивыми.
+                balanced_floor = 10.0 * 60.0
+                balanced_ceiling = 90.0 * 60.0
+                if median_hold <= balanced_floor:
+                    stability_components.append(0.7)
+                elif median_hold >= 3.0 * 60.0 * 60.0:
+                    stability_components.append(0.0)
+                elif median_hold <= balanced_ceiling:
+                    stability_components.append(1.0)
+                else:
+                    span = (3.0 * 60.0 * 60.0) - balanced_ceiling
+                    stability_components.append(
+                        max(0.0, 1.0 - ((median_hold - balanced_ceiling) / span))
+                    )
 
         confidence_score = _safe_float(summary.get("confidence_score"))
         if confidence_score is not None:
             contributions.append(max(0.0, min(confidence_score, 1.0)))
+            stability_components.append(max(0.0, min(confidence_score, 1.0)))
+
+        stability_score = _safe_float(summary.get("stability_score"))
+        if stability_score is None:
+            stability_payload = summary.get("automation_health")
+            if isinstance(stability_payload, Mapping):
+                stability_score = _safe_float(stability_payload.get("stability_score"))
+        if stability_score is not None:
+            stability_components.append(max(0.0, min(stability_score, 1.0)))
 
         if contributions:
             average = sum(contributions) / len(contributions)
             floor = 0.3 if summary.get("actionable") else 0.2
-            base_factor = floor + (1.0 - floor) * average
+
+            try:
+                risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                risk_pct = 0.0
+
+            risk_dampen = 1.0
+            if risk_pct > 0.0:
+                risk_dampen = max(0.3, min(1.0, (3.0 - min(risk_pct, 5.0)) / 3.0))
+
+            stability_strength = 0.0
+            if stability_components:
+                stability_strength = sum(stability_components) / len(stability_components)
+
+            floor += stability_strength * 0.25 * risk_dampen
+            floor = min(floor, 0.85)
+            headroom = max(0.05, 1.0 - floor)
+            strength = min(1.0, average * (0.7 + 0.3 * stability_strength))
+            base_factor = floor + headroom * strength
+            base_factor += headroom * 0.2 * stability_strength * risk_dampen * average
+            base_factor = min(base_factor, 1.0)
         else:
             base_factor = 1.0
 
