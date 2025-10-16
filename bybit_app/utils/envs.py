@@ -106,6 +106,7 @@ class Settings:
     spot_tp_reprice_threshold_bps: float = 5.0
     spot_tp_reprice_qty_buffer: float = 0.0
     spot_tp_fee_guard_bps: float = 20.0
+    spot_impulse_stop_loss_bps: float = 80.0
 
     # AI — общие
     ai_enabled: bool = True
@@ -133,6 +134,9 @@ class Settings:
     ai_market_scan_enabled: bool = True
     ai_max_hold_minutes: float = 0.0  # 0 → использовать авто-порог по статистике
     ai_min_exit_bps: Optional[float] = None  # None → авто-порог из статистики
+    ai_max_daily_surge_pct: float = 12.0
+    ai_overbought_rsi_threshold: float = 74.0
+    ai_overbought_stochastic_threshold: float = 88.0
 
     # TWAP
     twap_slices: int = 8
@@ -314,6 +318,9 @@ _ENV_MAP = {
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
     "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
     "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
+    "ai_max_daily_surge_pct": "AI_MAX_DAILY_SURGE_PCT",
+    "ai_overbought_rsi_threshold": "AI_OVERBOUGHT_RSI_THRESHOLD",
+    "ai_overbought_stochastic_threshold": "AI_OVERBOUGHT_STOCH_THRESHOLD",
     "twap_slices": "TWAP_SLICES",
     "twap_interval_sec": "TWAP_INTERVAL_SEC",
     "twap_child_secs": "TWAP_CHILD_SECS",
@@ -342,6 +349,7 @@ _ENV_MAP = {
     "spot_tp_reprice_threshold_bps": "SPOT_TP_REPRICE_THRESHOLD_BPS",
     "spot_tp_reprice_qty_buffer": "SPOT_TP_REPRICE_QTY_BUFFER",
     "spot_tp_fee_guard_bps": "SPOT_TP_FEE_GUARD_BPS",
+    "spot_impulse_stop_loss_bps": "SPOT_IMPULSE_STOP_LOSS_BPS",
     "telegram_token": "TG_BOT_TOKEN",
     "telegram_chat_id": "TG_CHAT_ID",
     "telegram_notify": "TG_NOTIFY",
@@ -463,6 +471,13 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
     m["ai_max_hold_minutes"] = _cast_float(m.get("ai_max_hold_minutes"))
     m["ai_min_exit_bps"] = _cast_float(m.get("ai_min_exit_bps"))
+    m["ai_max_daily_surge_pct"] = _cast_float(m.get("ai_max_daily_surge_pct"))
+    m["ai_overbought_rsi_threshold"] = _cast_float(
+        m.get("ai_overbought_rsi_threshold")
+    )
+    m["ai_overbought_stochastic_threshold"] = _cast_float(
+        m.get("ai_overbought_stochastic_threshold")
+    )
     m["ai_min_top_quote_usd"] = _cast_float(m.get("ai_min_top_quote_usd"))
 
     for csv_field in ("ai_symbols", "ai_whitelist"):
@@ -503,6 +518,9 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
         m.get("spot_trailing_stop_distance_bps", 25.0)
     )
     m["spot_tp_fee_guard_bps"] = _cast_float(m.get("spot_tp_fee_guard_bps", 20.0))
+    m["spot_impulse_stop_loss_bps"] = _cast_float(
+        m.get("spot_impulse_stop_loss_bps", 80.0)
+    )
     m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"

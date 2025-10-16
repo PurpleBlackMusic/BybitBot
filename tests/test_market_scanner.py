@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import types
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1348,3 +1349,88 @@ def test_scan_market_opportunities_detects_delist_candidates(tmp_path):
     symbols = {entry["symbol"] for entry in opportunities}
     assert symbols == {"ACTIVEUSDT"}
 
+
+
+def test_scanner_filters_extreme_daily_surge(tmp_path: Path) -> None:
+    rows = [_sample_row("HYPEUSDT", change_24h=15.0)]
+    _write_snapshot(tmp_path, rows)
+
+    settings = Settings(testnet=False, ai_live_only=False, ai_min_ev_bps=5.0)
+    opportunities = scan_market_opportunities(
+        None,
+        data_dir=tmp_path,
+        settings=settings,
+        min_turnover=100_000.0,
+    )
+
+    symbols = {entry["symbol"] for entry in opportunities}
+    assert "HYPEUSDT" not in symbols
+
+
+def test_scanner_filters_overbought_signals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_bundle(row: dict[str, object]) -> dict[str, object]:
+        return {
+            "blended_change_pct": 5.0,
+            "dominant_change_pct": 5.0,
+            "timeframe_contributions": {},
+            "volatility_pct": 4.0,
+            "volatility_windows": {},
+            "volume_spike_score": None,
+            "volume_impulse": {"1h": math.log(1.2)},
+            "depth_imbalance": None,
+            "order_flow_ratio": None,
+            "cvd_score": None,
+            "cvd_windows": {},
+            "top_depth_quote": {},
+            "top_depth_imbalance": None,
+            "correlations": {},
+            "correlation_strength": None,
+            "overbought_indicators": {
+                "rsi": 82.0,
+                "stochastic_pct": 92.0,
+                "distance_from_high_pct": 3.0,
+            },
+        }
+
+    monkeypatch.setattr(market_scanner_module, "build_feature_bundle", fake_bundle)
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+
+    rows = [_sample_row("RSIUSDT", change_24h=5.0)]
+    _write_snapshot(tmp_path, rows)
+
+    settings = Settings(testnet=False, ai_live_only=False, ai_min_ev_bps=5.0)
+    opportunities = scan_market_opportunities(
+        None,
+        data_dir=tmp_path,
+        settings=settings,
+        min_turnover=100_000.0,
+    )
+
+    symbols = {entry["symbol"] for entry in opportunities}
+    assert "RSIUSDT" not in symbols
+
+
+def test_scanner_marks_impulse_signal(tmp_path: Path) -> None:
+    extra = {
+        "volume1h": "500",
+        "prevVolume1h": "50",
+        "volume4h": "2000",
+        "prevVolume4h": "200",
+        "prevVolume24h": "100",
+    }
+    rows = [_sample_row("IMPULSEUSDT", change_24h=3.0, extra=extra)]
+    _write_snapshot(tmp_path, rows)
+
+    settings = Settings(testnet=False, ai_live_only=False, ai_min_ev_bps=5.0)
+    opportunities = scan_market_opportunities(
+        None,
+        data_dir=tmp_path,
+        settings=settings,
+        min_turnover=100_000.0,
+    )
+
+    impulse_entry = next(item for item in opportunities if item["symbol"] == "IMPULSEUSDT")
+    assert impulse_entry.get("impulse_signal") is True
+    assert impulse_entry.get("impulse_strength") is not None
