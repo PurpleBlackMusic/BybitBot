@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Mapping, MutableMapping, Optional, Sequence
+from threading import Lock
+from typing import Mapping, MutableMapping, Optional, Sequence, Tuple
 
 from .log import log
+
+
+_SUCCESS_CACHE_TTL_SECONDS = 90.0
+_ERROR_CACHE_TTL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -84,18 +88,56 @@ def _extract_entries(payload: Mapping[str, object]) -> Sequence[Mapping[str, obj
         return [entry for entry in entries if isinstance(entry, Mapping)]
     return []
 
+@dataclass
+class _CacheEntry:
+    value: Optional[FeeRateSnapshot]
+    expires_at: float
 
-@lru_cache(maxsize=128)
+
+_CACHE: dict[Tuple[str, Optional[str], Optional[str]], _CacheEntry] = {}
+_CACHE_LOCK = Lock()
+
+
+def _get_cache_entry(key: Tuple[str, Optional[str], Optional[str]], now: float) -> tuple[bool, Optional[FeeRateSnapshot]]:
+    entry = _CACHE.get(key)
+    if entry is None:
+        return False, None
+    if entry.expires_at > now:
+        return True, entry.value
+    # expired
+    del _CACHE[key]
+    return False, None
+
+
+def _set_cache_entry(
+    key: Tuple[str, Optional[str], Optional[str]],
+    value: Optional[FeeRateSnapshot],
+    *,
+    ttl: float,
+) -> None:
+    _CACHE[key] = _CacheEntry(value=value, expires_at=time.time() + ttl)
+
+
 def _cached_fee_rate(category: str, symbol: Optional[str], base_coin: Optional[str]) -> Optional[FeeRateSnapshot]:
     from .envs import get_api_client  # local import to avoid cycles
 
     normalised_symbol = _normalise_symbol(symbol)
     normalised_base = _normalise_base(base_coin)
 
+    cache_key = (category, normalised_symbol, normalised_base)
+    now = time.time()
+
+    with _CACHE_LOCK:
+        found, cached_value = _get_cache_entry(cache_key, now)
+    if found:
+        return cached_value
+
     try:
         api = get_api_client()
     except Exception as exc:  # pragma: no cover - defensive logging
         log("fees.api.client_error", err=str(exc))
+        with _CACHE_LOCK:
+            _set_cache_entry(cache_key, None, ttl=_ERROR_CACHE_TTL_SECONDS)
         return None
 
     try:
@@ -108,9 +150,13 @@ def _cached_fee_rate(category: str, symbol: Optional[str], base_coin: Optional[s
             symbol=normalised_symbol,
             base=normalised_base,
         )
+        with _CACHE_LOCK:
+            _set_cache_entry(cache_key, None, ttl=_ERROR_CACHE_TTL_SECONDS)
         return None
 
     if not isinstance(payload, Mapping):
+        with _CACHE_LOCK:
+            _set_cache_entry(cache_key, None, ttl=_ERROR_CACHE_TTL_SECONDS)
         return None
 
     entries = _extract_entries(payload)
@@ -133,6 +179,8 @@ def _cached_fee_rate(category: str, symbol: Optional[str], base_coin: Optional[s
         selected = entries[0]
 
     if selected is None:
+        with _CACHE_LOCK:
+            _set_cache_entry(cache_key, None, ttl=_ERROR_CACHE_TTL_SECONDS)
         return None
 
     maker_rate = _safe_float(selected.get("makerFeeRate"))
@@ -142,7 +190,7 @@ def _cached_fee_rate(category: str, symbol: Optional[str], base_coin: Optional[s
     if fetched_at is None:
         fetched_at = time.time()
 
-    return FeeRateSnapshot(
+    snapshot = FeeRateSnapshot(
         maker_rate=maker_rate,
         taker_rate=taker_rate,
         symbol=_normalise_symbol(selected.get("symbol")) or normalised_symbol,
@@ -151,6 +199,11 @@ def _cached_fee_rate(category: str, symbol: Optional[str], base_coin: Optional[s
         fetched_at=fetched_at,
         raw=selected,
     )
+
+    with _CACHE_LOCK:
+        _set_cache_entry(cache_key, snapshot, ttl=_SUCCESS_CACHE_TTL_SECONDS)
+
+    return snapshot
 
 
 def fee_rate_for_symbol(
@@ -179,7 +232,8 @@ def resolve_fee_rate_bps(
 
 
 def clear_fee_rate_cache() -> None:
-    _cached_fee_rate.cache_clear()
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 def update_fee_hint(
