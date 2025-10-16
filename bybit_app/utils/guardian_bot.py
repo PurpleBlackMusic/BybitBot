@@ -913,7 +913,7 @@ class GuardianBot:
             getattr(settings, "ai_sell_threshold", None),
             0.45,
         )
-        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0), 0.0)
+        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0), 0.0)
 
         effective_buy_threshold = buy_threshold
         effective_sell_threshold = max(0.0, min(sell_threshold, effective_buy_threshold))
@@ -1226,7 +1226,7 @@ class GuardianBot:
             max_spread = 0.0
 
         try:
-            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0) / 100.0
+            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0) / 100.0
         except (TypeError, ValueError):
             min_change_pct = 0.0
 
@@ -4369,7 +4369,7 @@ class GuardianBot:
 
         buy_threshold = float(getattr(settings, "ai_buy_threshold", 0.0) or 0.0) * 100.0
         sell_threshold = float(getattr(settings, "ai_sell_threshold", 0.0) or 0.0) * 100.0
-        min_ev = float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0)
+        min_ev = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0)
         lines.append(
             "Порог входа: покупка от {buy:.2f}%, продажа от {sell:.2f}%, ожидаемая выгода не ниже {ev:.2f} б.п.".format(
                 buy=buy_threshold,

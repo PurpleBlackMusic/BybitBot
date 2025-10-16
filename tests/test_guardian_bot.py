@@ -975,7 +975,7 @@ def test_guardian_answer_watchlist_summary(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
         "probability": 0.6,
-        "ev_bps": 12.5,
+        "ev_bps": 125.0,
         "side": "buy",
         "last_tick_ts": time.time(),
         "watchlist": {
@@ -1240,7 +1240,7 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
         "probability": 0.6,
-        "ev_bps": 12.5,
+        "ev_bps": 125.0,
         "watchlist": {
             "ETHUSDT": {"score": 0.7, "trend": "buy", "note": "объём растёт"},
             "XRPUSDT": 0.4,
@@ -1267,7 +1267,7 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     scorecard = bot.signal_scorecard(brief)
     assert scorecard["symbol"] == "BTCUSDT"
     assert scorecard["probability_pct"] == 60.0
-    assert scorecard["ev_bps"] == 12.5
+    assert scorecard["ev_bps"] == 125.0
     assert scorecard["buy_threshold"] == 55.0
     assert scorecard["sell_threshold"] == 45.0
     assert scorecard["configured_buy_threshold"] == 55.0
@@ -1888,7 +1888,7 @@ def test_guardian_symbol_plan_prioritises_positions(tmp_path: Path) -> None:
             {
                 "symbol": "SOLUSDT",
                 "probability": 0.66,
-                "ev_bps": 25.0,
+                "ev_bps": 125.0,
                 "trend": "buy",
                 "actionable": True,
                 "note": "сильный импульс",
@@ -2973,7 +2973,7 @@ def test_guardian_unified_report(tmp_path: Path) -> None:
     status = {
         "symbol": "BTCUSDT",
         "probability": 0.65,
-        "ev_bps": 14.0,
+        "ev_bps": 120.0,
         "side": "buy",
         "last_tick_ts": time.time(),
         "watchlist": {"ETHUSDT": {"score": 0.6, "trend": "buy"}},
