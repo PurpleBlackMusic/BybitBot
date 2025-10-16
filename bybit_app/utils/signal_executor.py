@@ -3574,10 +3574,6 @@ class SignalExecutor:
                 adjusted[-1] = (last_step, last_qty + carry)
             allocations = [(step_cfg, qty) for step_cfg, qty in adjusted if qty > 0]
 
-        if not allocations:
-            self._cancel_existing_stop_orders(symbol, api, settings)
-            return [], {}, []
-
         tif_candidate = getattr(settings, "spot_limit_tif", None) or getattr(settings, "order_time_in_force", None) or "GTC"
         time_in_force = "GTC"
         if isinstance(tif_candidate, str) and tif_candidate.strip():
@@ -3587,21 +3583,22 @@ class SignalExecutor:
 
         fee_guard_fraction = resolve_fee_guard_fraction(settings)
         aggregated: list[Dict[str, object]] = []
-        for step_cfg, qty in allocations:
-            multiplier = target_multiplier(step_cfg.profit_fraction, fee_guard_fraction)
-            price = avg_price * multiplier
-            price = self._round_to_step(price, price_step, rounding=ROUND_UP)
-            price = self._clamp_price_to_band(
-                price,
-                price_step=price_step,
-                band_min=price_band_min,
-                band_max=price_band_max,
-            )
-            if aggregated and aggregated[-1]["price"] == price:
-                aggregated[-1]["qty"] += qty
-                aggregated[-1]["steps"].append(step_cfg)
-            else:
-                aggregated.append({"price": price, "qty": qty, "steps": [step_cfg]})
+        if allocations:
+            for step_cfg, qty in allocations:
+                multiplier = target_multiplier(step_cfg.profit_fraction, fee_guard_fraction)
+                price = avg_price * multiplier
+                price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+                price = self._clamp_price_to_band(
+                    price,
+                    price_step=price_step,
+                    band_min=price_band_min,
+                    band_max=price_band_max,
+                )
+                if aggregated and aggregated[-1]["price"] == price:
+                    aggregated[-1]["qty"] += qty
+                    aggregated[-1]["steps"].append(step_cfg)
+                else:
+                    aggregated.append({"price": price, "qty": qty, "steps": [step_cfg]})
 
         base_timestamp = int(time.time() * 1000)
         plan_entries: list[Dict[str, object]] = []
@@ -3637,6 +3634,28 @@ class SignalExecutor:
                     "profit_text": profit_text,
                 }
             )
+
+        if not plan_entries:
+            fallback_entry = self._build_tp_fallback_entry(
+                steps=steps,
+                total_qty=total_qty,
+                avg_price=avg_price,
+                qty_step=qty_step,
+                price_step=price_step,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                price_band_min=price_band_min,
+                price_band_max=price_band_max,
+                fee_guard_fraction=fee_guard_fraction,
+            )
+            if fallback_entry is not None:
+                plan_entries.append(fallback_entry)
+                log(
+                    "guardian.auto.tp_ladder.fallback",
+                    symbol=symbol,
+                    qty=fallback_entry.get("qty_text"),
+                    price=fallback_entry.get("price_text"),
+                )
 
         if not plan_entries:
             self._cancel_existing_stop_orders(symbol, api, settings)
@@ -4031,6 +4050,67 @@ class SignalExecutor:
             order_entry["clientManaged"] = True
 
         return [order_entry]
+
+    def _build_tp_fallback_entry(
+        self,
+        *,
+        steps: Sequence[_LadderStep],
+        total_qty: Decimal,
+        avg_price: Decimal,
+        qty_step: Decimal,
+        price_step: Decimal,
+        min_qty: Decimal,
+        min_notional: Decimal,
+        price_band_min: Decimal,
+        price_band_max: Decimal,
+        fee_guard_fraction: Decimal,
+    ) -> Optional[Dict[str, object]]:
+        """Compose a single TP rung when the configured ladder cannot be placed."""
+
+        if not steps:
+            return None
+
+        fallback_step = next((step for step in steps if step.size_fraction > 0), steps[0])
+
+        qty = self._round_to_step(total_qty, qty_step, rounding=ROUND_DOWN)
+        if qty <= 0:
+            return None
+        if min_qty > 0 and qty < min_qty:
+            return None
+
+        multiplier = target_multiplier(fallback_step.profit_fraction, fee_guard_fraction)
+        price = avg_price * multiplier
+        price = self._round_to_step(price, price_step, rounding=ROUND_UP)
+        price = self._clamp_price_to_band(
+            price,
+            price_step=price_step,
+            band_min=price_band_min,
+            band_max=price_band_max,
+        )
+        if price <= 0:
+            return None
+
+        if min_notional > 0 and price * qty < min_notional:
+            return None
+
+        qty_text = self._format_decimal_step(qty, qty_step)
+        price_text = self._format_price_step(price, price_step)
+        if not qty_text or qty_text == "0":
+            return None
+        if not price_text or price_text == "0":
+            return None
+
+        profit_text = str(fallback_step.profit_bps.normalize())
+
+        return {
+            "rung": 1,
+            "qty": qty,
+            "qty_text": qty_text,
+            "price": price,
+            "price_text": price_text,
+            "profit_text": profit_text,
+            "fallback": True,
+        }
 
     def _update_trailing_stops(
         self,

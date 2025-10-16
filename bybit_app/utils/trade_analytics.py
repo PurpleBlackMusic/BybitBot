@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +74,31 @@ def _normalise_side(value: object) -> str:
     return ""
 
 
+def _parse_is_maker(value: object) -> Optional[bool]:
+    """Convert heterogeneous maker flags into ``bool`` values."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if math.isnan(numeric):
+            return None
+        if numeric > 0:
+            return True
+        if numeric < 0:
+            return False
+        return False
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if not token:
+            return None
+        if token in {"1", "true", "t", "yes", "y", "maker"}:
+            return True
+        if token in {"0", "false", "f", "no", "n", "taker"}:
+            return False
+    return None
+
+
 def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[ExecutionRecord]:
     """Convert a raw ledger payload into an :class:`ExecutionRecord`."""
 
@@ -95,7 +121,7 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
         price=price,
         fee=execution_fee_in_quote(payload, price=price),
         raw_fee=raw_fee,
-        is_maker=payload.get("isMaker") if isinstance(payload.get("isMaker"), bool) else None,
+        is_maker=_parse_is_maker(payload.get("isMaker")),
         timestamp=_parse_timestamp(
             payload.get("execTime")
             or payload.get("execTimeNs")
@@ -142,12 +168,16 @@ def load_executions(
 
 
 def _maker_ratio(records: Sequence[ExecutionRecord]) -> float:
-    makers = sum(1 for record in records if record.is_maker is True)
-    takers = sum(1 for record in records if record.is_maker is False)
-    total = makers + takers
-    if total == 0:
+    maker_notional = sum(
+        record.notional for record in records if record.is_maker is True
+    )
+    taker_notional = sum(
+        record.notional for record in records if record.is_maker is False
+    )
+    total = maker_notional + taker_notional
+    if total <= 0:
         return 0.0
-    return makers / total
+    return maker_notional / total
 
 
 def _activity_breakdown(records: Sequence[ExecutionRecord]) -> Tuple[int, int, int]:

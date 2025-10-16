@@ -37,11 +37,19 @@ def test_load_executions_normalises_json(tmp_path: Path) -> None:
             "execQty": "0.5",
             "execTimeNs": int(now.timestamp() * 1e9),
         },
+        {
+            "symbol": "XRPUSDT",
+            "side": "buy",
+            "execPrice": "0.5",
+            "execQty": "100",
+            "execTime": now.timestamp(),
+            "isMaker": "0",
+        },
     ]
     path = _write_ledger(tmp_path, events)
 
     records = load_executions(path)
-    assert len(records) == 2
+    assert len(records) == 3
     assert records[0].symbol == "BTCUSDT"
     assert records[0].side == "buy"
     assert records[0].notional == 270.0
@@ -49,6 +57,7 @@ def test_load_executions_normalises_json(tmp_path: Path) -> None:
     assert records[0].fee == pytest.approx(0.27)
     assert records[0].is_maker is True
     assert records[0].timestamp is not None
+    assert records[2].is_maker is False
 
 
 def test_aggregate_execution_metrics(tmp_path: Path) -> None:
@@ -95,3 +104,5 @@ def test_aggregate_execution_metrics(tmp_path: Path) -> None:
     btc_row = next(row for row in metrics["per_symbol"] if row["symbol"] == "BTCUSDT")
     assert btc_row["trades"] == 2
     assert btc_row["volume"] > 0
+    maker_ratio = 270.0 / (270.0 + 0.005 * 27400)
+    assert metrics["maker_ratio"] == pytest.approx(maker_ratio)
