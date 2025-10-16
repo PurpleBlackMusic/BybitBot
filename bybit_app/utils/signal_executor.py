@@ -1780,6 +1780,9 @@ class SignalExecutor:
                 **defaults_meta,
             )
 
+        if hold_limit_minutes > 0:
+            hold_limit_minutes = max(240.0, min(hold_limit_minutes, 720.0))
+
         if hold_limit_minutes <= 0 and pnl_limit is None and trade_loss_limit_pct <= 0:
             return None, None
 
@@ -1862,6 +1865,59 @@ class SignalExecutor:
                             "threshold_percent": float(trade_loss_limit_pct),
                         }
                     )
+
+            guard_state = self._active_stop_orders.get(str(symbol).upper())
+            if guard_state and bool(guard_state.get("client_managed")):
+                stop_price_value: Optional[Decimal]
+                stop_raw = guard_state.get("current_stop")
+                if isinstance(stop_raw, Decimal):
+                    stop_price_value = stop_raw
+                else:
+                    try:
+                        stop_price_value = Decimal(str(stop_raw))
+                    except (InvalidOperation, ValueError, TypeError):
+                        stop_price_value = None
+
+                price_value = info.get("price")
+                price_decimal: Optional[Decimal]
+                if isinstance(price_value, (int, float)):
+                    price_decimal = Decimal(str(price_value))
+                else:
+                    last_price = guard_state.get("last_price")
+                    if isinstance(last_price, Decimal):
+                        price_decimal = last_price
+                    else:
+                        try:
+                            price_decimal = Decimal(str(last_price))
+                        except (InvalidOperation, ValueError, TypeError):
+                            price_decimal = None
+
+                exit_side = str(guard_state.get("side") or "").capitalize() or "Sell"
+                trailing_flag = bool((_safe_float(guard_state.get("trailing_bps")) or 0.0) > 0)
+
+                triggered = False
+                if (
+                    stop_price_value is not None
+                    and price_decimal is not None
+                    and price_decimal > 0
+                ):
+                    if exit_side == "Sell":
+                        triggered = price_decimal <= stop_price_value
+                    else:
+                        triggered = price_decimal >= stop_price_value
+
+                if triggered and not bool(guard_state.get("client_triggered")):
+                    triggers.append(
+                        {
+                            "type": "client_stop",
+                            "stop_price": float(stop_price_value),
+                            "current_price": float(price_decimal),
+                            "trailing": trailing_flag,
+                            "side": exit_side,
+                        }
+                    )
+                    guard_state["client_triggered"] = True
+                    self._active_stop_orders[str(symbol).upper()] = guard_state
 
             if not triggers:
                 continue
@@ -3849,6 +3905,30 @@ class SignalExecutor:
         order_type_raw = getattr(settings, "spot_tpsl_sl_order_type", "Market") or "Market"
         order_type = str(order_type_raw).capitalize()
 
+        trailing_state: Dict[str, object] = {
+            "symbol": symbol_upper,
+            "side": exit_side,
+            "order_id": None,
+            "order_link_id": None,
+            "qty_step": qty_step,
+            "price_step": price_step,
+            "current_stop": stop_price,
+            "avg_price": avg_price,
+            "qty": qty,
+            "trailing_bps": trailing_bps,
+            "activation_bps": activation_bps,
+            "stop_loss_bps": stop_loss_bps,
+            "client_managed": False,
+            "last_price": avg_price,
+            "client_triggered": False,
+        }
+        if exit_side == "Sell":
+            trailing_state["highest_price"] = avg_price
+        else:
+            trailing_state["lowest_price"] = avg_price
+
+        place_supported = not active_dry_run(settings) and api is not None and hasattr(api, "place_order")
+
         payload: Dict[str, object] = {
             "category": "spot",
             "symbol": symbol,
@@ -3883,53 +3963,54 @@ class SignalExecutor:
             )
             payload["timeInForce"] = "GTC"
 
+        order_id: Optional[str] = None
+        order_link_id: Optional[str] = None
+        client_managed = not place_supported
         response_payload: Mapping[str, object] | None = None
-        try:
-            response_payload = api.place_order(**payload)  # type: ignore[call-arg]
-        except Exception as exc:  # pragma: no cover - network/runtime errors
+        if place_supported:
+            try:
+                response_payload = api.place_order(**payload)  # type: ignore[call-arg]
+            except Exception as exc:  # pragma: no cover - network/runtime errors
+                log(
+                    "guardian.auto.stop_loss.error",
+                    symbol=symbol_upper,
+                    err=str(exc),
+                )
+                client_managed = True
+            else:
+                order_id, order_link_id = self._extract_order_identifiers(response_payload)
+                if not order_link_id:
+                    raw_link = payload.get("orderLinkId")
+                    if isinstance(raw_link, str):
+                        order_link_id = raw_link
+
+        trailing_state["order_id"] = order_id
+        trailing_state["order_link_id"] = order_link_id
+        trailing_state["client_managed"] = client_managed
+
+        if client_managed:
             log(
-                "guardian.auto.stop_loss.error",
+                "guardian.auto.stop_loss.client_guard",
                 symbol=symbol_upper,
-                err=str(exc),
+                side=exit_side,
+                qty=qty_text,
+                trigger=stop_price_text,
+                trailing=bool(trailing_bps > 0),
+                enforced=bool(enforced),
             )
-            return []
-
-        order_id, order_link_id = self._extract_order_identifiers(response_payload)
-        if not order_link_id:
-            raw_link = payload.get("orderLinkId")
-            if isinstance(raw_link, str):
-                order_link_id = raw_link
-
-        trailing_state: Dict[str, object] = {
-            "symbol": symbol_upper,
-            "side": exit_side,
-            "order_id": order_id,
-            "order_link_id": order_link_id,
-            "qty_step": qty_step,
-            "price_step": price_step,
-            "current_stop": stop_price,
-            "avg_price": avg_price,
-            "qty": qty,
-            "trailing_bps": trailing_bps,
-            "activation_bps": activation_bps,
-        }
-        if exit_side == "Sell":
-            trailing_state["highest_price"] = avg_price
         else:
-            trailing_state["lowest_price"] = avg_price
+            log(
+                "guardian.auto.stop_loss.create",
+                symbol=symbol_upper,
+                side=exit_side,
+                qty=qty_text,
+                trigger=stop_price_text,
+                orderType=order_type,
+                trailing=bool(trailing_bps > 0),
+                enforced=bool(enforced),
+            )
 
         self._active_stop_orders[symbol_upper] = trailing_state
-
-        log(
-            "guardian.auto.stop_loss.create",
-            symbol=symbol_upper,
-            side=exit_side,
-            qty=qty_text,
-            trigger=stop_price_text,
-            orderType=order_type,
-            trailing=bool(trailing_bps > 0),
-            enforced=bool(enforced),
-        )
 
         order_entry: Dict[str, object] = {
             "qty": qty_text,
@@ -3946,6 +4027,8 @@ class SignalExecutor:
             order_entry["trailingDistanceBps"] = trailing_bps
             if activation_bps > 0:
                 order_entry["activationBps"] = activation_bps
+        if client_managed:
+            order_entry["clientManaged"] = True
 
         return [order_entry]
 
@@ -3957,10 +4040,12 @@ class SignalExecutor:
     ) -> None:
         if not self._active_stop_orders:
             return
-        if active_dry_run(settings):
-            return
-        if api is None or not hasattr(api, "amend_order"):
-            return
+
+        can_amend = (
+            not active_dry_run(settings)
+            and api is not None
+            and hasattr(api, "amend_order")
+        )
 
         price_map: Dict[str, Decimal] = {}
         if isinstance(summary, Mapping):
@@ -3980,6 +4065,10 @@ class SignalExecutor:
             current_price = price_map.get(symbol_upper)
             if current_price is None:
                 continue
+
+            state["last_price"] = current_price
+
+            client_managed = bool(state.get("client_managed"))
 
             trailing_bps = _safe_float(state.get("trailing_bps")) or 0.0
             if trailing_bps <= 0:
@@ -4065,22 +4154,30 @@ class SignalExecutor:
             if order_link_id:
                 payload["orderLinkId"] = order_link_id
 
-            try:
-                api.amend_order(**payload)  # type: ignore[call-arg]
-            except Exception as exc:  # pragma: no cover - defensive logging
-                log(
-                    "guardian.auto.stop_loss.trail.error",
-                    symbol=symbol_upper,
-                    err=str(exc),
-                )
-                continue
+            if can_amend and not client_managed:
+                try:
+                    api.amend_order(**payload)  # type: ignore[call-arg]
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    log(
+                        "guardian.auto.stop_loss.trail.error",
+                        symbol=symbol_upper,
+                        err=str(exc),
+                    )
+                    continue
 
-            state["current_stop"] = new_stop
-            log(
-                "guardian.auto.stop_loss.trail",
-                symbol=symbol_upper,
-                trigger=trigger_text,
-            )
+                state["current_stop"] = new_stop
+                log(
+                    "guardian.auto.stop_loss.trail",
+                    symbol=symbol_upper,
+                    trigger=trigger_text,
+                )
+            else:
+                state["current_stop"] = new_stop
+                log(
+                    "guardian.auto.stop_loss.trail.client",
+                    symbol=symbol_upper,
+                    trigger=trigger_text,
+                )
             trailing_updated = True
 
         if trailing_updated:

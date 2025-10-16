@@ -383,7 +383,7 @@ def test_signal_executor_force_exit_uses_trade_stats_defaults(
             "qty": 10.0,
             "avg_cost": 1.0,
             "realized_pnl": 0.0,
-            "hold_seconds": 1200.0,
+            "hold_seconds": 15000.0,
             "price": 0.95,
             "pnl_value": -0.5,
             "pnl_bps": -5.0,
@@ -413,7 +413,7 @@ def test_signal_executor_force_exit_uses_trade_stats_defaults(
     assert forced_summary["actionable"] is True
     assert forced_summary["symbol"] == "ADAUSDT"
     assert metadata is not None
-    assert metadata.get("hold_threshold_minutes") == pytest.approx(15.0)
+    assert metadata.get("hold_threshold_minutes") == pytest.approx(240.0)
     triggers = metadata.get("triggers") or []
     assert any(trigger.get("type") == "hold_time" for trigger in triggers)
     assert any(event == "guardian.auto.force_exit.defaults" for event, _ in events)
@@ -2516,7 +2516,7 @@ def test_signal_executor_guard_forces_sell_on_time_and_loss(
             "execPrice": "25000",
             "execQty": "0.01",
             "execFee": "0.0",
-            "execTime": now - 7200,
+            "execTime": now - 21600,
         }
     ]
 
@@ -2602,7 +2602,7 @@ def test_signal_executor_guard_forces_sell_on_time_and_loss(
     assert isinstance(forced, dict)
     assert forced.get("symbol") == "BTCUSDT"
     assert forced.get("pnl_bps") is not None and forced["pnl_bps"] < 0
-    assert forced.get("hold_minutes") is not None and forced["hold_minutes"] >= 30.0
+    assert forced.get("hold_minutes") is not None and forced["hold_minutes"] >= 240.0
     assert any(trigger.get("type") == "pnl" for trigger in forced.get("triggers", []))
     assert any(trigger.get("type") == "hold_time" for trigger in forced.get("triggers", []))
 
@@ -3441,7 +3441,7 @@ def test_signal_executor_tp_ladder_uses_local_attempts(monkeypatch: pytest.Monke
             step, rounding=ROUND_DOWN
         )
     assert qtys == expected_qtys
-    assert prices == [Decimal("100.55"), Decimal("100.9"), Decimal("101.3")]
+    assert prices == [Decimal("100.9"), Decimal("101.3"), Decimal("101.7")]
     assert stop_order["orderFilter"] == "tpslOrder"
     assert result.order is not None
     execution = result.order.get("execution")
