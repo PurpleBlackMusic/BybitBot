@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(paths, "DATA_DIR", data_dir)
     monkeypatch.setattr(paths, "SETTINGS_FILE", settings_file)
 
-    for key in (
+    tracked_env = (
         "BYBIT_API_KEY",
         "BYBIT_API_SECRET",
         "BYBIT_DRY_RUN",
@@ -36,11 +37,15 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "BYBIT_API_SECRET_TESTNET",
         "BYBIT_DRY_RUN_MAINNET",
         "BYBIT_DRY_RUN_TESTNET",
-    ):
+    )
+
+    for key in tracked_env:
         monkeypatch.delenv(key, raising=False)
 
     envs._invalidate_cache()
     yield settings_file
+    for key in tracked_env:
+        monkeypatch.delenv(key, raising=False)
     envs._invalidate_cache()
 
 
@@ -60,11 +65,16 @@ def test_update_settings_disables_dry_run_when_keys_supplied(isolated_settings: 
     assert settings.get_dry_run(testnet=False) is True
 
     persisted = _read_settings_file(isolated_settings)
-    assert persisted["api_key_testnet"] == "KEY"
-    assert persisted["api_secret_testnet"] == "SECRET"
+    assert "api_key_testnet" not in persisted
+    assert "api_secret_testnet" not in persisted
     assert persisted["dry_run_testnet"] is False
     assert persisted.get("dry_run_mainnet", True) is True
     assert "dry_run" not in persisted
+
+    assert os.getenv("BYBIT_API_KEY_TESTNET") == "KEY"
+    assert os.getenv("BYBIT_API_SECRET_TESTNET") == "SECRET"
+    assert os.getenv("BYBIT_API_KEY") == "KEY"
+    assert os.getenv("BYBIT_API_SECRET") == "SECRET"
 
 
 def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):
@@ -79,11 +89,16 @@ def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):
 
     persisted = _read_settings_file(isolated_settings)
     assert persisted.get("dry_run_testnet", True) is True
+    assert "api_key_testnet" not in persisted
+    assert os.getenv("BYBIT_API_KEY_TESTNET") == "KEY"
+    assert os.getenv("BYBIT_API_SECRET_TESTNET") == "SECRET"
 
 
 def test_testnet_false_string_uses_mainnet(
     isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    monkeypatch.setenv("BYBIT_API_KEY_MAINNET", "KEY")
+    monkeypatch.setenv("BYBIT_API_SECRET_MAINNET", "SECRET")
     _write_settings(
         isolated_settings,
         {
@@ -143,9 +158,14 @@ def test_mainnet_autoswitch_disables_only_mainnet(isolated_settings: Path) -> No
     assert settings.get_dry_run(testnet=True) is True
 
     persisted = _read_settings_file(isolated_settings)
-    assert persisted["api_key_mainnet"] == "MAIN"
+    assert "api_key_mainnet" not in persisted
     assert persisted["dry_run_mainnet"] is False
     assert persisted.get("dry_run_testnet", True) is True
+
+    assert os.getenv("BYBIT_API_KEY_MAINNET") == "MAIN"
+    assert os.getenv("BYBIT_API_SECRET_MAINNET") == "SECRET"
+    assert os.getenv("BYBIT_API_KEY") == "MAIN"
+    assert os.getenv("BYBIT_API_SECRET") == "SECRET"
 
 
 def test_legacy_config_migrates_on_save(isolated_settings: Path) -> None:
@@ -162,16 +182,34 @@ def test_legacy_config_migrates_on_save(isolated_settings: Path) -> None:
     envs._invalidate_cache()
     settings = envs.get_settings(force_reload=True)
 
-    assert settings.get_api_key(testnet=True) == "LEGACY"
-    assert settings.get_api_secret(testnet=True) == "SECRET"
+    assert settings.get_api_key(testnet=True) == ""
+    assert settings.get_api_secret(testnet=True) == ""
     assert settings.get_dry_run(testnet=True) is False
     assert settings.get_dry_run(testnet=False) is True
 
     envs.update_settings()
     migrated = _read_settings_file(isolated_settings)
 
-    assert migrated["api_key_testnet"] == "LEGACY"
-    assert migrated["api_secret_testnet"] == "SECRET"
+    assert "api_key_testnet" not in migrated
+    assert "api_secret_testnet" not in migrated
     assert migrated["dry_run_testnet"] is False
     assert "api_key" not in migrated
     assert "dry_run" not in migrated
+
+
+def test_validate_runtime_credentials_raises_without_keys(
+    isolated_settings: Path,
+) -> None:
+    envs.update_settings(dry_run=False)
+    settings = envs.get_settings(force_reload=True)
+
+    with pytest.raises(envs.CredentialValidationError):
+        envs.validate_runtime_credentials(settings)
+
+
+def test_validate_runtime_credentials_allows_dry_run(isolated_settings: Path) -> None:
+    envs.update_settings(dry_run=True)
+    settings = envs.get_settings(force_reload=True)
+
+    # Should not raise when both networks are in dry-run mode.
+    envs.validate_runtime_credentials(settings)
