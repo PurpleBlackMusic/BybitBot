@@ -116,19 +116,19 @@ class Settings:
     ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
-    ai_live_only: bool = True
+    ai_live_only: bool = False
     # трейдинг параметры
     ai_max_slippage_bps: int = 400
     ai_fee_bps: float = 5.0
     ai_slippage_bps: float = 10.0
-    ai_buy_threshold: float = 0.55
-    ai_sell_threshold: float = 0.45
+    ai_buy_threshold: float = 0.58
+    ai_sell_threshold: float = 0.42
     ai_daily_loss_limit_pct: float = 3.0
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
     ai_min_ev_bps: float = 0.0
-    ai_retrain_minutes: int = 60
+    ai_retrain_minutes: int = 240
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True

@@ -6552,12 +6552,33 @@ class SignalExecutor:
 
         mode = str(summary.get("mode") or "wait").lower()
         probability = _safe_float(summary.get("probability"))
+        thresholds_summary = summary.get("thresholds")
         buy_threshold = _safe_float(getattr(settings, "ai_buy_threshold", None))
         sell_threshold = _safe_float(getattr(settings, "ai_sell_threshold", None))
+        sell_exit_threshold = None
+        buy_exit_threshold = None
+        if isinstance(thresholds_summary, Mapping):
+            buy_entry_pct = _safe_float(thresholds_summary.get("buy_probability_pct"))
+            sell_entry_pct = _safe_float(thresholds_summary.get("sell_probability_pct"))
+            buy_exit_pct = _safe_float(thresholds_summary.get("buy_exit_probability_pct"))
+            sell_exit_pct = _safe_float(thresholds_summary.get("sell_exit_probability_pct"))
+            if buy_entry_pct is not None:
+                buy_threshold = buy_entry_pct / 100.0
+            if sell_entry_pct is not None:
+                sell_threshold = sell_entry_pct / 100.0
+            if buy_exit_pct is not None:
+                buy_exit_threshold = buy_exit_pct / 100.0
+            if sell_exit_pct is not None:
+                sell_exit_threshold = sell_exit_pct / 100.0
+        # fallbacks
         if buy_threshold is None or buy_threshold <= 0:
             buy_threshold = 0.6
         if sell_threshold is None or sell_threshold <= 0:
             sell_threshold = 0.45
+        if mode == "sell" and sell_exit_threshold is not None:
+            sell_threshold = sell_exit_threshold
+        elif mode == "buy" and buy_exit_threshold is not None:
+            buy_threshold = buy_exit_threshold
 
         if probability is not None:
             span = 0.25

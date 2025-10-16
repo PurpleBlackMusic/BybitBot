@@ -18,6 +18,7 @@ from statistics import StatisticsError, median, quantiles
 WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 LIVE_TICK_STALE_SECONDS = 3.0
+DEFAULT_HYSTERESIS_MARGIN = 0.04
 
 DEFAULT_SYMBOL_UNIVERSE: Tuple[str, ...] = (
     "BTCUSDT",
@@ -50,6 +51,38 @@ from .market_scanner import scan_market_opportunities
 from .instruments import get_listed_spot_symbols
 from .log import log
 from .universe import build_universe, is_symbol_blacklisted, load_universe
+
+
+@dataclass(frozen=True)
+class ProbabilityThresholds:
+    """Normalised probability and EV thresholds with hysteresis support."""
+
+    buy_entry: float
+    sell_entry: float
+    min_ev: float
+    effective_buy: float
+    effective_sell: float
+    buy_exit: float
+    sell_exit: float
+
+    def summary_payload(self) -> Dict[str, float]:
+        return {
+            "buy_probability_pct": round(self.buy_entry * 100.0, 2),
+            "sell_probability_pct": round(self.sell_entry * 100.0, 2),
+            "effective_buy_probability_pct": round(self.effective_buy * 100.0, 2),
+            "effective_sell_probability_pct": round(self.effective_sell * 100.0, 2),
+            "buy_exit_probability_pct": round(self.buy_exit * 100.0, 2),
+            "sell_exit_probability_pct": round(self.sell_exit * 100.0, 2),
+            "min_ev_bps": round(self.min_ev, 2),
+        }
+
+    def decision_threshold(self, mode: str, holding: bool) -> float:
+        mode = mode.lower()
+        if mode == "sell":
+            return self.sell_exit if holding else self.effective_sell
+        if mode == "buy":
+            return self.buy_exit if holding else self.effective_buy
+        return 0.5
 
 
 @dataclass(frozen=True)
@@ -893,9 +926,7 @@ class GuardianBot:
     def _clamp_probability(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
 
-    def _resolve_thresholds(
-        self, settings: Settings
-    ) -> Tuple[float, float, float, float, float]:
+    def _resolve_thresholds(self, settings: Settings) -> ProbabilityThresholds:
         """Normalise user-provided thresholds and derive safe fallbacks."""
 
         def _clamp_threshold(value: object, default: float) -> float:
@@ -907,23 +938,34 @@ class GuardianBot:
 
         buy_threshold = _clamp_threshold(
             getattr(settings, "ai_buy_threshold", None),
-            0.55,
+            0.58,
         )
         sell_threshold = _clamp_threshold(
             getattr(settings, "ai_sell_threshold", None),
-            0.45,
+            0.42,
         )
         min_ev = max(float(getattr(settings, "ai_min_ev_bps", 0.0) or 0.0), 0.0)
 
         effective_buy_threshold = buy_threshold
         effective_sell_threshold = max(0.0, min(sell_threshold, effective_buy_threshold))
 
-        return (
-            buy_threshold,
-            sell_threshold,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
+        margin = DEFAULT_HYSTERESIS_MARGIN
+        buy_exit = min(1.0, max(effective_buy_threshold, buy_threshold + margin))
+        sell_exit = max(0.0, min(effective_sell_threshold, sell_threshold - margin))
+
+        if sell_exit >= effective_sell_threshold:
+            sell_exit = max(0.0, effective_sell_threshold - margin)
+
+        sell_exit = max(0.0, sell_exit)
+
+        return ProbabilityThresholds(
+            buy_entry=buy_threshold,
+            sell_entry=sell_threshold,
+            min_ev=min_ev,
+            effective_buy=effective_buy_threshold,
+            effective_sell=effective_sell_threshold,
+            buy_exit=buy_exit,
+            sell_exit=sell_exit,
         )
 
     @staticmethod
@@ -2116,13 +2158,10 @@ class GuardianBot:
 
         if not filtered:
             return filtered
-        (
-            _,
-            _,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
-        ) = self._resolve_thresholds(settings)
+        thresholds = self._resolve_thresholds(settings)
+        min_ev = thresholds.min_ev
+        effective_buy_threshold = thresholds.effective_buy
+        effective_sell_threshold = thresholds.effective_sell
 
         def annotate(entry: Dict[str, object]) -> None:
             trend_hint = self._normalise_mode_hint(entry.get("trend"))
@@ -2248,6 +2287,7 @@ class GuardianBot:
         }
 
         summary: List[Dict[str, object]] = []
+        thresholds = self._resolve_thresholds(self.settings)
 
         for idx, raw_entry in enumerate(priority_table):
             if not isinstance(raw_entry, Mapping):
@@ -2270,20 +2310,53 @@ class GuardianBot:
             win_rate_pct = self._coerce_float(raw_entry.get("win_rate_pct"))
             median_hold_sec = self._coerce_float(raw_entry.get("median_hold_sec"))
             priority_adjustment = self._coerce_float(raw_entry.get("priority_adjustment"))
+            trend_hint = self._normalise_mode_hint(raw_entry.get("trend"))
+
+            probability_ratio: Optional[float] = None
+            if probability is not None:
+                probability_ratio = probability
+            elif probability_pct is not None:
+                probability_ratio = probability_pct / 100.0
+            if probability_ratio is not None and probability_ratio > 1.0:
+                probability_ratio = probability_ratio / 100.0
+
+            holding_flag = symbol in position_symbols or bool(raw_entry.get("holding"))
+            hysteresis_threshold: Optional[float] = None
+            probability_ready = bool(raw_entry.get("probability_ready"))
+            probability_gap: Optional[float] = None
+
+            if probability_ratio is None:
+                probability_ready = bool(raw_entry.get("probability_ready"))
+            elif trend_hint in {"buy", "sell"}:
+                use_holding = holding_flag if trend_hint == "sell" else False
+                hysteresis_threshold = thresholds.decision_threshold(trend_hint, use_holding)
+                if trend_hint == "sell":
+                    probability_ready = probability_ratio <= hysteresis_threshold
+                    probability_gap = hysteresis_threshold - probability_ratio
+                else:
+                    probability_ready = probability_ratio >= hysteresis_threshold
+                    probability_gap = probability_ratio - hysteresis_threshold
+            else:
+                probability_ready = probability_ratio >= 0.5
+                probability_gap = probability_ratio - 0.5
 
             entry = {
                 "symbol": symbol,
                 "priority": int(raw_entry.get("priority") or idx + 1),
                 "sources": tuple(raw_entry.get("sources") or ()),
                 "reasons": tuple(raw_entry.get("reasons") or ()),
-                "actionable": bool(raw_entry.get("actionable")),
+                "actionable": bool(raw_entry.get("actionable")) and probability_ready,
                 "ready": bool(raw_entry.get("ready")),
-                "holding": bool(raw_entry.get("holding")),
+                "holding": holding_flag,
                 "trend": raw_entry.get("trend"),
                 "note": raw_entry.get("note"),
                 "watchlist_rank": raw_entry.get("watchlist_rank"),
                 "probability_pct": round(probability_pct, 2) if probability_pct is not None else None,
-                "probability": round(probability, 4) if probability is not None else None,
+                "probability": round(probability_ratio, 4)
+                if probability_ratio is not None
+                else round(probability, 4)
+                if probability is not None
+                else None,
                 "ev_bps": round(ev_bps, 3) if ev_bps is not None else None,
                 "edge_score": round(edge_score, 3) if edge_score is not None else None,
                 "score": round(score, 3) if score is not None else None,
@@ -2302,7 +2375,14 @@ class GuardianBot:
                 if priority_adjustment is not None
                 else None,
                 "performance_bias": raw_entry.get("performance_bias"),
+                "probability_ready": probability_ready,
+                "probability_gap_pct": round(probability_gap * 100.0, 2)
+                if probability_gap is not None
+                else None,
             }
+
+            if hysteresis_threshold is not None:
+                entry["threshold_pct"] = round(hysteresis_threshold * 100.0, 2)
 
             summary.append(entry)
 
@@ -2947,13 +3027,24 @@ class GuardianBot:
         if tick_age is not None and tick_guard > 0:
             tick_fresh = tick_age <= tick_guard
 
-        (
-            buy_threshold,
-            sell_threshold,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
-        ) = self._resolve_thresholds(settings)
+        thresholds = self._resolve_thresholds(settings)
+        plan_details = None
+        if isinstance(context, Mapping):
+            plan_candidate = context.get("symbol_plan")
+            if isinstance(plan_candidate, Mapping):
+                plan_details = plan_candidate.get("details")
+        symbol_details = (
+            plan_details.get(brief.symbol) if isinstance(plan_details, Mapping) else None
+        )
+        holding_symbol = False
+        if isinstance(symbol_details, Mapping):
+            holding_symbol = bool(symbol_details.get("holding"))
+
+        buy_threshold = thresholds.decision_threshold("buy", holding_symbol)
+        sell_threshold = thresholds.decision_threshold("sell", holding_symbol)
+        min_ev = thresholds.min_ev
+        effective_buy_threshold = thresholds.effective_buy
+        effective_sell_threshold = thresholds.effective_sell
 
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
         actionable, reasons = self._evaluate_actionability(
@@ -2997,17 +3088,7 @@ class GuardianBot:
             "symbol_source": context.get("symbol_source"),
             "probability_source": context.get("probability_source"),
             "ev_source": context.get("ev_source"),
-            "thresholds": {
-                "buy_probability_pct": round(buy_threshold * 100.0, 2),
-                "sell_probability_pct": round(sell_threshold * 100.0, 2),
-                "effective_buy_probability_pct": round(
-                    effective_buy_threshold * 100.0, 2
-                ),
-                "effective_sell_probability_pct": round(
-                    effective_sell_threshold * 100.0, 2
-                ),
-                "min_ev_bps": round(min_ev, 2),
-            },
+            "thresholds": thresholds.summary_payload(),
             "has_status": bool(status),
             "fallback_used": bool(fallback_used),
             "status_source": self._status_source
@@ -3197,6 +3278,24 @@ class GuardianBot:
             symbol = "BTCUSDT"
             symbol_source = "default"
 
+        holding_symbols: Set[str] = set()
+        if isinstance(portfolio, Mapping):
+            raw_positions = portfolio.get("positions")
+            if isinstance(raw_positions, Sequence):
+                for entry in raw_positions:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    raw_symbol = entry.get("symbol")
+                    if not isinstance(raw_symbol, str):
+                        continue
+                    position_symbol = raw_symbol.strip().upper()
+                    if not position_symbol:
+                        continue
+                    qty = self._coerce_float(entry.get("qty")) or 0.0
+                    notional = self._coerce_float(entry.get("notional")) or 0.0
+                    if qty > 0.0 or notional > 0.0:
+                        holding_symbols.add(position_symbol)
+
         probability_value = self._normalise_probability_input(status.get("probability"))
         probability_source: Optional[str] = None
         if probability_value is not None and probability_value > 0.0:
@@ -3210,13 +3309,13 @@ class GuardianBot:
         side_hint = self._normalise_mode_hint(status.get("side"))
         status_side_hint = side_hint
 
-        (
-            buy_threshold,
-            sell_threshold,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
-        ) = self._resolve_thresholds(settings)
+        thresholds = self._resolve_thresholds(settings)
+        min_ev = thresholds.min_ev
+        effective_buy_threshold = thresholds.effective_buy
+        effective_sell_threshold = thresholds.effective_sell
+        holding_symbol = symbol in holding_symbols if symbol else False
+        buy_decision_threshold = thresholds.decision_threshold("buy", holding_symbol)
+        sell_decision_threshold = thresholds.decision_threshold("sell", holding_symbol)
 
         watchlist = self._build_watchlist(status, settings)
         watchlist_breakdown = self._watchlist_breakdown(watchlist) if watchlist else None
@@ -3251,13 +3350,13 @@ class GuardianBot:
             if status_side_hint == "sell":
                 status_actionable = (
                     probability_value is not None
-                    and probability_value <= effective_sell_threshold
+                    and probability_value <= sell_decision_threshold
                     and (ev_value is None or ev_value >= min_ev)
                 )
             else:
                 status_actionable = (
                     probability_value is not None
-                    and probability_value >= effective_buy_threshold
+                    and probability_value >= buy_decision_threshold
                     and (ev_value is None or ev_value >= min_ev)
                 )
 
@@ -3316,6 +3415,8 @@ class GuardianBot:
             "side_hint": side_hint,
             "watchlist": watchlist,
             "primary_watch": primary_entry,
+            "holding_symbol": holding_symbol,
+            "holding_symbols": tuple(sorted(holding_symbols)),
         }
 
         if watchlist_breakdown:
@@ -3328,7 +3429,17 @@ class GuardianBot:
             portfolio=portfolio,
             ledger_signature=self._ledger_signature,
         )
-        
+
+        plan_details = context["symbol_plan"].get("details") if isinstance(context["symbol_plan"], Mapping) else None
+        if not holding_symbol and isinstance(plan_details, Mapping) and symbol:
+            plan_info = plan_details.get(symbol)
+            if isinstance(plan_info, Mapping) and plan_info.get("holding"):
+                holding_symbol = True
+                holding_symbols.add(symbol)
+
+        context["holding_symbol"] = holding_symbol
+        context["holding_symbols"] = tuple(sorted(holding_symbols))
+
         return context
 
     def _brief_from_status(
@@ -3349,23 +3460,21 @@ class GuardianBot:
                 break
         side_hint = context.get("side_hint") or self._normalise_mode_hint(status.get("side"))
 
-        (
-            buy_threshold,
-            sell_threshold,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
-        ) = self._resolve_thresholds(settings)
+        thresholds = self._resolve_thresholds(settings)
+        holding_symbol = bool(context.get("holding_symbol"))
+        buy_decision_threshold = thresholds.decision_threshold("buy", holding_symbol)
+        sell_decision_threshold = thresholds.decision_threshold("sell", holding_symbol)
+        min_ev = thresholds.min_ev
 
         if mode_hint:
             mode = mode_hint
         elif side_hint == "wait":
             mode = "wait"
-        elif probability >= effective_buy_threshold and ev_bps >= min_ev:
+        elif probability >= buy_decision_threshold and ev_bps >= min_ev:
             mode = "buy"
         elif (
             side_hint == "sell"
-            and probability <= effective_sell_threshold
+            and probability <= sell_decision_threshold
             and ev_bps >= min_ev
         ):
             mode = "sell"
@@ -3542,23 +3651,19 @@ class GuardianBot:
         summary = snapshot.status_summary
         probability = float(summary.get("probability") or 0.0)
         ev_bps = float(summary.get("ev_bps") or 0.0)
-        (
-            configured_buy_threshold,
-            configured_sell_threshold,
-            min_ev,
-            effective_buy_threshold,
-            effective_sell_threshold,
-        ) = self._resolve_thresholds(self.settings)
+        thresholds = self._resolve_thresholds(self.settings)
         return {
             "symbol": brief.symbol,
             "mode": brief.mode,
             "probability_pct": round(self._clamp_probability(probability) * 100.0, 2),
             "ev_bps": round(ev_bps, 2),
-            "buy_threshold": round(effective_buy_threshold * 100.0, 2),
-            "sell_threshold": round(effective_sell_threshold * 100.0, 2),
-            "configured_buy_threshold": round(configured_buy_threshold * 100.0, 2),
-            "configured_sell_threshold": round(configured_sell_threshold * 100.0, 2),
-            "min_ev_bps": round(min_ev, 2),
+            "buy_threshold": round(thresholds.effective_buy * 100.0, 2),
+            "sell_threshold": round(thresholds.effective_sell * 100.0, 2),
+            "configured_buy_threshold": round(thresholds.buy_entry * 100.0, 2),
+            "configured_sell_threshold": round(thresholds.sell_entry * 100.0, 2),
+            "sell_exit_threshold": round(thresholds.sell_exit * 100.0, 2),
+            "buy_exit_threshold": round(thresholds.buy_exit * 100.0, 2),
+            "min_ev_bps": round(thresholds.min_ev, 2),
             "last_update": brief.updated_text,
         }
 
