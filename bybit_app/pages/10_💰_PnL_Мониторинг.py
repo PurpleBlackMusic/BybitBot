@@ -7,8 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from utils.dataframe import arrow_safe
-from utils.pnl import daily_pnl, read_ledger
-from utils.paths import DATA_DIR
+from utils.pnl import daily_pnl, daily_summary_path, read_ledger
 from utils.spot_fifo import spot_fifo_pnl
 from utils.spot_pnl import spot_inventory_and_pnl
 from utils.ui import safe_set_page_config
@@ -46,7 +45,7 @@ else:
 
 st.divider()
 st.caption("Сводка по дням/символам:")
-sum_path = DATA_DIR / "pnl" / "pnl_daily.json"
+sum_path = daily_summary_path()
 if sum_path.exists():
     st.json(json.loads(sum_path.read_text(encoding="utf-8")))
 else:

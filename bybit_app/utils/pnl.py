@@ -21,14 +21,16 @@ from .paths import DATA_DIR
 from . import symbol_resolver
 
 _LEDGER_DIR = DATA_DIR / "pnl"
-_SUMMARY = DATA_DIR / "pnl" / "pnl_daily.json"
+_SUMMARY: Path | None = None
 _LOCK = threading.Lock()
 _RECENT_CACHE_SIZE = 2048
 _RECENT_KEYS: dict[Path, deque[str]] = {}
 _RECENT_KEY_SET: dict[Path, set[str]] = {}
 _RECENT_WARMED: set[Path] = set()
 _DAILY_PNL_DEFAULT_TTL = 30.0
-_DAILY_PNL_CACHE: dict[str, object] = {}
+_DAILY_PNL_CACHE: dict[str, dict[str, object]] = {}
+
+PLACEHOLDER_ORDER_LINK_IDS = frozenset({"abc"})
 
 
 def _normalise_network_marker(value: object | None) -> Optional[str]:
@@ -311,12 +313,26 @@ def add_execution(
     else:
         resolved_category = raw_category or "spot"
 
+    link_id = ensure_link_id(_normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID")))
+
+    if (
+        link_id
+        and link_id.strip().lower() in PLACEHOLDER_ORDER_LINK_IDS
+        and not _is_testnet(settings, network=network)
+    ):
+        log(
+            "pnl.exec.placeholder_ignored",
+            symbol=symbol_text,
+            link=link_id,
+        )
+        return
+
     rec = {
         "ts": int(time.time() * 1000),
         "symbol": ev.get("symbol"),
         "side": ev.get("side"),
         "orderId": ev.get("orderId"),
-        "orderLinkId": ensure_link_id(_normalise_id(ev.get("orderLinkId") or ev.get("orderLinkID"))),
+        "orderLinkId": link_id,
         "execPrice": price,
         "execQty": qty,
         "execFee": fee_value,
@@ -353,14 +369,20 @@ def add_execution(
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
         with ledger_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    log(
-        "pnl.exec.add",
-        symbol=rec["symbol"],
-        qty=rec["execQty"],
-        price=rec["execPrice"],
-        fee=rec["execFee"],
-        link=rec["orderLinkId"],
-    )
+        log(
+            "pnl.exec.add",
+            symbol=rec["symbol"],
+            qty=rec["execQty"],
+            price=rec["execPrice"],
+            fee=rec["execFee"],
+            link=rec["orderLinkId"],
+        )
+
+    if (
+        resolved_category == "spot"
+        and str(rec.get("side") or "").strip().lower() == "sell"
+    ):
+        _trigger_trade_aggregation(settings=settings, network=network)
 
 
 def _f(x):
@@ -782,9 +804,40 @@ def _build_daily_summary(rows: List[Mapping[str, object]]) -> dict[str, dict[str
     return by_day
 
 
-def invalidate_daily_pnl_cache() -> None:
+def _summary_path_for(
+    *, settings: object | None = None, network: object | None = None
+) -> Path:
+    if _SUMMARY is not None:
+        return Path(_SUMMARY)
+
+    marker = _resolve_network_marker(settings, network=network)
+    filename = f"pnl_daily.{marker}.json"
+    return _LEDGER_DIR / filename
+
+
+def daily_summary_path(
+    *, settings: object | None = None, network: object | None = None
+) -> Path:
+    """Return the filesystem path for the cached daily PnL summary."""
+
+    return _summary_path_for(settings=settings, network=network)
+
+
+def invalidate_daily_pnl_cache(
+    *, settings: object | None = None, network: object | None = None
+) -> None:
+    marker: str | None = None
+    if settings is not None or network is not None:
+        try:
+            marker = _resolve_network_marker(settings, network=network)
+        except Exception:
+            marker = None
+
     with _LOCK:
-        _DAILY_PNL_CACHE.clear()
+        if marker is None:
+            _DAILY_PNL_CACHE.clear()
+        else:
+            _DAILY_PNL_CACHE.pop(marker, None)
 
 
 def _cache_expired(entry: dict[str, object], now: float) -> bool:
@@ -798,7 +851,11 @@ def _cache_expired(entry: dict[str, object], now: float) -> bool:
 
 
 def daily_pnl(
-    *, ttl: float | None = None, force_refresh: bool = False
+    *,
+    ttl: float | None = None,
+    force_refresh: bool = False,
+    settings: object | None = None,
+    network: object | None = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Грубая агрегация PnL по группам OCO на основе fills.
     Для spot считаем: + (sell fills) - (buy fills) - fees.
@@ -809,30 +866,51 @@ def daily_pnl(
     use_cache = resolved_ttl > 0.0 and not force_refresh
     now = time.time()
 
+    marker = _resolve_network_marker(settings, network=network)
+
     if use_cache:
         with _LOCK:
-            entry = dict(_DAILY_PNL_CACHE)
+            entry = dict(_DAILY_PNL_CACHE.get(marker, {}))
         cached_data = entry.get("data") if entry else None
         if cached_data is not None and not _cache_expired(entry, now):
             return copy.deepcopy(cached_data)
 
-    rows = read_ledger(100000)
+    rows = read_ledger(100000, settings=settings, network=network)
     summary = _build_daily_summary(rows)
 
     payload = json.dumps(summary, ensure_ascii=False, indent=2)
-    _SUMMARY.write_text(payload, encoding="utf-8")
+    summary_path = _summary_path_for(settings=settings, network=network)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(payload, encoding="utf-8")
 
     store_time = time.time()
     expires_at = store_time + resolved_ttl if resolved_ttl > 0.0 else None
     with _LOCK:
-        _DAILY_PNL_CACHE.clear()
-        _DAILY_PNL_CACHE.update(
-            {
-                "data": summary,
-                "timestamp": store_time,
-                "expires_at": expires_at,
-                "ttl": resolved_ttl,
-            }
-        )
+        _DAILY_PNL_CACHE[marker] = {
+            "data": summary,
+            "timestamp": store_time,
+            "expires_at": expires_at,
+            "ttl": resolved_ttl,
+        }
 
     return copy.deepcopy(summary)
+
+
+def _trigger_trade_aggregation(
+    *, settings: object | None = None, network: object | None = None
+) -> None:
+    try:
+        from . import trade_pairs  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log("pnl.exec.aggregate.import_error", err=str(exc))
+        return
+
+    try:
+        trade_pairs.pair_trades(settings=settings, network=network)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log("pnl.exec.aggregate.trades_error", err=str(exc))
+
+    try:
+        daily_pnl(force_refresh=True, settings=settings, network=network)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log("pnl.exec.aggregate.daily_pnl_error", err=str(exc))
