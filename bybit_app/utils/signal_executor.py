@@ -152,6 +152,7 @@ class SignalExecutor:
         self._active_stop_orders: Dict[str, Dict[str, object]] = {}
         self._last_daily_pnl_log_day: Optional[str] = None
         self._live_orderbook: Optional[LiveOrderbook] = None
+        self._risk_override_pct: Optional[float] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -2218,6 +2219,12 @@ class SignalExecutor:
         sizing_factor = self._signal_sizing_factor(summary, settings)
         risk_context: Dict[str, object] = {}
 
+        risk_pct_override, risk_meta = self._resolve_risk_per_trade_pct(settings, summary)
+        previous_risk_override = self._risk_override_pct
+        self._risk_override_pct = risk_pct_override
+        if risk_meta:
+            risk_context["per_trade"] = dict(risk_meta)
+
         vol_scale, vol_meta = self._volatility_scaling_factor(summary, settings)
         if vol_meta is not None:
             risk_context["volatility"] = vol_meta
@@ -2329,19 +2336,22 @@ class SignalExecutor:
             quote_wallet_limited_available = min(
                 available_equity, max(quote_balance_cap, 0.0)
             )
-        (
-            notional,
-            usable_after_reserve,
-            reserve_relaxed_for_min,
-            quote_cap_substituted,
-        ) = self._compute_notional(
-            settings,
-            total_equity,
-            available_equity,
-            sizing_factor,
-            min_notional=min_notional,
-            quote_balance_cap=quote_balance_cap,
-        )
+        try:
+            (
+                notional,
+                usable_after_reserve,
+                reserve_relaxed_for_min,
+                quote_cap_substituted,
+            ) = self._compute_notional(
+                settings,
+                total_equity,
+                available_equity,
+                sizing_factor,
+                min_notional=min_notional,
+                quote_balance_cap=quote_balance_cap,
+            )
+        finally:
+            self._risk_override_pct = previous_risk_override
 
         is_minimum_buy_request = False
         if (
@@ -5985,6 +5995,109 @@ class SignalExecutor:
 
         return scale, metadata
 
+    def _resolve_risk_per_trade_pct(
+        self,
+        settings: Settings,
+        summary: Optional[Mapping[str, object]],
+    ) -> Tuple[float, Optional[Dict[str, object]]]:
+        """Return the effective risk percent per trade with adaptive scaling."""
+
+        try:
+            base_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            base_pct = 0.0
+        if not math.isfinite(base_pct) or base_pct < 0.0:
+            base_pct = 0.0
+
+        probability_value: Optional[float] = None
+        probability_source: Optional[str] = None
+
+        if isinstance(summary, Mapping):
+            probability_paths: Tuple[Tuple[str, ...], ...] = (
+                ("probability",),
+                ("probability_pct",),
+                ("primary_watch", "probability"),
+                ("primary_watch", "probability_pct"),
+                ("metrics", "probability"),
+                ("metrics", "probability_pct"),
+                ("stats", "probability"),
+                ("stats", "probability_pct"),
+                ("meta", "probability"),
+                ("meta", "probability_pct"),
+            )
+
+            candidates: List[Tuple[float, str]] = []
+
+            for path in probability_paths:
+                current: object = summary
+                for part in path:
+                    if isinstance(current, Mapping):
+                        current = current.get(part)
+                    else:
+                        current = None
+                        break
+                if current is None:
+                    continue
+                candidate = _safe_float(current)
+                if candidate is None:
+                    continue
+                if not math.isfinite(candidate):
+                    continue
+                normalised = float(candidate)
+                # Values larger than one are assumed to be expressed in percent.
+                if normalised > 1.0:
+                    normalised /= 100.0
+                if normalised <= 0.0:
+                    continue
+                if normalised > 1.0:
+                    normalised = 1.0
+                candidates.append((normalised, ".".join(path)))
+
+            if candidates:
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                probability_value, probability_source = candidates[0]
+
+        if probability_value is None:
+            if base_pct > 0.0:
+                return base_pct, {
+                    "mode": "static",
+                    "effective_pct": base_pct,
+                }
+            return base_pct, None
+
+        probability_scale_pct = 1.5
+        min_risk_pct = 0.5
+        max_risk_pct = 2.0
+
+        scaled_pct = probability_value * probability_scale_pct
+        adaptive_pct = max(min_risk_pct, min(max_risk_pct, scaled_pct))
+        effective_pct = adaptive_pct
+        meta: Dict[str, object] = {
+            "mode": "adaptive",
+            "probability": probability_value,
+            "probability_source": probability_source,
+            "scale_pct": probability_scale_pct,
+            "adaptive_pct": scaled_pct,
+            "effective_pct": adaptive_pct,
+            "min_pct": min_risk_pct,
+            "max_pct": max_risk_pct,
+        }
+        if adaptive_pct != scaled_pct:
+            meta["clamped"] = True
+        if adaptive_pct == min_risk_pct:
+            meta["clamped_to_min"] = min_risk_pct
+        elif adaptive_pct == max_risk_pct:
+            meta["clamped_to_max"] = max_risk_pct
+
+        if base_pct > 0.0:
+            meta["base_pct"] = base_pct
+            if base_pct > effective_pct:
+                effective_pct = base_pct
+                meta["effective_pct"] = effective_pct
+                meta["base_applied"] = True
+
+        return effective_pct, meta
+
     def _compute_notional(
         self,
         settings: Settings,
@@ -6008,6 +6121,15 @@ class SignalExecutor:
             risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
         except (TypeError, ValueError):
             risk_pct = 0.0
+
+        override_pct = self._risk_override_pct
+        if override_pct is not None:
+            try:
+                coerced = float(override_pct)
+            except (TypeError, ValueError):
+                coerced = 0.0
+            if math.isfinite(coerced) and coerced >= 0.0:
+                risk_pct = coerced
 
         try:
             cap_pct = float(getattr(settings, "spot_max_cap_per_trade_pct", 0.0) or 0.0)
@@ -6764,10 +6886,7 @@ class SignalExecutor:
             average = sum(contributions) / len(contributions)
             floor = 0.3 if summary.get("actionable") else 0.2
 
-            try:
-                risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                risk_pct = 0.0
+            risk_pct, _ = self._resolve_risk_per_trade_pct(settings, summary)
 
             risk_dampen = 1.0
             if risk_pct > 0.0:
