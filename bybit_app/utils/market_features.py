@@ -161,6 +161,68 @@ def compute_volume_impulse(row: Mapping[str, object]) -> Dict[str, Optional[floa
     }
 
 
+def compute_overbought_indicators(
+    momentum: Mapping[str, object],
+    row: Mapping[str, object],
+) -> Dict[str, Optional[float]]:
+    """Derive simple overbought signals such as RSI and stochastic oscillators."""
+
+    contributions = momentum.get("timeframe_contributions")
+    changes: list[float] = []
+    if isinstance(contributions, Mapping):
+        for value in contributions.values():
+            numeric = _safe_float(value)
+            if numeric is None:
+                continue
+            changes.append(float(numeric))
+
+    gains = [val / 100.0 for val in changes if val > 0]
+    losses = [abs(val) / 100.0 for val in changes if val < 0]
+
+    avg_gain = _avg(gains) or 0.0
+    avg_loss = _avg(losses) or 0.0
+
+    rsi: Optional[float]
+    if avg_gain <= 0 and avg_loss <= 0:
+        rsi = None
+    else:
+        imbalance = avg_gain - avg_loss
+        scaled = math.tanh(imbalance * 2.0)
+        rsi = 50.0 + scaled * 50.0
+
+    last_price = _safe_float(
+        row.get("lastPrice") or row.get("close") or row.get("closePrice")
+    )
+    high_24h = _safe_float(row.get("highPrice24h") or row.get("high24h"))
+    low_24h = _safe_float(row.get("lowPrice24h") or row.get("low24h"))
+
+    stochastic_pct: Optional[float] = None
+    if (
+        last_price is not None
+        and high_24h is not None
+        and low_24h is not None
+        and high_24h > low_24h
+    ):
+        width = high_24h - low_24h
+        if width > 0:
+            raw = (last_price - low_24h) / width
+            if math.isfinite(raw):
+                stochastic_pct = max(0.0, min(raw, 1.0)) * 100.0
+
+    distance_from_high_pct: Optional[float] = None
+    if high_24h is not None and last_price is not None and high_24h > 0:
+        distance = (high_24h - last_price) / high_24h * 100.0
+        distance_from_high_pct = max(0.0, min(distance, 100.0))
+
+    return {
+        "rsi": rsi,
+        "stochastic_pct": stochastic_pct,
+        "distance_from_high_pct": distance_from_high_pct,
+        "avg_gain": avg_gain if gains else None,
+        "avg_loss": avg_loss if losses else None,
+    }
+
+
 def _first_float(row: Mapping[str, object], keys: Sequence[str]) -> Optional[float]:
     """Return the first valid float from ``row`` among ``keys``."""
 
@@ -323,6 +385,7 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
     depth_signal = compute_orderbook_depth_signal(row)
     order_flow = compute_order_flow_metrics(row)
     correlation = compute_cross_market_correlation(row)
+    overbought = compute_overbought_indicators(momentum, row)
 
     blended_change = momentum["blended_change_pct"]
     if blended_change is None:
@@ -344,4 +407,5 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
         "top_depth_imbalance": order_flow["top_depth_imbalance"],
         "correlations": correlation["correlations"],
         "correlation_strength": correlation["avg_abs"],
+        "overbought_indicators": overbought,
     }

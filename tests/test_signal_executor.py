@@ -1,4 +1,5 @@
 import copy
+import math
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple, Union
@@ -6339,3 +6340,63 @@ def test_signal_executor_sell_uses_fresh_summary_price_snapshot(
     assert expected is not None
     assert expected == pytest.approx(2.0)
 
+
+
+def test_stop_loss_enforced_for_impulse(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {
+        "actionable": True,
+        "mode": "buy",
+        "symbol": "BTCUSDT",
+        "watchlist": [
+            {
+                "symbol": "BTCUSDT",
+                "impulse_signal": True,
+                "impulse_strength": math.log(2.0),
+                "volume_impulse": {"1h": math.log(2.0)},
+            }
+        ],
+    }
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=5.0,
+        spot_stop_loss_bps=0.0,
+        spot_trailing_stop_distance_bps=0.0,
+        spot_trailing_stop_activation_bps=0.0,
+        spot_impulse_stop_loss_bps=55.0,
+    )
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    api = StubAPI(total=1000.0, available=900.0)
+    placed: list[dict[str, object]] = []
+
+    def fake_place(self, **kwargs: object) -> dict[str, object]:
+        placed.append(kwargs)
+        return {"result": {"orderId": "sl-order"}}
+
+    monkeypatch.setattr(api, "place_order", fake_place.__get__(api, StubAPI))
+
+    stop_orders = executor._place_stop_loss_orders(
+        api,
+        settings,
+        "BTCUSDT",
+        "buy",
+        avg_price=Decimal("100"),
+        qty_step=Decimal("0.01"),
+        price_step=Decimal("0.01"),
+        sell_budget=Decimal("0.75"),
+        min_qty=Decimal("0.01"),
+        price_band_min=Decimal("0"),
+        price_band_max=Decimal("0"),
+        force_stop_loss=True,
+        fallback_stop_loss_bps=50.0,
+    )
+
+    assert placed, "stop-loss order was not sent"
+    payload = placed[0]
+    assert payload["orderFilter"] == "tpslOrder"
+    assert payload["triggerPrice"] == "99.50"
+    assert stop_orders and stop_orders[0].get("impulseEnforced") is True
+    assert executor._active_stop_orders["BTCUSDT"]["current_stop"] == Decimal("99.50")

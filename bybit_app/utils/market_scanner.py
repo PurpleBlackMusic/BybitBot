@@ -76,6 +76,11 @@ _DELIST_KEYS: Tuple[str, ...] = (
     "delistList",
 )
 
+_DEFAULT_DAILY_SURGE_LIMIT = 12.0
+_DEFAULT_RSI_OVERBOUGHT = 74.0
+_DEFAULT_STOCH_OVERBOUGHT = 88.0
+_IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
+
 
 def _ledger_path_for_costs(data_dir: Path, testnet: Optional[bool]) -> Path:
     data_dir = Path(data_dir)
@@ -875,6 +880,27 @@ def scan_market_opportunities(
         0.0,
     )
 
+    max_daily_surge_pct = max(
+        _safe_setting_float(settings, "ai_max_daily_surge_pct", _DEFAULT_DAILY_SURGE_LIMIT),
+        0.0,
+    )
+    rsi_overbought_threshold = max(
+        _safe_setting_float(
+            settings,
+            "ai_overbought_rsi_threshold",
+            _DEFAULT_RSI_OVERBOUGHT,
+        ),
+        0.0,
+    )
+    stochastic_overbought_threshold = max(
+        _safe_setting_float(
+            settings,
+            "ai_overbought_stochastic_threshold",
+            _DEFAULT_STOCH_OVERBOUGHT,
+        ),
+        0.0,
+    )
+
     effective_change = float(min_change_pct) if min_change_pct is not None else 0.5
     if effective_change < 0.05:
         effective_change = 0.05
@@ -1027,6 +1053,19 @@ def scan_market_opportunities(
         top_depth_imbalance = feature_bundle.get("top_depth_imbalance")
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
+        overbought_indicators = feature_bundle.get("overbought_indicators")
+
+        rsi_value: Optional[float] = None
+        stochastic_value: Optional[float] = None
+        distance_from_high: Optional[float] = None
+        if isinstance(overbought_indicators, Mapping):
+            rsi_value = _safe_float(overbought_indicators.get("rsi"))
+            stochastic_value = _safe_float(
+                overbought_indicators.get("stochastic_pct")
+            )
+            distance_from_high = _safe_float(
+                overbought_indicators.get("distance_from_high_pct")
+            )
 
         if not force_include and turnover is not None and turnover < min_turnover:
             turnover_ok = False
@@ -1061,6 +1100,27 @@ def scan_market_opportunities(
         else:
             trend = "wait"
 
+        raw_change_value = _safe_float(raw.get("price24hPcnt"))
+        if raw_change_value is not None and abs(raw_change_value) <= 1.0:
+            daily_change_for_guard = abs(raw_change_value)
+        else:
+            daily_change_for_guard = change_pct
+
+        if (
+            not force_include
+            and trend == "buy"
+            and max_daily_surge_pct > 0
+            and daily_change_for_guard is not None
+            and daily_change_for_guard >= max_daily_surge_pct
+        ):
+            log(
+                "market_scanner.filter.daily_surge",
+                symbol=symbol,
+                change_pct=daily_change_for_guard,
+                limit=max_daily_surge_pct,
+            )
+            continue
+
         actionable = False
         spread_ok = True
         if spread_bps is not None and max_spread_bps > 0:
@@ -1086,6 +1146,34 @@ def scan_market_opportunities(
             spread_bps=spread_bps,
             correlation_strength=correlation_strength,
         )
+
+        overbought_flags: List[str] = []
+        if (
+            rsi_overbought_threshold > 0
+            and rsi_value is not None
+            and rsi_value >= rsi_overbought_threshold
+        ):
+            overbought_flags.append("rsi")
+        if (
+            stochastic_overbought_threshold > 0
+            and stochastic_value is not None
+            and stochastic_value >= stochastic_overbought_threshold
+        ):
+            overbought_flags.append("stochastic")
+
+        if (
+            len(overbought_flags) >= 2
+            and not force_include
+            and trend == "buy"
+        ):
+            log(
+                "market_scanner.filter.overbought",
+                symbol=symbol,
+                rsi=rsi_value,
+                stochastic=stochastic_value,
+                reasons=overbought_flags,
+            )
+            continue
 
         if model is not None:
             probability = model.predict_proba(feature_vector)
@@ -1210,6 +1298,16 @@ def scan_market_opportunities(
             note_parts.append("конвертировано из USDC")
         if volatility_pct is not None:
             note_parts.append(f"волатильность {volatility_pct:.1f}%")
+        if rsi_value is not None:
+            note_parts.append(f"RSI≈{rsi_value:.1f}")
+        if stochastic_value is not None:
+            note_parts.append(f"Стох≈{stochastic_value:.0f}%")
+        if (
+            distance_from_high is not None
+            and distance_from_high > 0
+            and distance_from_high < 20.0
+        ):
+            note_parts.append(f"от хая {distance_from_high:.1f}%")
         if volume_spike_score is not None and volume_spike_score > 0:
             note_parts.append(f"всплеск объёма ×{math.exp(volume_spike_score):.2f}")
         if depth_imbalance is not None and direction != 0:
@@ -1228,17 +1326,28 @@ def scan_market_opportunities(
                 note_parts.append(f"CVD на стороне {side} {abs(cvd_pct):.1f}%")
         if correlation_strength is not None and correlation_strength > 0:
             note_parts.append(f"корреляция {correlation_strength * 100:.0f}%")
+        best_impulse_window = None
+        best_impulse_value: Optional[float] = None
         if isinstance(volume_impulse, Mapping):
-            best_window = None
-            best_value = 0.0
             for window, value in volume_impulse.items():
-                if value is None:
+                numeric = _safe_float(value)
+                if numeric is None:
                     continue
-                if abs(value) > abs(best_value):
-                    best_window = window
-                    best_value = float(value)
-            if best_window is not None and best_value > 0:
-                note_parts.append(f"импульс объёма {best_window} ×{math.exp(best_value):.2f}")
+                if best_impulse_value is None or abs(numeric) > abs(best_impulse_value):
+                    best_impulse_window = window
+                    best_impulse_value = float(numeric)
+        impulse_signal = bool(
+            best_impulse_value is not None
+            and best_impulse_value >= _IMPULSE_SIGNAL_THRESHOLD
+        )
+        if (
+            best_impulse_window is not None
+            and best_impulse_value is not None
+            and best_impulse_value > 0
+        ):
+            note_parts.append(
+                f"импульс объёма {best_impulse_window} ×{math.exp(best_impulse_value):.2f}"
+            )
         if not liquidity_ok and min_top_quote > 0:
             available_quote = top_total_quote if top_total_quote is not None else 0.0
             note_parts.append(
@@ -1247,6 +1356,8 @@ def scan_market_opportunities(
                     required=min_top_quote,
                 )
             )
+        if overbought_flags:
+            note_parts.append("⚠️ перекупленность")
 
         entry = {
             "symbol": symbol,
@@ -1290,6 +1401,13 @@ def scan_market_opportunities(
             "blended_change_pct": blended_change,
             "correlations": correlations,
             "correlation_strength": correlation_strength,
+            "overbought_indicators": overbought_indicators
+            if isinstance(overbought_indicators, Mapping)
+            else None,
+            "overbought_flags": tuple(overbought_flags) if overbought_flags else None,
+            "distance_from_high_pct": distance_from_high,
+            "impulse_signal": impulse_signal,
+            "impulse_strength": best_impulse_value,
             "model_metrics": model_metrics,
             "source": "market_scanner",
             "actionable": actionable,

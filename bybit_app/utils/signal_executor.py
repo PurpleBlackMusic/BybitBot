@@ -66,6 +66,7 @@ _PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
 _DUST_FLUSH_INTERVAL = 12.0
 _DUST_RETRY_DELAY = 45.0
 _DUST_MIN_QUOTE = Decimal("0.00000001")
+_IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -2133,6 +2134,16 @@ class SignalExecutor:
             risk_context["volatility"] = vol_meta
         sizing_factor = max(0.0, min(sizing_factor * vol_scale, 1.0))
 
+        impulse_signal = False
+        impulse_context: Optional[Dict[str, object]] = None
+        impulse_stop_bps: Optional[float] = None
+        if isinstance(summary, Mapping):
+            impulse_signal, impulse_context = self._resolve_impulse_signal(
+                summary, symbol
+            )
+        if impulse_signal:
+            impulse_stop_bps = self._impulse_stop_loss_bps(settings)
+
         portfolio_exposure: Dict[str, float] = {}
         total_portfolio_exposure = 0.0
         symbol_cap_available: Optional[float] = None
@@ -2484,6 +2495,15 @@ class SignalExecutor:
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if impulse_signal:
+            order_context["impulse_signal"] = True
+            if impulse_context:
+                order_context["impulse_context"] = dict(impulse_context)
+            if impulse_stop_bps is not None:
+                order_context["impulse_stop_loss_bps"] = impulse_stop_bps
+            order_context["stop_loss_enforced"] = True
+        elif impulse_context:
+            order_context["impulse_context"] = dict(impulse_context)
         if wallet_meta:
             order_context["wallet_meta"] = copy.deepcopy(wallet_meta)
             error_code = wallet_meta.get("quote_wallet_cap_error")
@@ -3134,6 +3154,8 @@ class SignalExecutor:
             response,
             ledger_rows=ledger_rows_after,
             private_snapshot=private_snapshot,
+            force_stop_loss=impulse_signal,
+            fallback_stop_loss_bps=impulse_stop_bps,
         )
         if execution_stats:
             order_context["execution"] = execution_stats
@@ -3219,6 +3241,8 @@ class SignalExecutor:
         *,
         ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
         private_snapshot: Mapping[str, object] | None = None,
+        force_stop_loss: bool = False,
+        fallback_stop_loss_bps: Optional[float] = None,
     ) -> tuple[list[Dict[str, object]], Dict[str, str], list[Dict[str, object]]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
@@ -3613,6 +3637,8 @@ class SignalExecutor:
             min_qty=min_qty,
             price_band_min=price_band_min,
             price_band_max=price_band_max,
+            force_stop_loss=force_stop_loss,
+            fallback_stop_loss_bps=fallback_stop_loss_bps,
         )
 
         execution_payload = execution_stats if execution_stats else {}
@@ -3632,6 +3658,8 @@ class SignalExecutor:
         min_qty: Decimal,
         price_band_min: Decimal,
         price_band_max: Decimal,
+        force_stop_loss: bool = False,
+        fallback_stop_loss_bps: Optional[float] = None,
     ) -> list[Dict[str, object]]:
         symbol_upper = symbol.upper()
         if sell_budget <= 0 or qty_step <= 0 or avg_price <= 0:
@@ -3672,6 +3700,28 @@ class SignalExecutor:
         activation_bps = _safe_float(
             getattr(settings, "spot_trailing_stop_activation_bps", None)
         ) or 0.0
+
+        enforced = False
+        if force_stop_loss:
+            fallback = fallback_stop_loss_bps
+            if fallback is None or fallback <= 0:
+                fallback = _safe_float(
+                    getattr(settings, "spot_impulse_stop_loss_bps", None)
+                )
+            if fallback is None or fallback <= 0:
+                fallback = 80.0
+            if stop_loss_bps <= 0 and trailing_bps <= 0:
+                stop_loss_bps = float(fallback)
+                trailing_bps = 0.0
+                enforced = True
+            elif stop_loss_bps > 0 and float(fallback) > 0:
+                if stop_loss_bps < float(fallback):
+                    stop_loss_bps = float(fallback)
+                    enforced = True
+            elif trailing_bps > 0 and float(fallback) > 0:
+                stop_loss_bps = float(fallback)
+                trailing_bps = 0.0
+                enforced = True
 
         if stop_loss_bps <= 0 and trailing_bps <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
@@ -3783,6 +3833,7 @@ class SignalExecutor:
             trigger=stop_price_text,
             orderType=order_type,
             trailing=bool(trailing_bps > 0),
+            enforced=bool(enforced),
         )
 
         order_entry: Dict[str, object] = {
@@ -3790,6 +3841,8 @@ class SignalExecutor:
             "triggerPrice": stop_price_text,
             "orderType": order_type,
         }
+        if enforced:
+            order_entry["impulseEnforced"] = True
         if order_link_id:
             order_entry["orderLinkId"] = order_link_id
         if order_id:
@@ -6262,6 +6315,119 @@ class SignalExecutor:
         _append(summary.get("symbol"), {"source": "summary.symbol"})
 
         return self._filter_quarantined_candidates(ordered)
+
+    def _extract_summary_entry(
+        self, summary: Mapping[str, object], symbol: str
+    ) -> Optional[Mapping[str, object]]:
+        if not isinstance(summary, Mapping):
+            return None
+
+        target = _safe_symbol(symbol)
+        if not target:
+            return None
+        target_upper = target.upper()
+
+        def _matches(entry: Mapping[str, object]) -> bool:
+            entry_symbol = _safe_symbol(entry.get("symbol"))
+            if entry_symbol:
+                return entry_symbol.upper() == target_upper
+            alt = entry.get("ticker")
+            if isinstance(alt, str):
+                return alt.strip().upper() == target_upper
+            return False
+
+        candidates: List[Mapping[str, object]] = []
+
+        if _matches(summary):
+            candidates.append(summary)
+
+        primary = summary.get("primary_watch")
+        if isinstance(primary, Mapping) and _matches(primary):
+            candidates.append(primary)
+
+        for key in ("watchlist", "trade_candidates"):
+            container = summary.get(key)
+            if isinstance(container, Sequence) and not isinstance(
+                container, (str, bytes, bytearray, memoryview)
+            ):
+                for item in container:
+                    if isinstance(item, Mapping) and _matches(item):
+                        candidates.append(item)
+
+        plan = summary.get("symbol_plan")
+        if isinstance(plan, Mapping):
+            for pool_key in (
+                "combined",
+                "actionable_combined",
+                "dynamic",
+                "actionable",
+            ):
+                container = plan.get(pool_key)
+                if isinstance(container, Sequence) and not isinstance(
+                    container, (str, bytes, bytearray, memoryview)
+                ):
+                    for item in container:
+                        if isinstance(item, Mapping) and _matches(item):
+                            candidates.append(item)
+
+        if candidates:
+            return candidates[0]
+        return None
+
+    def _resolve_impulse_signal(
+        self, summary: Mapping[str, object], symbol: str
+    ) -> Tuple[bool, Optional[Dict[str, object]]]:
+        entry = self._extract_summary_entry(summary, symbol)
+        if entry is None:
+            return False, None
+
+        context: Dict[str, object] = {}
+
+        overbought_flags = entry.get("overbought_flags")
+        if isinstance(overbought_flags, Sequence) and not isinstance(
+            overbought_flags, (str, bytes, bytearray)
+        ):
+            context["overbought_flags"] = [
+                str(flag) for flag in overbought_flags if isinstance(flag, str)
+            ]
+
+        strength_hint = _safe_float(entry.get("impulse_strength"))
+        if strength_hint is not None:
+            context["impulse_strength"] = strength_hint
+
+        volume_impulse = entry.get("volume_impulse")
+        if isinstance(volume_impulse, Mapping):
+            context["volume_impulse"] = dict(volume_impulse)
+
+        if bool(entry.get("impulse_signal")):
+            context.setdefault("trigger", "flag")
+            return True, context or {"trigger": "flag"}
+
+        best_impulse: Optional[float] = None
+        if isinstance(volume_impulse, Mapping):
+            for value in volume_impulse.values():
+                numeric = _safe_float(value)
+                if numeric is None:
+                    continue
+                if best_impulse is None or float(numeric) > best_impulse:
+                    best_impulse = float(numeric)
+
+        if best_impulse is None:
+            best_impulse = strength_hint
+
+        if best_impulse is not None and best_impulse >= _IMPULSE_SIGNAL_THRESHOLD:
+            context.setdefault("trigger", "volume_impulse")
+            context["impulse_strength"] = best_impulse
+            return True, context
+
+        return False, context or None
+
+    @staticmethod
+    def _impulse_stop_loss_bps(settings: Settings) -> float:
+        fallback = _safe_float(getattr(settings, "spot_impulse_stop_loss_bps", None))
+        if fallback is None or fallback <= 0:
+            fallback = 80.0
+        return float(fallback)
 
     @staticmethod
     def _merge_symbol_meta(
