@@ -119,7 +119,7 @@ class Settings:
     ai_live_only: bool = True
     # трейдинг параметры
     ai_max_slippage_bps: int = 400
-    ai_fee_bps: float = 5.0
+    ai_fee_bps: float = 15.0
     ai_slippage_bps: float = 10.0
     ai_buy_threshold: float = 0.55
     ai_sell_threshold: float = 0.45
