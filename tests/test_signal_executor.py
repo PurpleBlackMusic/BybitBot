@@ -315,6 +315,49 @@ def test_signal_executor_maps_usdc_symbol(monkeypatch: pytest.MonkeyPatch) -> No
     assert result.order["symbol"] == "ADAUSDT"
 
 
+def test_effective_risk_pct_scales_with_probability() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT", "probability": 0.62}
+    settings = Settings(ai_enabled=True, ai_risk_per_trade_pct=0.25)
+    executor = SignalExecutor(StubBot(summary, settings))
+
+    risk_pct, meta = executor._effective_risk_pct(settings, summary)
+
+    assert risk_pct == pytest.approx(0.93, rel=1e-6)
+    assert meta is not None
+    assert meta["base_pct"] == pytest.approx(0.25, rel=1e-6)
+    assert meta["final_pct"] == pytest.approx(0.93, rel=1e-6)
+    assert meta["adaptive_pct"] == pytest.approx(0.93, rel=1e-6)
+    assert meta["probability"] == pytest.approx(0.62, rel=1e-6)
+
+
+def test_effective_risk_pct_respects_manual_override() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT", "probability": 0.12}
+    settings = Settings(ai_enabled=True, ai_risk_per_trade_pct=1.8)
+    executor = SignalExecutor(StubBot(summary, settings))
+
+    risk_pct, meta = executor._effective_risk_pct(settings, summary)
+
+    assert risk_pct == pytest.approx(1.8, rel=1e-6)
+    assert meta is not None
+    assert meta["base_pct"] == pytest.approx(1.8, rel=1e-6)
+    assert meta["final_pct"] == pytest.approx(1.8, rel=1e-6)
+    assert meta.get("adaptive_pct") == pytest.approx(0.5, rel=1e-6)
+
+
+def test_effective_risk_pct_uses_floor_without_probability() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, ai_risk_per_trade_pct=0.25)
+    executor = SignalExecutor(StubBot(summary, settings))
+
+    risk_pct, meta = executor._effective_risk_pct(settings, summary)
+
+    assert risk_pct == pytest.approx(0.75, rel=1e-6)
+    assert meta is not None
+    assert meta["base_pct"] == pytest.approx(0.25, rel=1e-6)
+    assert meta["final_pct"] == pytest.approx(0.75, rel=1e-6)
+    assert meta["fallback_floor_pct"] == pytest.approx(0.75, rel=1e-6)
+
+
 def test_signal_sizing_factor_uses_performance_metrics() -> None:
     base_summary = {
         "actionable": True,
