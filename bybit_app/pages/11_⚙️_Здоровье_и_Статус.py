@@ -35,6 +35,10 @@ def _to_float(value: object | None) -> float | None:
         return None
 
 
+def _to_mapping(payload: object) -> Mapping[str, Any]:
+    return payload if isinstance(payload, Mapping) else {}
+
+
 def _format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "—"
@@ -145,16 +149,6 @@ def _render_ws_channel(
             st.success(f"Обновления поступают вовремя ({age_text}).")
 
 
-preflight_snapshot = get_preflight_snapshot()
-ws_snapshot = get_ws_snapshot()
-automation_snapshot = get_automation_status()
-events_payload = get_ws_events(limit=20)
-
-_render_preflight_section(preflight_snapshot)
-
-st.divider()
-
-
 def _render_preflight_section(snapshot: Mapping[str, Any]) -> None:
     state = snapshot if isinstance(snapshot, Mapping) else {}
     ok = bool(state.get("ok"))
@@ -202,67 +196,16 @@ def _render_preflight_component(payload: object, fallback_title: str) -> None:
         st.write(f"{icon} {message}")
 
         details = payload.get("details")
-        if isinstance(details, Mapping) or isinstance(details, list):
+        if isinstance(details, (Mapping, list)):
             with st.expander("Подробности", expanded=False):
                 st.json(details)
 
-ws_status = ws_snapshot.get("status") if isinstance(ws_snapshot, Mapping) else {}
-public_info = ws_status.get("public") if isinstance(ws_status, Mapping) else {}
-private_info = ws_status.get("private") if isinstance(ws_status, Mapping) else {}
-
-public_threshold = _to_float(ws_snapshot.get("public_stale_after"))
-private_threshold = _to_float(ws_snapshot.get("private_stale_after"))
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("WebSocket")
-    _render_ws_channel(
-        "Публичный канал",
-        public_info,
-        stale=bool(ws_snapshot.get("public_stale")),
-        threshold=public_threshold,
-    )
-    _render_ws_channel(
-        "Приватный канал",
-        private_info,
-        stale=bool(ws_snapshot.get("private_stale")),
-        threshold=private_threshold,
-    )
-
-    recent_events = events_payload.get("events") if isinstance(events_payload, Mapping) else []
-    cursor = ws_snapshot.get("private_event_cursor")
-    backlog = ws_snapshot.get("private_event_backlog")
-    dropped = ws_snapshot.get("private_event_dropped")
-
-    with st.container(border=True):
-        st.markdown("### Очередь приватных событий")
-        cols = st.columns(3)
-        cols[0].metric("Последний ID", int(cursor or 0))
-        cols[1].metric("В очереди", int(backlog or 0))
-        cols[2].metric("Пропущено", int(dropped or 0))
-
-        if not recent_events:
-            st.caption("События ещё не поступали или очередь пуста.")
-        else:
-            now = time.time()
-            for event in reversed(recent_events):
-                header = _format_event_header(event, now=now)
-                with st.expander(header, expanded=False):
-                    payload = event.get("payload")
-                    if isinstance(payload, Mapping) or isinstance(payload, list):
-                        st.json(payload or {})
-                    else:
-                        st.write(payload)
-                    meta = {k: v for k, v in event.items() if k not in {"payload"}}
-                    st.caption(json.dumps(meta, ensure_ascii=False))
-
-with col2:
-    st.subheader("Автоисполнение")
+def _render_automation_section(snapshot: Mapping[str, Any]) -> None:
     container = st.container(border=True)
     with container:
-        thread_alive = bool(automation_snapshot.get("thread_alive"))
-        stale = bool(automation_snapshot.get("stale"))
-        last_run_at = automation_snapshot.get("last_run_at") or automation_snapshot.get("last_cycle_at")
+        thread_alive = bool(snapshot.get("thread_alive"))
+        stale = bool(snapshot.get("stale"))
+        last_run_at = snapshot.get("last_run_at") or snapshot.get("last_cycle_at")
         last_run_ts = _to_float(last_run_at)
         last_run_human = _format_timestamp(last_run_ts)
         last_age = _format_duration(
@@ -280,33 +223,119 @@ with col2:
             )
         )
         if stale:
-            limit = _format_duration(_to_float(automation_snapshot.get("stale_after")))
-            st.error(f"Последний цикл устарел — обновление было {last_age} назад (порог {limit}).")
+            limit = _format_duration(_to_float(snapshot.get("stale_after")))
+            st.error(
+                f"Последний цикл устарел — обновление было {last_age} назад (порог {limit})."
+            )
         else:
             st.success("Циклы автоматики выполняются вовремя.")
 
-        last_result = automation_snapshot.get("last_result")
+        last_result = snapshot.get("last_result")
         if isinstance(last_result, Mapping) and last_result:
             st.caption("Последний результат исполнения:")
             st.json(last_result)
 
-    st.subheader("Действия")
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        if st.button("Перезапустить WebSocket", use_container_width=True):
-            restarted = restart_websockets()
-            st.success("WebSocket перезапущен." if restarted else "Не удалось перезапустить.")
-    with action_col2:
-        if st.button("Перезапустить автоматику", use_container_width=True):
-            restarted = restart_automation()
-            st.success("Автоматизация перезапущена." if restarted else "Не удалось перезапустить.")
 
-st.divider()
+def _render_private_queue(
+    ws_snapshot: Mapping[str, Any], events_payload: Mapping[str, Any]
+) -> None:
+    recent_events = events_payload.get("events")
+    if not isinstance(recent_events, list):
+        recent_events = []
 
-with st.expander("Сырые данные"):
-    st.markdown("### Настройки")
-    st.json({"testnet": settings.testnet, "dry_run": active_dry_run(settings)})
-    st.markdown("### WebSocket snapshot")
-    st.json(ws_snapshot)
-    st.markdown("### Automation snapshot")
-    st.json(automation_snapshot)
+    cursor = ws_snapshot.get("private_event_cursor")
+    backlog = ws_snapshot.get("private_event_backlog")
+    dropped = ws_snapshot.get("private_event_dropped")
+
+    with st.container(border=True):
+        st.markdown("### Очередь приватных событий")
+        cols = st.columns(3)
+        cols[0].metric("Последний ID", int(cursor or 0))
+        cols[1].metric("В очереди", int(backlog or 0))
+        cols[2].metric("Пропущено", int(dropped or 0))
+
+        if not recent_events:
+            st.caption("События ещё не поступали или очередь пуста.")
+            return
+
+        now = time.time()
+        for raw_event in reversed(recent_events):
+            event = raw_event if isinstance(raw_event, Mapping) else {}
+            header = _format_event_header(event, now=now)
+            with st.expander(header, expanded=False):
+                payload = event.get("payload")
+                if isinstance(payload, (Mapping, list)):
+                    st.json(payload or {})
+                else:
+                    st.write(payload)
+                meta = {k: v for k, v in event.items() if k not in {"payload"}}
+                if meta:
+                    st.caption(json.dumps(meta, ensure_ascii=False))
+
+
+def _render_health_page() -> None:
+    preflight_snapshot = _to_mapping(get_preflight_snapshot())
+    ws_snapshot = _to_mapping(get_ws_snapshot())
+    automation_snapshot = _to_mapping(get_automation_status())
+    events_payload = _to_mapping(get_ws_events(limit=20))
+
+    _render_preflight_section(preflight_snapshot)
+
+    st.divider()
+
+    ws_status = _to_mapping(ws_snapshot.get("status"))
+    public_info = _to_mapping(ws_status.get("public"))
+    private_info = _to_mapping(ws_status.get("private"))
+
+    public_threshold = _to_float(ws_snapshot.get("public_stale_after"))
+    private_threshold = _to_float(ws_snapshot.get("private_stale_after"))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("WebSocket")
+        _render_ws_channel(
+            "Публичный канал",
+            public_info,
+            stale=bool(ws_snapshot.get("public_stale")),
+            threshold=public_threshold,
+        )
+        _render_ws_channel(
+            "Приватный канал",
+            private_info,
+            stale=bool(ws_snapshot.get("private_stale")),
+            threshold=private_threshold,
+        )
+
+        _render_private_queue(ws_snapshot, events_payload)
+
+    with col2:
+        st.subheader("Автоисполнение")
+        _render_automation_section(automation_snapshot)
+
+        st.subheader("Действия")
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            if st.button("Перезапустить WebSocket", use_container_width=True):
+                restarted = restart_websockets()
+                st.success(
+                    "WebSocket перезапущен." if restarted else "Не удалось перезапустить."
+                )
+        with action_col2:
+            if st.button("Перезапустить автоматику", use_container_width=True):
+                restarted = restart_automation()
+                st.success(
+                    "Автоматизация перезапущена." if restarted else "Не удалось перезапустить."
+                )
+
+    st.divider()
+
+    with st.expander("Сырые данные"):
+        st.markdown("### Настройки")
+        st.json({"testnet": settings.testnet, "dry_run": active_dry_run(settings)})
+        st.markdown("### WebSocket snapshot")
+        st.json(ws_snapshot)
+        st.markdown("### Automation snapshot")
+        st.json(automation_snapshot)
+
+
+_render_health_page()
