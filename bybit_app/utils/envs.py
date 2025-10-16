@@ -172,19 +172,20 @@ class Settings:
     ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
-    ai_live_only: bool = True
+    ai_live_only: bool = False
     # трейдинг параметры
     ai_max_slippage_bps: int = 400
     ai_fee_bps: float = 15.0
     ai_slippage_bps: float = 10.0
-    ai_buy_threshold: float = 0.55
-    ai_sell_threshold: float = 0.45
+    ai_buy_threshold: float = 0.58
+    ai_sell_threshold: float = 0.42
     ai_daily_loss_limit_pct: float = 3.0
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
     ai_min_ev_bps: float = 80.0
-    ai_retrain_minutes: int = 60
+    ai_signal_hysteresis: float = 0.04
+    ai_retrain_minutes: int = 240
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True
@@ -383,6 +384,7 @@ _ENV_MAP = {
     "ai_portfolio_loss_limit_pct": "AI_PORTFOLIO_LOSS_LIMIT_PCT",
     "ai_kill_switch_cooldown_min": "AI_KILL_SWITCH_COOLDOWN_MIN",
     "ai_min_ev_bps": "AI_MIN_EV_BPS",
+    "ai_signal_hysteresis": "AI_SIGNAL_HYSTERESIS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
@@ -536,6 +538,10 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
         m.get("ai_kill_switch_cooldown_min")
     )
     m["ai_min_ev_bps"] = _cast_float(m.get("ai_min_ev_bps"))
+    hysteresis = _cast_float(m.get("ai_signal_hysteresis"))
+    if hysteresis is not None:
+        hysteresis = max(0.0, min(float(hysteresis), 0.25))
+    m["ai_signal_hysteresis"] = hysteresis
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
