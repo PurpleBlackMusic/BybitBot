@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple, Iterable
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for, execution_fee_in_quote
 from .file_io import tail_lines
+from .log import log
 
 DEC = DATA_DIR / "pnl" / "decisions.jsonl"
 LED: Path | None = None
@@ -162,9 +163,77 @@ def _read_jsonl(
     return selected
 
 def _write_jsonl(p: Path, rows: List[Dict[str, Any]]):
+    p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def _trade_identity(trade: Dict[str, Any]) -> Tuple:
+    link = trade.get("orderLinkId")
+    if isinstance(link, str) and link.strip():
+        symbol = trade.get("symbol") or ""
+        return ("link", symbol, link.strip())
+
+    symbol = trade.get("symbol") or ""
+    entry_ts = _coerce_timestamp(trade.get("entry_ts")) or 0
+    exit_ts = _coerce_timestamp(trade.get("exit_ts")) or 0
+    qty = float(trade.get("qty") or 0.0)
+    entry_vwap = float(trade.get("entry_vwap") or 0.0)
+    exit_vwap = float(trade.get("exit_vwap") or 0.0)
+    return (
+        "fallback",
+        symbol,
+        entry_ts,
+        exit_ts,
+        round(qty, 12),
+        round(entry_vwap, 8),
+        round(exit_vwap, 8),
+    )
+
+
+def _merge_trade_history(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    existing = _read_jsonl(TRD, window_ms=None)
+    merged: Dict[Tuple, Dict[str, Any]] = {}
+
+    for record in existing:
+        merged[_trade_identity(record)] = record
+
+    new_records: List[Dict[str, Any]] = []
+    for trade in trades:
+        key = _trade_identity(trade)
+        if key not in merged:
+            new_records.append(trade)
+        merged[key] = trade
+
+    ordered = sorted(
+        merged.values(),
+        key=lambda row: (
+            _coerce_timestamp(row.get("exit_ts"))
+            or _coerce_timestamp(row.get("entry_ts"))
+            or 0,
+            row.get("symbol") or "",
+            row.get("orderLinkId") or "",
+        ),
+    )
+
+    _write_jsonl(TRD, ordered)
+
+    for trade in new_records:
+        log(
+            "pnl.trade.recorded",
+            symbol=trade.get("symbol"),
+            orderLinkId=trade.get("orderLinkId"),
+            entry_ts=trade.get("entry_ts"),
+            exit_ts=trade.get("exit_ts"),
+            qty=trade.get("qty"),
+            entry_vwap=trade.get("entry_vwap"),
+            exit_vwap=trade.get("exit_vwap"),
+            fees=trade.get("fees"),
+            bps=trade.get("bps_realized"),
+        )
+
+    return ordered
 
 def _resolve_ledger_path(
     *,
@@ -631,7 +700,7 @@ def pair_trades(
             # остальные типы игнорируем
 
     # записываем
-    _write_jsonl(TRD, trades)
+    _merge_trade_history(trades)
     cached_payload = tuple(deepcopy(trade) for trade in trades)
     _PAIR_CACHE[cache_key] = _PairTradeCacheEntry(signature=signature, trades=cached_payload)
 

@@ -1,5 +1,8 @@
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("BYBITBOT_ENV", "test")
 
 # Ensure the project root is on sys.path for module imports
 ROOT = Path(__file__).resolve().parents[1]

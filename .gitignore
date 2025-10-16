@@ -11,6 +11,7 @@ __pycache__/
 .DS_Store
 bybit_app/_data/ws/
 bybit_app/_data/cache/
+bybit_app/_data/profiles/
 .runtime/
 
 
