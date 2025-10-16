@@ -5057,7 +5057,16 @@ def test_price_limit_backoff_preserves_price_cap_without_details(
 
     first_result = executor.execute_once()
     executor._symbol_quarantine.pop("ETHUSDT", None)
-    time_state["value"] = base_time + signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL + 10.0
+    backoff_state = executor._price_limit_backoff.get("ETHUSDT")
+    resume_time = None
+    if isinstance(backoff_state, dict):
+        ttl = backoff_state.get("quarantine_ttl")
+        last_updated = backoff_state.get("last_updated")
+        if isinstance(ttl, (int, float)) and isinstance(last_updated, (int, float)):
+            resume_time = float(last_updated + ttl + 10.0)
+    if resume_time is None:
+        resume_time = base_time + signal_executor_module._PRICE_LIMIT_LIQUIDITY_TTL + 10.0
+    time_state["value"] = resume_time
     second_result = executor.execute_once()
 
     assert first_result.status == "skipped"
