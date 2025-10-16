@@ -1100,8 +1100,8 @@ def scan_market_opportunities(
         else:
             trend = "wait"
 
-        raw_change_value = _safe_float(raw.get("price24hPcnt"))
-        if raw_change_value is not None and abs(raw_change_value) <= 1.0:
+        raw_change_value = _normalise_percent(raw.get("price24hPcnt"))
+        if raw_change_value is not None:
             daily_change_for_guard = abs(raw_change_value)
         else:
             daily_change_for_guard = change_pct
