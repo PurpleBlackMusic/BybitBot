@@ -134,6 +134,7 @@ class GuardianBot:
         self._live_fetcher: Optional[LiveSignalFetcher] = None
         self._listed_spot_symbols: Optional[Set[str]] = None
         self._symbol_universe_cache: Optional[Tuple[float, Tuple[str, ...]]] = None
+        self._signal_state: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # internal plumbing
@@ -895,7 +896,7 @@ class GuardianBot:
 
     def _resolve_thresholds(
         self, settings: Settings
-    ) -> Tuple[float, float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float]:
         """Normalise user-provided thresholds and derive safe fallbacks."""
 
         def _clamp_threshold(value: object, default: float) -> float:
@@ -907,16 +908,28 @@ class GuardianBot:
 
         buy_threshold = _clamp_threshold(
             getattr(settings, "ai_buy_threshold", None),
-            0.55,
+            0.58,
         )
         sell_threshold = _clamp_threshold(
             getattr(settings, "ai_sell_threshold", None),
-            0.45,
+            0.42,
         )
         min_ev = max(float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0), 0.0)
 
         effective_buy_threshold = buy_threshold
         effective_sell_threshold = max(0.0, min(sell_threshold, effective_buy_threshold))
+
+        hysteresis = getattr(settings, "ai_signal_hysteresis", None)
+        try:
+            hysteresis_margin = float(hysteresis)
+        except (TypeError, ValueError):
+            hysteresis_margin = 0.04
+        if not math.isfinite(hysteresis_margin):
+            hysteresis_margin = 0.04
+        hysteresis_margin = max(0.0, min(hysteresis_margin, 0.25))
+
+        exit_buy_threshold = min(1.0, effective_buy_threshold + hysteresis_margin)
+        exit_sell_threshold = max(0.0, effective_sell_threshold - hysteresis_margin)
 
         return (
             buy_threshold,
@@ -924,6 +937,8 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            exit_buy_threshold,
+            exit_sell_threshold,
         )
 
     @staticmethod
@@ -2122,6 +2137,8 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            _,
+            _,
         ) = self._resolve_thresholds(settings)
 
         def annotate(entry: Dict[str, object]) -> None:
@@ -2953,6 +2970,8 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            exit_buy_threshold,
+            exit_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
@@ -3006,6 +3025,8 @@ class GuardianBot:
                 "effective_sell_probability_pct": round(
                     effective_sell_threshold * 100.0, 2
                 ),
+                "exit_buy_probability_pct": round(exit_buy_threshold * 100.0, 2),
+                "exit_sell_probability_pct": round(exit_sell_threshold * 100.0, 2),
                 "min_ev_bps": round(min_ev, 2),
             },
             "has_status": bool(status),
@@ -3216,6 +3237,8 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            exit_buy_threshold,
+            exit_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
         watchlist = self._build_watchlist(status, settings)
@@ -3355,22 +3378,54 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            exit_buy_threshold,
+            exit_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
         if mode_hint:
             mode = mode_hint
-        elif side_hint == "wait":
-            mode = "wait"
-        elif probability >= effective_buy_threshold and ev_bps >= min_ev:
-            mode = "buy"
-        elif (
-            side_hint == "sell"
-            and probability <= effective_sell_threshold
-            and ev_bps >= min_ev
-        ):
-            mode = "sell"
         else:
-            mode = "wait"
+            candidate_mode: str
+            if side_hint == "wait":
+                candidate_mode = "wait"
+            elif probability >= effective_buy_threshold and ev_bps >= min_ev:
+                candidate_mode = "buy"
+            elif (
+                side_hint == "sell"
+                and probability <= effective_sell_threshold
+                and ev_bps >= min_ev
+            ):
+                candidate_mode = "sell"
+            elif probability <= effective_sell_threshold and ev_bps >= min_ev:
+                candidate_mode = "sell"
+            else:
+                candidate_mode = "wait"
+
+            previous_mode = self._signal_state.get(symbol)
+            mode = candidate_mode
+
+            if previous_mode == "buy":
+                if candidate_mode == "sell":
+                    if probability <= exit_sell_threshold and ev_bps >= min_ev:
+                        mode = "sell"
+                    else:
+                        mode = "buy"
+                elif candidate_mode == "wait":
+                    if ev_bps < min_ev or probability <= exit_sell_threshold:
+                        mode = "wait"
+                    else:
+                        mode = "buy"
+            elif previous_mode == "sell":
+                if candidate_mode == "buy":
+                    if probability >= exit_buy_threshold and ev_bps >= min_ev:
+                        mode = "buy"
+                    else:
+                        mode = "sell"
+                elif candidate_mode == "wait":
+                    if ev_bps < min_ev or probability >= exit_buy_threshold:
+                        mode = "wait"
+                    else:
+                        mode = "sell"
 
         confidence_pct = probability * 100.0
         if confidence_pct >= 70:
@@ -3379,6 +3434,9 @@ class GuardianBot:
             level = "средняя"
         else:
             level = "низкая"
+
+        if symbol:
+            self._signal_state[symbol] = mode
 
         confidence_text = (
             f"Уверенность модели: {confidence_pct:.1f}% — {level}. Чем выше процент, тем спокойнее можно действовать."
@@ -3552,6 +3610,8 @@ class GuardianBot:
             min_ev,
             effective_buy_threshold,
             effective_sell_threshold,
+            exit_buy_threshold,
+            exit_sell_threshold,
         ) = self._resolve_thresholds(self.settings)
         return {
             "symbol": brief.symbol,
@@ -3560,6 +3620,8 @@ class GuardianBot:
             "ev_bps": round(ev_bps, 2),
             "buy_threshold": round(effective_buy_threshold * 100.0, 2),
             "sell_threshold": round(effective_sell_threshold * 100.0, 2),
+            "exit_buy_threshold": round(exit_buy_threshold * 100.0, 2),
+            "exit_sell_threshold": round(exit_sell_threshold * 100.0, 2),
             "configured_buy_threshold": round(configured_buy_threshold * 100.0, 2),
             "configured_sell_threshold": round(configured_sell_threshold * 100.0, 2),
             "min_ev_bps": round(min_ev, 2),

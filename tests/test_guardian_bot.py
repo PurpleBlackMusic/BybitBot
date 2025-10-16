@@ -349,9 +349,9 @@ def test_guardian_summary_flags_low_confidence_under_defaults(tmp_path: Path) ->
     assert any("порог" in reason.lower() for reason in summary["actionable_reasons"])
     reason_text = " ".join(summary["actionable_reasons"])
     assert "48.00%" in reason_text
-    assert "55.00%" in reason_text
-    assert summary["thresholds"]["buy_probability_pct"] == 55.0
-    assert summary["thresholds"]["sell_probability_pct"] == 45.0
+    assert "58.00%" in reason_text
+    assert summary["thresholds"]["buy_probability_pct"] == 58.0
+    assert summary["thresholds"]["sell_probability_pct"] == 42.0
     assert (
         summary["thresholds"]["effective_buy_probability_pct"]
         == summary["thresholds"]["buy_probability_pct"]
@@ -1125,7 +1125,7 @@ def test_guardian_answer_fee_activity_summary(tmp_path: Path) -> None:
     reply = bot.answer("дай сводку по комиссиям и maker/taker")
 
     assert "0.08019" in reply
-    assert "66.7%" in reply
+    assert "55.6%" in reply
     assert "за 15 минут 2" in reply
     assert "за час 2" in reply
     assert "за сутки 3" in reply
@@ -1268,10 +1268,12 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert scorecard["symbol"] == "BTCUSDT"
     assert scorecard["probability_pct"] == 60.0
     assert scorecard["ev_bps"] == 125.0
-    assert scorecard["buy_threshold"] == 55.0
-    assert scorecard["sell_threshold"] == 45.0
-    assert scorecard["configured_buy_threshold"] == 55.0
-    assert scorecard["configured_sell_threshold"] == 45.0
+    assert scorecard["buy_threshold"] == 58.0
+    assert scorecard["sell_threshold"] == 42.0
+    assert scorecard["exit_buy_threshold"] == pytest.approx(62.0, rel=1e-3)
+    assert scorecard["exit_sell_threshold"] == pytest.approx(38.0, rel=1e-3)
+    assert scorecard["configured_buy_threshold"] == 58.0
+    assert scorecard["configured_sell_threshold"] == 42.0
 
     summary = bot.status_summary()
     assert summary["watchlist_total"] == 3
@@ -1281,6 +1283,31 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert highlights[0]["primary"] is True
     assert highlights[0]["actionable"] is True
     assert summary["primary_watch"]["symbol"] == "ETHUSDT"
+
+
+def test_guardian_signal_hysteresis(tmp_path: Path) -> None:
+    settings = Settings(ai_live_only=False, ai_min_ev_bps=5.0, ai_signal_hysteresis=0.04)
+    bot = _make_bot(tmp_path, settings)
+
+    def update_status(probability: float) -> None:
+        payload = {
+            "symbol": "BTCUSDT",
+            "probability": probability,
+            "ev_bps": 20.0,
+        }
+        _write_status(bot, payload)
+
+    update_status(0.63)
+    brief = bot._get_snapshot(force=True).brief
+    assert brief.mode == "buy"
+
+    update_status(0.55)
+    brief = bot._get_snapshot(force=True).brief
+    assert brief.mode == "buy"
+
+    update_status(0.36)
+    brief = bot._get_snapshot(force=True).brief
+    assert brief.mode == "sell"
 
 
 def test_guardian_brief_selects_best_watchlist_symbol(tmp_path: Path) -> None:
@@ -1363,7 +1390,7 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
             },
             {
                 "symbol": "LTCUSDT",
-                "probability": 0.44,
+                "probability": 0.38,
                 "ev_bps": 12.0,
                 "trend": "sell",
                 "note": "давление продавцов",
@@ -1381,11 +1408,11 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
+    settings = Settings(ai_live_only=False,
         ai_symbols="ADAUSDT,LTCUSDT,XRPUSDT",
         ai_buy_threshold=0.6,
         ai_min_ev_bps=10.0,
-        ai_sell_threshold=0.45,
+        ai_sell_threshold=0.42,
         ai_enabled=True,
     )
 
@@ -1403,7 +1430,7 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     assert [item["symbol"] for item in highlights] == ["ADAUSDT", "LTCUSDT", "XRPUSDT"]
     assert highlights[0]["probability_pct"] == 66.0
     assert highlights[1]["trend"] == "sell"
-    assert highlights[1]["probability_gap_pct"] == 1.0
+    assert highlights[1]["probability_gap_pct"] == 4.0
     assert summary["primary_watch"]["symbol"] == "ADAUSDT"
 
     breakdown = summary["watchlist_breakdown"]
@@ -1425,10 +1452,10 @@ def test_guardian_watchlist_enriches_actionable_entries(tmp_path: Path) -> None:
     ]
     metrics = breakdown["metrics"]
     actionable_metrics = metrics["actionable"]
-    assert actionable_metrics["probability_avg_pct"] == pytest.approx(55.0)
+    assert actionable_metrics["probability_avg_pct"] == pytest.approx(52.0)
     assert actionable_metrics["ev_avg_bps"] == pytest.approx(13.5)
     overall_metrics = metrics["overall"]
-    assert overall_metrics["probability_avg_pct"] == pytest.approx(54.0)
+    assert overall_metrics["probability_avg_pct"] == pytest.approx(52.0)
     assert overall_metrics["ev_avg_bps"] == pytest.approx(11.0)
 
     digest = summary["watchlist_digest"]
@@ -1809,9 +1836,9 @@ def test_guardian_dynamic_symbols_prioritize_actionable(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
-        ai_buy_threshold=0.55,
-        ai_sell_threshold=0.45,
+    settings = Settings(ai_live_only=False,
+        ai_buy_threshold=0.58,
+        ai_sell_threshold=0.42,
         ai_min_ev_bps=10.0,
         ai_max_concurrent=2,
         ai_enabled=True,
@@ -2054,7 +2081,7 @@ def test_guardian_symbol_plan_trade_performance_adjusts_priority(
         ai_live_only=False,
         ai_max_concurrent=3,
         ai_enabled=True,
-        ai_buy_threshold=0.55,
+        ai_buy_threshold=0.58,
         ai_min_ev_bps=10.0,
     )
 
@@ -2260,7 +2287,7 @@ def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
             },
             {
                 "symbol": "XRPUSDT",
-                "probability": 0.44,
+                "probability": 0.38,
                 "ev_bps": 13.0,
                 "trend": "sell",
             },
@@ -2277,10 +2304,10 @@ def test_guardian_actionable_opportunities(tmp_path: Path) -> None:
     status_path.parent.mkdir(parents=True, exist_ok=True)
     status_path.write_text(json.dumps(status), encoding="utf-8")
 
-    settings = Settings(ai_live_only=False, 
+    settings = Settings(ai_live_only=False,
         ai_symbols="SOLUSDT,XRPUSDT,DOGEUSDT",
         ai_buy_threshold=0.6,
-        ai_sell_threshold=0.45,
+        ai_sell_threshold=0.42,
         ai_min_ev_bps=10.0,
         ai_enabled=True,
     )
