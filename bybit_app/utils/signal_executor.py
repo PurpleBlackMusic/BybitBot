@@ -912,6 +912,7 @@ class SignalExecutor:
         symbol: Optional[str],
         *,
         limit: int = 1,
+        spread_window_sec: Optional[float] = None,
     ) -> Optional[Dict[str, float]]:
         if api is None or not symbol:
             return None
@@ -946,6 +947,11 @@ class SignalExecutor:
                         value = ws_top.get(key)
                         if isinstance(value, (int, float)):
                             snapshot[key] = float(value)
+                    ts_value = ws_top.get("ts")
+                    if isinstance(ts_value, (int, float)):
+                        snapshot["ts"] = float(ts_value)
+                    else:
+                        snapshot["ts"] = time.time() * 1000.0
                     if snapshot:
                         best_ask_val = snapshot.get("best_ask")
                         best_bid_val = snapshot.get("best_bid")
@@ -959,6 +965,16 @@ class SignalExecutor:
                                 ((best_ask_val - best_bid_val) / best_ask_val) * 10_000.0,
                                 0.0,
                             )
+                    if (
+                        snapshot
+                        and spread_window_sec is not None
+                        and spread_window_sec > 0
+                    ):
+                        stats = live_orderbook.spread_window_stats(
+                            cleaned_symbol, float(spread_window_sec)
+                        )
+                        if stats:
+                            snapshot["spread_window_stats"] = stats
         if snapshot:
             return snapshot
 
@@ -1027,6 +1043,18 @@ class SignalExecutor:
         if spread_bps is not None:
             snapshot["spread_bps"] = spread_bps
 
+        if live_orderbook is not None and snapshot:
+            try:
+                live_orderbook.record_top(cleaned_symbol, snapshot, source="rest")
+            except Exception:  # pragma: no cover - defensive guard
+                pass
+            if spread_window_sec is not None and spread_window_sec > 0:
+                stats = live_orderbook.spread_window_stats(
+                    cleaned_symbol, float(spread_window_sec)
+                )
+                if stats:
+                    snapshot["spread_window_stats"] = stats
+
         return snapshot
 
     def _apply_liquidity_guard(
@@ -1049,17 +1077,61 @@ class SignalExecutor:
         best_bid_qty = _safe_float(orderbook_top.get("best_bid_qty"))
         spread_bps = _safe_float(orderbook_top.get("spread_bps"))
 
+        try:
+            max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            max_spread = 0.0
+
+        try:
+            spread_window_sec = float(
+                getattr(settings, "ai_spread_compression_window_sec", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            spread_window_sec = 0.0
+
+        spread_window_sec = max(spread_window_sec, 0.0)
+
         if spread_bps is not None:
             context["spread_bps"] = spread_bps
-            try:
-                max_spread = float(getattr(settings, "ai_max_spread_bps", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                max_spread = 0.0
             if max_spread > 0 and spread_bps > max_spread:
                 context["max_spread_bps"] = max_spread
                 reason = (
                     "ждём восстановления ликвидности — спред {spread:.1f} б.п. превышает лимит {limit:.1f} б.п."
                 ).format(spread=spread_bps, limit=max_spread)
+                return {"decision": "skip", "reason": reason, "context": context}
+
+        if max_spread > 0 and spread_window_sec > 0:
+            window_stats = orderbook_top.get("spread_window_stats")
+            stats_mapping = window_stats if isinstance(window_stats, Mapping) else None
+            if stats_mapping is None and spread_bps is not None:
+                ts_value = _safe_float(orderbook_top.get("ts"))
+                age_ms = 0.0
+                if ts_value is not None:
+                    age_ms = max(time.time() * 1000.0 - ts_value, 0.0)
+                if age_ms <= spread_window_sec * 1000.0:
+                    stats_mapping = {
+                        "window_sec": float(spread_window_sec),
+                        "observations": 1,
+                        "max_bps": spread_bps,
+                        "min_bps": spread_bps,
+                        "avg_bps": spread_bps,
+                        "latest_bps": spread_bps,
+                        "age_ms": age_ms,
+                    }
+            if stats_mapping is None:
+                context["spread_window_required_sec"] = spread_window_sec
+                reason = (
+                    "ждём сжатия спреда — нет данных за последние {window:.0f} с."
+                ).format(window=spread_window_sec)
+                return {"decision": "skip", "reason": reason, "context": context}
+
+            context["spread_window_stats"] = dict(stats_mapping)
+            max_recent = _safe_float(stats_mapping.get("max_bps"))
+            if max_recent is not None and max_recent > max_spread:
+                context["max_spread_bps"] = max_spread
+                reason = (
+                    "ждём сжатия спреда — максимум за {window:.0f} с. {max_recent:.1f} б.п. превышает лимит {limit:.1f} б.п."
+                ).format(window=spread_window_sec, max_recent=max_recent, limit=max_spread)
                 return {"decision": "skip", "reason": reason, "context": context}
 
         top_price = best_ask if side == "Buy" else best_bid
@@ -2798,7 +2870,18 @@ class SignalExecutor:
                 if max_quote is None or allowed_quote > max_quote:
                     max_quote = allowed_quote
 
-        orderbook_top = self._resolve_orderbook_top(api, symbol)
+        try:
+            spread_window_sec = float(
+                getattr(settings, "ai_spread_compression_window_sec", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            spread_window_sec = 0.0
+
+        orderbook_top = self._resolve_orderbook_top(
+            api,
+            symbol,
+            spread_window_sec=spread_window_sec,
+        )
         if orderbook_top:
             order_context["orderbook_top"] = orderbook_top
             best_price = orderbook_top.get("best_ask") if side == "Buy" else orderbook_top.get("best_bid")

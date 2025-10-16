@@ -203,7 +203,8 @@ class Settings:
 
     # Universe presets / filters
     ai_universe_preset: str = "Стандарт"
-    ai_max_spread_bps: float = 75.0
+    ai_max_spread_bps: float = 40.0
+    ai_spread_compression_window_sec: float = 5.0
     ai_min_turnover_usd: float = 250_000.0
     ai_top_depth_coverage: float = 0.6
     ai_top_depth_shortfall_usd: float = 20.0

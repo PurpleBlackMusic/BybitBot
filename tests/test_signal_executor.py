@@ -4639,6 +4639,57 @@ def test_signal_executor_skips_on_wide_spread(monkeypatch: pytest.MonkeyPatch) -
     assert guard_meta.get("spread_bps") > guard_meta.get("max_spread_bps", 0.0)
 
 
+def test_liquidity_guard_skips_on_recent_spread_violation() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        ai_spread_compression_window_sec=5.0,
+    )
+    bot = StubBot(summary, settings)
+
+    executor = SignalExecutor(bot)
+
+    orderbook_top = {
+        "best_ask": 100.0,
+        "best_bid": 99.95,
+        "best_ask_qty": 1.0,
+        "best_bid_qty": 1.0,
+        "spread_bps": 5.0,
+        "ts": time.time() * 1000.0,
+        "spread_window_stats": {
+            "window_sec": 5.0,
+            "observations": 5,
+            "max_bps": 55.0,
+            "min_bps": 5.0,
+            "avg_bps": 20.0,
+            "latest_bps": 5.0,
+            "age_ms": 0.0,
+        },
+    }
+
+    decision = executor._apply_liquidity_guard(
+        "Buy",
+        100.0,
+        orderbook_top,
+        settings=settings,
+        price_hint=100.0,
+    )
+
+    assert decision is not None
+    assert decision.get("decision") == "skip"
+    reason = decision.get("reason")
+    assert isinstance(reason, str) and "сжатия" in reason
+    context = decision.get("context")
+    assert isinstance(context, dict)
+    stats = context.get("spread_window_stats")
+    assert isinstance(stats, dict)
+    assert stats.get("max_bps") == 55.0
+
+
 def test_signal_executor_skips_on_thin_top_of_book(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
     settings = Settings(
@@ -4726,6 +4777,8 @@ def test_liquidity_guard_relaxes_when_partial_supported() -> None:
         "best_bid": 99.9,
         "best_ask_qty": 0.2,
         "best_bid_qty": 10.0,
+        "spread_bps": 10.0,
+        "ts": time.time() * 1000.0,
     }
 
     decision = executor._apply_liquidity_guard(
