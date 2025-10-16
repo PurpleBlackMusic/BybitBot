@@ -1035,12 +1035,14 @@ def test_weighted_model_sorts_by_risk_features(tmp_path: Path) -> None:
 
     _write_snapshot(tmp_path, rows)
 
+    settings = Settings(testnet=False, ai_max_daily_surge_pct=120.0)
     opportunities = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
         min_turnover=2_000_000.0,
         min_change_pct=0.5,
         max_spread_bps=60.0,
+        settings=settings,
     )
 
     ordered = [entry["symbol"] for entry in opportunities]
@@ -1274,6 +1276,7 @@ def test_scan_market_opportunities_filters_percent_outliers(tmp_path):
 
     _write_snapshot(tmp_path, rows)
 
+    settings = Settings(testnet=False, ai_max_daily_surge_pct=50.0)
     opportunities = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
@@ -1281,6 +1284,7 @@ def test_scan_market_opportunities_filters_percent_outliers(tmp_path):
         min_turnover=0.0,
         min_change_pct=0.1,
         max_spread_bps=200.0,
+        settings=settings,
     )
 
     returned = {entry["symbol"] for entry in opportunities}
@@ -1302,6 +1306,7 @@ def test_scan_market_opportunities_respects_maintenance_stoplist(tmp_path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot), encoding="utf-8")
 
+    settings = Settings(testnet=False, ai_max_daily_surge_pct=50.0)
     opportunities = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
@@ -1309,6 +1314,7 @@ def test_scan_market_opportunities_respects_maintenance_stoplist(tmp_path):
         min_turnover=0.0,
         min_change_pct=0.1,
         max_spread_bps=200.0,
+        settings=settings,
     )
 
     symbols = {entry["symbol"] for entry in opportunities}
@@ -1337,6 +1343,7 @@ def test_scan_market_opportunities_detects_delist_candidates(tmp_path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(snapshot), encoding="utf-8")
 
+    settings = Settings(testnet=False, ai_max_daily_surge_pct=50.0)
     opportunities = scan_market_opportunities(
         api=None,
         data_dir=tmp_path,
@@ -1344,6 +1351,7 @@ def test_scan_market_opportunities_detects_delist_candidates(tmp_path):
         min_turnover=0.0,
         min_change_pct=0.1,
         max_spread_bps=200.0,
+        settings=settings,
     )
 
     symbols = {entry["symbol"] for entry in opportunities}
