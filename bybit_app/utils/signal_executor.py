@@ -59,7 +59,7 @@ _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 900.0  # extend cooldown to 15 minutes after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
 _SUMMARY_PRICE_ENTRY_GRACE = 2.0
-_SUMMARY_PRICE_EXECUTION_MAX_AGE = 3.0
+_SUMMARY_PRICE_EXECUTION_MAX_AGE = 9.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 _PARTIAL_FILL_MAX_FOLLOWUPS = 3
 _PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
@@ -966,7 +966,7 @@ class SignalExecutor:
         *,
         settings: Settings,
         price_hint: Optional[float] = None,
-    ) -> Optional[Tuple[str, Dict[str, object]]]:
+    ) -> Optional[Dict[str, object]]:
         if notional_quote <= 0:
             return None
 
@@ -989,7 +989,7 @@ class SignalExecutor:
                 reason = (
                     "ждём восстановления ликвидности — спред {spread:.1f} б.п. превышает лимит {limit:.1f} б.п."
                 ).format(spread=spread_bps, limit=max_spread)
-                return reason, context
+                return {"decision": "skip", "reason": reason, "context": context}
 
         top_price = best_ask if side == "Buy" else best_bid
         top_qty = best_ask_qty if side == "Buy" else best_bid_qty
@@ -1000,7 +1000,7 @@ class SignalExecutor:
                 context["top_price"] = top_price
             if top_qty is not None and top_qty > 0:
                 context["top_qty"] = top_qty
-            return reason, context
+            return {"decision": "skip", "reason": reason, "context": context}
 
         context["top_price"] = top_price
         context["top_qty"] = top_qty
@@ -1023,7 +1023,7 @@ class SignalExecutor:
             )
         except (TypeError, ValueError):
             coverage_threshold = 0.0
-        coverage_threshold = max(min(coverage_threshold, 0.99), 0.0)
+        coverage_threshold = max(min(coverage_threshold, 0.95), 0.0)
 
         shortfall_quote = required_quote - available_quote
         context["shortfall_quote"] = shortfall_quote
@@ -1038,26 +1038,61 @@ class SignalExecutor:
         if shortfall_limit > 0:
             context["shortfall_limit_quote"] = shortfall_limit
 
-        if (
+        partial_execution_allowed = bool(getattr(settings, "allow_partial_fills", True))
+        slicing_fallback_enabled = bool(
+            getattr(settings, "twap_enabled", False)
+            or getattr(settings, "twap_spot_enabled", False)
+            or getattr(settings, "iceberg_enabled", False)
+            or getattr(settings, "spot_iceberg_enabled", False)
+        )
+        fallback_available = partial_execution_allowed or slicing_fallback_enabled
+
+        coverage_issue = (
             required_quote > 0
             and coverage_threshold > 0
             and coverage_ratio + 1e-9 < coverage_threshold
-        ):
+        )
+        shortfall_issue = (
+            required_quote > 0
+            and shortfall_limit > 0
+            and shortfall_quote > shortfall_limit
+        )
+
+        if not coverage_issue and not shortfall_issue:
+            return None
+
+        reasons: List[str] = []
+        reason_messages: List[str] = []
+
+        if coverage_issue:
             context["coverage_threshold"] = coverage_threshold
-            reason = (
-                "ждём восстановления ликвидности — на первом уровне доступно ≈{available:.2f} USDT,"
-                " требуется ≈{required:.2f} USDT."
-            ).format(available=available_quote, required=required_quote)
-            return reason, context
+            reasons.append("coverage")
+            reason_messages.append(
+                (
+                    "ждём восстановления ликвидности — на первом уровне доступно ≈{available:.2f} USDT,"
+                    " требуется ≈{required:.2f} USDT."
+                ).format(available=available_quote, required=required_quote)
+            )
 
-        if required_quote > 0 and shortfall_limit > 0 and shortfall_quote > shortfall_limit:
-            reason = (
-                "ждём восстановления ликвидности — дефицит первого уровня ≈{shortfall:.2f} USDT превышает"
-                " лимит {limit:.2f} USDT."
-            ).format(shortfall=shortfall_quote, limit=shortfall_limit)
-            return reason, context
+        if shortfall_issue:
+            reasons.append("shortfall")
+            reason_messages.append(
+                (
+                    "ждём восстановления ликвидности — дефицит первого уровня ≈{shortfall:.2f} USDT превышает"
+                    " лимит {limit:.2f} USDT."
+                ).format(shortfall=shortfall_quote, limit=shortfall_limit)
+            )
 
-        return None
+        if fallback_available:
+            context["guard_relaxed"] = True
+            context["liquidity_guard_reasons"] = reasons
+            context["partial_execution_allowed"] = partial_execution_allowed
+            if slicing_fallback_enabled:
+                context["slicing_fallback_enabled"] = True
+            return {"decision": "relaxed", "context": context, "reason": " ".join(reason_messages)}
+
+        reason_text = " ".join(reason_messages)
+        return {"decision": "skip", "reason": reason_text, "context": context}
 
     def _resolve_summary_update_meta(
         self, summary: Mapping[str, object], now: float
@@ -2616,14 +2651,20 @@ class SignalExecutor:
                 price_hint=summary_price_snapshot,
             )
             if guard_result is not None:
-                reason_text, guard_context = guard_result
+                guard_context = guard_result.get("context") if isinstance(guard_result, Mapping) else None
                 if guard_context:
                     order_context["liquidity_guard"] = guard_context
-                return self._decision(
-                    "skipped",
-                    reason=reason_text,
-                    context=order_context,
-                )
+                decision = guard_result.get("decision") if isinstance(guard_result, Mapping) else None
+                if decision == "skip":
+                    return self._decision(
+                        "skipped",
+                        reason=guard_result.get("reason"),
+                        context=order_context,
+                    )
+                if decision == "relaxed":
+                    reason_text = guard_result.get("reason")
+                    if reason_text:
+                        order_context.setdefault("liquidity_guard_reason", reason_text)
 
         ledger_before, last_exec_id = self._ledger_rows_snapshot(settings=settings)
 

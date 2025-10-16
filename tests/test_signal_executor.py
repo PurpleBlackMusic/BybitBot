@@ -4573,6 +4573,8 @@ def test_signal_executor_skips_on_thin_top_of_book(monkeypatch: pytest.MonkeyPat
         spot_cash_reserve_pct=0.0,
         ai_top_depth_coverage=0.9,
         ai_top_depth_shortfall_usd=2.0,
+        allow_partial_fills=False,
+        twap_enabled=False,
     )
     bot = StubBot(summary, settings)
 
@@ -4624,6 +4626,46 @@ def test_signal_executor_skips_on_thin_top_of_book(monkeypatch: pytest.MonkeyPat
     guard_meta = result.context.get("liquidity_guard")
     assert isinstance(guard_meta, dict)
     assert guard_meta.get("coverage_ratio", 1.0) < guard_meta.get("coverage_threshold", 1.0)
+
+
+def test_liquidity_guard_relaxes_when_partial_supported() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        dry_run=False,
+        ws_watchdog_enabled=False,
+        ai_risk_per_trade_pct=1.0,
+        spot_cash_reserve_pct=0.0,
+        ai_top_depth_coverage=0.8,
+        ai_top_depth_shortfall_usd=10.0,
+        allow_partial_fills=True,
+        twap_enabled=True,
+    )
+    bot = StubBot(summary, settings)
+
+    executor = SignalExecutor(bot)
+
+    orderbook_top = {
+        "best_ask": 100.0,
+        "best_bid": 99.9,
+        "best_ask_qty": 0.2,
+        "best_bid_qty": 10.0,
+    }
+
+    decision = executor._apply_liquidity_guard(
+        "Buy",
+        100.0,
+        orderbook_top,
+        settings=settings,
+        price_hint=100.0,
+    )
+
+    assert decision is not None
+    assert decision.get("decision") == "relaxed"
+    context = decision.get("context")
+    assert isinstance(context, dict)
+    assert context.get("guard_relaxed") is True
+    assert "coverage" in (context.get("liquidity_guard_reasons") or [])
 
 
 def test_signal_executor_skips_on_min_notional(monkeypatch: pytest.MonkeyPatch) -> None:
