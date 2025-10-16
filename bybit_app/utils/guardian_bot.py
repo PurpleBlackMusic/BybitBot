@@ -3469,16 +3469,20 @@ class GuardianBot:
         elif not (slip_low <= slippage <= slip_high):
             slip_line += " Подстрой значение, чтобы не переплачивать за вход."
 
-        risk_target = 0.25
-        per_trade_txt = fmt_pct(per_trade)
+        adaptive_floor = 0.5
+        adaptive_ceiling = 2.0
+        adaptive_range = f"{fmt_pct(adaptive_floor, keep_trailing=True)}–{fmt_pct(adaptive_ceiling, keep_trailing=True)}"
         risk_line = (
-            f"• Риск на сделку: до {per_trade_txt}% капитала"
-            f" (ориентир {fmt_pct(risk_target)}%)."
+            "• Риск на сделку: бот подстраивает долю между "
+            f"{adaptive_range}% капитала в зависимости от уверенности сигнала."
         )
-        if per_trade > risk_target:
-            risk_line += " Снизь долю, если стратегия ещё проходит обкатку."
-        elif per_trade == 0:
-            risk_line += " Задай лимит ~0,25%, чтобы удерживать риски под контролем."
+        if per_trade > 0:
+            per_trade_txt = fmt_pct(per_trade)
+            risk_line += f" Минимум из настроек: {per_trade_txt}%."
+            if per_trade > adaptive_ceiling:
+                risk_line += " Лимит выше авто-диапазона — держи руку на пульсе."
+        else:
+            risk_line += " Дополнительный ручной лимит пока не задан."
 
         if loss_limit > 0:
             risk_line += f" Дневной лимит убытка: {fmt_pct(loss_limit)}%."
@@ -4268,6 +4272,10 @@ class GuardianBot:
         risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0))
         cash_only = bool(getattr(settings, "spot_cash_only", True))
 
+        adaptive_floor = 0.5
+        adaptive_ceiling = 2.0
+        adaptive_range_txt = f"{adaptive_floor:.2f}–{adaptive_ceiling:.2f}%"
+
         if open_notional <= 0:
             reserve_line = (
                 "Капитал свободен — сделки не открыты. "
@@ -4277,10 +4285,15 @@ class GuardianBot:
                 reserve_line += ", работаем без плеча."
             else:
                 reserve_line += ", при необходимости оператор может добавить плечо."
+            allocation_hint = (
+                f" Авто-аллокатор выдаёт {adaptive_range_txt} капитала на новую идею."
+            )
+            if risk_pct > 0:
+                allocation_hint += f" Минимум из настроек: {risk_pct:.2f}%."
             return (
                 reserve_line
-                + " На новую идею откладываем не более "
-                + f"{risk_pct:.2f}% капитала. Зафиксированная прибыль с начала сессии: "
+                + allocation_hint
+                + " Зафиксированная прибыль с начала сессии: "
                 + f"{realized:.2f} USDT."
             )
 
@@ -4310,8 +4323,10 @@ class GuardianBot:
 
         sizing_line = (
             "Новые сделки открываем небольшими частями:"
-            f" до {risk_pct:.2f}% капитала на одну идею,"
+            f" авто-аллокатор выделяет {adaptive_range_txt} капитала на идею."
         )
+        if risk_pct > 0:
+            sizing_line += f" Ручной минимум из настроек: {risk_pct:.2f}%."
         if cash_only:
             sizing_line += " работаем только на собственные средства."
         else:
@@ -4387,7 +4402,14 @@ class GuardianBot:
             getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0
         )
         cash_only = bool(getattr(settings, "spot_cash_only", True))
-        risk_line_parts = [f"Риск на сделку ограничен {risk_per_trade:.2f}% капитала"]
+        adaptive_floor = 0.5
+        adaptive_ceiling = 2.0
+        adaptive_range_txt = f"{adaptive_floor:.2f}–{adaptive_ceiling:.2f}%"
+        risk_line_parts = [
+            f"бот варьирует риск {adaptive_range_txt} капитала на сделку"
+        ]
+        if risk_per_trade > 0:
+            risk_line_parts.append(f"минимум по настройкам {risk_per_trade:.2f}%")
         risk_line_parts.append(f"резервируем в кэше не менее {reserve_pct:.1f}%")
         if daily_loss_limit > 0:
             risk_line_parts.append(f"дневной стоп по убытку {daily_loss_limit:.2f}%")
