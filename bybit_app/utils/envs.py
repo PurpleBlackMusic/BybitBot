@@ -7,6 +7,62 @@ CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
 from .paths import DATA_DIR, SETTINGS_FILE
 
+
+_SENSITIVE_FIELDS = {
+    "api_key",
+    "api_secret",
+    "api_key_mainnet",
+    "api_secret_mainnet",
+    "api_key_testnet",
+    "api_secret_testnet",
+    "telegram_token",
+    "telegram_chat_id",
+}
+
+_PLACEHOLDER_VALUES = {
+    "demo_key",
+    "demo_secret",
+    "your_key_here",
+    "your_secret_here",
+    "changeme",
+}
+
+
+class CredentialValidationError(RuntimeError):
+    """Raised when the runtime credentials are invalid or incomplete."""
+
+
+def _set_env_value(field: str, value: Any) -> None:
+    env_key = _ENV_MAP.get(field)
+    if env_key and value is not None:
+        os.environ[env_key] = str(value)
+
+
+def _propagate_alias(field: str, value: Any, *, testnet: Optional[bool]) -> None:
+    if testnet is None:
+        return
+    alias_field = None
+    if field == _network_field("api_key", testnet):
+        alias_field = "api_key"
+    elif field == _network_field("api_secret", testnet):
+        alias_field = "api_secret"
+    if alias_field:
+        _set_env_value(alias_field, value)
+
+
+def _apply_sensitive_update(field: str, value: Any, *, alias_network: Optional[bool] = None) -> None:
+    if value is None:
+        return
+    _set_env_value(field, value)
+    _propagate_alias(field, value, testnet=alias_network)
+
+
+def _is_placeholder(value: str) -> bool:
+    cleaned = value.strip()
+    if not cleaned:
+        return True
+    return cleaned.lower() in _PLACEHOLDER_VALUES
+
 _CACHE: dict[str, Any] = {
     "settings": None,
     "key": None,
@@ -272,10 +328,24 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out.update({k: v for k, v in b.items() if v is not None})
     return out
 
+
+def _scrub_sensitive(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not payload:
+        return {}
+    return {k: v for k, v in payload.items() if k not in _SENSITIVE_FIELDS}
+
+
 def _load_file() -> Dict[str, Any]:
     try:
         if SETTINGS_FILE.exists():
-            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            cleaned = _scrub_sensitive(payload)
+            if cleaned != payload:
+                SETTINGS_FILE.write_text(
+                    json.dumps(cleaned, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return cleaned
     except Exception:
         pass
     return {}
@@ -670,6 +740,7 @@ def update_settings(**kwargs) -> Settings:
         target_testnet = _coerce_bool(requested_testnet)
 
     updates: Dict[str, Any] = {}
+    sensitive_updates: Dict[str, Any] = {}
     explicit_dry_run = False
 
     for key, value in kwargs.items():
@@ -677,9 +748,26 @@ def update_settings(**kwargs) -> Settings:
             continue
 
         if key == "api_key":
-            updates[_network_field("api_key", target_testnet)] = value
+            field_name = _network_field("api_key", target_testnet)
+            sensitive_updates[field_name] = value
+            _apply_sensitive_update(field_name, value, alias_network=target_testnet)
         elif key == "api_secret":
-            updates[_network_field("api_secret", target_testnet)] = value
+            field_name = _network_field("api_secret", target_testnet)
+            sensitive_updates[field_name] = value
+            _apply_sensitive_update(field_name, value, alias_network=target_testnet)
+        elif key in {
+            "api_key_mainnet",
+            "api_secret_mainnet",
+            "api_key_testnet",
+            "api_secret_testnet",
+            "telegram_token",
+            "telegram_chat_id",
+        }:
+            sensitive_updates[key] = value
+            _apply_sensitive_update(key, value, alias_network=None)
+        elif key in _SENSITIVE_FIELDS:
+            sensitive_updates[key] = value
+            _apply_sensitive_update(key, value, alias_network=None)
         elif key == "dry_run":
             field_name = _network_field("dry_run", target_testnet)
             updates[field_name] = value
@@ -692,6 +780,7 @@ def update_settings(**kwargs) -> Settings:
             updates[key] = value
 
     current.update(updates)
+    current.update(sensitive_updates)
 
     dry_field = _network_field("dry_run", target_testnet)
     key_field = _network_field("api_key", target_testnet)
@@ -732,7 +821,11 @@ def update_settings(**kwargs) -> Settings:
     for legacy in ("api_key", "api_secret", "dry_run"):
         current.pop(legacy, None)
 
-    SETTINGS_FILE.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    persistable = {k: v for k, v in current.items() if k not in _SENSITIVE_FIELDS}
+    SETTINGS_FILE.write_text(
+        json.dumps(persistable, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     _invalidate_cache()
     try:
         from .bybit_api import clear_api_cache  # local import to avoid cycle
@@ -743,6 +836,37 @@ def update_settings(**kwargs) -> Settings:
     file_mtime = _current_file_mtime()
     env_sig = _env_signature(_read_env())
     return _set_cache(refreshed, _cache_key(file_mtime, env_sig))
+
+
+def validate_runtime_credentials(settings: Optional[Settings] = None) -> None:
+    """Ensure live trading credentials are present before enabling live mode."""
+
+    settings = settings or get_settings()
+    problems: list[str] = []
+
+    for network_flag, label in ((True, "Testnet"), (False, "Mainnet")):
+        if settings.get_dry_run(testnet=network_flag):
+            continue
+
+        key = settings.get_api_key(testnet=network_flag) or ""
+        secret = settings.get_api_secret(testnet=network_flag) or ""
+
+        missing_parts: list[str] = []
+        if _is_placeholder(key):
+            missing_parts.append("API key")
+        if _is_placeholder(secret):
+            missing_parts.append("API secret")
+
+        if missing_parts:
+            joined = " и ".join(missing_parts)
+            problems.append(f"{label}: отсутствует {joined}")
+
+    if problems:
+        detail = "; ".join(problems)
+        raise CredentialValidationError(
+            f"Недостаточно API ключей для live режима: {detail}."
+        )
+
 
 def creds_ok(s: Optional[Settings] = None) -> bool:
     if s is None:

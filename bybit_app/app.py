@@ -29,9 +29,21 @@ from bybit_app.utils.background import (
     get_guardian_state,
     get_ws_snapshot,
 )
-from bybit_app.utils.envs import active_api_key, active_api_secret, active_dry_run, get_settings
+from bybit_app.utils.envs import (
+    CredentialValidationError,
+    active_api_key,
+    active_api_secret,
+    active_dry_run,
+    get_settings,
+    validate_runtime_credentials,
+)
 
 safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
+try:
+    validate_runtime_credentials()
+except CredentialValidationError as cred_err:
+    st.warning(str(cred_err))
+
 ensure_background_services()
 auto_refresh(20, key="home_auto_refresh")
 
