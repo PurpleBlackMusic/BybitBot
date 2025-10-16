@@ -486,6 +486,72 @@ def test_scan_market_opportunities_uses_api_fee_rate(
     )
 
 
+def test_scan_market_opportunities_filters_low_ev(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot_rows = [
+        {
+            "symbol": "LOWEVUSDT",
+            "turnover24h": 5_000_000.0,
+            "price24hPcnt": 0.006,
+            "bestBidPrice": 10.0,
+            "bestAskPrice": 10.0005,
+            "volume24h": 750_000.0,
+        },
+        {
+            "symbol": "HIGHEVUSDT",
+            "turnover24h": 5_000_000.0,
+            "price24hPcnt": 0.012,
+            "bestBidPrice": 5.0,
+            "bestAskPrice": 5.001,
+            "volume24h": 750_000.0,
+        },
+    ]
+
+    _write_snapshot(tmp_path, snapshot_rows)
+
+    def fake_feature_bundle(raw: dict[str, object]) -> dict[str, object]:
+        change = float(raw.get("price24hPcnt", 0.0) or 0.0)
+        return {
+            "blended_change_pct": change,
+            "volatility_pct": 1.0,
+            "volatility_windows": {},
+            "volume_spike_score": 0.0,
+            "volume_impulse": {},
+            "depth_imbalance": 0.0,
+            "correlations": {},
+            "correlation_strength": 0.0,
+        }
+
+    monkeypatch.setattr(market_scanner_module, "build_feature_bundle", fake_feature_bundle)
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+    monkeypatch.setattr(market_scanner_module, "fee_rate_for_symbol", lambda *_, **__: None)
+
+    settings = Settings(
+        testnet=False,
+        ai_live_only=False,
+        ai_fee_bps=0.0,
+        ai_slippage_bps=0.0,
+        ai_min_ev_bps=80.0,
+        spot_tp_fee_guard_bps=0.0,
+    )
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        limit=5,
+        min_turnover=0.0,
+        min_change_pct=0.05,
+        max_spread_bps=500.0,
+        settings=settings,
+        testnet=False,
+    )
+
+    symbols = [entry["symbol"] for entry in opportunities]
+    assert symbols == ["HIGHEVUSDT"]
+    assert opportunities[0]["ev_bps"] >= settings.ai_min_ev_bps
+
+
 def test_training_dataset_prorates_fee_for_oversized_sell(tmp_path: Path) -> None:
     state = ai_models._SymbolState()
     timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)

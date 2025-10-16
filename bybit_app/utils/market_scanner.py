@@ -870,6 +870,11 @@ def scan_market_opportunities(
     if testnet_active and min_turnover > 50_000.0:
         min_turnover = 50_000.0
 
+    min_ev_bps_threshold = max(
+        _safe_setting_float(settings, "ai_min_ev_bps", 0.0),
+        0.0,
+    )
+
     effective_change = float(min_change_pct) if min_change_pct is not None else 0.5
     if effective_change < 0.05:
         effective_change = 0.05
@@ -1173,6 +1178,24 @@ def scan_market_opportunities(
         else:
             ev_bps = None
             total_cost_bps = total_cost_bps if total_cost_bps > 0 else 0.0
+
+        if not force_include and min_ev_bps_threshold > 0.0:
+            if ev_bps is None:
+                log(
+                    "market_scanner.filter.ev_threshold",
+                    symbol=symbol,
+                    reason="missing_ev",
+                    min_ev_bps=min_ev_bps_threshold,
+                )
+                continue
+            if ev_bps < min_ev_bps_threshold:
+                log(
+                    "market_scanner.filter.ev_threshold",
+                    symbol=symbol,
+                    ev_bps=ev_bps,
+                    min_ev_bps=min_ev_bps_threshold,
+                )
+                continue
 
         note_parts: List[str] = []
         if change_pct is not None:
