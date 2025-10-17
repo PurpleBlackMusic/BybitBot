@@ -6,7 +6,6 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import os
-import copy
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path

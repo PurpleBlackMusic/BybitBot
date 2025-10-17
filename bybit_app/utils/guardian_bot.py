@@ -116,6 +116,7 @@ class GuardianBot:
         self._settings = settings
         self._custom_settings = settings is not None
         self._last_status: Dict[str, object] = {}
+        self._last_raw_status: Dict[str, object] = {}
         self._snapshot: Optional[GuardianSnapshot] = None
         self._ledger_signature: Optional[int] = None
         self._ledger_view: Optional[GuardianLedgerView] = None
@@ -292,8 +293,12 @@ class GuardianBot:
         return fetcher
 
     def _should_use_live_status(self, status: Dict[str, object]) -> bool:
-        if not status:
+        live_only = bool(getattr(self.settings, "ai_live_only", False))
+        if live_only:
             return True
+
+        if not status:
+            return False
 
         source = str(status.get("source") or "").lower()
         if source in {"demo", "seed", "demo_signal"}:
@@ -605,8 +610,8 @@ class GuardianBot:
             else:
                 read_error = "status file not found"
 
-            if not raw and self._last_status:
-                raw = copy.deepcopy(self._last_status)
+            if not raw and self._last_raw_status:
+                raw = copy.deepcopy(self._last_raw_status)
                 fallback_used = True
                 status_source = "cached"
                 if content_hash is None:
@@ -1324,7 +1329,8 @@ class GuardianBot:
         if universe_set:
             allowed_symbols = set(universe_set)
             allowed_symbols.update(whitelist_seen)
-            filtered_entries = []
+            filtered_entries: List[Dict[str, object]] = []
+            removed_entries: List[Dict[str, object]] = []
             for entry in opportunities:
                 symbol_value = entry.get("symbol")
                 if not isinstance(symbol_value, str):
@@ -1332,7 +1338,19 @@ class GuardianBot:
                 symbol_key = symbol_value.strip().upper()
                 if symbol_key in allowed_symbols:
                     filtered_entries.append(entry)
+                else:
+                    removed_entries.append(entry)
             if filtered_entries:
+                if removed_entries and len(filtered_entries) < limit_hint:
+                    extras = [
+                        entry
+                        for entry in removed_entries
+                        if bool(entry.get("actionable"))
+                        or bool(entry.get("source"))
+                    ]
+                    if extras:
+                        room = max(limit_hint - len(filtered_entries), 0)
+                        filtered_entries.extend(extras[:room])
                 opportunities = filtered_entries
         return opportunities
 
@@ -2788,8 +2806,11 @@ class GuardianBot:
         prefetched_hash: Optional[int] = None,
     ) -> GuardianSnapshot:
         previous_snapshot = self._snapshot
-        status = self._load_status(prefetched=prefetched_status, prefetched_hash=prefetched_hash)
-        self._last_status = status
+        status = self._load_status(
+            prefetched=prefetched_status, prefetched_hash=prefetched_hash
+        )
+        has_raw_status = bool(status)
+        self._last_raw_status = copy.deepcopy(status) if has_raw_status else {}
         ledger_view = self._ledger_view_for_signature(signature[1])
         portfolio = ledger_view.portfolio
         settings = self.settings
@@ -2858,6 +2879,7 @@ class GuardianBot:
             settings,
             self._status_fallback_used,
             context,
+            has_status=has_raw_status,
         )
 
         recent_trades = list(ledger_view.recent_trades)
@@ -2894,6 +2916,8 @@ class GuardianBot:
         )
         if self._status_fallback_used and previous_snapshot is not None:
             status_signature = previous_snapshot.status_signature
+
+        self._last_status = copy.deepcopy(status) if status else {}
 
         return GuardianSnapshot(
             status=status,
@@ -2965,6 +2989,8 @@ class GuardianBot:
         settings: Settings,
         fallback_used: bool,
         context: Optional[Dict[str, object]] = None,
+        *,
+        has_status: Optional[bool] = None,
     ) -> Dict[str, object]:
         context = context or self._derive_signal_context(status, settings)
         probability = float(context.get("probability") or 0.0)
@@ -3058,7 +3084,7 @@ class GuardianBot:
                 "exit_sell_probability_pct": round(exit_sell_threshold * 100.0, 2),
                 "min_ev_bps": round(min_ev, 2),
             },
-            "has_status": bool(status),
+            "has_status": bool(status) if has_status is None else bool(has_status),
             "fallback_used": bool(fallback_used),
             "status_source": self._status_source
             if self._status_source
