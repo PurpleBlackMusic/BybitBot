@@ -32,6 +32,7 @@ from bybit_app.utils.market_scanner import (
     scan_market_opportunities,
     _CandleCache,
 )
+from bybit_app.utils.freqai.store import FreqAIPredictionStore
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
 from bybit_app.utils.trade_analytics import ExecutionRecord
@@ -1099,6 +1100,88 @@ def test_weighted_model_sorts_by_risk_features(tmp_path: Path) -> None:
     assert opportunities[0]["probability"] > opportunities[-1]["probability"]
 
 
+def test_freqai_predictions_override_probabilities(tmp_path: Path) -> None:
+    rows = [
+        _sample_row("ALPHAUSDT", change_24h=1.2),
+        _sample_row("BETAUSDT", change_24h=0.8),
+    ]
+    _write_snapshot(tmp_path, rows)
+
+    store = FreqAIPredictionStore(data_dir=tmp_path)
+    store.update(
+        {
+            "generated_at": 1700000000.0,
+            "source": "freqtrade",
+            "predictions": {
+                "ALPHAUSDT": {"probability": 0.81, "ev_bps": 210.0, "confidence": 0.9}
+            },
+        }
+    )
+
+    settings = Settings(
+        testnet=False,
+        ai_min_ev_bps=0.0,
+        ai_min_top_quote_usd=0.0,
+        ai_min_top_quote_ratio=0.0,
+        ai_min_turnover_usd=0.0,
+        ai_min_turnover_ratio=0.0,
+    )
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=1000.0,
+        min_change_pct=0.1,
+        max_spread_bps=120.0,
+        settings=settings,
+    )
+
+    assert opportunities
+    leader = next(entry for entry in opportunities if entry["symbol"] == "ALPHAUSDT")
+    assert pytest.approx(leader["probability"], rel=1e-6) == 0.81
+    assert pytest.approx(leader["ev_bps"], rel=1e-6) == 210.0
+    assert leader.get("freqai", {}).get("source") == "freqtrade"
+    assert leader.get("probability_source") == "freqtrade"
+    assert leader["model_metrics"].get("freqai_override")
+
+
+def test_freqai_prediction_path_override_used(tmp_path: Path) -> None:
+    rows = [
+        _sample_row("THETAUSDT", change_24h=1.5),
+        _sample_row("OMEGAUSDT", change_24h=0.4),
+    ]
+    _write_snapshot(tmp_path, rows)
+
+    custom_relative = "custom/freqai_predictions.json"
+    store = FreqAIPredictionStore(data_dir=tmp_path, predictions_path=custom_relative)
+    store.update(
+        {
+            "generated_at": 1700000200.0,
+            "predictions": {"THETAUSDT": {"probability": 0.77, "ev_bps": 185.0}},
+        }
+    )
+
+    settings = Settings(
+        testnet=False,
+        ai_min_ev_bps=0.0,
+        ai_min_top_quote_usd=0.0,
+        ai_min_top_quote_ratio=0.0,
+        ai_min_turnover_usd=0.0,
+        ai_min_turnover_ratio=0.0,
+        freqai_prediction_path=custom_relative,
+    )
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_turnover=1_000.0,
+        min_change_pct=0.1,
+        settings=settings,
+    )
+
+    assert opportunities
+    theta = next(entry for entry in opportunities if entry["symbol"] == "THETAUSDT")
+    assert pytest.approx(theta["probability"], rel=1e-6) == 0.77
+    assert pytest.approx(theta["ev_bps"], rel=1e-6) == 185.0
 def test_market_scanner_uses_network_specific_snapshot(tmp_path: Path) -> None:
     mainnet_rows = [
         {

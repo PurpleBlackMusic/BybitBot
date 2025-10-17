@@ -1,0 +1,47 @@
+{
+  "dry_run": true,
+  "dry_run_wallet": 1000,
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "tradable_balance_ratio": 0.85,
+  "timeframe": "5m",
+  "max_open_trades": 5,
+  "entry_pricing": {
+    "price_side": "ask",
+    "use_order_book": true,
+    "order_book_top": 5
+  },
+  "exit_pricing": {
+    "price_side": "bid",
+    "use_order_book": true,
+    "order_book_top": 5
+  },
+  "exchange": {
+    "name": "bybit",
+    "key": "CHANGE_ME",
+    "secret": "CHANGE_ME",
+    "ccxt_config": {
+      "enableRateLimit": true
+    },
+    "pair_whitelist": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT"
+    ]
+  },
+  "telegram": {
+    "enabled": false
+  },
+  "freqai": {
+    "enabled": true,
+    "feature_source": "custom",
+    "feature_script": "freqai/data_providers/bybitbot_features.py",
+    "feature_url": "http://host.docker.internal:8099/features",
+    "prediction_url": "http://host.docker.internal:8099/predictions",
+    "train_cron": "0 4 * * *",
+    "predict_interval_min": 5,
+    "top_n_signals": 5,
+    "model_repository": "user_data/freqai_models",
+    "training_period_days": 30
+  }
+}

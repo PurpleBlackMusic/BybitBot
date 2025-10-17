@@ -10,3 +10,6 @@ python-dotenv>=1.0.0
 pydantic>=1.10.0
 pyarrow==16.1.0
 tenacity>=8.2.0
+fastapi>=0.103.0,<0.110.0
+uvicorn>=0.23.0,<0.26.0
+httpx>=0.24.0,<0.27.0
