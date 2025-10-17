@@ -106,6 +106,31 @@ def _safe_float(value: object, default: float | None = 0.0) -> float | None:
         return default
 
 
+def _normalise_tone(value: object) -> str:
+    if not isinstance(value, str):
+        return "warning"
+    tone = value.strip().lower()
+    mapping = {
+        "critical": "danger",
+        "danger": "danger",
+        "error": "danger",
+        "severe": "danger",
+        "warn": "warning",
+        "warning": "warning",
+        "caution": "warning",
+        "info": "info",
+        "information": "info",
+        "notice": "info",
+        "success": "success",
+        "ok": "success",
+    }
+    return mapping.get(tone, "warning")
+
+
+def _tone_priority(tone: str) -> int:
+    return {"danger": 0, "warning": 1, "info": 2, "success": 3}.get(tone, 1)
+
+
 def _normalise_brief(raw: Mapping[str, object] | None) -> dict[str, object]:
     if not isinstance(raw, Mapping):
         raw = {}
@@ -475,29 +500,6 @@ def collect_user_actions(
         joiner = " " if primary.endswith((".", "!", "?", ":", "—", "-", "–")) else " · "
         return f"{primary}{joiner}{extra}".strip()
 
-    def _normalise_tone(value: object) -> str:
-        if not isinstance(value, str):
-            return "warning"
-        tone = value.strip().lower()
-        mapping = {
-            "critical": "danger",
-            "danger": "danger",
-            "error": "danger",
-            "severe": "danger",
-            "warn": "warning",
-            "warning": "warning",
-            "caution": "warning",
-            "info": "info",
-            "information": "info",
-            "notice": "info",
-            "success": "success",
-            "ok": "success",
-        }
-        return mapping.get(tone, "warning")
-
-    def _tone_priority(tone: str) -> int:
-        return {"danger": 0, "warning": 1, "info": 2, "success": 3}.get(tone, 1)
-
     def _merge_action(existing: dict[str, object], incoming: dict[str, object]) -> None:
         existing_priority = existing.get("priority", 1)
         incoming_priority = incoming.get("priority", 1)
@@ -853,8 +855,25 @@ def render_data_health(health: dict[str, dict[str, object]] | None) -> None:
             info = health.get(key, {})
             if not info:
                 continue
-            tone = "success" if info.get("ok") else "warning"
-            icon = "✅" if info.get("ok") else "⚠️"
+            ok = bool(info.get("ok"))
+            tone_candidates = [
+                _normalise_tone(info.get(field))
+                for field in ("tone", "severity", "status", "level")
+                if info.get(field) is not None
+            ]
+            if ok:
+                tone = "success"
+            else:
+                tone = (
+                    min(tone_candidates, key=_tone_priority)
+                    if tone_candidates
+                    else _normalise_tone(None)
+                )
+                if tone == "success":
+                    tone = "warning"
+            if tone not in {"success", "warning", "danger"}:
+                tone = "warning" if not ok else "success"
+            icon = {"success": "✅", "warning": "⚠️", "danger": "⛔"}.get(tone, "⚠️")
             title = info.get("title", key)
             message = info.get("message", "")
             cards.append((title, message, icon, tone))
