@@ -77,7 +77,7 @@ def min_change_from_ev_bps(min_ev_bps: float, *, floor: float) -> float:
 
     if min_ev_bps <= 0.0:
         return floor
-    return max(min_ev_bps / 10_000.0, floor)
+    return max(min_ev_bps / 100.0, floor)
 
 
 def resolve_min_ev_from_settings(settings: Any, *, default_bps: float) -> float:
