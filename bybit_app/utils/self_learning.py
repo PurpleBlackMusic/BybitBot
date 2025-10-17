@@ -225,6 +225,14 @@ def maybe_retrain_market_model(
         )
     except Exception as exc:  # pragma: no cover - defensive logging
         log("market_model.retrain.error", err=str(exc))
+        log(
+            "market_model.retrain.fallback",
+            severity="warning",
+            reason="training_failed",
+            using_cached_model=model is not None,
+            previous_trained_at=getattr(model, "trained_at", None),
+            previous_samples=getattr(model, "samples", None),
+        )
         return state or None
 
     if trained is None:
@@ -236,7 +244,7 @@ def maybe_retrain_market_model(
         )
         return state or None
 
-    metrics = trained.metrics or {}
+    metrics = dict(getattr(trained, "training_metrics", {}) or {})
     new_state = {
         "last_retrain_ts": now_ts,
         "samples": trained.samples,
