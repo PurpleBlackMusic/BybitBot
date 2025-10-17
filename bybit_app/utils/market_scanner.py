@@ -1720,6 +1720,21 @@ def scan_market_opportunities(
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             _log_data_warning(symbol, "missing_orderbook", bid=bid, ask=ask)
 
+        if (
+            not force_include
+            and (
+                turnover is None
+                or turnover <= 0
+                or volume is None
+                or volume <= 0
+                or bid is None
+                or bid <= 0
+                or ask is None
+                or ask <= 0
+            )
+        ):
+            continue
+
         if total_turnover_usd > 0 and turnover is not None and turnover > 0:
             market_dominance_pct: Optional[float] = (turnover / total_turnover_usd) * 100.0
         else:

@@ -5857,6 +5857,11 @@ class SignalExecutor:
         summary_meta: Optional[Tuple[Optional[float], Optional[float]]],
         price_meta: Optional[Tuple[Optional[float], Optional[float]]],
     ) -> Optional[ExecutionResult]:
+        guard = self._loss_streak_guard(settings)
+        if guard is not None:
+            message, context = guard
+            return self._decision("disabled", reason=message, context=context)
+
         guard = self._portfolio_loss_guard(
             settings,
             summary,
@@ -5874,6 +5879,70 @@ class SignalExecutor:
             message, context = guard
             return self._decision("disabled", reason=message, context=context)
         return None
+
+    def _loss_streak_guard(self, settings: Settings) -> Optional[Tuple[str, Dict[str, object]]]:
+        try:
+            threshold = int(getattr(settings, "ai_kill_switch_loss_streak", 0) or 0)
+        except (TypeError, ValueError):
+            threshold = 0
+
+        if threshold <= 0:
+            return None
+
+        snapshot = self._performance_state
+        if snapshot is None or snapshot.loss_streak < threshold:
+            return None
+
+        context: Dict[str, object] = {
+            "guard": "loss_streak_limit",
+            "loss_streak": snapshot.loss_streak,
+            "threshold": threshold,
+            "recent_results": snapshot.recent_results(),
+            "average_pnl": snapshot.average_pnl,
+            "sample_count": snapshot.sample_count,
+            "last_exit_ts": snapshot.last_exit_ts,
+        }
+
+        try:
+            cooldown_minutes = float(
+                getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            cooldown_minutes = 0.0
+
+        kill_until = None
+        if cooldown_minutes > 0.0:
+            reason = (
+                "Серия убыточных сделок достигла лимита: {loss_streak} подряд."
+            ).format(loss_streak=snapshot.loss_streak)
+            kill_until = activate_kill_switch(cooldown_minutes, reason)
+            context["kill_switch_until"] = kill_until
+
+        log(
+            "guardian.auto.guard.loss_streak",
+            loss_streak=snapshot.loss_streak,
+            threshold=threshold,
+            sample_count=snapshot.sample_count,
+            average_pnl=round(snapshot.average_pnl, 6),
+        )
+
+        message = (
+            "Серия из {loss_streak} убыточных сделок подряд достигла лимита {threshold} —"
+            " автоматика приостановлена"
+        ).format(loss_streak=snapshot.loss_streak, threshold=threshold)
+
+        if kill_until:
+            try:
+                resume_at = datetime.fromtimestamp(kill_until, tz=timezone.utc).strftime(
+                    "%H:%M:%S UTC"
+                )
+            except (OSError, ValueError):
+                resume_at = None
+            else:
+                message += f". Kill-switch активирован до {resume_at}."
+
+        context["message"] = message
+        return message, context
 
     def _kill_switch_guard(self) -> Optional[Tuple[str, Dict[str, object]]]:
         state = kill_switch_state()
@@ -6546,9 +6615,9 @@ class SignalExecutor:
         except (TypeError, ValueError):
             reserve_pct = 0.0
 
-        # Минимальный страховой буфер 2% помогает избежать отмен из-за комиссий
-        # и мелких движений цены даже если пользователь указал более низкое значение
-        reserve_pct = max(reserve_pct, 2.0)
+        # Запрет отрицательного значения, но даём возможность использовать весь капитал
+        # если пользователь явно указал 0% резервного буфера.
+        reserve_pct = max(reserve_pct, 0.0)
 
         try:
             risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)

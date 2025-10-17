@@ -197,9 +197,6 @@ class LiveSignalFetcher:
             min_ev_bps, floor=MIN_EV_CHANGE_PCT_FLOOR
         )
 
-        whitelist = _parse_symbol_list(getattr(settings, "ai_whitelist", "")) or None
-        blacklist = _parse_symbol_list(getattr(settings, "ai_blacklist", "")) or None
-
         try:
             limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0)
         except Exception:
@@ -209,6 +206,47 @@ class LiveSignalFetcher:
             limit_hint = 10
         else:
             limit_hint = min(max(limit_hint * 2, 5), 50)
+
+        whitelist = _parse_symbol_list(getattr(settings, "ai_whitelist", "")) or None
+        blacklist = _parse_symbol_list(getattr(settings, "ai_blacklist", "")) or None
+
+        universe: list[str] = []
+        if not whitelist:
+            try:
+                universe = load_universe(quote_assets=("USDT",))
+            except Exception:
+                universe = []
+
+            if not universe and api is not None:
+                try:
+                    size_hint = max(limit_hint * 2, 40)
+                    universe = list(
+                        build_universe(
+                            api,
+                            size=size_hint,
+                            quote_assets=("USDT",),
+                            persist=False,
+                        )
+                    )
+                except Exception:
+                    universe = []
+
+            if universe:
+                whitelist = universe
+
+        if not whitelist:
+            whitelist = [
+                "BTCUSDT",
+                "ETHUSDT",
+                "SOLUSDT",
+                "BNBUSDT",
+                "XRPUSDT",
+                "DOGEUSDT",
+                "ADAUSDT",
+                "TONUSDT",
+                "LINKUSDT",
+                "LTCUSDT",
+            ]
 
         testnet = bool(getattr(settings, "testnet", False))
 

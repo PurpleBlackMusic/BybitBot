@@ -21,6 +21,7 @@ from bybit_app.utils.signal_executor import (
     SignalExecutor,
 )
 from bybit_app.utils.ai.kill_switch import KillSwitchState
+from bybit_app.utils.self_learning import TradePerformanceSnapshot
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     SpotTradeSnapshot,
@@ -1134,6 +1135,23 @@ def test_signal_executor_relaxes_reserve_for_minimum_buy(
     assert result.context.get("usable_after_reserve") == pytest.approx(4.5)
     assert result.order is not None
     assert result.order.get("notional_quote") == pytest.approx(5.0)
+
+
+def test_compute_notional_allows_zero_reserve() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(ai_enabled=True, spot_cash_reserve_pct=0.0, ai_risk_per_trade_pct=5.0)
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    notional, usable_after_reserve, reserve_relaxed, _ = executor._compute_notional(
+        settings,
+        total_equity=100.0,
+        available_equity=100.0,
+    )
+
+    assert usable_after_reserve == pytest.approx(100.0)
+    assert reserve_relaxed is False
+    assert notional == pytest.approx(5.0)
 
 
 def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
@@ -5969,6 +5987,47 @@ def test_portfolio_loss_guard_triggers_kill_switch(
     assert context.get("loss_percent") == pytest.approx(2.5)
     assert captured.get("minutes") == pytest.approx(15.0)
     assert context.get("kill_switch_until") == pytest.approx(1700000000.0)
+
+
+def test_loss_streak_guard_triggers_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_kill_switch_loss_streak=3,
+        ai_kill_switch_cooldown_min=30.0,
+    )
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    snapshot = TradePerformanceSnapshot(
+        results=(-1, -1, -1),
+        win_streak=0,
+        loss_streak=3,
+        realised_sum=-15.0,
+        average_pnl=-5.0,
+        sample_count=3,
+        last_exit_ts=1700.0,
+        window_ms=86_400_000,
+    )
+    executor._performance_state = snapshot
+
+    captured: Dict[str, object] = {}
+
+    def fake_set_pause(minutes: float, reason: str) -> float:
+        captured["minutes"] = minutes
+        captured["reason"] = reason
+        return 1700000500.0
+
+    monkeypatch.setattr(signal_executor_module, "activate_kill_switch", fake_set_pause)
+
+    guard = executor._loss_streak_guard(settings)
+    assert guard is not None
+    message, context = guard
+    assert "Серия" in message
+    assert context.get("guard") == "loss_streak_limit"
+    assert context.get("loss_streak") == 3
+    assert captured.get("minutes") == pytest.approx(30.0)
+    assert context.get("kill_switch_until") == pytest.approx(1700000500.0)
 
 
 def test_kill_switch_guard_reports_active_pause(monkeypatch: pytest.MonkeyPatch) -> None:
