@@ -801,6 +801,46 @@ def _normalised_turnover(value: Optional[float]) -> float:
     return float(value) / TURNOVER_AVG_TRADES_PER_DAY
 
 
+def _infer_volume_from_turnover(
+    turnover: Optional[float],
+    bid: Optional[float],
+    ask: Optional[float],
+) -> Optional[float]:
+    """Best-effort volume estimate when exchanges omit the explicit field.
+
+    Some Bybit spot endpoints omit ``volume24h`` in lightweight snapshots while
+    keeping ``turnover24h`` populated.  A number of callers – including the
+    market scanner tests – rely on the scanner tolerating these partial payloads.
+    We infer an approximate base volume from the turnover and current bid/ask
+    prices so the downstream feature builders can continue to operate.
+    """
+
+    if turnover is None or turnover <= 0:
+        return None
+
+    price_candidates = [
+        float(value)
+        for value in (bid, ask)
+        if isinstance(value, (int, float)) and float(value) > 0.0
+    ]
+    if not price_candidates:
+        return None
+
+    average_price = sum(price_candidates) / len(price_candidates)
+    if average_price <= 0:
+        return None
+
+    try:
+        estimate = float(turnover) / average_price
+    except (TypeError, ValueError, ZeroDivisionError):  # pragma: no cover - defensive
+        return None
+
+    if not math.isfinite(estimate) or estimate <= 0:
+        return None
+
+    return estimate
+
+
 def _score_turnover(turnover: Optional[float]) -> float:
     normalised = _normalised_turnover(turnover)
     return liquidity_feature(normalised)
@@ -1711,12 +1751,27 @@ def scan_market_opportunities(
                 "missing_turnover",
                 raw_turnover=raw.get("turnover24h"),
             )
-        if volume is None or volume <= 0:
-            _log_data_warning(
-                symbol,
-                "missing_volume",
-                raw_volume=raw.get("volume24h"),
-            )
+        volume_missing = volume is None or volume <= 0
+        if volume_missing:
+            inferred_volume = _infer_volume_from_turnover(turnover, bid, ask)
+            if inferred_volume is not None:
+                volume = inferred_volume
+                raw["volume24h"] = inferred_volume
+                _log_data_warning(
+                    symbol,
+                    "inferred_volume",
+                    turnover=turnover,
+                    bid=bid,
+                    ask=ask,
+                    inferred=inferred_volume,
+                )
+                volume_missing = False
+            else:
+                _log_data_warning(
+                    symbol,
+                    "missing_volume",
+                    raw_volume=raw.get("volume24h"),
+                )
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             _log_data_warning(symbol, "missing_orderbook", bid=bid, ask=ask)
 
@@ -1725,8 +1780,7 @@ def scan_market_opportunities(
             and (
                 turnover is None
                 or turnover <= 0
-                or volume is None
-                or volume <= 0
+                or volume_missing
                 or bid is None
                 or bid <= 0
                 or ask is None
