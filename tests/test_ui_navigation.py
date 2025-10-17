@@ -64,3 +64,31 @@ def test_navigation_link_falls_back_when_page_is_missing(monkeypatch, streamlit_
     assert calls["button"] == 1
     assert calls["caption"] == 1
     assert session_state["_bybit_nav_hint_shown"] is True
+
+
+def test_navigation_link_uses_custom_key_in_button_fallback(monkeypatch, streamlit_ctx):
+    calls = {"button_key": None}
+
+    def fake_page_link(*args, **kwargs):
+        raise ui.StreamlitAPIException("missing page")
+
+    def fake_button(label, key=None):
+        calls["button_key"] = key
+        return False
+
+    monkeypatch.setattr(ui.st, "page_link", fake_page_link, raising=False)
+    monkeypatch.setattr(ui.st, "button", fake_button, raising=False)
+    monkeypatch.setattr(ui, "get_query_params", lambda: {})
+    monkeypatch.setattr(ui, "set_query_params", lambda params: None)
+    monkeypatch.setattr(ui, "rerun", lambda: None)
+
+    session_state: dict[str, bool] = {}
+    monkeypatch.setattr(ui.st, "session_state", session_state, raising=False)
+
+    ui.navigation_link(
+        "pages/02_⚙️_Настройки.py",
+        label="Настройки",
+        key="custom_nav_key",
+    )
+
+    assert calls["button_key"] == "custom_nav_key"
