@@ -63,9 +63,18 @@ def test_pair_trades_allocates_buy_fees_proportionally(pnl_dir: Path):
 
     assert first["qty"] == pytest.approx(4)
     assert first["fees"] == pytest.approx(2.2)
+    assert first["entry_value"] == pytest.approx(400)
+    assert first["exit_value"] == pytest.approx(440)
+    assert first["gross_pnl"] == pytest.approx(40)
+    assert first["net_pnl"] == pytest.approx(37.8)
+    assert first["slippage_bps"] is None
 
     assert second["qty"] == pytest.approx(3)
     assert second["fees"] == pytest.approx(1.8)
+    assert second["entry_value"] == pytest.approx(300)
+    assert second["exit_value"] == pytest.approx(360)
+    assert second["gross_pnl"] == pytest.approx(60)
+    assert second["net_pnl"] == pytest.approx(58.2)
 
     remaining_fee = trade_pairs._read_jsonl(trade_pairs.TRD)
     assert remaining_fee == trades
@@ -106,6 +115,10 @@ def test_pair_trades_preserves_fee_signs(pnl_dir: Path) -> None:
     trade = trades[0]
 
     assert trade["fees"] == pytest.approx(-0.07)
+    assert trade["entry_value"] == pytest.approx(10)
+    assert trade["exit_value"] == pytest.approx(11)
+    assert trade["gross_pnl"] == pytest.approx(1)
+    assert trade["net_pnl"] == pytest.approx(1.07)
 
 
 def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
@@ -145,9 +158,12 @@ def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
 
     trades_a = trade_pairs.pair_trades()
     assert len(trades_a) == 1
+    assert trades_a[0]["gross_pnl"] == pytest.approx(5)
+    assert trades_a[0]["net_pnl"] == pytest.approx(4.95)
 
     stored_after_first = [json.loads(line) for line in trades_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(stored_after_first) == 1
+    assert stored_after_first[0]["net_pnl"] == pytest.approx(4.95)
 
     second_wave = [
         {
@@ -178,6 +194,8 @@ def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
 
     trades_b = trade_pairs.pair_trades()
     assert len(trades_b) == 2
+    assert trades_b[0]["net_pnl"] == pytest.approx(4.95)
+    assert trades_b[1]["net_pnl"] == pytest.approx(7.91)
 
     stored_after_second = [
         json.loads(line)
@@ -186,6 +204,9 @@ def test_pair_trades_appends_completed_trades(pnl_dir: Path) -> None:
     ]
     assert len(stored_after_second) == 2
     assert {row["orderLinkId"] for row in stored_after_second} == {"SOL-1", "SOL-2"}
+    net_values = {row["orderLinkId"]: row["net_pnl"] for row in stored_after_second}
+    assert net_values["SOL-1"] == pytest.approx(4.95)
+    assert net_values["SOL-2"] == pytest.approx(7.91)
 
     trade_pairs.pair_trades()
     stored_after_third = [
@@ -307,11 +328,65 @@ def test_pair_trades_prefers_matching_order_link_id(pnl_dir: Path):
     assert first["exit_vwap"] == pytest.approx(300)
     assert first["fees"] == pytest.approx(0.2 + 0.3)
     assert first["decision_mid"] == "mid-b"
+    assert first["gross_pnl"] == pytest.approx(100)
+    assert first["net_pnl"] == pytest.approx(99.5)
 
     assert second["entry_vwap"] == pytest.approx(100)
     assert second["exit_vwap"] == pytest.approx(150)
     assert second["fees"] == pytest.approx(0.1 + 0.15)
     assert second["decision_mid"] == "mid-a"
+    assert second["gross_pnl"] == pytest.approx(50)
+    assert second["net_pnl"] == pytest.approx(49.75)
+
+
+def test_pair_trades_calculates_slippage(pnl_dir: Path) -> None:
+    decisions = [
+        {"symbol": "BTCUSDT", "ts": 50, "orderLinkId": "BTC-1", "decision_mid": 100.0},
+        {"symbol": "BTCUSDT", "ts": 150, "orderLinkId": "BTC-1", "decision_mid": 105.0},
+    ]
+
+    executions = [
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "orderLinkId": "BTC-1",
+            "execTime": 100,
+            "execPrice": 101.0,
+            "execQty": 1,
+            "execFee": 0.05,
+        },
+        {
+            "category": "spot",
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "orderLinkId": "BTC-1",
+            "execTime": 200,
+            "execPrice": 104.0,
+            "execQty": 1,
+            "execFee": 0.04,
+        },
+    ]
+
+    (pnl_dir / "decisions.jsonl").write_text(
+        "\n".join(json.dumps(d) for d in decisions), encoding="utf-8"
+    )
+    (pnl_dir / "executions.testnet.jsonl").write_text(
+        "\n".join(json.dumps(ev) for ev in executions), encoding="utf-8"
+    )
+
+    trades = trade_pairs.pair_trades()
+
+    assert len(trades) == 1
+    trade = trades[0]
+
+    assert trade["entry_mid"] == pytest.approx(100.0)
+    assert trade["exit_mid"] == pytest.approx(105.0)
+    assert trade["entry_slippage_bps"] == pytest.approx(100.0)
+    assert trade["exit_slippage_bps"] == pytest.approx((104.0 / 105.0 - 1.0) * 10000.0)
+    assert trade["slippage_bps"] == trade["exit_slippage_bps"]
+    assert trade["gross_pnl"] == pytest.approx(3.0)
+    assert trade["net_pnl"] == pytest.approx(2.91)
 
 
 def test_pair_trades_discards_buys_outside_window(pnl_dir: Path):
@@ -394,6 +469,8 @@ def test_pair_trades_retains_recent_fill_when_pruning_stale_link(pnl_dir: Path):
     assert trade["qty"] == pytest.approx(1)
     assert trade["entry_vwap"] == pytest.approx(0.33)
     assert trade["fees"] == pytest.approx(0.000363 + 0.00048)
+    assert trade["gross_pnl"] == pytest.approx(0.4 - 0.33)
+    assert trade["net_pnl"] == pytest.approx((0.4 - 0.33) - (0.000363 + 0.00048))
 
     expected_hold = int(max(0, (12 * day - 9 * day) / 1000))
     assert trade["hold_sec"] == expected_hold

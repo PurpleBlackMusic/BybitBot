@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -326,6 +327,15 @@ def pair_trades(
         sl=None,
         rr=None,
         mid=None,
+        entry_mid=None,
+        exit_mid=None,
+        entry_value=None,
+        exit_value=None,
+        gross_pnl=None,
+        net_pnl=None,
+        entry_slippage_bps=None,
+        exit_slippage_bps=None,
+        aggregate_slippage_bps=None,
         link=None,
     ):
         if qty <= 0: return
@@ -346,13 +356,42 @@ def pair_trades(
             "entry_vwap": entry_vwap,
             "exit_vwap": exit_vwap,
             "fees": fees,
+            "entry_value": entry_value,
+            "exit_value": exit_value,
+            "gross_pnl": gross_pnl,
+            "net_pnl": net_pnl,
             "bps_realized": bps,
+            "slippage_bps": aggregate_slippage_bps,
+            "entry_slippage_bps": entry_slippage_bps,
+            "exit_slippage_bps": exit_slippage_bps,
             "r_mult": r_mult,
             "decision_mid": mid,
+            "entry_mid": entry_mid,
+            "exit_mid": exit_mid,
             "sl": sl,
             "rr": rr,
             "orderLinkId": link,
         })
+
+    def _coerce_float(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(numeric):
+            return None
+        return numeric
+
+    def _slippage_bps(price: object, reference: object) -> float | None:
+        price_value = _coerce_float(price)
+        reference_value = _coerce_float(reference)
+        if price_value is None or reference_value is None:
+            return None
+        if reference_value == 0:
+            return None
+        return (price_value / reference_value - 1.0) * 10000.0
 
     # индекс решений по символу
     dec_idx = {}
@@ -439,8 +478,13 @@ def pair_trades(
         if ctx_ts is not None and lot_ctx_ts is not None and ctx_ts < lot_ctx_ts:
             return
 
-        if "decision_mid" in context:
-            lot["mid"] = context["decision_mid"]
+        decision_mid = context.get("decision_mid")
+        if decision_mid is not None:
+            lot["mid"] = decision_mid
+            if require_link:
+                lot["exit_mid"] = decision_mid
+            else:
+                lot["entry_mid"] = decision_mid
         if "sl" in context:
             lot["sl"] = context["sl"]
         if "rr" in context:
@@ -644,6 +688,8 @@ def pair_trades(
                         "last_ts": ev["ts"],
                         "link": link,
                         "mid": None,
+                        "entry_mid": None,
+                        "exit_mid": None,
                         "sl": None,
                         "rr": None,
                         "fills": [fill],
@@ -710,17 +756,43 @@ def pair_trades(
                         sell_fee_used += sell_fee_share
 
                     fees = buy_fee_share + sell_fee_share
+                    exit_price = ev["px"]
+                    entry_value = entry_vwap * trade_qty
+                    exit_value = exit_price * trade_qty
+                    gross_pnl = exit_value - entry_value
+                    net_pnl = gross_pnl - fees
+
+                    entry_mid = lot.get("entry_mid")
+                    exit_mid = lot.get("exit_mid")
+
+                    entry_slippage_bps = _slippage_bps(entry_vwap, entry_mid)
+                    exit_slippage_bps = _slippage_bps(exit_price, exit_mid)
+                    aggregate_slippage_bps = (
+                        exit_slippage_bps
+                        if exit_slippage_bps is not None
+                        else entry_slippage_bps
+                    )
+
                     push_trade(
                         sym,
                         entry_ts,
                         ev["ts"],
                         entry_vwap,
-                        ev["px"],
+                        exit_price,
                         trade_qty,
                         fees,
                         sl=lot.get("sl"),
                         rr=lot.get("rr"),
                         mid=lot.get("mid"),
+                        entry_mid=entry_mid,
+                        exit_mid=exit_mid,
+                        entry_value=entry_value,
+                        exit_value=exit_value,
+                        gross_pnl=gross_pnl,
+                        net_pnl=net_pnl,
+                        entry_slippage_bps=entry_slippage_bps,
+                        exit_slippage_bps=exit_slippage_bps,
+                        aggregate_slippage_bps=aggregate_slippage_bps,
                         link=lot.get("link"),
                     )
 
