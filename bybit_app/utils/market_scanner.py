@@ -482,7 +482,10 @@ def _load_hourly_indicator_bundle(
 
     high_series = working.get("high")
     low_series = working.get("low")
-    recent_window = working.last(f"{max(_HOURLY_LOOKBACK_HOURS, 48)}H")
+    lookback_hours = max(_HOURLY_LOOKBACK_HOURS, 48)
+    end_ts = working.index[-1]
+    start_ts = end_ts - pd.Timedelta(hours=lookback_hours)
+    recent_window = working.loc[working.index >= start_ts]
     last_close = float(closes.iloc[-1])
     breakout = False
     breakdown = False
