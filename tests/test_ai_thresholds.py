@@ -25,8 +25,8 @@ def test_normalise_min_ev_bps_handles_invalid_and_negative() -> None:
 
 
 def test_min_change_from_ev_bps() -> None:
-    assert min_change_from_ev_bps(0.0, floor=0.0005) == 0.0005
-    assert math.isclose(min_change_from_ev_bps(12.0, floor=0.0005), 0.0012)
+    assert min_change_from_ev_bps(0.0, floor=0.05) == 0.05
+    assert math.isclose(min_change_from_ev_bps(12.0, floor=0.05), 0.12)
 
 
 def test_resolve_min_ev_from_settings() -> None:

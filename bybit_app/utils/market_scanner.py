@@ -41,7 +41,7 @@ from .paths import DATA_DIR
 from .market_features import build_feature_bundle
 
 
-MIN_EV_CHANGE_PCT_FLOOR = 0.0005  # 0.05%
+MIN_EV_CHANGE_PCT_FLOOR = 0.05  # 0.05%
 from .ohlcv import normalise_ohlcv_frame
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
