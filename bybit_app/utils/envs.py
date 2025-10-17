@@ -181,14 +181,14 @@ class Settings:
     ai_max_slippage_bps: int = 400
     ai_fee_bps: float = 15.0
     ai_slippage_bps: float = 10.0
-    ai_buy_threshold: float = 0.58
+    ai_buy_threshold: float = 0.52
     ai_sell_threshold: float = 0.42
     ai_daily_loss_limit_pct: float = 3.0
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
-    ai_min_ev_bps: float = 80.0
-    ai_signal_hysteresis: float = 0.04
+    ai_min_ev_bps: float = 12.0
+    ai_signal_hysteresis: float = 0.015
     ai_retrain_minutes: int = 10080
     ai_training_trade_limit: int = 400
     ai_max_concurrent: int = 3

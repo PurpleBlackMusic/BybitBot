@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from .ai_thresholds import (
+    min_change_from_ev_bps,
+    resolve_min_ev_from_settings,
+)
 from .envs import Settings, get_api_client, get_settings
-from .market_scanner import scan_market_opportunities
+from .market_scanner import MIN_EV_CHANGE_PCT_FLOOR, scan_market_opportunities
 from .paths import DATA_DIR
 
 
@@ -188,17 +192,10 @@ class LiveSignalFetcher:
         except (TypeError, ValueError):
             max_spread = 0.0
 
-        try:
-            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0)
-        except (TypeError, ValueError):
-            min_change_pct = 0.0
-
-        if min_change_pct <= 0:
-            min_change_pct = 0.5
-        else:
-            min_change_pct /= 100.0
-            if min_change_pct < 0.05:
-                min_change_pct = 0.05
+        min_ev_bps = resolve_min_ev_from_settings(settings, default_bps=12.0)
+        min_change_pct = min_change_from_ev_bps(
+            min_ev_bps, floor=MIN_EV_CHANGE_PCT_FLOOR
+        )
 
         whitelist = _parse_symbol_list(getattr(settings, "ai_whitelist", "")) or None
         blacklist = _parse_symbol_list(getattr(settings, "ai_blacklist", "")) or None
@@ -315,7 +312,7 @@ class LiveSignalFetcher:
         if analysis:
             status["analysis"] = analysis
 
-        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0), 0.0)
+        min_ev = resolve_min_ev_from_settings(settings, default_bps=12.0)
         if min_ev > 0:
             status["risk"] = {
                 "min_ev_bps": min_ev,
