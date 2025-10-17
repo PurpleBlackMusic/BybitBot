@@ -21,6 +21,7 @@ from bybit_app.utils.ui import (
     build_status_card,
     inject_css,
     navigation_link,
+    page_slug_from_path,
     safe_set_page_config,
     auto_refresh,
 )
@@ -133,19 +134,32 @@ def _normalise_brief(raw: Mapping[str, object] | None) -> dict[str, object]:
     }
 
 
-def render_navigation_grid(shortcuts: list[tuple[str, str, str]], *, columns: int = 2) -> None:
+def _normalise_key_fragment(value: str) -> str:
+    """Return a Streamlit-safe fragment for widget keys."""
+
+    fragment = re.sub(r"[^0-9a-zA-Z_]+", "_", value).strip("_")
+    return fragment or "page"
+
+
+def render_navigation_grid(
+    shortcuts: list[tuple[str, str, str]], *, columns: int = 2, key_prefix: str = "nav"
+) -> None:
     """Render navigation links in a compact grid layout."""
 
     if not shortcuts:
         return
 
+    prefix_fragment = _normalise_key_fragment(str(key_prefix))
+
     for idx in range(0, len(shortcuts), columns):
         row = shortcuts[idx : idx + columns]
         cols = st.columns(len(row))
-        for column, shortcut in zip(cols, row):
+        for column_offset, (column, shortcut) in enumerate(zip(cols, row)):
             label, page, description = shortcut
+            slug_fragment = _normalise_key_fragment(page_slug_from_path(page))
+            unique_key = f"{prefix_fragment}_{slug_fragment}_{idx + column_offset}"
             with column:
-                navigation_link(page, label=label)
+                navigation_link(page, label=label, key=unique_key)
                 st.caption(description)
 
 
@@ -838,7 +852,7 @@ def render_shortcuts() -> None:
         ),
     ]
 
-    render_navigation_grid(shortcuts, columns=3)
+    render_navigation_grid(shortcuts, columns=3, key_prefix="shortcuts")
 
 
 def render_data_health(health: dict[str, dict[str, object]] | None) -> None:
@@ -955,9 +969,9 @@ def render_hidden_tools() -> None:
         tab_titles = [title for title, _ in groups]
         tabs = st.tabs(tab_titles)
 
-        for tab, (_, items) in zip(tabs, groups):
+        for group_index, (tab, (_, items)) in enumerate(zip(tabs, groups)):
             with tab:
-                render_navigation_grid(items)
+                render_navigation_grid(items, key_prefix=f"hidden_{group_index}")
 
 
 def render_action_plan(
