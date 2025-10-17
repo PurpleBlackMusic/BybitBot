@@ -50,6 +50,10 @@ def test_model_features_layout() -> None:
         "depth_imbalance",
         "spread_bps",
         "correlation_strength",
+        "market_dominance_pct",
+        "correlation_btc",
+        "correlation_eth",
+        "social_trend_score",
     )
 
 
@@ -177,6 +181,37 @@ def test_market_model_predict_proba_handles_zero_std() -> None:
 
     assert math.isfinite(probability)
     assert 0.0 < probability <= 1.0
+
+
+def test_market_model_initialises_missing_scaler_state() -> None:
+    classifier = _WeightedLogisticRegression()
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("classifier", classifier),
+    ])
+
+    feature_count = len(MODEL_FEATURES)
+    classifier.classes_ = np.array([0, 1], dtype=int)
+    classifier.coef_ = np.zeros((1, feature_count), dtype=float)
+    classifier.intercept_ = np.zeros((1,), dtype=float)
+    classifier._constant_prob = None
+
+    model = MarketModel(
+        feature_names=MODEL_FEATURES,
+        pipeline=pipeline,
+        trained_at=0.0,
+        samples=0,
+    )
+
+    probability = model.predict_proba({name: 0.0 for name in MODEL_FEATURES})
+
+    assert math.isfinite(probability)
+    assert probability == pytest.approx(0.5)
+
+    scaler = pipeline.named_steps["scaler"]
+    assert isinstance(scaler, StandardScaler)
+    assert hasattr(scaler, "mean_")
+    assert scaler.n_features_in_ == feature_count
 
 
 def test_cross_sectional_weights_equalise_symbols() -> None:

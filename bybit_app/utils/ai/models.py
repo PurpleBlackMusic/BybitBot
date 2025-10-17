@@ -28,6 +28,10 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "depth_imbalance",
     "spread_bps",
     "correlation_strength",
+    "market_dominance_pct",
+    "correlation_btc",
+    "correlation_eth",
+    "social_trend_score",
 )
 
 
@@ -198,6 +202,31 @@ def _clone_step(step: object) -> object:
     return copy.deepcopy(step)
 
 
+def _ensure_pipeline_scaler(pipeline: "Pipeline", feature_count: int) -> None:
+    """Initialise the scaler step when loading legacy or partial models."""
+
+    if feature_count <= 0:
+        return
+
+    try:
+        scaler = pipeline.named_steps.get("scaler")  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - defensive fallback
+        return
+
+    if not isinstance(scaler, StandardScaler):
+        return
+
+    required = ("scale_", "mean_", "var_", "n_features_in_", "n_samples_seen_")
+    missing = any(not hasattr(scaler, attr) for attr in required)
+    mismatch = getattr(scaler, "n_features_in_", feature_count) != feature_count
+
+    if not missing and not mismatch:
+        return
+
+    fallback = np.zeros((1, feature_count), dtype=float)
+    scaler.fit(fallback)
+
+
 def clone_pipeline(pipeline: Pipeline) -> Pipeline:
     """Return a fresh copy of the provided pipeline."""
 
@@ -242,6 +271,8 @@ class MarketModel:
     def predict_proba(self, features: Mapping[str, float]) -> float:
         """Predict the probability for the provided feature mapping."""
 
+        feature_count = len(self.feature_names)
+        _ensure_pipeline_scaler(self.pipeline, feature_count)
         vector = np.array(
             [[float(features.get(name, 0.0)) for name in self.feature_names]],
             dtype=float,
