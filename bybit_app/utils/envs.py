@@ -187,6 +187,7 @@ class Settings:
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
+    ai_kill_switch_loss_streak: int = 0
     ai_min_ev_bps: float = 80.0
     ai_signal_hysteresis: float = 0.04
     ai_retrain_minutes: int = 10080
@@ -401,6 +402,7 @@ _ENV_MAP = {
     "ai_max_trade_loss_pct": "AI_MAX_TRADE_LOSS_PCT",
     "ai_portfolio_loss_limit_pct": "AI_PORTFOLIO_LOSS_LIMIT_PCT",
     "ai_kill_switch_cooldown_min": "AI_KILL_SWITCH_COOLDOWN_MIN",
+    "ai_kill_switch_loss_streak": "AI_KILL_SWITCH_LOSS_STREAK",
     "ai_min_ev_bps": "AI_MIN_EV_BPS",
     "ai_signal_hysteresis": "AI_SIGNAL_HYSTERESIS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
@@ -559,6 +561,10 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_kill_switch_cooldown_min"] = _cast_float(
         m.get("ai_kill_switch_cooldown_min")
     )
+    streak_limit = _cast_int(m.get("ai_kill_switch_loss_streak"))
+    if streak_limit is not None and streak_limit < 0:
+        streak_limit = 0
+    m["ai_kill_switch_loss_streak"] = streak_limit
     m["ai_min_ev_bps"] = _cast_float(m.get("ai_min_ev_bps"))
     hysteresis = _cast_float(m.get("ai_signal_hysteresis"))
     if hysteresis is not None:
