@@ -117,7 +117,8 @@ class BackgroundServices:
         if self._ws_private_stale_after <= 0:
             return True
 
-        deadline = time.time() + (
+        start_wait = time.time()
+        deadline = start_wait + (
             float(timeout)
             if isinstance(timeout, (int, float)) and float(timeout) > 0
             else min(self._ws_private_stale_after, 15.0)
@@ -129,6 +130,7 @@ class BackgroundServices:
             except (TypeError, ValueError):
                 return None
 
+        logged_wait = False
         while True:
             status = self._safe_ws_status()
             private = status.get("private") if isinstance(status, dict) else None
@@ -148,9 +150,23 @@ class BackgroundServices:
                 )
 
                 if running and connected and (last_beat or fresh_age):
+                    if logged_wait:
+                        log(
+                            "background.ws.private.wait.ready",
+                            waited=round(time.time() - start_wait, 3),
+                        )
                     return True
 
+            if not logged_wait:
+                log("background.ws.private.waiting")
+                logged_wait = True
+
             if time.time() >= deadline:
+                log(
+                    "background.ws.private.wait.timeout",
+                    waited=round(time.time() - start_wait, 3),
+                    status=status,
+                )
                 return False
 
             time.sleep(0.2)
@@ -251,6 +267,8 @@ class BackgroundServices:
                     )
                 except Exception as exc:  # pragma: no cover - defensive guard
                     log("background.ws.fallback.error", err=str(exc))
+                else:
+                    log("background.ws.fallback.engaged", **fallback_payload)
 
             previous_started = self._ws_started
             start_mode = None
@@ -284,14 +302,21 @@ class BackgroundServices:
                     self._ws_last_started_at = time.time()
                     if restart_public or force or not previous_started:
                         self._ws_restart_count += 1
+                    log(
+                        "background.ws.start.success",
+                        mode=start_mode,
+                        restart_count=self._ws_restart_count,
+                    )
                 else:
                     self._ws_started = False
                     self._ws_error = "manager.start returned False"
+                    log("background.ws.start.failed", mode=start_mode)
                 return self._ws_started
 
             # private-only restart path
             if ok:
                 self._ws_error = None
+                log("background.ws.start.success", mode=start_mode)
                 return True
 
             self._ws_error = "manager.start_private returned False"
@@ -541,11 +566,15 @@ class BackgroundServices:
             except Exception:  # pragma: no cover - defensive guard
                 pass
 
+        cycle_counter = 0
+
         def handle_cycle(
             result: ExecutionResult,
             signature: Optional[str],
             marker: Tuple[bool, bool, bool],
         ) -> None:
+            nonlocal cycle_counter
+            cycle_counter += 1
             payload: Dict[str, Any] = {"status": result.status}
             if result.reason is not None:
                 payload["reason"] = result.reason
@@ -568,19 +597,42 @@ class BackgroundServices:
                 self._automation_state = state
                 self._automation_last_cycle = ts
 
+            log(
+                "background.automation.loop.cycle",
+                cycle=cycle_counter,
+                status=result.status,
+                reason=result.reason,
+                signature=signature,
+            )
+
         def sweep_orders() -> bool:
             return self._maybe_sweep_orders()
 
         loop = self._create_loop(executor, handle_cycle, sweeper=sweep_orders)
 
         current_thread = threading.current_thread()
+        started_at = time.time()
+        log(
+            "background.automation.loop.start",
+            thread=current_thread.name,
+            has_executor=bool(self._automation_executor),
+        )
         try:
             loop.run(stop_event=stop_event)
         except Exception as exc:  # pragma: no cover - defensive guard
             log("background.automation.error", err=str(exc))
             with self._automation_lock:
                 self._automation_error = str(exc)
+        else:
+            with self._automation_lock:
+                self._automation_error = None
         finally:
+            log(
+                "background.automation.loop.stop",
+                thread=current_thread.name,
+                duration=round(time.time() - started_at, 3),
+                cycles=cycle_counter,
+            )
             with self._automation_lock:
                 try:
                     self._executor_state = executor.export_state()
