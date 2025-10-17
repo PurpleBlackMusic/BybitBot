@@ -31,11 +31,56 @@ from bybit_app.utils.market_scanner import (
     MarketScannerError,
     scan_market_opportunities,
     _CandleCache,
+    fetch_market_snapshot,
 )
 from bybit_app.utils.freqai.store import FreqAIPredictionStore
 from bybit_app.utils.portfolio_manager import PortfolioManager
 from bybit_app.utils.symbol_resolver import SymbolResolver
 from bybit_app.utils.trade_analytics import ExecutionRecord
+
+
+class _TickerAPIStub:
+    def __init__(self, responses: list[dict[str, object]]):
+        self._responses = responses
+        self.calls = 0
+
+    def tickers(self, category: str = "spot") -> dict[str, object]:  # pragma: no cover - exercised in tests
+        index = min(self.calls, len(self._responses) - 1)
+        self.calls += 1
+        return self._responses[index]
+
+
+def test_fetch_market_snapshot_retries_until_quality_ok() -> None:
+    api = _TickerAPIStub(
+        [
+            {"result": {"list": [{"symbol": "AAAUSDT", "volume24h": 0, "bestBidPrice": 0, "bestAskPrice": 0}]}},
+            {"result": {"list": [{"symbol": "AAAUSDT", "volume24h": 123.0, "bestBidPrice": 1.0, "bestAskPrice": 1.01}]}},
+        ]
+    )
+
+    snapshot = fetch_market_snapshot(api, max_retries=2, retry_delay=0.0)
+
+    assert api.calls == 2
+    assert snapshot["quality"]["attempts"] == 2
+    assert snapshot["quality"]["volume_missing"] == 0
+    assert snapshot["quality"]["orderbook_missing"] == 0
+    assert snapshot["rows"][0]["volume24h"] == 123.0
+
+
+def test_fetch_market_snapshot_repairs_zero_volume() -> None:
+    api = _TickerAPIStub(
+        [
+            {"result": {"list": [{"symbol": "AAAUSDT", "volume24h": 0, "bestBidPrice": 1.0, "bestAskPrice": 1.01}]}},
+        ]
+    )
+
+    snapshot = fetch_market_snapshot(api, max_retries=1, retry_delay=0.0)
+
+    assert api.calls == 2
+    assert snapshot["quality"]["attempts"] == 2
+    assert snapshot["quality"]["volume_missing"] == 1
+    assert snapshot["quality"]["volume_repaired"] == 1
+    assert snapshot["rows"][0]["volume24h"] == market_scanner_module._MIN_VOLUME_FALLBACK
 
 
 def _write_snapshot(

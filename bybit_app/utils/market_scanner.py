@@ -54,6 +54,9 @@ DEFAULT_CACHE_TTL = 300.0
 _TRADE_COST_SAMPLE = 600
 _DEFAULT_MAKER_RATIO = 0.25
 _DEFAULT_TAKER_FEE_BPS = 5.0
+_MIN_VOLUME_FALLBACK = 1e-6
+_DEFAULT_SNAPSHOT_RETRIES = 2
+_DEFAULT_SNAPSHOT_RETRY_DELAY = 0.25
 
 _OUTLIER_PERCENT_FIELDS: Tuple[str, ...] = (
     "price5mPcnt",
@@ -1261,19 +1264,96 @@ def save_market_snapshot(
     path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def fetch_market_snapshot(api: BybitAPI, category: str = "spot") -> Dict[str, object]:
-    response = api.tickers(category=category)
+def _extract_ticker_rows(response: Mapping[str, object]) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    if isinstance(response, dict):
-        result = response.get("result")
-        if isinstance(result, dict):
-            rows = result.get("list") or []  # type: ignore[assignment]
-        elif isinstance(response.get("list"), list):
-            rows = response.get("list")  # type: ignore[assignment]
+    result = response.get("result") if isinstance(response, Mapping) else None
+    if isinstance(result, Mapping):
+        rows = result.get("list") or []  # type: ignore[assignment]
+    elif isinstance(response.get("list"), list):  # type: ignore[union-attr]
+        rows = response.get("list")  # type: ignore[assignment]
+    cleaned_rows: List[Dict[str, object]] = []
+    for raw in rows:
+        if isinstance(raw, Mapping):
+            cleaned_rows.append(dict(raw))
+    return cleaned_rows
+
+
+def _assess_row_quality(row: Mapping[str, object]) -> Tuple[bool, bool]:
+    volume = _safe_float(row.get("volume24h"))
+    volume_issue = volume is None or volume <= 0
+    bid = _safe_float(row.get("bestBidPrice"))
+    ask = _safe_float(row.get("bestAskPrice"))
+    orderbook_issue = bid is None or ask is None or bid <= 0 or ask <= 0
+    return volume_issue, orderbook_issue
+
+
+def _analyse_rows(rows: Sequence[Mapping[str, object]]) -> Dict[str, int]:
+    volume_missing = 0
+    orderbook_missing = 0
+    for row in rows:
+        volume_issue, orderbook_issue = _assess_row_quality(row)
+        if volume_issue:
+            volume_missing += 1
+        if orderbook_issue:
+            orderbook_missing += 1
+    return {
+        "volume_missing": volume_missing,
+        "orderbook_missing": orderbook_missing,
+    }
+
+
+def _repair_rows(rows: Sequence[Dict[str, object]]) -> Dict[str, int]:
+    repairs = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        volume = _safe_float(row.get("volume24h"))
+        if volume is None or volume <= 0:
+            row["volume24h"] = _MIN_VOLUME_FALLBACK
+            repairs += 1
+    return {"volume_repaired": repairs}
+
+
+def fetch_market_snapshot(
+    api: BybitAPI,
+    category: str = "spot",
+    *,
+    max_retries: int = _DEFAULT_SNAPSHOT_RETRIES,
+    retry_delay: float = _DEFAULT_SNAPSHOT_RETRY_DELAY,
+) -> Dict[str, object]:
+    attempts = 0
+    max_retries = max(int(max_retries), 0)
+    retry_delay = max(float(retry_delay), 0.0)
+    last_rows: List[Dict[str, object]] = []
+    quality: Dict[str, int] = {"volume_missing": 0, "orderbook_missing": 0}
+
+    while True:
+        response = api.tickers(category=category)
+        extracted_rows = _extract_ticker_rows(response if isinstance(response, Mapping) else {})
+        quality = _analyse_rows(extracted_rows)
+        last_rows = extracted_rows
+        if (quality["volume_missing"] == 0 and quality["orderbook_missing"] == 0) or attempts >= max_retries:
+            break
+        attempts += 1
+        if retry_delay > 0:
+            time.sleep(retry_delay)
+
+    repairs = _repair_rows(last_rows)
+    if quality["volume_missing"] or quality["orderbook_missing"]:
+        log(
+            "market_scanner.data_quality.snapshot",
+            severity="warning",
+            category=category,
+            attempts=attempts + 1,
+            **quality,
+            **repairs,
+        )
+
     snapshot = {
         "ts": time.time(),
         "category": category,
-        "rows": rows,
+        "rows": last_rows,
+        "quality": {**quality, **repairs, "attempts": attempts + 1},
     }
     return snapshot
 
