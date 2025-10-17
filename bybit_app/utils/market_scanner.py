@@ -1454,8 +1454,26 @@ def scan_market_opportunities(
             **details,
         )
 
+    retrain_minutes = _safe_setting_float(settings, "ai_retrain_minutes", 0.0)
+    if retrain_minutes is None or retrain_minutes <= 0:
+        retrain_interval = 7 * 24 * 3600.0
+    else:
+        retrain_interval = max(float(retrain_minutes) * 60.0, 3600.0)
+
+    training_limit_setting = _safe_setting_float(
+        settings, "ai_training_trade_limit", 0.0
+    )
+    if training_limit_setting is None or training_limit_setting <= 0:
+        training_limit = 400
+    else:
+        training_limit = max(int(training_limit_setting), 50)
+
     try:
-        model: Optional[MarketModel] = ensure_market_model(data_dir=data_dir)
+        model: Optional[MarketModel] = ensure_market_model(
+            data_dir=data_dir,
+            max_age=retrain_interval,
+            limit=training_limit,
+        )
     except Exception as exc:  # pragma: no cover - defensive logging
         log("market_scanner.model.error", err=str(exc))
         model = None

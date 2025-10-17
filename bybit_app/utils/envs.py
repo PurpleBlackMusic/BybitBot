@@ -188,7 +188,8 @@ class Settings:
     ai_kill_switch_cooldown_min: float = 60.0
     ai_min_ev_bps: float = 80.0
     ai_signal_hysteresis: float = 0.04
-    ai_retrain_minutes: int = 240
+    ai_retrain_minutes: int = 10080
+    ai_training_trade_limit: int = 400
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True
@@ -395,6 +396,7 @@ _ENV_MAP = {
     "ai_signal_hysteresis": "AI_SIGNAL_HYSTERESIS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
+    "ai_training_trade_limit": "AI_TRAINING_TRADE_LIMIT",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
     "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
     "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
@@ -555,6 +557,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_signal_hysteresis"] = hysteresis
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
+    m["ai_training_trade_limit"] = _cast_int(m.get("ai_training_trade_limit"))
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
     ai_max_hold = _cast_float(m.get("ai_max_hold_minutes"))
     if ai_max_hold is None or ai_max_hold <= 0:

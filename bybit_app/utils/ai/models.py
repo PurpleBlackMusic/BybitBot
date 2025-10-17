@@ -267,6 +267,7 @@ class MarketModel:
     pipeline: Pipeline
     trained_at: float
     samples: int
+    metrics: Optional[Mapping[str, object]] = None
 
     def predict_proba(self, features: Mapping[str, float]) -> float:
         """Predict the probability for the provided feature mapping."""
@@ -901,14 +902,18 @@ def train_market_model(
         min_train=max(int(min_samples), 10),
     )
 
+    metrics_payload: Dict[str, object] = {
+        "samples": int(len(labels)),
+        "accuracy": float(accuracy),
+        "log_loss": float(log_loss_value),
+        "positive_rate": float(labels.mean() if len(labels) else 0.0),
+    }
+    metrics_payload["out_of_sample"] = oos_metrics
+
     log(
         "market_model.training_metrics",
-        samples=int(len(labels)),
         symbols=len(set(str(symbol) for symbol in symbols)),
-        accuracy=float(accuracy),
-        log_loss=float(log_loss_value),
-        positive_rate=float(labels.mean() if len(labels) else 0.0),
-        out_of_sample=oos_metrics,
+        **metrics_payload,
     )
 
     payload = {
@@ -916,12 +921,19 @@ def train_market_model(
         "trained_at": float(time.time()),
         "samples": int(len(labels)),
         "pipeline": pipeline,
+        "metrics": metrics_payload,
     }
 
     path = Path(model_path) if model_path is not None else Path(data_dir) / "ai" / MODEL_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(payload, path)
-    return load_model(path)
+    return MarketModel(
+        feature_names=tuple(MODEL_FEATURES),
+        pipeline=pipeline,
+        trained_at=payload["trained_at"],
+        samples=payload["samples"],
+        metrics=metrics_payload,
+    )
 
 
 def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Optional[MarketModel]:
@@ -940,6 +952,7 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
         pipeline = payload["pipeline"]
         trained_at = float(payload.get("trained_at", time.time()))
         samples = int(payload.get("samples", 0))
+        metrics = payload.get("metrics") if isinstance(payload, Mapping) else None
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -951,6 +964,7 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
         pipeline=pipeline,
         trained_at=trained_at,
         samples=samples,
+        metrics=metrics if isinstance(metrics, Mapping) else None,
     )
 
 
@@ -976,6 +990,7 @@ def ensure_market_model(
     model_path: Optional[Path] = None,
     max_age: float = 3600.0,
     min_samples: int = 25,
+    limit: Optional[int] = None,
 ) -> Optional[MarketModel]:
     """Load the current model, retraining it when it is missing or stale."""
 
@@ -989,6 +1004,7 @@ def ensure_market_model(
         ledger_path=ledger_path,
         model_path=resolved_path,
         min_samples=min_samples,
+        limit=limit,
     )
     if trained is not None:
         return trained
