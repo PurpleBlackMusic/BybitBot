@@ -161,6 +161,24 @@ def compute_volume_impulse(row: Mapping[str, object]) -> Dict[str, Optional[floa
     }
 
 
+def compute_volume_trend(row: Mapping[str, object]) -> Optional[float]:
+    """Estimate momentum of traded volume versus recent history."""
+
+    current = _safe_float(row.get("volume24h") or row.get("turnover24h"))
+    previous = _safe_float(row.get("prevVolume24h") or row.get("prevTurnover24h"))
+    weekly = _safe_float(row.get("volume7d") or row.get("turnover7d"))
+    baseline_candidates = [value for value in (previous, weekly) if value is not None and value > 0]
+    if current is None or current <= 0 or not baseline_candidates:
+        return None
+    baseline = sum(baseline_candidates) / len(baseline_candidates)
+    if baseline <= 0:
+        return None
+    ratio = (current - baseline) / baseline
+    if not math.isfinite(ratio):
+        return None
+    return ratio
+
+
 def compute_overbought_indicators(
     momentum: Mapping[str, object],
     row: Mapping[str, object],
@@ -450,10 +468,19 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
     correlation = compute_cross_market_correlation(row)
     social_trend = compute_social_trend(row)
     overbought = compute_overbought_indicators(momentum, row)
+    volume_trend = compute_volume_trend(row)
 
     blended_change = momentum["blended_change_pct"]
     if blended_change is None:
         blended_change = momentum["dominant_change_pct"]
+
+    volatility_ratio: Optional[float] = None
+    windows = volatility["windows"]
+    if isinstance(windows, Mapping):
+        fast = _safe_float(windows.get("1h"))
+        slow = _safe_float(windows.get("24h"))
+        if fast is not None and slow is not None and slow > 0:
+            volatility_ratio = fast / slow
 
     return {
         "blended_change_pct": blended_change,
@@ -461,8 +488,10 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
         "timeframe_contributions": momentum["timeframe_contributions"],
         "volatility_pct": volatility["overall"],
         "volatility_windows": volatility["windows"],
+        "volatility_ratio": volatility_ratio,
         "volume_spike_score": volume["spike_score"],
         "volume_impulse": volume["impulses"],
+        "volume_trend": volume_trend,
         "depth_imbalance": depth_signal,
         "order_flow_ratio": order_flow["order_flow_ratio"],
         "cvd_score": order_flow["cvd_score"],
