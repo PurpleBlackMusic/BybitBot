@@ -86,8 +86,8 @@ _DELIST_KEYS: Tuple[str, ...] = (
 )
 
 _DEFAULT_DAILY_SURGE_LIMIT = 12.0
-_DEFAULT_RSI_OVERBOUGHT = 74.0
-_DEFAULT_STOCH_OVERBOUGHT = 88.0
+_DEFAULT_RSI_OVERBOUGHT = 72.0
+_DEFAULT_STOCH_OVERBOUGHT = 85.0
 
 _HOURLY_SIGNAL_CACHE_TTL = 300.0
 _VOLATILITY_CACHE_TTL = 900.0
@@ -149,6 +149,37 @@ def _ledger_signature(path: Path) -> Tuple[str, int, int]:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(value, upper))
+
+
+def _extract_training_metric(
+    model: Optional[MarketModel], name: str
+) -> Optional[float]:
+    if model is None:
+        return None
+    metrics = getattr(model, "training_metrics", None)
+    if not isinstance(metrics, Mapping):
+        return None
+    return _safe_float(metrics.get(name))
+
+
+def _calibrate_probability(
+    probability: Optional[float], model: Optional[MarketModel]
+) -> Optional[float]:
+    if probability is None:
+        return None
+    bias = _extract_training_metric(model, "calibration_bias")
+    if bias is None:
+        return probability
+    adjusted = float(probability) + float(bias) * 0.5
+    return max(min(adjusted, 0.995), 0.005)
+
+
+def _decision_threshold(model: Optional[MarketModel], default: float = 0.5) -> float:
+    positive_rate = _extract_training_metric(model, "positive_rate")
+    if positive_rate is None:
+        return default
+    candidate = float(positive_rate) + 0.08
+    return max(0.4, min(0.6, candidate))
 
 
 def _safe_setting_float(settings: Optional["Settings"], name: str, default: float) -> float:
@@ -1849,35 +1880,32 @@ def scan_market_opportunities(
         )
 
         overbought_flags: List[str] = []
+        overbought_details: Dict[str, float] = {}
         if (
             rsi_overbought_threshold > 0
             and rsi_value is not None
             and rsi_value >= rsi_overbought_threshold
         ):
             overbought_flags.append("rsi")
+            overbought_details["rsi_excess"] = float(
+                rsi_value - rsi_overbought_threshold
+            )
         if (
             stochastic_overbought_threshold > 0
             and stochastic_value is not None
             and stochastic_value >= stochastic_overbought_threshold
         ):
             overbought_flags.append("stochastic")
-
-        if (
-            len(overbought_flags) >= 2
-            and not force_include
-            and trend == "buy"
-        ):
-            log(
-                "market_scanner.filter.overbought",
-                symbol=symbol,
-                rsi=rsi_value,
-                stochastic=stochastic_value,
-                reasons=overbought_flags,
+            overbought_details["stochastic_excess"] = float(
+                stochastic_value - stochastic_overbought_threshold
             )
-            continue
+
+        decision_threshold = _decision_threshold(model, default=0.5)
+        raw_logistic_probability: Optional[float] = None
 
         if model is not None:
             probability = model.predict_proba(feature_vector)
+            raw_logistic_probability = float(probability)
             score = probability * 100.0
             prob_clamped = min(max(probability, 1e-6), 1.0 - 1e-6)
             logit = math.log(prob_clamped / (1.0 - prob_clamped))
@@ -1888,6 +1916,7 @@ def scan_market_opportunities(
                 "trained_at": model.trained_at,
                 "samples": model.samples,
             }
+            model_metrics["raw_probability"] = raw_logistic_probability
         else:
             probability, score, fallback_metrics = _weighted_opportunity_model(
                 change_pct=change_pct,
@@ -1908,8 +1937,22 @@ def scan_market_opportunities(
                 }
             )
 
-        logistic_probability = probability
-        logistic_score = score
+        logistic_probability: Optional[float]
+        logistic_score: Optional[float]
+        if model is not None:
+            calibrated = _calibrate_probability(raw_logistic_probability, model)
+            if calibrated is not None:
+                probability = calibrated
+                score = calibrated * 100.0
+            logistic_probability = probability if probability is not None else calibrated
+            logistic_score = score
+            if calibrated is not None:
+                model_metrics["calibrated_probability"] = calibrated
+            model_metrics["decision_threshold"] = decision_threshold
+        else:
+            logistic_probability = probability
+            logistic_score = score
+
         freqai_prediction = _freqai_lookup(symbol, raw_symbol=raw_symbol)
         freqai_payload: Optional[Dict[str, object]] = None
 
@@ -2029,6 +2072,43 @@ def scan_market_opportunities(
             freqai_payload["logistic_ev_bps"] = (
                 float(logistic_ev_bps) if logistic_ev_bps is not None else None
             )
+
+        probability_context: Optional[float] = None
+        if freqai_payload and "probability" in freqai_payload:
+            probability_context = _safe_float(freqai_payload.get("probability"))
+        if probability_context is None and logistic_probability is not None:
+            probability_context = float(logistic_probability)
+
+        overbought_blocked = (
+            len(overbought_flags) >= 2 and not force_include and trend == "buy"
+        )
+        if overbought_blocked:
+            rsi_margin = float(overbought_details.get("rsi_excess", 0.0))
+            stochastic_margin = float(
+                overbought_details.get("stochastic_excess", 0.0)
+            )
+            if max(rsi_margin, stochastic_margin) < 3.0:
+                overbought_blocked = False
+            elif (
+                probability_context is not None
+                and (
+                    model is not None
+                    or (freqai_payload is not None and "probability" in freqai_payload)
+                )
+                and probability_context >= decision_threshold
+            ):
+                overbought_blocked = False
+        if overbought_blocked:
+            log(
+                "market_scanner.filter.overbought",
+                symbol=symbol,
+                rsi=rsi_value,
+                stochastic=stochastic_value,
+                reasons=overbought_flags,
+                probability=probability_context,
+                decision_threshold=decision_threshold,
+            )
+            continue
 
         if logistic_probability is not None:
             model_metrics["logistic_probability"] = float(logistic_probability)
