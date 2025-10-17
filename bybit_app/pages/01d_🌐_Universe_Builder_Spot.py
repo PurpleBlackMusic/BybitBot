@@ -35,8 +35,19 @@ if st.button("💾 Применить в настройки (ai_symbols)"):
 
 st.divider()
 st.subheader("Auto‑rotate (раз в сутки) + WL/BL")
-wl = st.text_input("Whitelist (через запятую, принудительно оставить)", value=(getattr(s, "ai_whitelist", "") or ""))
-bl = st.text_input("Blacklist (через запятую, исключить)", value=(getattr(s, "ai_blacklist", "") or ""))
+wl = st.text_input(
+    "Whitelist (через запятую, принудительно оставить)",
+    value=(getattr(s, "ai_whitelist", "") or ""),
+)
+bl = st.text_input(
+    "Blacklist (через запятую, исключить)",
+    value=(getattr(s, "ai_blacklist", "") or ""),
+)
+force_text = st.text_input(
+    "Force include (обойти фильтры сканера)",
+    value=(getattr(s, "ai_force_include", "") or ""),
+    help="Символы из списка будут попадать в шорт-лист даже при низкой ликвидности.",
+)
 if st.button("🔁 Авто‑ротация сейчас"):
     from utils.universe import auto_rotate_universe
     from utils.envs import update_settings
@@ -45,9 +56,49 @@ if st.button("🔁 Авто‑ротация сейчас"):
     wl_usdt = filter_available_spot_pairs(wl_list)
     if wl_usdt != wl_list:
         st.warning("Whitelist очищен от недоступных или не-USDT пар перед сохранением.")
-    syms = auto_rotate_universe(api, size=int(size), min_turnover=float(min_turn), max_spread_bps=25.0, whitelist=wl_usdt, blacklist=bl_list)
+    force_list = [x.strip().upper() for x in (force_text or "").split(',') if x.strip()]
+    force_usdt = filter_available_spot_pairs(force_list)
+    syms = auto_rotate_universe(
+        api,
+        size=int(size),
+        min_turnover=float(min_turn),
+        max_spread_bps=25.0,
+        whitelist=wl_usdt,
+        blacklist=bl_list,
+    )
     if syms:
         st.success(', '.join(syms))
-        update_settings(ai_symbols=','.join(syms), ai_whitelist=','.join(wl_usdt), ai_blacklist=bl)
+        update_settings(
+            ai_symbols=','.join(syms),
+            ai_whitelist=','.join(wl_usdt),
+            ai_blacklist=','.join(bl_list),
+            ai_force_include=','.join(force_usdt),
+        )
     else:
         st.info("Недавно уже крутили. Пройдёт ~сутки — обновим.")
+
+st.caption("Force include хранится в настройках (ai_force_include) и работает как белый список с ослабленными фильтрами.")
+col1, col2 = st.columns([2, 1])
+with col1:
+    new_force = st.text_input(
+        "Добавить монету в force include", "", placeholder="Например, INJUSDT"
+    )
+with col2:
+    remove_force = st.checkbox("Очистить force include", value=False)
+
+if st.button("💾 Сохранить force include"):
+    symbols = [x.strip().upper() for x in (force_text or "").split(',') if x.strip()]
+    if remove_force:
+        symbols = []
+    elif new_force.strip():
+        candidate = new_force.strip().upper()
+        filtered = filter_available_spot_pairs([candidate])
+        if not filtered:
+            st.warning("Монета должна быть доступной USDT-парой на споте.")
+        elif filtered[0] not in symbols:
+            symbols.append(filtered[0])
+    force_usdt = filter_available_spot_pairs(symbols)
+    update_settings(ai_force_include=','.join(force_usdt))
+    st.success(
+        "Force include обновлён: " + (', '.join(force_usdt) if force_usdt else "пусто")
+    )

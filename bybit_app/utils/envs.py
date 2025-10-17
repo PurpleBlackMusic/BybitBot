@@ -169,6 +169,7 @@ class Settings:
     ai_category: str = "spot"
     ai_symbols: str = ""
     ai_whitelist: str = ""
+    ai_force_include: str = ""
     ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
@@ -194,6 +195,9 @@ class Settings:
     ai_max_daily_surge_pct: float = 12.0
     ai_overbought_rsi_threshold: float = 74.0
     ai_overbought_stochastic_threshold: float = 88.0
+    ai_min_change_volatility_ratio: float = 0.6
+    ai_min_turnover_ratio: float = 0.3
+    ai_min_top_quote_ratio: float = 0.2
 
     # TWAP
     twap_slices: int = 8
@@ -370,6 +374,7 @@ _ENV_MAP = {
     "ai_category": "AI_CATEGORY",
     "ai_symbols": "AI_SYMBOLS",
     "ai_whitelist": "AI_WHITELIST",
+    "ai_force_include": "AI_FORCE_INCLUDE",
     "ai_blacklist": "AI_BLACKLIST",
     "ai_interval": "AI_INTERVAL",
     "ai_horizon_bars": "AI_HORIZON_BARS",
@@ -394,6 +399,9 @@ _ENV_MAP = {
     "ai_max_daily_surge_pct": "AI_MAX_DAILY_SURGE_PCT",
     "ai_overbought_rsi_threshold": "AI_OVERBOUGHT_RSI_THRESHOLD",
     "ai_overbought_stochastic_threshold": "AI_OVERBOUGHT_STOCH_THRESHOLD",
+    "ai_min_change_volatility_ratio": "AI_MIN_CHANGE_VOL_RATIO",
+    "ai_min_turnover_ratio": "AI_MIN_TURNOVER_RATIO",
+    "ai_min_top_quote_ratio": "AI_MIN_TOP_QUOTE_RATIO",
     "twap_slices": "TWAP_SLICES",
     "twap_interval_sec": "TWAP_INTERVAL_SEC",
     "twap_child_secs": "TWAP_CHILD_SECS",
@@ -560,9 +568,14 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_overbought_stochastic_threshold"] = _cast_float(
         m.get("ai_overbought_stochastic_threshold")
     )
+    m["ai_min_change_volatility_ratio"] = _cast_float(
+        m.get("ai_min_change_volatility_ratio")
+    )
+    m["ai_min_turnover_ratio"] = _cast_float(m.get("ai_min_turnover_ratio"))
+    m["ai_min_top_quote_ratio"] = _cast_float(m.get("ai_min_top_quote_ratio"))
     m["ai_min_top_quote_usd"] = _cast_float(m.get("ai_min_top_quote_usd"))
 
-    for csv_field in ("ai_symbols", "ai_whitelist"):
+    for csv_field in ("ai_symbols", "ai_whitelist", "ai_force_include"):
         cleaned = _normalise_symbol_csv(m.get(csv_field))
         if cleaned is not None:
             m[csv_field] = cleaned
