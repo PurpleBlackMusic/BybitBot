@@ -18,6 +18,7 @@ from statistics import StatisticsError, median, quantiles
 WARNING_SIGNAL_SECONDS = 300.0
 STALE_SIGNAL_SECONDS = 900.0
 LIVE_TICK_STALE_SECONDS = 3.0
+LISTED_SYMBOLS_REFRESH_SECONDS = 600.0
 
 DEFAULT_SYMBOL_UNIVERSE: Tuple[str, ...] = (
     "BTCUSDT",
@@ -133,6 +134,7 @@ class GuardianBot:
         self._pair_trades_cache: Optional[Tuple[Dict[str, object], ...]] = None
         self._live_fetcher: Optional[LiveSignalFetcher] = None
         self._listed_spot_symbols: Optional[Set[str]] = None
+        self._listed_spot_symbols_fetched_at: Optional[float] = None
         self._symbol_universe_cache: Optional[Tuple[float, Tuple[str, ...]]] = None
         self._signal_state: Dict[str, str] = {}
 
@@ -383,20 +385,32 @@ class GuardianBot:
         self._live_fetcher = None
         self._status_source = "missing"
         self._listed_spot_symbols = None
+        self._listed_spot_symbols_fetched_at = None
 
     def _fetch_listed_spot_symbols(self) -> Set[str]:
         cached = self._listed_spot_symbols
-        if cached is not None:
+        cached_at = self._listed_spot_symbols_fetched_at
+        now = time.time()
+        should_refresh = (
+            cached is None
+            or cached_at is None
+            or now - cached_at >= LISTED_SYMBOLS_REFRESH_SECONDS
+        )
+
+        if cached is not None and not should_refresh:
             return cached
 
         testnet = self.settings.testnet
         try:
-            listed = get_listed_spot_symbols(testnet=testnet)
+            listed = get_listed_spot_symbols(
+                testnet=testnet, force_refresh=should_refresh
+            )
         except Exception as exc:  # pragma: no cover - defensive guard
             log("guardian.listed_symbols.error", err=str(exc), testnet=testnet)
             listed = set()
 
         self._listed_spot_symbols = set(listed)
+        self._listed_spot_symbols_fetched_at = now if listed else cached_at
         return self._listed_spot_symbols
 
     def _resolve_symbol_universe(
@@ -2099,12 +2113,21 @@ class GuardianBot:
             listed_symbols = self._fetch_listed_spot_symbols()
             if listed_symbols:
                 before = len(filtered)
-                filtered_candidates = [
-                    entry
-                    for entry in filtered
-                    if isinstance(entry.get("symbol"), str)
-                    and entry["symbol"].strip().upper() in listed_symbols
-                ]
+                cleaned: List[Dict[str, object]] = []
+                removed_symbols: List[str] = []
+                for entry in filtered:
+                    symbol_value = entry.get("symbol")
+                    symbol_cleaned = (
+                        symbol_value.strip().upper()
+                        if isinstance(symbol_value, str)
+                        else ""
+                    )
+                    if symbol_cleaned and symbol_cleaned in listed_symbols:
+                        cleaned.append(entry)
+                    else:
+                        if symbol_cleaned:
+                            removed_symbols.append(symbol_cleaned)
+                filtered_candidates = cleaned
                 removed = before - len(filtered_candidates)
                 if removed > 0 and testnet_mode and len(filtered_candidates) <= max(5, before // 2):
                     log(
@@ -2120,6 +2143,7 @@ class GuardianBot:
                             "guardian.watchlist.filtered_unlisted",
                             removed=removed,
                             remaining=len(filtered),
+                            symbols=sorted(removed_symbols),
                         )
             elif testnet_mode:
                 log(
@@ -2130,6 +2154,7 @@ class GuardianBot:
                 )
 
         if not filtered:
+            status["watchlist"] = []
             return filtered
         (
             _,
@@ -2244,6 +2269,7 @@ class GuardianBot:
             )
 
         filtered.sort(key=sort_key)
+        status["watchlist"] = [dict(item) for item in filtered]
         return filtered
 
     def _summarise_trade_candidates(
@@ -4128,6 +4154,7 @@ class GuardianBot:
         self._watchlist_breakdown_cache_signature = None
         self._watchlist_breakdown_cache = None
         self._listed_spot_symbols = None
+        self._listed_spot_symbols_fetched_at = None
         return self._get_snapshot(force=True)
 
     def unified_report(self) -> Dict[str, object]:

@@ -279,6 +279,77 @@ def test_guardian_watchlist_drops_unlisted_symbols(
     watchlist = bot.market_watchlist()
 
     assert [item["symbol"] for item in watchlist] == ["BTCUSDT"]
+    assert bot._last_status.get("watchlist") == watchlist
+
+
+def test_guardian_watchlist_logs_removed_symbols(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    status = {
+        "watchlist": [
+            {"symbol": "BTCUSDT", "score": 0.5, "trend": "buy"},
+            {"symbol": "FAKEUSDT", "score": 0.1, "trend": "sell"},
+        ]
+    }
+
+    log_calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_log(event: str, **payload: object) -> None:
+        log_calls.append((event, payload))
+
+    monkeypatch.setattr(guardian_bot_module, "log", _fake_log)
+    monkeypatch.setattr(
+        guardian_bot_module,
+        "get_listed_spot_symbols",
+        lambda **kwargs: {"BTCUSDT"},
+    )
+
+    settings = Settings(ai_live_only=False)
+    settings.testnet = False
+    bot = _make_bot(tmp_path, settings)
+    _write_status(bot, status)
+
+    watchlist = bot.market_watchlist()
+
+    assert [item["symbol"] for item in watchlist] == ["BTCUSDT"]
+    filtered_events = [
+        payload for event, payload in log_calls if event == "guardian.watchlist.filtered_unlisted"
+    ]
+    assert filtered_events
+    assert filtered_events[0]["symbols"] == ["FAKEUSDT"]
+
+
+def test_guardian_listed_symbols_refreshes_via_api(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[bool] = []
+
+    def _fake_listed(*, testnet: bool, force_refresh: bool = False, timeout: float = 5.0):
+        calls.append(force_refresh)
+        return {"BTCUSDT", "ETHUSDT"}
+
+    monkeypatch.setattr(guardian_bot_module, "get_listed_spot_symbols", _fake_listed)
+
+    bot = _make_bot(tmp_path)
+    first = bot._fetch_listed_spot_symbols()
+
+    assert first == {"BTCUSDT", "ETHUSDT"}
+    assert calls == [True]
+
+    second = bot._fetch_listed_spot_symbols()
+    assert second == {"BTCUSDT", "ETHUSDT"}
+    assert calls == [True]
+
+    bot._listed_spot_symbols_fetched_at = (
+        (bot._listed_spot_symbols_fetched_at or time.time())
+        - guardian_bot_module.LISTED_SYMBOLS_REFRESH_SECONDS
+        - 1
+    )
+
+    third = bot._fetch_listed_spot_symbols()
+
+    assert third == {"BTCUSDT", "ETHUSDT"}
+    assert calls[-1] is True
 
 
 def test_guardian_brief_understands_russian_buy_hint(tmp_path: Path) -> None:
