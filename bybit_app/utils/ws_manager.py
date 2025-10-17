@@ -6,7 +6,7 @@ import threading
 import time
 import ssl
 import random
-from collections import Counter
+from collections import Counter, deque
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
@@ -56,6 +56,10 @@ class WSManager:
 
     _LEDGER_RECOVERY_LIMIT = 800
     _PUBLIC_FALLBACK_RETRY_DELAY = 60.0
+    _PUBLIC_LATENCY_THRESHOLD = 5.0
+    _PRIVATE_LATENCY_THRESHOLD = 5.0
+    _PING_TIMEOUT = 12.0
+    _LATENCY_RESTART_COOLDOWN = 30.0
 
     def __init__(self):
         self.s = get_settings()
@@ -94,6 +98,25 @@ class WSManager:
         self._inventory_snapshot: dict[str, dict[str, Decimal]] = {}
         self._inventory_baseline: dict[str, dict[str, Decimal]] = {}
         self._inventory_last_exec_id: Optional[str] = None
+
+        # latency monitoring
+        self._pub_ping_lock = threading.Lock()
+        self._pub_ping_waiting = False
+        self._pub_ping_sent_monotonic = 0.0
+        self._pub_pending_req_id: Optional[str] = None
+        self._pub_last_latency: Optional[float] = None
+        self._pub_latency_spikes = 0
+        self._pub_latency_history: deque[float] = deque(maxlen=5)
+        self._pub_last_latency_restart = 0.0
+
+        self._priv_ping_lock = threading.Lock()
+        self._priv_ping_waiting = False
+        self._priv_ping_sent_monotonic = 0.0
+        self._priv_pending_req_id: Optional[str] = None
+        self._priv_last_latency: Optional[float] = None
+        self._priv_latency_spikes = 0
+        self._priv_latency_history: deque[float] = deque(maxlen=5)
+        self._priv_last_latency_restart = 0.0
 
     # ----------------------- Public -----------------------
     def _refresh_settings(self) -> None:
@@ -192,6 +215,255 @@ class WSManager:
 
         return False
 
+    def _public_latency_timeout(self) -> float:
+        return getattr(self, "_PING_TIMEOUT", 12.0)
+
+    def _private_latency_timeout(self) -> float:
+        return getattr(self, "_PING_TIMEOUT", 12.0)
+
+    def _reset_public_ping_state(self) -> None:
+        with self._pub_ping_lock:
+            self._pub_ping_waiting = False
+            self._pub_ping_sent_monotonic = 0.0
+            self._pub_pending_req_id = None
+
+    def _reset_private_ping_state(self) -> None:
+        with self._priv_ping_lock:
+            self._priv_ping_waiting = False
+            self._priv_ping_sent_monotonic = 0.0
+            self._priv_pending_req_id = None
+
+    def _record_public_ping(self, req_id: str) -> None:
+        now = time.monotonic()
+        with self._pub_ping_lock:
+            previous_waiting = self._pub_ping_waiting
+            previous_sent = self._pub_ping_sent_monotonic
+            self._pub_ping_waiting = True
+            self._pub_ping_sent_monotonic = now
+            self._pub_pending_req_id = req_id
+        if previous_waiting and previous_sent:
+            elapsed = max(0.0, now - previous_sent)
+            if elapsed >= self._public_latency_timeout():
+                self._handle_public_latency_issue(
+                    "pending_overlap",
+                    elapsed=elapsed,
+                    req_id=req_id,
+                )
+
+    def _record_public_pong(self, payload: Mapping[str, object]) -> None:
+        now = time.monotonic()
+        with self._pub_ping_lock:
+            waiting = self._pub_ping_waiting
+            sent = self._pub_ping_sent_monotonic
+            req_id = self._pub_pending_req_id
+            self._pub_ping_waiting = False
+            self._pub_pending_req_id = None
+            self._pub_ping_sent_monotonic = 0.0
+        latency: Optional[float] = None
+        if waiting and sent:
+            latency = max(0.0, now - sent)
+        req_id_value = str(payload.get("req_id")) if payload.get("req_id") else req_id
+        if latency is not None:
+            self._update_public_latency(latency, req_id=req_id_value)
+        else:
+            log("ws.public.pong", req_id=req_id_value)
+
+    def _update_public_latency(self, latency: float, *, req_id: Optional[str]) -> None:
+        self._pub_last_latency = latency
+        self._pub_latency_history.append(latency)
+        latency_ms = round(latency * 1000, 3)
+        log("ws.public.pong", latency_ms=latency_ms, req_id=req_id)
+
+        threshold = getattr(self, "_PUBLIC_LATENCY_THRESHOLD", 5.0)
+        if latency > threshold:
+            self._pub_latency_spikes += 1
+            if self._pub_latency_spikes >= 2:
+                self._restart_public_due_to_latency(latency, reason="high_latency")
+        else:
+            self._pub_latency_spikes = 0
+
+    def _monitor_public_ping(self, ws, interval: float) -> bool:
+        deadline = time.monotonic() + max(interval, 1.0)
+        while time.monotonic() < deadline:
+            if not self._pub_running or self._pub_ws is not ws:
+                return True
+            if self._check_public_ping_timeout():
+                return True
+            time.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
+        return False
+
+    def _check_public_ping_timeout(self) -> bool:
+        with self._pub_ping_lock:
+            waiting = self._pub_ping_waiting
+            sent = self._pub_ping_sent_monotonic
+            req_id = self._pub_pending_req_id
+        if not waiting or not sent:
+            return False
+        elapsed = max(0.0, time.monotonic() - sent)
+        if elapsed < self._public_latency_timeout():
+            return False
+        self._handle_public_latency_issue("timeout", elapsed=elapsed, req_id=req_id)
+        return True
+
+    def _handle_public_latency_issue(
+        self,
+        reason: str,
+        *,
+        elapsed: Optional[float],
+        req_id: Optional[str],
+    ) -> None:
+        latency_ms = round(elapsed * 1000, 3) if isinstance(elapsed, (int, float)) else None
+        log(
+            "ws.public.latency.issue",
+            reason=reason,
+            latency_ms=latency_ms,
+            req_id=req_id,
+        )
+        if isinstance(elapsed, (int, float)):
+            self._pub_last_latency = elapsed
+            self._pub_latency_history.append(elapsed)
+        self._pub_latency_spikes += 1
+        if self._pub_latency_spikes >= 2:
+            self._restart_public_due_to_latency(elapsed, reason=reason)
+
+    def _restart_public_due_to_latency(
+        self, latency: Optional[float], *, reason: str
+    ) -> None:
+        now = time.monotonic()
+        if now - self._pub_last_latency_restart < getattr(
+            self, "_LATENCY_RESTART_COOLDOWN", 30.0
+        ):
+            return
+
+        self._pub_last_latency_restart = now
+        self._pub_latency_spikes = 0
+        threshold = getattr(self, "_PUBLIC_LATENCY_THRESHOLD", 5.0)
+        log(
+            "ws.public.latency.restart",
+            reason=reason,
+            latency_ms=round(latency * 1000, 3) if isinstance(latency, (int, float)) else None,
+            threshold_ms=round(threshold * 1000, 3),
+        )
+        self._reset_public_ping_state()
+        try:
+            self.stop_public()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("ws.public.restart.error", err=str(exc))
+        finally:
+            subs = self._pub_subs or ("tickers.BTCUSDT",)
+            try:
+                self.start_public(subs=subs)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("ws.public.restart.fail", err=str(exc), subs=list(subs))
+
+    def _record_private_ping(self, payload: Mapping[str, object]) -> None:
+        req_id = payload.get("req_id")
+        raw_monotonic = payload.get("sent_monotonic")
+        try:
+            now = float(raw_monotonic) if raw_monotonic is not None else time.monotonic()
+        except (TypeError, ValueError):
+            now = time.monotonic()
+        with self._priv_ping_lock:
+            previous_waiting = self._priv_ping_waiting
+            previous_sent = self._priv_ping_sent_monotonic
+            self._priv_ping_waiting = True
+            self._priv_ping_sent_monotonic = now
+            self._priv_pending_req_id = str(req_id) if req_id else None
+        if previous_waiting and previous_sent:
+            elapsed = max(0.0, now - previous_sent)
+            if elapsed >= self._private_latency_timeout():
+                self._handle_private_latency_issue(
+                    "pending_overlap",
+                    elapsed=elapsed,
+                    req_id=req_id,
+                )
+
+    def _record_private_pong(self, payload: Mapping[str, object]) -> None:
+        raw_monotonic = payload.get("received_monotonic")
+        try:
+            now = float(raw_monotonic) if raw_monotonic is not None else time.monotonic()
+        except (TypeError, ValueError):
+            now = time.monotonic()
+        with self._priv_ping_lock:
+            waiting = self._priv_ping_waiting
+            sent = self._priv_ping_sent_monotonic
+            req_id = self._priv_pending_req_id or payload.get("req_id")
+            self._priv_ping_waiting = False
+            self._priv_pending_req_id = None
+            self._priv_ping_sent_monotonic = 0.0
+        latency: Optional[float] = None
+        if waiting and sent:
+            latency = max(0.0, now - sent)
+
+        req_id_value = str(req_id) if req_id else None
+        if latency is not None:
+            self._update_private_latency(latency, req_id=req_id_value)
+        else:
+            log("ws.private.pong", req_id=req_id_value)
+
+    def _update_private_latency(self, latency: float, *, req_id: Optional[str]) -> None:
+        self._priv_last_latency = latency
+        self._priv_latency_history.append(latency)
+        latency_ms = round(latency * 1000, 3)
+        log("ws.private.pong", latency_ms=latency_ms, req_id=req_id)
+
+        threshold = getattr(self, "_PRIVATE_LATENCY_THRESHOLD", 5.0)
+        if latency > threshold:
+            self._priv_latency_spikes += 1
+            if self._priv_latency_spikes >= 2:
+                self._restart_private_due_to_latency(latency, reason="high_latency")
+        else:
+            self._priv_latency_spikes = 0
+
+    def _handle_private_latency_issue(
+        self,
+        reason: str,
+        *,
+        elapsed: Optional[float],
+        req_id: Optional[object],
+    ) -> None:
+        latency_ms = round(elapsed * 1000, 3) if isinstance(elapsed, (int, float)) else None
+        log(
+            "ws.private.latency.issue",
+            reason=reason,
+            latency_ms=latency_ms,
+            req_id=str(req_id) if req_id is not None else None,
+        )
+        if isinstance(elapsed, (int, float)):
+            self._priv_last_latency = elapsed
+            self._priv_latency_history.append(elapsed)
+        self._priv_latency_spikes += 1
+        if self._priv_latency_spikes >= 2:
+            self._restart_private_due_to_latency(elapsed, reason=reason)
+
+    def _restart_private_due_to_latency(
+        self, latency: Optional[float], *, reason: str
+    ) -> None:
+        now = time.monotonic()
+        if now - self._priv_last_latency_restart < getattr(
+            self, "_LATENCY_RESTART_COOLDOWN", 30.0
+        ):
+            return
+
+        self._priv_last_latency_restart = now
+        self._priv_latency_spikes = 0
+        threshold = getattr(self, "_PRIVATE_LATENCY_THRESHOLD", 5.0)
+        log(
+            "ws.private.latency.restart",
+            reason=reason,
+            latency_ms=round(latency * 1000, 3) if isinstance(latency, (int, float)) else None,
+            threshold_ms=round(threshold * 1000, 3),
+        )
+        self._reset_private_ping_state()
+        try:
+            self.stop_private()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("ws.private.restart.error", err=str(exc))
+        finally:
+            try:
+                self.start_private()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("ws.private.restart.fail", err=str(exc))
     def start_public(self, subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
         subs = tuple(subs)
         self._pub_subs = subs
@@ -215,14 +487,19 @@ class WSManager:
                 try:
                     while self._pub_running and self._pub_ws is ws:
                         try:
-                            req = {"op": "ping", "req_id": str(int(time.time() * 1000))}
+                            req_id = str(int(time.time() * 1000))
+                            req = {"op": "ping", "req_id": req_id}
                             ws.send(json.dumps(req))
                         except Exception as e:
                             log("ws.public.ping.error", err=str(e))
                             break
-                        time.sleep(20)
+                        self._record_public_ping(req_id)
+                        if self._monitor_public_ping(ws, 20.0):
+                            break
                 except Exception as e:
                     log("ws.public.ping.exit", err=str(e))
+                finally:
+                    self._reset_public_ping_state()
 
             try:
                 if not (self._pub_ping_thread and self._pub_ping_thread.is_alive()):
@@ -251,7 +528,7 @@ class WSManager:
             self.pub_store.append(obj)
             self._record_public_payload(obj)
             if isinstance(obj, dict) and obj.get("op") == "pong":
-                log("ws.public.pong")
+                self._record_public_pong(obj)
 
         def on_error(ws, error):
             log("ws.public.error", err=str(error), url=self._pub_current_url)
@@ -553,17 +830,31 @@ class WSManager:
                 "subscriptions": list(self._pub_subs),
                 "last_beat": self.last_public_beat or None,
                 "age_seconds": pub_age,
+                "latency_ms": round(self._pub_last_latency * 1000, 3)
+                if isinstance(self._pub_last_latency, (int, float))
+                else None,
             },
             "private": {
                 "running": private_running,
                 "connected": bool(private_ws),
                 "last_beat": self.last_private_beat or None,
                 "age_seconds": priv_age,
+                "latency_ms": round(self._priv_last_latency * 1000, 3)
+                if isinstance(self._priv_last_latency, (int, float))
+                else None,
             },
         }
 
     def _process_private_payload(self, payload: dict) -> None:
         if not isinstance(payload, dict):
+            return
+
+        op = str(payload.get("op") or "").strip().lower()
+        if op == "ping":
+            self._record_private_ping(payload)
+            return
+        if op == "pong":
+            self._record_private_pong(payload)
             return
 
         topic = str(payload.get("topic") or payload.get("topicName") or "").lower()

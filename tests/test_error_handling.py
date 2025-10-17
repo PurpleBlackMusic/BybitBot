@@ -20,6 +20,9 @@ def _collectors(monkeypatch: pytest.MonkeyPatch) -> tuple[list[tuple[str, dict[s
 
     monkeypatch.setattr(error_handling, "log", fake_log)
     monkeypatch.setattr(error_handling, "enqueue_telegram_message", fake_notify)
+    monkeypatch.setattr(error_handling, "restart_websockets", lambda: False)
+    monkeypatch.setattr(error_handling, "restart_automation", lambda: False)
+    monkeypatch.setattr(error_handling, "restart_guardian", lambda: False)
 
     return recorded_logs, telegram_messages
 

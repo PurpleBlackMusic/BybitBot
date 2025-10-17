@@ -7,7 +7,7 @@ import json
 import random
 import threading
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .bybit_api import API_MAIN, API_TEST
 from .envs import get_settings
@@ -46,6 +46,12 @@ class WSPrivateV5:
         self._authenticated = False
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
+
+    def _emit_to_callback(self, payload: Mapping[str, Any]) -> None:
+        try:
+            self.on_msg(dict(payload))
+        except Exception as exc:
+            log("ws.private.callback.error", err=str(exc))
 
     def _sign(self, expires_ms: int, key: str, secret: str) -> str:
         """Return a Bybit-compatible signature for private WebSocket auth."""
@@ -271,15 +277,21 @@ class WSPrivateV5:
                         if not self._is_socket_connected(ws):
                             break
                         try:
-                            payload = {
-                                "op": "ping",
-                                "req_id": str(int(time.time() * 1000)),
-                            }
+                            req_id = str(int(time.time() * 1000))
+                            payload = {"op": "ping", "req_id": req_id}
                             ws.send(json.dumps(payload))
+                            control_event = {
+                                "op": "ping",
+                                "source": "control",
+                                "req_id": req_id,
+                                "sent_at": time.time(),
+                                "sent_monotonic": time.monotonic(),
+                            }
+                            self._emit_to_callback(control_event)
                         except Exception as exc:
                             log("ws.private.ping.error", err=str(exc))
                             break
-                        interval = random.uniform(14.0, 16.0)
+                        interval = random.uniform(19.0, 21.0)
                         if ping_stop.wait(interval):
                             break
 
@@ -364,11 +376,12 @@ class WSPrivateV5:
                             ws.send(json.dumps(response))
                         except Exception as exc:
                             log("ws.private.pong.error", err=str(exc))
+                    elif payload.get("op") == "pong":
+                        payload.setdefault("source", "message")
+                        payload.setdefault("received_at", time.time())
+                        payload.setdefault("received_monotonic", time.monotonic())
 
-                try:
-                    self.on_msg(payload)
-                except Exception as exc:
-                    log("ws.private.callback.error", err=str(exc))
+                self._emit_to_callback(payload)
 
             def handle_error(ws, error) -> None:
                 log("ws.private.error", err=str(error))
@@ -382,13 +395,15 @@ class WSPrivateV5:
                         text = None
                 else:
                     text = str(message) if message else None
-                payload: dict[str, Any] = {"op": "pong", "source": "control"}
+                payload: dict[str, Any] = {
+                    "op": "pong",
+                    "source": "control",
+                    "received_at": time.time(),
+                    "received_monotonic": time.monotonic(),
+                }
                 if text:
                     payload["raw"] = text
-                try:
-                    self.on_msg(payload)
-                except Exception as exc:
-                    log("ws.private.callback.error", err=str(exc))
+                self._emit_to_callback(payload)
 
             def handle_close(ws, code, msg) -> None:
                 log("ws.private.close", code=code, msg=msg, requested=self._stop)

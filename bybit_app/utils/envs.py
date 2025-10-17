@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
 from .paths import DATA_DIR, SETTINGS_FILE
+from .log import log
 
 
 _SENSITIVE_FIELDS = {
@@ -66,6 +67,7 @@ def _is_placeholder(value: str) -> bool:
 _CACHE: dict[str, Any] = {
     "settings": None,
     "key": None,
+    "api_error": None,
 }
 
 
@@ -886,12 +888,84 @@ def creds_ok(s: Optional[Settings] = None) -> bool:
     return bool(active_api_key(s) and active_api_secret(s))
 
 
+def _store_api_client_error(message: str | None) -> None:
+    _CACHE["api_error"] = str(message) if message else None
+
+
+def last_api_client_error() -> Optional[str]:
+    error = _CACHE.get("api_error")
+    if not error:
+        return None
+    return str(error)
+
+
+def _coerce_error_message(error: BaseException | object) -> str:
+    if isinstance(error, BaseException):
+        message = str(error)
+    else:
+        message = str(error or "")
+    cleaned = message.strip()
+    return cleaned or "Bybit API client недоступен"
+
+
+def _force_dry_run_mode(settings: Settings, *, reason: str | None = None) -> None:
+    suffix = "testnet" if getattr(settings, "testnet", True) else "mainnet"
+    attr_name = f"dry_run_{suffix}"
+    if getattr(settings, attr_name, True):
+        return
+
+    log(
+        "envs.dry_run.forced",
+        reason=reason or "api_client_error",
+        network=suffix,
+    )
+
+    try:
+        update_settings(dry_run=True)
+    except Exception as exc:  # pragma: no cover - persistence edge cases
+        log("envs.dry_run.force.error", err=str(exc))
+    else:
+        try:
+            setattr(settings, attr_name, True)
+        except Exception:
+            pass
+        try:
+            # refresh cached settings so callers observe the change
+            get_settings(force_reload=True)
+        except Exception:
+            pass
+
+
 def get_api_client(force_reload: bool = False):
     """Convenience accessor that reuses cached settings and API sessions."""
 
-    from .bybit_api import api_from_settings
+    from .bybit_api import api_from_settings, BybitCreds, get_api
 
-    return api_from_settings(get_settings(force_reload=force_reload))
+    settings = get_settings(force_reload=force_reload)
+
+    try:
+        client = api_from_settings(settings)
+    except Exception as exc:
+        message = _coerce_error_message(exc)
+        _store_api_client_error(message)
+        _force_dry_run_mode(settings, reason=message)
+        log("envs.api_client.error", err=message)
+
+        try:
+            fallback_creds = BybitCreds(key="", secret="", testnet=settings.testnet)
+            client = get_api(
+                fallback_creds,
+                recv_window=int(getattr(settings, "recv_window_ms", 15000)),
+                timeout=int(getattr(settings, "http_timeout_ms", 10000)),
+                verify_ssl=bool(getattr(settings, "verify_ssl", True)),
+            )
+        except Exception as fallback_exc:  # pragma: no cover - defensive fallback
+            log("envs.api_client.fallback.error", err=str(fallback_exc))
+            return None
+    else:
+        _store_api_client_error(None)
+
+    return client
 
 
 def active_api_key(settings: Any) -> str:

@@ -35,6 +35,7 @@ from bybit_app.utils.envs import (
     active_api_secret,
     active_dry_run,
     get_settings,
+    last_api_client_error,
     validate_runtime_credentials,
 )
 
@@ -46,6 +47,12 @@ except CredentialValidationError as cred_err:
 
 ensure_background_services()
 auto_refresh(20, key="home_auto_refresh")
+
+api_client_error = last_api_client_error()
+if api_client_error:
+    st.error(
+        f"API клиент недоступен: {api_client_error}. Включён безопасный режим DRY-RUN."
+    )
 
 MINIMAL_CSS = """
 :root { color-scheme: dark; }

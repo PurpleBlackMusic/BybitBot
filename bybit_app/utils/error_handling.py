@@ -5,11 +5,13 @@ import sys
 import threading
 import traceback
 import weakref
+import time
 from types import TracebackType
 from typing import Any, Callable, Dict, Mapping, MutableMapping
 
 from .log import log
 from .telegram_notify import enqueue_telegram_message
+from .background import restart_automation, restart_guardian, restart_websockets
 
 _installed = False
 _previous_sys_hook: Callable[[type[BaseException], BaseException, TracebackType | None], None] | None = None
@@ -20,6 +22,8 @@ _asyncio_previous_handlers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop
 
 _TELEGRAM_LIMIT = 3600
 _TRACEBACK_TAIL = 1600
+_RECOVERY_THROTTLE = 30.0
+_last_recovery_attempt = 0.0
 
 
 def install_global_exception_handlers(*, force: bool = False) -> None:
@@ -265,6 +269,10 @@ def _process_exception(
         context=context,
     )
     _safe_notify(text)
+    try:
+        _maybe_trigger_recovery(origin, exc_value)
+    except Exception:
+        pass
 
 
 def _safe_notify(text: str | None) -> None:
@@ -274,6 +282,47 @@ def _safe_notify(text: str | None) -> None:
         enqueue_telegram_message(text)
     except Exception:
         pass
+
+
+def _maybe_trigger_recovery(origin: str, exc: BaseException) -> None:
+    global _last_recovery_attempt
+
+    try:
+        now = time.monotonic()
+    except Exception:  # pragma: no cover - monotonic edge cases
+        return
+
+    if now - _last_recovery_attempt < _RECOVERY_THROTTLE:
+        return
+
+    _last_recovery_attempt = now
+
+    try:
+        ws_restarted = bool(restart_websockets())
+    except Exception as ws_exc:
+        log("runtime.recovery.ws.error", err=str(ws_exc), origin=origin)
+        ws_restarted = False
+
+    try:
+        automation_restarted = bool(restart_automation())
+    except Exception as auto_exc:
+        log("runtime.recovery.automation.error", err=str(auto_exc), origin=origin)
+        automation_restarted = False
+
+    try:
+        guardian_restarted = bool(restart_guardian())
+    except Exception as guardian_exc:
+        log("runtime.recovery.guardian.error", err=str(guardian_exc), origin=origin)
+        guardian_restarted = False
+
+    log(
+        "runtime.recovery",
+        origin=origin,
+        ws=ws_restarted,
+        automation=automation_restarted,
+        guardian=guardian_restarted,
+        exc_type=type(exc).__name__,
+    )
 
 
 def _build_exception_message(
