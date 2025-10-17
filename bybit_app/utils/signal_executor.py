@@ -76,6 +76,7 @@ _DUST_FLUSH_INTERVAL = 12.0
 _DUST_RETRY_DELAY = 45.0
 _DUST_MIN_QUOTE = Decimal("0.00000001")
 _IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
+_MIN_QUOTE_RESERVE_PCT = 2.0
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -6618,6 +6619,18 @@ class SignalExecutor:
         # Запрет отрицательного значения, но даём возможность использовать весь капитал
         # если пользователь явно указал 0% резервного буфера.
         reserve_pct = max(reserve_pct, 0.0)
+
+        reserve_floor_pct = 0.0
+        if quote_balance_cap is not None:
+            try:
+                cap_hint = float(quote_balance_cap)
+            except (TypeError, ValueError):
+                cap_hint = None
+            if cap_hint is not None and cap_hint > 0.0:
+                reserve_floor_pct = _MIN_QUOTE_RESERVE_PCT
+
+        if reserve_floor_pct > 0.0 and reserve_pct < reserve_floor_pct:
+            reserve_pct = reserve_floor_pct
 
         try:
             risk_pct = float(getattr(settings, "ai_risk_per_trade_pct", 0.0) or 0.0)

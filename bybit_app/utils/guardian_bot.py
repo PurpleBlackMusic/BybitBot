@@ -1993,6 +1993,36 @@ class GuardianBot:
 
             position_summary["diversification"] = diversification
 
+        def _skip_reason(info: Mapping[str, object]) -> Optional[str]:
+            if not isinstance(info, Mapping):
+                return None
+            if info.get("actionable"):
+                return None
+            reasons: list[str] = []
+            if info.get("holding") and not info.get("actionable"):
+                reasons.append("Позиция уже открыта")
+            probability_ready = info.get("probability_ready")
+            if probability_ready is False:
+                reasons.append("Нет подтверждения вероятности")
+            ev_ready = info.get("ev_ready")
+            if ev_ready is False:
+                reasons.append("EV ниже порога")
+            trend_hint = str(info.get("trend") or "").strip().lower()
+            if not trend_hint or trend_hint == "wait":
+                reasons.append("Нет направления")
+            note_value = info.get("note")
+            if isinstance(note_value, str) and note_value.strip():
+                reasons.append(note_value.strip())
+            if info.get("watchlist") and not reasons:
+                reasons.append("В списке наблюдения")
+            if not reasons:
+                return None
+            unique_reasons: list[str] = []
+            for item in reasons:
+                if item not in unique_reasons:
+                    unique_reasons.append(item)
+            return "; ".join(unique_reasons)
+
         priority_table: List[Dict[str, object]] = []
         for idx, symbol in enumerate(dynamic_sequence):
             info = details.get(symbol, {})
@@ -2038,6 +2068,7 @@ class GuardianBot:
                     "trade_sample_count": info.get("trade_sample_count"),
                     "priority_adjustment": info.get("priority_adjustment"),
                     "performance_bias": info.get("performance_bias"),
+                    "skip_reason": _skip_reason(info),
                 }
             )
 

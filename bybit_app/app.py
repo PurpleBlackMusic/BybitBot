@@ -25,77 +25,38 @@ from bybit_app.utils.ui import (
     safe_set_page_config,
     auto_refresh,
 )
-from bybit_app.utils.background import (
-    ensure_background_services,
-    get_guardian_state,
-    get_ws_snapshot,
-)
+from bybit_app.utils.background import ensure_background_services
 from bybit_app.utils.envs import (
     CredentialValidationError,
     active_api_key,
     active_api_secret,
     active_dry_run,
     get_settings,
-    last_api_client_error,
     validate_runtime_credentials,
+    update_settings,
+)
+from bybit_app.ui.state import (
+    BASE_SESSION_STATE,
+    cached_api_client,
+    cached_guardian_snapshot,
+    cached_preflight_snapshot,
+    cached_ws_snapshot,
+    clear_data_caches,
+    ensure_keys,
+)
+from bybit_app.ui.components import (
+    log_viewer,
+    metrics_strip,
+    orders_table,
+    show_error_banner,
+    signals_table,
+    status_bar,
+    trade_ticket,
+    wallet_overview,
 )
 
-safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="centered")
-try:
-    validate_runtime_credentials()
-except CredentialValidationError as cred_err:
-    st.warning(str(cred_err))
 
-ensure_background_services()
-auto_refresh(20, key="home_auto_refresh")
 
-api_client_error = last_api_client_error()
-if api_client_error:
-    st.error(
-        f"API клиент недоступен: {api_client_error}. Включён безопасный режим DRY-RUN."
-    )
-
-MINIMAL_CSS = """
-:root { color-scheme: dark; }
-.block-container { max-width: 900px; padding-top: 1.5rem; }
-.bybit-card { border-radius: 18px; border: 1px solid rgba(148, 163, 184, 0.2); padding: 1.2rem 1.4rem; background: rgba(15, 23, 42, 0.35); }
-.bybit-card h3 { margin-bottom: 0.6rem; }
-.stButton>button { width: 100%; border-radius: 14px; padding: 0.7rem 1rem; font-weight: 600; }
-.stMetric { border-radius: 12px; padding: 0.4rem 0.6rem; }
-.pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
-.pill-row span { background: rgba(148, 163, 184, 0.22); border-radius: 999px; padding: 0.3rem 0.75rem; font-size: 0.85rem; font-weight: 600; }
-[data-testid="stTabs"] { margin-top: 0.6rem; }
-[data-testid="stPageLinkContainer"] { margin-top: 0.35rem; }
-[data-testid="stPageLinkContainer"] a, .bybit-shortcut {
-    display: block;
-    border-radius: 14px;
-    padding: 0.85rem 1rem;
-    background: rgba(16, 185, 129, 0.12);
-    border: 1px solid rgba(16, 185, 129, 0.28);
-    font-weight: 600;
-    text-decoration: none;
-    color: inherit;
-}
-[data-testid="stPageLinkContainer"] a:hover, .bybit-shortcut:hover {
-    border-color: rgba(16, 185, 129, 0.45);
-    background: rgba(16, 185, 129, 0.18);
-}
-[data-testid="stPageLinkContainer"] a:focus, .bybit-shortcut:focus {
-    outline: 2px solid rgba(16, 185, 129, 0.6);
-}
-.signal-card { display: flex; flex-direction: column; gap: 0.55rem; }
-.signal-card__badge { display: flex; gap: 0.45rem; align-items: center; }
-.signal-card__symbol { font-weight: 600; opacity: 0.8; }
-.signal-card__headline { font-size: 1.05rem; font-weight: 700; }
-.signal-card__body { font-size: 0.95rem; line-height: 1.45; opacity: 0.92; }
-.signal-card__footer { display: flex; flex-wrap: wrap; gap: 0.6rem; font-size: 0.85rem; opacity: 0.75; }
-.checklist { list-style: decimal; padding-left: 1.15rem; line-height: 1.5; }
-.checklist li { margin-bottom: 0.35rem; }
-.safety-list { list-style: disc; padding-left: 1.1rem; line-height: 1.5; }
-.safety-list li { margin-bottom: 0.3rem; }
-"""
-
-inject_css(MINIMAL_CSS)
 
 
 def _safe_float(value: object, default: float | None = 0.0) -> float | None:
@@ -1060,54 +1021,177 @@ def render_tips(settings, brief: Mapping[str, object] | None) -> None:
 
 
 def main() -> None:
+    safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="wide")
+
+    ensure_keys()
+
+    theme_path = Path(__file__).resolve().parent / "ui" / "theme.css"
+    if theme_path.exists():
+        try:
+            inject_css(theme_path.read_text(encoding="utf-8"))
+        except Exception:  # pragma: no cover - IO errors
+            pass
+
+    try:
+        validate_runtime_credentials()
+    except CredentialValidationError as cred_err:
+        show_error_banner(str(cred_err), title="Проверка ключей")
+
+    ensure_background_services()
+
+    state = st.session_state
+
+    auto_enabled = bool(state.get("auto_refresh_enabled", BASE_SESSION_STATE["auto_refresh_enabled"]))
+    refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
+
+    with st.sidebar:
+        st.header("⏱ Обновление данных")
+        auto_enabled = st.toggle("Автообновление", value=auto_enabled)
+        refresh_interval = st.slider("Интервал, сек", min_value=5, max_value=120, value=refresh_interval)
+        refresh_now = st.button("Обновить сейчас")
+        state["auto_refresh_enabled"] = auto_enabled
+        state["refresh_interval"] = refresh_interval
+        if refresh_now:
+            clear_data_caches()
+            st.experimental_rerun()
+        if not auto_enabled:
+            st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
+
+    if auto_enabled:
+        auto_refresh(refresh_interval, key="home_auto_refresh_v2")
+
     settings = get_settings()
-    ws_snapshot = get_ws_snapshot()
-    guardian_snapshot = get_guardian_state()
-    guardian_state = (
-        guardian_snapshot.get("state")
-        if isinstance(guardian_snapshot, Mapping)
-        else None
-    )
+    guardian_snapshot = cached_guardian_snapshot()
+    ws_snapshot = cached_ws_snapshot()
+    preflight_snapshot = cached_preflight_snapshot()
+
+    guardian_state = guardian_snapshot.get("state") if isinstance(guardian_snapshot, Mapping) else {}
     guardian_state = guardian_state if isinstance(guardian_state, Mapping) else {}
-    report = guardian_state.get("report")
-    if not isinstance(report, Mapping):
-        report = {}
+    report = guardian_state.get("report") if isinstance(guardian_state.get("report"), Mapping) else {}
 
-    brief_payload = guardian_state.get("brief")
-    if not isinstance(brief_payload, Mapping):
-        brief_payload = report.get("brief") if isinstance(report.get("brief"), Mapping) else {}
-    scorecard = guardian_state.get("scorecard")
-    if not isinstance(scorecard, Mapping):
-        scorecard = {}
-    plan_steps = guardian_state.get("plan_steps")
-    safety_notes = guardian_state.get("safety_notes")
-    risk_summary = guardian_state.get("risk_summary")
-
-    render_header()
-    st.divider()
-    render_status(settings)
-    render_ws_telemetry(ws_snapshot)
-    st.divider()
-    if not guardian_state:
-        st.info(
-            "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
-        )
+    brief_payload = guardian_state.get("brief") if isinstance(guardian_state.get("brief"), Mapping) else {}
+    if not brief_payload and isinstance(report.get("brief"), Mapping):
+        brief_payload = report.get("brief", {})  # type: ignore[assignment]
 
     health = _normalise_health(report.get("health"))
     watchlist = _normalise_watchlist(report.get("watchlist"))
-    brief = render_signal_brief(brief_payload, scorecard, settings=settings)
-    st.divider()
-    render_user_actions(settings, brief, health, watchlist)
-    st.divider()
-    render_shortcuts()
-    st.divider()
-    render_data_health(health)
-    st.divider()
-    render_market_watchlist(watchlist)
-    st.divider()
-    render_guides(settings, plan_steps, safety_notes, risk_summary, brief)
-    st.divider()
-    render_hidden_tools()
+    actions = collect_user_actions(settings, brief_payload, health, watchlist)
+
+    guardian_error = guardian_snapshot.get("error")
+    if guardian_error:
+        show_error_banner(str(guardian_error), title="Guardian background worker")
+
+    preflight_error = preflight_snapshot.get("error")
+    if preflight_error:
+        show_error_banner(str(preflight_error), title="Preflight")
+
+    tabs = st.tabs(["Dashboard", "Signals", "Orders", "Wallet", "Settings", "Logs"])
+
+    with tabs[0]:
+        status_bar(settings, guardian_snapshot=guardian_snapshot, ws_snapshot=ws_snapshot)
+        metrics_strip(report)
+        if not guardian_state:
+            st.info(
+                "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
+            )
+        st.markdown("### Быстрые действия")
+        if actions:
+            for action in actions:
+                icon = str(action.get("icon") or "").strip()
+                title = str(action.get("title") or "").strip()
+                description = str(action.get("description") or "").strip()
+                tone = str(action.get("tone") or "info").lower()
+                message = " ".join(part for part in (icon, f"**{title}**", description) if part).strip()
+                if tone == "danger":
+                    st.error(message)
+                elif tone == "warning":
+                    st.warning(message)
+                elif tone == "success":
+                    st.success(message)
+                else:
+                    st.info(message)
+                page = action.get("page")
+                if isinstance(page, str) and page:
+                    navigation_link(
+                        page,
+                        label=action.get("page_label") or "Открыть раздел",
+                        key=f"action_link_{page}_{title}",
+                    )
+        else:
+            st.success("Все проверки зелёные — можно сосредоточиться на торговле.")
+        if watchlist:
+            st.markdown("### Наблюдаемые активы")
+            st.dataframe(arrow_safe(pd.DataFrame(watchlist)), hide_index=True, use_container_width=True)
+
+    with tabs[1]:
+        signals_table(report.get("symbol_plan") if isinstance(report, Mapping) else {})
+        caution = ""
+        if isinstance(brief_payload, Mapping):
+            caution = str(brief_payload.get("caution") or "").strip()
+        if caution:
+            st.warning(caution)
+        if watchlist:
+            st.divider()
+            st.markdown("**Watchlist**")
+            st.dataframe(arrow_safe(pd.DataFrame(watchlist)), hide_index=True, use_container_width=True)
+
+    with tabs[2]:
+        orders_table(report)
+
+        def _refresh_after_trade() -> None:
+            clear_data_caches()
+            st.experimental_rerun()
+
+        trade_ticket(
+            settings,
+            client_factory=cached_api_client,
+            state=state,
+            on_success=[_refresh_after_trade],
+        )
+
+    with tabs[3]:
+        wallet_overview(report)
+
+    with tabs[4]:
+        st.subheader("Стратегия")
+        buy_threshold = float(getattr(settings, "ai_buy_threshold", 0.52) * 100.0)
+        sell_threshold = float(getattr(settings, "ai_sell_threshold", 0.42) * 100.0)
+        min_ev = float(getattr(settings, "ai_min_ev_bps", 12.0))
+        kill_streak = int(getattr(settings, "ai_kill_switch_loss_streak", 0) or 0)
+        kill_cooldown = float(getattr(settings, "ai_kill_switch_cooldown_min", 60.0) or 0.0)
+
+        buy_value = st.slider("Порог покупки (%)", min_value=40.0, max_value=90.0, value=buy_threshold, step=0.5)
+        sell_value = st.slider("Порог продажи (%)", min_value=10.0, max_value=60.0, value=sell_threshold, step=0.5)
+        ev_value = st.number_input("Минимальная выгода (bps)", min_value=0.0, value=min_ev, step=1.0)
+        kill_streak_value = st.number_input("Kill-switch: серия убыточных сделок", min_value=0, value=kill_streak, step=1)
+        kill_cooldown_value = st.number_input("Kill-switch: пауза (мин)", min_value=0.0, value=kill_cooldown, step=5.0)
+
+        st.subheader("Режим работы")
+        dry_run_value = st.toggle("Учебный режим (DRY-RUN)", value=active_dry_run(settings))
+        network_value = st.selectbox("Сеть", ["Testnet", "Mainnet"], index=0 if settings.testnet else 1)
+
+        st.subheader("Интерфейс")
+        refresh_slider = st.slider("Интервал автообновления (сек)", min_value=5, max_value=120, value=refresh_interval, key="settings_refresh_interval")
+        if refresh_slider != state.get("refresh_interval"):
+            state["refresh_interval"] = refresh_slider
+
+        if st.button("Сохранить настройки"):
+            update_settings(
+                ai_buy_threshold=buy_value / 100.0,
+                ai_sell_threshold=sell_value / 100.0,
+                ai_min_ev_bps=ev_value,
+                ai_kill_switch_loss_streak=kill_streak_value,
+                ai_kill_switch_cooldown_min=kill_cooldown_value,
+                dry_run=dry_run_value,
+                testnet=(network_value == "Testnet"),
+            )
+            settings = get_settings(force_reload=True)
+            clear_data_caches()
+            st.success("Настройки сохранены.")
+
+    with tabs[5]:
+        log_path = Path(__file__).resolve().parent / "_data" / "logs" / "app.log"
+        log_viewer(log_path, state=state)
 
 
 if __name__ == "__main__":
