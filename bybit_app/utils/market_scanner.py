@@ -34,6 +34,7 @@ from .ai.models import (
     liquidity_feature,
 )
 from .fees import fee_rate_for_symbol
+from .freqai import get_prediction_store
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
@@ -1513,6 +1514,34 @@ def scan_market_opportunities(
         pass
     macro_regime_hint = external_provider.macro_regime_score()
 
+    prediction_path_override: Optional[str] = None
+    if settings is not None:
+        raw_override = getattr(settings, "freqai_prediction_path", None)
+        if isinstance(raw_override, str):
+            cleaned = raw_override.strip()
+            if cleaned:
+                prediction_path_override = cleaned
+        elif raw_override:
+            prediction_path_override = str(raw_override)
+
+    freqai_store = get_prediction_store(data_dir, prediction_path=prediction_path_override)
+    freqai_snapshot = freqai_store.snapshot()
+    raw_freqai_pairs = freqai_snapshot.get("pairs")
+    if isinstance(raw_freqai_pairs, Mapping):
+        freqai_pairs: Mapping[str, Mapping[str, object]] = raw_freqai_pairs
+    else:
+        freqai_pairs = {}
+    freqai_source = str(freqai_snapshot.get("source") or "freqai")
+    freqai_generated_at = _safe_float(freqai_snapshot.get("generated_at"))
+    freqai_updated_at = _safe_float(freqai_snapshot.get("updated_at"))
+
+    def _freqai_lookup(symbol: str, *, raw_symbol: object | None = None) -> Optional[Mapping[str, object]]:
+        canonical = freqai_store.canonical_symbol(symbol)
+        prediction = freqai_pairs.get(canonical)
+        if prediction is None and raw_symbol:
+            prediction = freqai_pairs.get(freqai_store.canonical_symbol(str(raw_symbol)))
+        return prediction
+
     snapshot_ts = None
     if isinstance(snapshot, Mapping):
         snapshot_ts = _safe_float(snapshot.get("ts"))
@@ -1796,6 +1825,11 @@ def scan_market_opportunities(
                 }
             )
 
+        logistic_probability = probability
+        logistic_score = score
+        freqai_prediction = _freqai_lookup(symbol, raw_symbol=raw_symbol)
+        freqai_payload: Optional[Dict[str, object]] = None
+
         direction = 0
         if trend == "buy":
             direction = 1
@@ -1855,6 +1889,74 @@ def scan_market_opportunities(
         else:
             ev_bps = None
             total_cost_bps = total_cost_bps if total_cost_bps > 0 else 0.0
+
+        logistic_ev_bps = ev_bps
+        if isinstance(freqai_prediction, Mapping):
+            freqai_payload = {
+                "symbol": freqai_prediction.get("symbol") or symbol,
+                "canonical": freqai_prediction.get("canonical")
+                or freqai_store.canonical_symbol(symbol),
+                "source": str(freqai_prediction.get("source") or freqai_source),
+                "generated_at": freqai_prediction.get("generated_at") or freqai_generated_at,
+                "updated_at": freqai_updated_at,
+            }
+
+            override_prob = _safe_float(freqai_prediction.get("probability"))
+            if override_prob is not None:
+                probability = max(0.0, min(override_prob, 1.0))
+                score_candidate = _safe_float(freqai_prediction.get("score"))
+                if score_candidate is not None:
+                    score = float(score_candidate)
+                else:
+                    score = probability * 100.0
+                freqai_payload["probability"] = probability
+                freqai_payload["probability_pct"] = probability * 100.0
+            elif logistic_probability is not None:
+                freqai_payload["probability"] = float(logistic_probability)
+                freqai_payload["probability_pct"] = float(logistic_probability) * 100.0
+
+            override_ev = _safe_float(freqai_prediction.get("ev_bps"))
+            if override_ev is not None:
+                ev_bps = float(override_ev)
+            if ev_bps is not None:
+                freqai_payload["ev_bps"] = float(ev_bps)
+                freqai_payload["ev_pct"] = float(ev_bps) / 100.0
+            elif logistic_ev_bps is not None:
+                freqai_payload["ev_bps"] = float(logistic_ev_bps)
+                freqai_payload["ev_pct"] = float(logistic_ev_bps) / 100.0
+
+            confidence = _safe_float(freqai_prediction.get("confidence"))
+            if confidence is not None:
+                freqai_payload["confidence"] = confidence
+                freqai_payload["confidence_pct"] = confidence * 100.0
+
+            for key in ("horizon_minutes", "window_minutes"):
+                value = _safe_float(freqai_prediction.get(key))
+                if value is not None:
+                    freqai_payload[key] = value
+
+            meta = freqai_prediction.get("meta")
+            if isinstance(meta, Mapping):
+                freqai_payload["meta"] = dict(meta)
+
+            freqai_payload["logistic_probability"] = (
+                float(logistic_probability) if logistic_probability is not None else None
+            )
+            freqai_payload["logistic_score"] = float(logistic_score) if logistic_score is not None else None
+            freqai_payload["logistic_ev_bps"] = (
+                float(logistic_ev_bps) if logistic_ev_bps is not None else None
+            )
+
+        if logistic_probability is not None:
+            model_metrics["logistic_probability"] = float(logistic_probability)
+        if logistic_score is not None:
+            model_metrics["logistic_score"] = float(logistic_score)
+        if logistic_ev_bps is not None:
+            model_metrics["logistic_ev_bps"] = float(logistic_ev_bps)
+        if freqai_payload:
+            model_metrics["freqai_override"] = dict(freqai_payload)
+            model_metrics["probability_source"] = freqai_payload.get("source")
+            model_metrics["ev_source"] = freqai_payload.get("source")
 
         if not force_include and min_ev_bps_threshold > 0.0:
             if ev_bps is None:
@@ -2020,6 +2122,15 @@ def scan_market_opportunities(
             entry["hourly_signal"] = hourly_signal
         if quote_source == "USDC" and upper_source:
             entry["quote_conversion"] = {"from": "USDC", "to": "USDT", "original": upper_source}
+
+        if freqai_payload:
+            entry["freqai"] = freqai_payload
+            entry["probability_source"] = freqai_payload.get("source") or "freqai"
+            entry["ev_source"] = freqai_payload.get("source") or "freqai"
+        elif logistic_probability is not None:
+            entry["probability_source"] = "logistic_regression"
+            entry["ev_source"] = "market_scanner"
+
         entries.append(entry)
 
     entries.sort(

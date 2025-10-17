@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    restart: unless-stopped
+    command:
+      - "trade"
+      - "--config"
+      - "/freqtrade/config/config.json"
+      - "--freqaimodel"
+      - "LightGBMRegressor"
+    environment:
+      FREQAI: "1"
+      FREQAI_FEATURE_URL: "http://host.docker.internal:8099/features"
+      FREQAI_PREDICT_URL: "http://host.docker.internal:8099/predictions"
+      FREQAI_TRAIN_CRON: "0 4 * * *"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../../bybit_app/_data:/freqtrade/user_data/data
+      - ./config:/freqtrade/config
+      - ./user_data:/freqtrade/user_data
+    tty: true
+    stdin_open: true

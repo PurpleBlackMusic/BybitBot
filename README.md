@@ -47,6 +47,23 @@ python dev/seed_guardian_demo.py
 - `bybit_app/pages/` — набор Streamlit-страниц для торговли, аналитики, управления риском и сервисных задач.
 - `bybit_app/utils/` — движок спотового бота: API-клиенты, аллокаторы, расчёт PnL, риск-менеджмент и вспомогательные библиотеки.
 - `bybit_app/_data/` — локальный кэш, пользовательские настройки, журналы сделок и результаты анализа.
+- `dev/freqtrade/` — шаблон sidecar-а Freqtrade/FreqAI, конфиг и провайдер признаков для обмена данными с Guardian.
+
+## Интеграция с FreqAI
+
+- Пакет `bybit_app.utils.freqai` содержит стор `FreqAIPredictionStore` и FastAPI-приложение `freqai.api`.
+  Запуск локального сервиса:
+
+  ```bash
+  uvicorn bybit_app.utils.freqai.api:app --host 0.0.0.0 --port 8099
+  ```
+
+  Эндпоинт `GET /features` отдаёт признаки (волатильность, импульсы, RSI/EMA, стакан), `POST /predictions` принимает прогнозы
+  FreqAI, `GET /health` — быстрый статус.
+- `scan_market_opportunities` автоматически применяет `freqai_override`: вероятность, EV и confidence поступают от sidecar-а и
+  используются в SignalExecutor. Если предсказаний нет, срабатывает логистическая модель.
+- В `dev/freqtrade` лежат `docker-compose.yml`, `config/config.json` и провайдер `user_data/freqai/data_providers/bybitbot_features.py`,
+  который забирает признаки с `/features` и отправляет результаты инференса на `/predictions`.
 
 ## Советы по работе
 

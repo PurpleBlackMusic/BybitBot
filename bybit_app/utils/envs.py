@@ -96,6 +96,7 @@ _SETTINGS_BOOL_FIELDS = {
     "heartbeat_enabled",
     "ws_watchdog_enabled",
     "ws_autostart",
+    "freqai_enabled",
 }
 
 
@@ -217,6 +218,14 @@ class Settings:
     ai_top_depth_coverage: float = 0.6
     ai_top_depth_shortfall_usd: float = 20.0
     ai_min_top_quote_usd: float = 15.0
+
+    # FreqAI bridge
+    freqai_enabled: bool = False
+    freqai_host: str = "127.0.0.1"
+    freqai_port: int = 8099
+    freqai_feature_limit: int = 40
+    freqai_top_pairs: int = 5
+    freqai_prediction_path: str = ""
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False
