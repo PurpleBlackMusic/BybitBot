@@ -720,6 +720,26 @@ def _weighted_opportunity_model(
     return probability, score, metrics
 
 
+def _resolve_correlation_value(
+    correlations: Mapping[str, object] | None, aliases: Sequence[str]
+) -> Optional[float]:
+    if not isinstance(correlations, Mapping):
+        return None
+    lowered_aliases = [alias.strip().lower() for alias in aliases if alias]
+    for key, value in correlations.items():
+        if not isinstance(key, str):
+            continue
+        cleaned = key.replace("-", "_").replace("/", "_").lower()
+        for alias in lowered_aliases:
+            if cleaned == alias:
+                return _safe_float(value)
+            if cleaned.replace("usdt", "") == alias:
+                return _safe_float(value)
+            if cleaned.endswith(alias):
+                return _safe_float(value)
+    return None
+
+
 def _model_feature_vector(
     *,
     trend: str,
@@ -731,6 +751,9 @@ def _model_feature_vector(
     depth_imbalance: Optional[float],
     spread_bps: Optional[float],
     correlation_strength: Optional[float],
+    market_dominance_pct: Optional[float],
+    correlations: Mapping[str, object] | None,
+    social_trend_score: Optional[float],
 ) -> Dict[str, float]:
     direction = 0
     if trend == "buy":
@@ -776,6 +799,21 @@ def _model_feature_vector(
     if isinstance(correlation_strength, (int, float)):
         correlation_value = float(correlation_strength)
 
+    dominance_value = 0.0
+    if isinstance(market_dominance_pct, (int, float)):
+        dominance_value = max(float(market_dominance_pct), 0.0)
+
+    btc_corr = _resolve_correlation_value(
+        correlations, ("btc", "btcusdt", "bitcoin")
+    )
+    eth_corr = _resolve_correlation_value(
+        correlations, ("eth", "ethusdt", "ethereum")
+    )
+
+    social_value = 0.0
+    if isinstance(social_trend_score, (int, float)) and math.isfinite(social_trend_score):
+        social_value = float(social_trend_score)
+
     features = initialise_feature_map()
     features["directional_change_pct"] = signed_change
     features["multiframe_change_pct"] = multi_tf_value
@@ -785,6 +823,10 @@ def _model_feature_vector(
     features["depth_imbalance"] = depth_value
     features["spread_bps"] = spread_value
     features["correlation_strength"] = correlation_value
+    features["market_dominance_pct"] = dominance_value
+    features["correlation_btc"] = float(btc_corr) if btc_corr is not None else 0.0
+    features["correlation_eth"] = float(eth_corr) if eth_corr is not None else 0.0
+    features["social_trend_score"] = social_value
     return features
 
 
@@ -967,6 +1009,18 @@ def scan_market_opportunities(
         else:
             rows = []
 
+    total_turnover_usd = 0.0
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            sym, _ = ensure_usdt_symbol(item.get("symbol"))
+            if not sym:
+                continue
+            turnover_value = _safe_float(item.get("turnover24h"))
+            if turnover_value is not None and turnover_value > 0:
+                total_turnover_usd += turnover_value
+
     def _normalise_symbol_set(symbols: Iterable[object]) -> Set[str]:
         normalised: Set[str] = set()
         for item in symbols:
@@ -988,6 +1042,21 @@ def scan_market_opportunities(
     _apply_stoplists_from_settings(settings, maintenance=maintenance_symbols, delisted=delist_symbols)
 
     outlier_symbols = _detect_outlier_symbols(rows if isinstance(rows, list) else [])
+
+    data_warning_cache: Set[Tuple[str, str]] = set()
+
+    def _log_data_warning(symbol: str, issue: str, **details: object) -> None:
+        key = (symbol, issue)
+        if not symbol or key in data_warning_cache:
+            return
+        data_warning_cache.add(key)
+        log(
+            "market_scanner.data_warning",
+            symbol=symbol,
+            issue=issue,
+            severity="warning",
+            **details,
+        )
 
     try:
         model: Optional[MarketModel] = ensure_market_model(data_dir=data_dir)
@@ -1039,6 +1108,26 @@ def scan_market_opportunities(
         bid = _safe_float(raw.get("bestBidPrice"))
         ask = _safe_float(raw.get("bestAskPrice"))
         spread_bps = _spread_bps(bid, ask)
+        if turnover is None or turnover <= 0:
+            _log_data_warning(
+                symbol,
+                "missing_turnover",
+                raw_turnover=raw.get("turnover24h"),
+            )
+        if volume is None or volume <= 0:
+            _log_data_warning(
+                symbol,
+                "missing_volume",
+                raw_volume=raw.get("volume24h"),
+            )
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            _log_data_warning(symbol, "missing_orderbook", bid=bid, ask=ask)
+
+        if total_turnover_usd > 0 and turnover is not None and turnover > 0:
+            market_dominance_pct: Optional[float] = (turnover / total_turnover_usd) * 100.0
+        else:
+            market_dominance_pct = None
+
         feature_bundle = build_feature_bundle(raw)
         blended_change = feature_bundle.get("blended_change_pct")
         volatility_pct = feature_bundle.get("volatility_pct")
@@ -1053,6 +1142,7 @@ def scan_market_opportunities(
         top_depth_imbalance = feature_bundle.get("top_depth_imbalance")
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
+        social_trend_score = feature_bundle.get("social_trend_score")
         overbought_indicators = feature_bundle.get("overbought_indicators")
 
         rsi_value: Optional[float] = None
@@ -1145,6 +1235,9 @@ def scan_market_opportunities(
             depth_imbalance=depth_imbalance,
             spread_bps=spread_bps,
             correlation_strength=correlation_strength,
+            market_dominance_pct=market_dominance_pct,
+            correlations=correlations if isinstance(correlations, Mapping) else None,
+            social_trend_score=_safe_float(social_trend_score),
         )
 
         overbought_flags: List[str] = []
