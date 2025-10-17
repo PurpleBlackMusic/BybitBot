@@ -2974,6 +2974,9 @@ class GuardianBot:
             exit_sell_threshold,
         ) = self._resolve_thresholds(settings)
 
+        buy_decision_threshold = effective_buy_threshold
+        sell_decision_threshold = effective_sell_threshold
+
         staleness_state, staleness_message = self._status_staleness(brief.status_age)
         actionable, reasons = self._evaluate_actionability(
             brief.mode,
@@ -3218,6 +3221,25 @@ class GuardianBot:
             symbol = "BTCUSDT"
             symbol_source = "default"
 
+        holding_symbols: Set[str] = set()
+        if isinstance(portfolio, Mapping):
+            raw_positions = portfolio.get("positions") or []
+            for entry in raw_positions:
+                if not isinstance(entry, Mapping):
+                    continue
+                raw_position_symbol = entry.get("symbol")
+                if not isinstance(raw_position_symbol, str):
+                    continue
+                position_symbol = raw_position_symbol.strip().upper()
+                if not position_symbol:
+                    continue
+                qty = self._coerce_float(entry.get("qty")) or 0.0
+                notional = self._coerce_float(entry.get("notional")) or 0.0
+                if qty > 0.0 or notional > 0.0:
+                    holding_symbols.add(position_symbol)
+
+        holding_symbol = symbol in holding_symbols if symbol else False
+
         probability_value = self._normalise_probability_input(status.get("probability"))
         probability_source: Optional[str] = None
         if probability_value is not None and probability_value > 0.0:
@@ -3240,6 +3262,9 @@ class GuardianBot:
             exit_buy_threshold,
             exit_sell_threshold,
         ) = self._resolve_thresholds(settings)
+
+        buy_decision_threshold = effective_buy_threshold
+        sell_decision_threshold = effective_sell_threshold
 
         watchlist = self._build_watchlist(status, settings)
         watchlist_breakdown = self._watchlist_breakdown(watchlist) if watchlist else None
@@ -3274,13 +3299,13 @@ class GuardianBot:
             if status_side_hint == "sell":
                 status_actionable = (
                     probability_value is not None
-                    and probability_value <= effective_sell_threshold
+                    and probability_value <= sell_decision_threshold
                     and (ev_value is None or ev_value >= min_ev)
                 )
             else:
                 status_actionable = (
                     probability_value is not None
-                    and probability_value >= effective_buy_threshold
+                    and probability_value >= buy_decision_threshold
                     and (ev_value is None or ev_value >= min_ev)
                 )
 
@@ -3301,8 +3326,10 @@ class GuardianBot:
             using_watchlist_symbol = allow_watchlist_symbol or same_symbol_as_status
 
             if allow_watchlist_symbol and isinstance(primary_entry.get("symbol"), str):
-                symbol = primary_entry["symbol"]
-                symbol_source = "watchlist"
+                candidate_symbol = primary_entry["symbol"].strip().upper()
+                if candidate_symbol:
+                    symbol = candidate_symbol
+                    symbol_source = "watchlist"
 
             if using_watchlist_symbol and watchlist_hint and (
                 not side_hint or side_hint == "wait"
@@ -3323,6 +3350,11 @@ class GuardianBot:
                 if candidate_ev is not None and candidate_ev != 0.0:
                     ev_value = candidate_ev
                     ev_source = "watchlist"
+
+            if using_watchlist_symbol:
+                holding_symbol = symbol in holding_symbols if symbol else False
+                buy_decision_threshold = effective_buy_threshold
+                sell_decision_threshold = effective_sell_threshold
         else:
             side_hint = status_side_hint
 
@@ -4752,20 +4784,39 @@ class GuardianBot:
         maker_ratio = float(stats.get("maker_ratio") or 0.0) * 100.0
         last_trade_at = str(stats.get("last_trade_at") or "—")
 
+        maker_trade_ratio: Optional[float] = None
+        executions = getattr(self._ledger_view, "executions", None)
+        if executions:
+            maker_trades = sum(1 for record in executions if record.is_maker is True)
+            total_trades = len(executions)
+            if total_trades > 0:
+                maker_trade_ratio = (maker_trades / total_trades) * 100.0
+
         activity = stats.get("activity") or {}
         recent_15 = int(activity.get("15m") or 0)
         recent_hour = int(activity.get("1h") or 0)
         recent_day = int(activity.get("24h") or 0)
+
+        maker_line = (
+            f"Средний размер сделки: {avg_trade:.2f} USDT. "
+            f"Доля maker-исполнений: {maker_ratio:.1f}%."
+        )
+        if (
+            maker_trade_ratio is not None
+            and abs(maker_trade_ratio - maker_ratio) >= 0.05
+        ):
+            maker_line = (
+                f"Средний размер сделки: {avg_trade:.2f} USDT. "
+                f"Доля maker-исполнений: {maker_ratio:.1f}% по объёму, "
+                f"{maker_trade_ratio:.1f}% по сделкам."
+            )
 
         lines = [
             (
                 f"Совокупные комиссии: {fees_paid:.5f} USDT за {trades} сделк(и) "
                 f"с объёмом около {gross_volume:.2f} USDT."
             ),
-            (
-                f"Средний размер сделки: {avg_trade:.2f} USDT. "
-                f"Доля maker-исполнений: {maker_ratio:.1f}%."
-            ),
+            maker_line,
             (
                 "Активность: за 15 минут {recent_15}, за час {recent_hour}, за сутки {recent_day}. "
                 f"Последняя запись: {last_trade_at} по UTC."
