@@ -608,7 +608,7 @@ def build_training_dataset(
         return empty_matrix, empty_vector, empty_vector
 
     max_ts = max((ts for ts in timestamps if ts is not None), default=None)
-    half_life = 6 * 3600.0  # six hours
+    half_life = 12 * 3600.0  # extend horizon to incorporate more history
     weights: List[float] = []
     for ts in timestamps:
         if max_ts is None or ts is None:
@@ -1198,6 +1198,16 @@ def _normalise_sample_weights(sample_weights: np.ndarray) -> np.ndarray:
     return weights / mean
 
 
+def _as_float(value: object) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
 def _weighted_average(values: np.ndarray, weights: np.ndarray) -> float:
     total_weight = float(np.sum(weights))
     if not math.isfinite(total_weight) or total_weight <= 0:
@@ -1211,6 +1221,28 @@ def _weighted_log_loss(
     probs = np.clip(probabilities, 1e-8, 1.0 - 1e-8)
     losses = -(labels * np.log(probs) + (1.0 - labels) * np.log(1.0 - probs))
     return _weighted_average(losses, weights)
+
+
+def _weighted_brier_score(
+    labels: np.ndarray, probabilities: np.ndarray, weights: np.ndarray
+) -> float:
+    probs = np.clip(probabilities, 1e-8, 1.0 - 1e-8)
+    residuals = probs - labels
+    squared = residuals**2
+    return _weighted_average(squared, weights)
+
+
+def _blend_average(
+    existing: Optional[float], existing_weight: int, new_value: float, new_weight: int
+) -> float:
+    if new_weight <= 0:
+        return float(existing or 0.0)
+    if existing is None or not math.isfinite(existing) or existing_weight <= 0:
+        return float(new_value)
+    total = existing_weight + new_weight
+    if total <= 0:
+        return float(new_value)
+    return float((existing * existing_weight + new_value * new_weight) / total)
 
 
 def _weighted_accuracy(labels: np.ndarray, predictions: np.ndarray, weights: np.ndarray) -> float:
@@ -1327,7 +1359,7 @@ def _choose_classifier(sample_count: int, class_count: int) -> object:
             learning_rate=0.01,
             l2=1e-4,
         )
-    return _WeightedLogisticRegression(max_iter=800, l2=1e-2, learning_rate=0.08)
+    return _WeightedLogisticRegression(max_iter=800, l2=2e-2, learning_rate=0.08)
 
 
 def train_market_model(
@@ -1383,6 +1415,10 @@ def train_market_model(
     predictions = (probabilities >= 0.5).astype(int)
     accuracy = _weighted_accuracy(labels, predictions, metrics_weights)
     log_loss_value = _weighted_log_loss(labels, probabilities, metrics_weights)
+    brier_score = _weighted_brier_score(labels, probabilities, metrics_weights)
+    avg_probability = _weighted_average(probabilities, metrics_weights)
+    positive_rate = float(labels.mean() if len(labels) else 0.0)
+    calibration_bias = float(positive_rate - avg_probability)
 
     oos_metrics = _rolling_out_of_sample_metrics(
         pipeline,
@@ -1399,9 +1435,12 @@ def train_market_model(
         "symbols": len(set(str(symbol) for symbol in symbols)),
         "accuracy": float(accuracy),
         "log_loss": float(log_loss_value),
-        "positive_rate": float(labels.mean() if len(labels) else 0.0),
+        "positive_rate": positive_rate,
         "out_of_sample": oos_metrics,
         "model_type": type(classifier).__name__,
+        "avg_predicted_probability": float(avg_probability),
+        "brier_score": float(brier_score),
+        "calibration_bias": float(calibration_bias),
     }
 
     log("market_model.training_metrics", **metrics_payload)
@@ -1467,8 +1506,12 @@ def incremental_update_market_model(
     predictions = (probabilities >= 0.5).astype(int)
     accuracy = _weighted_accuracy(labels, predictions, metrics_weights)
     log_loss_value = _weighted_log_loss(labels, probabilities, metrics_weights)
+    brier_score = _weighted_brier_score(labels, probabilities, metrics_weights)
+    avg_probability = _weighted_average(probabilities, metrics_weights)
+    positive_rate = float(labels.mean() if len(labels) else 0.0)
 
     new_stats = _summarise_feature_distribution(matrix)
+    previous_samples = int(model.samples)
     model.feature_stats = _blend_feature_stats(
         model.feature_stats,
         new_stats,
@@ -1478,12 +1521,42 @@ def incremental_update_market_model(
     model.samples += sample_count
     model.trained_at = float(time.time())
     metrics = dict(model.training_metrics)
+    existing_positive = _as_float(metrics.get("positive_rate"))
+    existing_avg_probability = _as_float(metrics.get("avg_predicted_probability"))
+    existing_brier = _as_float(metrics.get("brier_score"))
+    total_samples = max(previous_samples + sample_count, 1)
+    combined_positive = _blend_average(
+        existing_positive,
+        previous_samples,
+        positive_rate,
+        sample_count,
+    )
+    combined_avg_probability = _blend_average(
+        existing_avg_probability,
+        previous_samples,
+        avg_probability,
+        sample_count,
+    )
+    combined_brier = _blend_average(
+        existing_brier,
+        previous_samples,
+        brier_score,
+        sample_count,
+    )
+    calibration_bias = combined_positive - combined_avg_probability
     metrics.update(
         {
             "recent_accuracy": float(accuracy),
             "recent_log_loss": float(log_loss_value),
+            "recent_avg_probability": float(avg_probability),
+            "recent_brier_score": float(brier_score),
             "last_update_samples": sample_count,
             "last_update_at": datetime.utcnow().isoformat(),
+            "samples": int(total_samples),
+            "positive_rate": float(combined_positive),
+            "avg_predicted_probability": float(combined_avg_probability),
+            "brier_score": float(combined_brier),
+            "calibration_bias": float(calibration_bias),
         }
     )
     model.training_metrics = metrics
