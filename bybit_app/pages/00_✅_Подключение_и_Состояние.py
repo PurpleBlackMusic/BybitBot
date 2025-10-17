@@ -1,7 +1,13 @@
 
 from __future__ import annotations
 import streamlit as st
-from utils.envs import get_api_client, get_settings, update_settings, creds_ok
+from utils.envs import (
+    get_api_client,
+    get_settings,
+    update_settings,
+    creds_ok,
+    last_api_client_error,
+)
 from utils.log import log
 from utils.time_sync import extract_server_datetime
 
@@ -138,27 +144,34 @@ st.divider()
 st.subheader("Проверка соединения")
 if creds_ok():
     api = get_api_client()
-    try:
-        t = api.server_time()
-        server_dt = extract_server_datetime(t)
-        if server_dt is not None:
-            server_time_text = server_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-        else:
-            server_time_text = t.get("result", {}).get("timeSecond", "—")
-        st.success(f"Связь с API есть. Серверное время: {server_time_text}")
-    except Exception as e:
-        st.error(f"Ошибка запроса: {e}")
-
-    st.write("---")
-    st.caption("Локальная проверка пары")
-    sym = st.text_input("Тикер для проверки", value="BTCUSDT")
-    if st.button("Проверить инструменты и тикер"):
+    api_error = last_api_client_error()
+    if api is None:
+        st.error(
+            api_error
+            or "Не удалось инициализировать Bybit клиент. Проверьте подключение и ключи."
+        )
+    else:
         try:
-            info = api.instruments_info(category="spot", symbol=sym.strip().upper())
-            st.json(info)
-            tk = api.tickers(category="spot", symbol=sym.strip().upper())
-            st.json(tk)
+            t = api.server_time()
+            server_dt = extract_server_datetime(t)
+            if server_dt is not None:
+                server_time_text = server_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                server_time_text = t.get("result", {}).get("timeSecond", "—")
+            st.success(f"Связь с API есть. Серверное время: {server_time_text}")
         except Exception as e:
-            st.error(f"Ошибка: {e}")
+            st.error(f"Ошибка запроса: {e}")
+
+        st.write("---")
+        st.caption("Локальная проверка пары")
+        sym = st.text_input("Тикер для проверки", value="BTCUSDT")
+        if st.button("Проверить инструменты и тикер"):
+            try:
+                info = api.instruments_info(category="spot", symbol=sym.strip().upper())
+                st.json(info)
+                tk = api.tickers(category="spot", symbol=sym.strip().upper())
+                st.json(tk)
+            except Exception as e:
+                st.error(f"Ошибка: {e}")
 else:
     st.warning("Укажите API ключи выше и сохраните.")
