@@ -30,20 +30,38 @@ class ExternalFeatureProvider:
         self.data_dir = Path(data_dir)
         self._cache: Optional[ExternalFeatureSnapshot] = None
         self._cache_path: Optional[Path] = None
+        self._cache_mtime: Optional[float] = None
 
     def _snapshot_path(self) -> Path:
         return self.data_dir / "external" / "sentiment.json"
 
     def _load_snapshot(self) -> ExternalFeatureSnapshot:
         path = self._snapshot_path()
-        if self._cache is not None and path == self._cache_path:
+        mtime: Optional[float] = None
+        try:
+            stat_result = path.stat()
+        except FileNotFoundError:
+            stat_result = None
+        except OSError:
+            stat_result = None
+        else:
+            mtime = float(getattr(stat_result, "st_mtime", None) or 0.0)
+
+        if (
+            self._cache is not None
+            and path == self._cache_path
+            and (
+                (mtime is None and self._cache_mtime is None)
+                or (mtime is not None and self._cache_mtime == mtime)
+            )
+        ):
             return self._cache
         sentiment: Dict[str, float] = {}
         news_heat: Dict[str, float] = {}
         social_score: Dict[str, float] = {}
         macro_regime = 0.0
         updated_at: Optional[float] = None
-        if path.exists():
+        if stat_result is not None:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
@@ -79,6 +97,7 @@ class ExternalFeatureProvider:
         )
         self._cache = snapshot
         self._cache_path = path
+        self._cache_mtime = mtime
         return snapshot
 
     def sentiment_for(self, symbol: str) -> float:
