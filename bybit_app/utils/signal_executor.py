@@ -13,6 +13,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from .ai_thresholds import resolve_min_ev_from_settings
 from .envs import (
     Settings,
     active_dry_run,
@@ -7273,9 +7274,9 @@ class SignalExecutor:
         buy_threshold = _safe_float(getattr(settings, "ai_buy_threshold", None))
         sell_threshold = _safe_float(getattr(settings, "ai_sell_threshold", None))
         if buy_threshold is None or buy_threshold <= 0:
-            buy_threshold = 0.6
+            buy_threshold = 0.52
         if sell_threshold is None or sell_threshold <= 0:
-            sell_threshold = 0.45
+            sell_threshold = 0.42
 
         if probability is not None:
             span = 0.25
@@ -7289,16 +7290,15 @@ class SignalExecutor:
 
         ev_bps = _safe_float(summary.get("ev_bps"))
         thresholds = summary.get("thresholds")
-        min_ev_setting = _safe_float(getattr(settings, "ai_min_ev_bps", None))
+        min_ev = resolve_min_ev_from_settings(settings, default_bps=12.0)
         if isinstance(thresholds, dict):
             threshold_override = _safe_float(thresholds.get("min_ev_bps"))
             if threshold_override is not None:
-                min_ev_setting = threshold_override
-        min_ev = max(min_ev_setting or 0.0, 0.0)
+                min_ev = max(threshold_override, 0.0)
         if ev_bps is not None:
-            baseline = max(min_ev, 5.0)
-            span = max(baseline * 1.5, 20.0)
-            margin = ev_bps - baseline
+            baseline = max(min_ev * 0.9, 4.0)
+            span = max(baseline * 1.6, 16.0)
+            margin = ev_bps - max(min_ev, baseline)
             contributions.append(max(0.0, min(margin / span, 1.0)))
 
         primary = summary.get("primary_watch")

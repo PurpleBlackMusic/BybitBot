@@ -33,6 +33,10 @@ DEFAULT_SYMBOL_UNIVERSE: Tuple[str, ...] = (
     "LTCUSDT",
 )
 
+from .ai_thresholds import (
+    min_change_from_ev_bps,
+    resolve_min_ev_from_settings,
+)
 from .envs import Settings, active_dry_run, get_settings, get_api_client
 from .settings_loader import call_get_settings
 from .paths import DATA_DIR
@@ -47,7 +51,7 @@ from .spot_pnl import spot_inventory_and_pnl
 from .symbols import ensure_usdt_symbol
 from .live_checks import api_key_status, bybit_realtime_status
 from .live_signal import LiveSignalError, LiveSignalFetcher
-from .market_scanner import scan_market_opportunities
+from .market_scanner import MIN_EV_CHANGE_PCT_FLOOR, scan_market_opportunities
 from .instruments import get_listed_spot_symbols
 from .log import log
 from .universe import build_universe, is_symbol_blacklisted, load_universe
@@ -927,13 +931,13 @@ class GuardianBot:
 
         buy_threshold = _clamp_threshold(
             getattr(settings, "ai_buy_threshold", None),
-            0.58,
+            0.52,
         )
         sell_threshold = _clamp_threshold(
             getattr(settings, "ai_sell_threshold", None),
             0.42,
         )
-        min_ev = max(float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0), 0.0)
+        min_ev = resolve_min_ev_from_settings(settings, default_bps=12.0)
 
         effective_buy_threshold = buy_threshold
         effective_sell_threshold = max(0.0, min(sell_threshold, effective_buy_threshold))
@@ -942,9 +946,9 @@ class GuardianBot:
         try:
             hysteresis_margin = float(hysteresis)
         except (TypeError, ValueError):
-            hysteresis_margin = 0.04
+            hysteresis_margin = 0.015
         if not math.isfinite(hysteresis_margin):
-            hysteresis_margin = 0.04
+            hysteresis_margin = 0.015
         hysteresis_margin = max(0.0, min(hysteresis_margin, 0.25))
 
         exit_buy_threshold = min(1.0, effective_buy_threshold + hysteresis_margin)
@@ -1259,13 +1263,10 @@ class GuardianBot:
         except (TypeError, ValueError):
             max_spread = 0.0
 
-        try:
-            min_change_pct = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0) / 100.0
-        except (TypeError, ValueError):
-            min_change_pct = 0.0
-
-        if min_change_pct <= 0:
-            min_change_pct = 0.5
+        min_ev_bps = resolve_min_ev_from_settings(settings, default_bps=12.0)
+        min_change_pct = min_change_from_ev_bps(
+            min_ev_bps, floor=MIN_EV_CHANGE_PCT_FLOOR
+        )
 
         limit_hint = int(getattr(settings, "ai_max_concurrent", 0) or 0) * 4
         if limit_hint <= 0:
@@ -4531,7 +4532,7 @@ class GuardianBot:
 
         buy_threshold = float(getattr(settings, "ai_buy_threshold", 0.0) or 0.0) * 100.0
         sell_threshold = float(getattr(settings, "ai_sell_threshold", 0.0) or 0.0) * 100.0
-        min_ev = float(getattr(settings, "ai_min_ev_bps", 80.0) or 0.0)
+        min_ev = resolve_min_ev_from_settings(settings, default_bps=12.0)
         lines.append(
             "Порог входа: покупка от {buy:.2f}%, продажа от {sell:.2f}%, ожидаемая выгода не ниже {ev:.2f} б.п.".format(
                 buy=buy_threshold,

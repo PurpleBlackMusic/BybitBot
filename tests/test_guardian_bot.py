@@ -419,8 +419,8 @@ def test_guardian_summary_flags_low_confidence_under_defaults(tmp_path: Path) ->
     assert any("порог" in reason.lower() for reason in summary["actionable_reasons"])
     reason_text = " ".join(summary["actionable_reasons"])
     assert "48.00%" in reason_text
-    assert "58.00%" in reason_text
-    assert summary["thresholds"]["buy_probability_pct"] == 58.0
+    assert "52.00%" in reason_text
+    assert summary["thresholds"]["buy_probability_pct"] == 52.0
     assert summary["thresholds"]["sell_probability_pct"] == 42.0
     assert (
         summary["thresholds"]["effective_buy_probability_pct"]
@@ -1338,11 +1338,11 @@ def test_guardian_watchlist_and_scorecard(tmp_path: Path) -> None:
     assert scorecard["symbol"] == "BTCUSDT"
     assert scorecard["probability_pct"] == 60.0
     assert scorecard["ev_bps"] == 125.0
-    assert scorecard["buy_threshold"] == 58.0
+    assert scorecard["buy_threshold"] == 52.0
     assert scorecard["sell_threshold"] == 42.0
-    assert scorecard["exit_buy_threshold"] == pytest.approx(62.0, rel=1e-3)
-    assert scorecard["exit_sell_threshold"] == pytest.approx(38.0, rel=1e-3)
-    assert scorecard["configured_buy_threshold"] == 58.0
+    assert scorecard["exit_buy_threshold"] == pytest.approx(53.5, rel=1e-3)
+    assert scorecard["exit_sell_threshold"] == pytest.approx(40.5, rel=1e-3)
+    assert scorecard["configured_buy_threshold"] == 52.0
     assert scorecard["configured_sell_threshold"] == 42.0
 
     summary = bot.status_summary()

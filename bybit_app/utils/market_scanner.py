@@ -25,6 +25,7 @@ from typing import (
 import numpy as np
 import pandas as pd
 
+from .ai_thresholds import resolve_min_ev_from_settings
 from .bybit_api import BybitAPI
 from .ai.external import ExternalFeatureProvider
 from .ai.models import (
@@ -38,6 +39,9 @@ from .freqai import get_prediction_store
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
+
+
+MIN_EV_CHANGE_PCT_FLOOR = 0.0005  # 0.05%
 from .ohlcv import normalise_ohlcv_frame
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -591,7 +595,7 @@ def _compute_dynamic_min_change(
     now: Optional[float] = None,
 ) -> float:
     if ratio is None or ratio <= 0:
-        return max(fallback, 0.05)
+        return max(fallback, MIN_EV_CHANGE_PCT_FLOOR)
 
     resolved_dir = str(Path(data_dir).resolve())
     now_ts = now if isinstance(now, (int, float)) else time.time()
@@ -599,13 +603,13 @@ def _compute_dynamic_min_change(
     if cached and now_ts - cached[0] <= _VOLATILITY_CACHE_TTL:
         cached_value = cached[1]
         if cached_value is None:
-            return max(fallback, 0.05)
-        return max(cached_value, 0.05)
+            return max(fallback, MIN_EV_CHANGE_PCT_FLOOR)
+        return max(cached_value, MIN_EV_CHANGE_PCT_FLOOR)
 
     base_dir = Path(data_dir) / "ohlcv" / "spot"
     if not base_dir.exists():
         _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
-        return max(fallback, 0.05)
+        return max(fallback, MIN_EV_CHANGE_PCT_FLOOR)
 
     changes: List[float] = []
     for symbol_dir in sorted(base_dir.iterdir()):
@@ -636,15 +640,15 @@ def _compute_dynamic_min_change(
 
     if not changes:
         _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
-        return max(fallback, 0.05)
+        return max(fallback, MIN_EV_CHANGE_PCT_FLOOR)
 
     avg_change = fmean(changes)
     dynamic = max(avg_change * ratio, 0.0)
     if dynamic <= 0:
         _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
-        return max(fallback, 0.05)
+        return max(fallback, MIN_EV_CHANGE_PCT_FLOOR)
 
-    final_value = max(dynamic, 0.05)
+    final_value = max(dynamic, MIN_EV_CHANGE_PCT_FLOOR)
     _VOLATILITY_CACHE[resolved_dir] = (now_ts, final_value)
     return final_value
 
@@ -1395,7 +1399,7 @@ def scan_market_opportunities(
     data_dir: Path = DATA_DIR,
     limit: int = 25,
     min_turnover: float = 1_000_000.0,
-    min_change_pct: float = 0.5,
+    min_change_pct: float = 0.002,
     max_spread_bps: float = 60.0,
     whitelist: Iterable[str] | None = None,
     blacklist: Iterable[str] | None = None,
@@ -1432,10 +1436,7 @@ def scan_market_opportunities(
     if testnet_active and min_turnover > 50_000.0:
         min_turnover = 50_000.0
 
-    min_ev_bps_threshold = max(
-        _safe_setting_float(settings, "ai_min_ev_bps", 80.0),
-        0.0,
-    )
+    min_ev_bps_threshold = resolve_min_ev_from_settings(settings, default_bps=12.0)
 
     max_daily_surge_pct = max(
         _safe_setting_float(settings, "ai_max_daily_surge_pct", _DEFAULT_DAILY_SURGE_LIMIT),
@@ -1458,9 +1459,9 @@ def scan_market_opportunities(
         0.0,
     )
 
-    effective_change = float(min_change_pct) if min_change_pct is not None else 0.5
-    if effective_change < 0.05:
-        effective_change = 0.05
+    effective_change = float(min_change_pct) if min_change_pct is not None else 0.002
+    if effective_change < MIN_EV_CHANGE_PCT_FLOOR:
+        effective_change = MIN_EV_CHANGE_PCT_FLOOR
     max_spread_bps = float(max_spread_bps)
     if testnet_active:
         if max_spread_bps <= 0:
