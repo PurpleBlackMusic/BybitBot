@@ -396,6 +396,69 @@ def compute_cross_market_correlation(row: Mapping[str, object]) -> Dict[str, Opt
     return {"correlations": correlations, "avg_abs": avg_abs}
 
 
+def compute_social_trend(row: Mapping[str, object]) -> Dict[str, Optional[float]]:
+    """Estimate social sentiment momentum from vendor-supplied metrics."""
+
+    direct_keys = ("socialTrendScore", "socialTrend", "social_trend_score")
+    for key in direct_keys:
+        value = _safe_float(row.get(key))
+        if value is not None and math.isfinite(value):
+            return {"score": float(value), "source": key}
+
+    ratio_specs: Sequence[tuple[str, Sequence[str]]] = (
+        ("socialMentions24h", ("socialMentionsPrev24h", "prevSocialMentions24h")),
+        ("twitterMentions24h", ("twitterMentionsPrev24h", "prevTwitterMentions24h")),
+        ("tweetMentions24h", ("tweetMentionsPrev24h", "prevTweetMentions24h")),
+        ("socialVolume24h", ("socialVolumePrev24h", "prevSocialVolume24h")),
+    )
+
+    for current_key, prev_candidates in ratio_specs:
+        current = _safe_float(row.get(current_key))
+        if current is None or current <= 0:
+            continue
+        baselines: list[float] = []
+        for prev_key in prev_candidates:
+            baseline = _safe_float(row.get(prev_key))
+            if baseline is not None and baseline > 0:
+                baselines.append(float(baseline))
+        fallback_key = f"prev{current_key[0].upper()}{current_key[1:]}" if current_key else None
+        if fallback_key:
+            fallback_value = _safe_float(row.get(fallback_key))
+            if fallback_value is not None and fallback_value > 0:
+                baselines.append(float(fallback_value))
+        if not baselines:
+            continue
+        baseline_avg = _avg(baselines)
+        if baseline_avg is None or baseline_avg <= 0:
+            continue
+        ratio = (current + 1.0) / (baseline_avg + 1.0)
+        if ratio <= 0:
+            continue
+        score = math.log(ratio)
+        if math.isfinite(score):
+            return {"score": score, "source": current_key}
+
+    delta_keys = (
+        "socialMentionsDelta24h",
+        "socialTrendDelta",
+        "social_mentions_delta",
+    )
+    for key in delta_keys:
+        delta = _safe_float(row.get(key))
+        if delta is None or not math.isfinite(delta):
+            continue
+        scale = _safe_float(row.get("socialMentionsPrev24h"))
+        if scale is None or scale <= 0:
+            scale = _safe_float(row.get("socialMentions24h"))
+        if scale is None or scale <= 0:
+            scale = 1.0
+        score = float(delta) / max(scale, 1.0)
+        if math.isfinite(score):
+            return {"score": score, "source": key}
+
+    return {"score": None, "source": None}
+
+
 def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
     momentum = compute_multi_timeframe_momentum(row)
     volatility = compute_volatility_windows(row)
@@ -403,6 +466,7 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
     depth_signal = compute_orderbook_depth_signal(row)
     order_flow = compute_order_flow_metrics(row)
     correlation = compute_cross_market_correlation(row)
+    social_trend = compute_social_trend(row)
     overbought = compute_overbought_indicators(momentum, row)
     volume_trend = compute_volume_trend(row)
 
@@ -436,5 +500,7 @@ def build_feature_bundle(row: Mapping[str, object]) -> Dict[str, object]:
         "top_depth_imbalance": order_flow["top_depth_imbalance"],
         "correlations": correlation["correlations"],
         "correlation_strength": correlation["avg_abs"],
+        "social_trend_score": social_trend["score"],
+        "social_trend_source": social_trend["source"],
         "overbought_indicators": overbought,
     }

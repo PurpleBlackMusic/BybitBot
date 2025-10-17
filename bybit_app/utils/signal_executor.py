@@ -27,6 +27,7 @@ from .precision import format_to_step, quantize_to_step
 from .live_checks import extract_wallet_totals
 from .log import log
 from .bybit_errors import parse_bybit_error_message
+from .paths import DATA_DIR
 from .spot_market import (
     OrderValidationError,
     _instrument_limits,
@@ -53,6 +54,11 @@ from .tp_targets import resolve_fee_guard_fraction, target_multiplier
 from .trade_notifications import format_sell_close_message
 from .ws_manager import manager as ws_manager
 from .ws_orderbook import LiveOrderbook
+from .self_learning import (
+    TradePerformanceSnapshot,
+    load_trade_performance,
+    maybe_retrain_market_model,
+)
 
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
@@ -170,6 +176,7 @@ class SignalExecutor:
         self._last_daily_pnl_log_day: Optional[str] = None
         self._live_orderbook: Optional[LiveOrderbook] = None
         self._risk_override_pct: Optional[float] = None
+        self._performance_state: Optional[TradePerformanceSnapshot] = None
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -360,6 +367,35 @@ class SignalExecutor:
     # state helpers
     def _current_time(self) -> float:
         return time.time()
+
+    def _maybe_refresh_market_model(self, settings: Settings, now: float) -> None:
+        data_dir = getattr(self.bot, "data_dir", DATA_DIR)
+        try:
+            maybe_retrain_market_model(data_dir=data_dir, settings=settings, now=now)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log("guardian.auto.learning.retrain_error", err=str(exc))
+
+    def _update_performance_state(self, settings: Settings) -> Optional[TradePerformanceSnapshot]:
+        data_dir = getattr(self.bot, "data_dir", DATA_DIR)
+        limit = getattr(settings, "ai_training_trade_limit", 0) if settings else 0
+        try:
+            limit_value = int(limit)
+        except (TypeError, ValueError):
+            limit_value = 0
+        if limit_value <= 0:
+            limit_value = 200
+        try:
+            snapshot = load_trade_performance(
+                data_dir=data_dir,
+                settings=settings,
+                limit=limit_value,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log("guardian.auto.learning.performance_error", err=str(exc))
+            snapshot = None
+        if snapshot is not None:
+            self._performance_state = snapshot
+        return snapshot
 
     def _penalty_threshold_for_code(self, code: Optional[str]) -> int:
         if not code:
@@ -2212,6 +2248,8 @@ class SignalExecutor:
         summary = self._fetch_summary()
         settings = self._resolve_settings()
         now = self._current_time()
+        self._maybe_refresh_market_model(settings, now)
+        performance_snapshot = self._update_performance_state(settings)
         self._maybe_log_daily_pnl(settings, now=now)
         summary_meta = self._resolve_summary_update_meta(summary, now)
         price_meta = self._resolve_price_update_meta(summary, now)
@@ -2389,7 +2427,11 @@ class SignalExecutor:
         sizing_factor = self._signal_sizing_factor(summary, settings)
         risk_context: Dict[str, object] = {}
 
-        risk_pct_override, risk_meta = self._resolve_risk_per_trade_pct(settings, summary)
+        risk_pct_override, risk_meta = self._resolve_risk_per_trade_pct(
+            settings,
+            summary,
+            performance=performance_snapshot,
+        )
         previous_risk_override = self._risk_override_pct
         self._risk_override_pct = risk_pct_override
         if risk_meta:
@@ -2399,6 +2441,11 @@ class SignalExecutor:
         if vol_meta is not None:
             risk_context["volatility"] = vol_meta
         sizing_factor = max(0.0, min(sizing_factor * vol_scale, 1.0))
+        volatility_pct = None
+        if isinstance(vol_meta, Mapping):
+            volatility_candidate = _safe_float(vol_meta.get("volatility_pct"))
+            if volatility_candidate is not None and volatility_candidate > 0:
+                volatility_pct = volatility_candidate
 
         impulse_signal = False
         impulse_context: Optional[Dict[str, object]] = None
@@ -3452,6 +3499,8 @@ class SignalExecutor:
             private_snapshot=private_snapshot,
             force_stop_loss=impulse_signal,
             fallback_stop_loss_bps=impulse_stop_bps,
+            volatility_pct=volatility_pct,
+            performance=performance_snapshot,
         )
         if execution_stats:
             order_context["execution"] = execution_stats
@@ -3539,6 +3588,8 @@ class SignalExecutor:
         private_snapshot: Mapping[str, object] | None = None,
         force_stop_loss: bool = False,
         fallback_stop_loss_bps: Optional[float] = None,
+        volatility_pct: Optional[float] = None,
+        performance: Optional[TradePerformanceSnapshot] = None,
     ) -> tuple[list[Dict[str, object]], Dict[str, str], list[Dict[str, object]]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
@@ -3954,6 +4005,8 @@ class SignalExecutor:
             price_band_max=price_band_max,
             force_stop_loss=force_stop_loss,
             fallback_stop_loss_bps=fallback_stop_loss_bps,
+            volatility_pct=volatility_pct,
+            performance=performance,
         )
 
         execution_payload = execution_stats if execution_stats else {}
@@ -3975,6 +4028,8 @@ class SignalExecutor:
         price_band_max: Decimal,
         force_stop_loss: bool = False,
         fallback_stop_loss_bps: Optional[float] = None,
+        volatility_pct: Optional[float] = None,
+        performance: Optional[TradePerformanceSnapshot] = None,
     ) -> list[Dict[str, object]]:
         symbol_upper = symbol.upper()
         if sell_budget <= 0 or qty_step <= 0 or avg_price <= 0:
@@ -4038,6 +4093,38 @@ class SignalExecutor:
                 trailing_bps = 0.0
                 enforced = True
 
+        adaptive_meta: Dict[str, object] = {}
+        if volatility_pct is not None and volatility_pct > 0:
+            base_reference = stop_loss_bps if stop_loss_bps > 0 else trailing_bps
+            if base_reference is None or base_reference <= 0:
+                base_reference = float(fallback_stop_loss_bps or 120.0)
+            quiet_threshold = 1.4
+            storm_threshold = 4.5
+            if volatility_pct <= quiet_threshold:
+                scale = 0.7
+            elif volatility_pct >= storm_threshold:
+                scale = 1.5
+            else:
+                span = max(storm_threshold - quiet_threshold, 1e-6)
+                scale = 0.7 + ((volatility_pct - quiet_threshold) / span) * (1.5 - 0.7)
+            adjusted_bps = max(60.0, min(base_reference * scale, 600.0))
+            if stop_loss_bps > 0:
+                stop_loss_bps = adjusted_bps
+            elif trailing_bps > 0:
+                trailing_bps = adjusted_bps
+            else:
+                stop_loss_bps = adjusted_bps
+                trailing_bps = 0.0
+            adaptive_meta = {
+                "volatility_pct": volatility_pct,
+                "base_bps": base_reference,
+                "scale": scale,
+                "adjusted_bps": adjusted_bps,
+            }
+            if performance is not None:
+                adaptive_meta["loss_streak"] = performance.loss_streak
+                adaptive_meta["win_streak"] = performance.win_streak
+
         if stop_loss_bps <= 0 and trailing_bps <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
             return []
@@ -4088,6 +4175,8 @@ class SignalExecutor:
         }
         if exit_side == "Sell":
             trailing_state["highest_price"] = avg_price
+        if adaptive_meta:
+            trailing_state["adaptive_stop"] = adaptive_meta
         else:
             trailing_state["lowest_price"] = avg_price
 
@@ -6311,6 +6400,7 @@ class SignalExecutor:
         self,
         settings: Settings,
         summary: Optional[Mapping[str, object]],
+        performance: Optional[TradePerformanceSnapshot] = None,
     ) -> Tuple[float, Optional[Dict[str, object]]]:
         """Return the effective risk percent per trade with adaptive scaling."""
 
@@ -6369,45 +6459,75 @@ class SignalExecutor:
                 candidates.sort(key=lambda item: item[0], reverse=True)
                 probability_value, probability_source = candidates[0]
 
+        snapshot = performance or self._performance_state
+        meta: Optional[Dict[str, object]] = None
+
         if probability_value is None:
-            if base_pct > 0.0:
-                return base_pct, {
+            effective_pct = max(base_pct, 0.0)
+            if effective_pct > 0.0:
+                meta = {
                     "mode": "static",
-                    "effective_pct": base_pct,
+                    "effective_pct": effective_pct,
                 }
-            return base_pct, None
+        else:
+            probability_scale_pct = 1.5
+            min_risk_pct = 0.5
+            max_risk_pct = 2.0
 
-        probability_scale_pct = 1.5
-        min_risk_pct = 0.5
-        max_risk_pct = 2.0
+            scaled_pct = probability_value * probability_scale_pct
+            adaptive_pct = max(min_risk_pct, min(max_risk_pct, scaled_pct))
+            effective_pct = adaptive_pct
+            meta = {
+                "mode": "adaptive",
+                "probability": probability_value,
+                "probability_source": probability_source,
+                "scale_pct": probability_scale_pct,
+                "adaptive_pct": scaled_pct,
+                "effective_pct": adaptive_pct,
+                "min_pct": min_risk_pct,
+                "max_pct": max_risk_pct,
+            }
+            if adaptive_pct != scaled_pct:
+                meta["clamped"] = True
+            if adaptive_pct == min_risk_pct:
+                meta["clamped_to_min"] = min_risk_pct
+            elif adaptive_pct == max_risk_pct:
+                meta["clamped_to_max"] = max_risk_pct
 
-        scaled_pct = probability_value * probability_scale_pct
-        adaptive_pct = max(min_risk_pct, min(max_risk_pct, scaled_pct))
-        effective_pct = adaptive_pct
-        meta: Dict[str, object] = {
-            "mode": "adaptive",
-            "probability": probability_value,
-            "probability_source": probability_source,
-            "scale_pct": probability_scale_pct,
-            "adaptive_pct": scaled_pct,
-            "effective_pct": adaptive_pct,
-            "min_pct": min_risk_pct,
-            "max_pct": max_risk_pct,
-        }
-        if adaptive_pct != scaled_pct:
-            meta["clamped"] = True
-        if adaptive_pct == min_risk_pct:
-            meta["clamped_to_min"] = min_risk_pct
-        elif adaptive_pct == max_risk_pct:
-            meta["clamped_to_max"] = max_risk_pct
+            if base_pct > 0.0:
+                meta["base_pct"] = base_pct
+                if base_pct > effective_pct:
+                    effective_pct = base_pct
+                    meta["effective_pct"] = effective_pct
+                    meta["base_applied"] = True
 
-        if base_pct > 0.0:
-            meta["base_pct"] = base_pct
-            if base_pct > effective_pct:
-                effective_pct = base_pct
+        if snapshot is not None:
+            adjustments: Dict[str, object] = {}
+            if snapshot.loss_streak >= 5:
+                effective_pct *= 0.5
+                adjustments["loss_streak"] = snapshot.loss_streak
+            elif snapshot.win_streak >= 3:
+                boost = 1.0 + min((snapshot.win_streak - 2) * 0.05, 0.25)
+                effective_pct *= boost
+                adjustments["win_streak"] = snapshot.win_streak
+
+            if adjustments:
+                effective_pct = max(effective_pct, 0.05)
+                perf_meta = {
+                    "win_streak": snapshot.win_streak,
+                    "loss_streak": snapshot.loss_streak,
+                    "recent_results": snapshot.recent_results(),
+                    "average_pnl": snapshot.average_pnl,
+                    "sample_count": snapshot.sample_count,
+                    "adjustments": adjustments,
+                }
+                if meta is None:
+                    meta = {"mode": "adaptive", "effective_pct": effective_pct}
+                meta["performance"] = perf_meta
                 meta["effective_pct"] = effective_pct
-                meta["base_applied"] = True
 
+        if meta is None:
+            return effective_pct, None
         return effective_pct, meta
 
     def _compute_notional(
@@ -7198,7 +7318,11 @@ class SignalExecutor:
             average = sum(contributions) / len(contributions)
             floor = 0.3 if summary.get("actionable") else 0.2
 
-            risk_pct, _ = self._resolve_risk_per_trade_pct(settings, summary)
+            risk_pct, _ = self._resolve_risk_per_trade_pct(
+                settings,
+                summary,
+                performance=self._performance_state,
+            )
 
             risk_dampen = 1.0
             if risk_pct > 0.0:

@@ -96,7 +96,27 @@ def _sample_row(symbol: str, *, change_24h: float = 0.5, extra: dict[str, object
     return base
 
 
-def test_market_scanner_ranks_opportunities(tmp_path: Path) -> None:
+def test_market_scanner_ranks_opportunities(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_compute_dynamic_min_change",
+        lambda data_dir, ratio, fallback, **_: fallback,
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_resolve_min_turnover_threshold",
+        lambda base, rows, ratio: base,
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_estimate_top_depth_threshold",
+        lambda rows, ratio, fallback: float(fallback or 0.0),
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_load_hourly_indicator_bundle",
+        lambda *args, **kwargs: None,
+    )
     rows = [
         {
             "symbol": "BTCUSDT",
@@ -281,6 +301,26 @@ def test_market_scanner_enforces_top_liquidity_threshold(
     _write_snapshot(tmp_path, rows)
 
     monkeypatch.setattr(ai_models, "ensure_market_model", lambda **_: None)
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_compute_dynamic_min_change",
+        lambda data_dir, ratio, fallback, **_: fallback,
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_resolve_min_turnover_threshold",
+        lambda base, rows, ratio: base,
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_estimate_top_depth_threshold",
+        lambda rows, ratio, fallback: float(fallback or 0.0),
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_load_hourly_indicator_bundle",
+        lambda *args, **kwargs: None,
+    )
 
     opportunities = scan_market_opportunities(
         api=None,
@@ -1202,6 +1242,90 @@ def test_stateful_market_scanner_enriches_candidates(tmp_path: Path) -> None:
     assert cached == results
     assert len(scan_calls) == 1
     assert len(api.kline_calls) == 8
+
+
+def test_hourly_confirmation_filters_without_cross(monkeypatch, tmp_path: Path) -> None:
+    market_scanner_module._VOLATILITY_CACHE.clear()
+    market_scanner_module._HOURLY_SIGNAL_CACHE.clear()
+    _write_snapshot(tmp_path, [_sample_row("ABCUSDT", change_24h=1.2)])
+    settings = Settings(ai_min_ev_bps=0.0, testnet=False)
+
+    monkeypatch.setattr(market_scanner_module, "ensure_market_model", lambda **_: None)
+    monkeypatch.setattr(market_scanner_module, "_compute_dynamic_min_change", lambda *args, **kwargs: 0.5)
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_resolve_min_turnover_threshold",
+        lambda base, rows, ratio: 0.0,
+    )
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_estimate_top_depth_threshold",
+        lambda rows, ratio, fallback: 0.0,
+    )
+
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_load_hourly_indicator_bundle",
+        lambda *args, **kwargs: {
+            "ema_cross": None,
+            "ema_cross_bars_ago": None,
+            "rsi": 60.0,
+            "momentum_pct": 0.4,
+        },
+    )
+
+    opportunities = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_change_pct=0.5,
+        settings=settings,
+    )
+    assert opportunities
+    assert opportunities[0]["trend"] == "wait"
+
+    monkeypatch.setattr(
+        market_scanner_module,
+        "_load_hourly_indicator_bundle",
+        lambda *args, **kwargs: {
+            "ema_cross": "bullish",
+            "ema_cross_bars_ago": 0,
+            "rsi": 60.0,
+            "momentum_pct": 0.4,
+        },
+    )
+
+    refreshed = scan_market_opportunities(
+        api=None,
+        data_dir=tmp_path,
+        min_change_pct=0.5,
+        settings=settings,
+    )
+    assert refreshed
+    assert refreshed[0]["trend"] == "buy"
+
+
+def test_compute_dynamic_min_change_from_volatility(tmp_path: Path) -> None:
+    market_scanner_module._VOLATILITY_CACHE.clear()
+    market_scanner_module._HOURLY_SIGNAL_CACHE.clear()
+    base_dir = tmp_path / "ohlcv" / "spot" / "TESTUSDT"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    path = base_dir / "TESTUSDT_1h.csv"
+    start = 1_700_000_000
+    rows = ["timestamp,open,high,low,close,volume"]
+    for day in range(35):
+        close = 100.0 * (1.02 ** day)
+        for hour in range(24):
+            ts = start + (day * 24 + hour) * 3600
+            rows.append(f"{ts},{close:.4f},{close:.4f},{close:.4f},{close:.4f},1.0")
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    threshold = market_scanner_module._compute_dynamic_min_change(
+        tmp_path,
+        ratio=0.5,
+        fallback=0.5,
+    )
+    assert threshold > 0.5
+    assert threshold < 3.0
 def test_candle_cache_filters_unclosed_payload() -> None:
     now = 10_000.0
     interval = 1

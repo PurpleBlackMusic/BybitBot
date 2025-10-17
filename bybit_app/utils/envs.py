@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
 from .paths import DATA_DIR, SETTINGS_FILE
+from .log import log
 
 
 _SENSITIVE_FIELDS = {
@@ -66,6 +67,7 @@ def _is_placeholder(value: str) -> bool:
 _CACHE: dict[str, Any] = {
     "settings": None,
     "key": None,
+    "api_error": None,
 }
 
 
@@ -169,6 +171,7 @@ class Settings:
     ai_category: str = "spot"
     ai_symbols: str = ""
     ai_whitelist: str = ""
+    ai_force_include: str = ""
     ai_blacklist: str = ""
     ai_interval: str = "5"
     ai_horizon_bars: int = 48
@@ -185,7 +188,8 @@ class Settings:
     ai_kill_switch_cooldown_min: float = 60.0
     ai_min_ev_bps: float = 80.0
     ai_signal_hysteresis: float = 0.04
-    ai_retrain_minutes: int = 240
+    ai_retrain_minutes: int = 10080
+    ai_training_trade_limit: int = 400
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
     ai_market_scan_enabled: bool = True
@@ -194,6 +198,9 @@ class Settings:
     ai_max_daily_surge_pct: float = 12.0
     ai_overbought_rsi_threshold: float = 74.0
     ai_overbought_stochastic_threshold: float = 88.0
+    ai_min_change_volatility_ratio: float = 0.6
+    ai_min_turnover_ratio: float = 0.3
+    ai_min_top_quote_ratio: float = 0.2
 
     # TWAP
     twap_slices: int = 8
@@ -370,6 +377,7 @@ _ENV_MAP = {
     "ai_category": "AI_CATEGORY",
     "ai_symbols": "AI_SYMBOLS",
     "ai_whitelist": "AI_WHITELIST",
+    "ai_force_include": "AI_FORCE_INCLUDE",
     "ai_blacklist": "AI_BLACKLIST",
     "ai_interval": "AI_INTERVAL",
     "ai_horizon_bars": "AI_HORIZON_BARS",
@@ -388,12 +396,16 @@ _ENV_MAP = {
     "ai_signal_hysteresis": "AI_SIGNAL_HYSTERESIS",
     "ai_max_concurrent": "AI_MAX_CONCURRENT",
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
+    "ai_training_trade_limit": "AI_TRAINING_TRADE_LIMIT",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
     "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
     "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
     "ai_max_daily_surge_pct": "AI_MAX_DAILY_SURGE_PCT",
     "ai_overbought_rsi_threshold": "AI_OVERBOUGHT_RSI_THRESHOLD",
     "ai_overbought_stochastic_threshold": "AI_OVERBOUGHT_STOCH_THRESHOLD",
+    "ai_min_change_volatility_ratio": "AI_MIN_CHANGE_VOL_RATIO",
+    "ai_min_turnover_ratio": "AI_MIN_TURNOVER_RATIO",
+    "ai_min_top_quote_ratio": "AI_MIN_TOP_QUOTE_RATIO",
     "twap_slices": "TWAP_SLICES",
     "twap_interval_sec": "TWAP_INTERVAL_SEC",
     "twap_child_secs": "TWAP_CHILD_SECS",
@@ -545,6 +557,7 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_signal_hysteresis"] = hysteresis
     m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
     m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
+    m["ai_training_trade_limit"] = _cast_int(m.get("ai_training_trade_limit"))
     m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
     ai_max_hold = _cast_float(m.get("ai_max_hold_minutes"))
     if ai_max_hold is None or ai_max_hold <= 0:
@@ -560,9 +573,14 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     m["ai_overbought_stochastic_threshold"] = _cast_float(
         m.get("ai_overbought_stochastic_threshold")
     )
+    m["ai_min_change_volatility_ratio"] = _cast_float(
+        m.get("ai_min_change_volatility_ratio")
+    )
+    m["ai_min_turnover_ratio"] = _cast_float(m.get("ai_min_turnover_ratio"))
+    m["ai_min_top_quote_ratio"] = _cast_float(m.get("ai_min_top_quote_ratio"))
     m["ai_min_top_quote_usd"] = _cast_float(m.get("ai_min_top_quote_usd"))
 
-    for csv_field in ("ai_symbols", "ai_whitelist"):
+    for csv_field in ("ai_symbols", "ai_whitelist", "ai_force_include"):
         cleaned = _normalise_symbol_csv(m.get(csv_field))
         if cleaned is not None:
             m[csv_field] = cleaned
@@ -886,12 +904,84 @@ def creds_ok(s: Optional[Settings] = None) -> bool:
     return bool(active_api_key(s) and active_api_secret(s))
 
 
+def _store_api_client_error(message: str | None) -> None:
+    _CACHE["api_error"] = str(message) if message else None
+
+
+def last_api_client_error() -> Optional[str]:
+    error = _CACHE.get("api_error")
+    if not error:
+        return None
+    return str(error)
+
+
+def _coerce_error_message(error: BaseException | object) -> str:
+    if isinstance(error, BaseException):
+        message = str(error)
+    else:
+        message = str(error or "")
+    cleaned = message.strip()
+    return cleaned or "Bybit API client недоступен"
+
+
+def _force_dry_run_mode(settings: Settings, *, reason: str | None = None) -> None:
+    suffix = "testnet" if getattr(settings, "testnet", True) else "mainnet"
+    attr_name = f"dry_run_{suffix}"
+    if getattr(settings, attr_name, True):
+        return
+
+    log(
+        "envs.dry_run.forced",
+        reason=reason or "api_client_error",
+        network=suffix,
+    )
+
+    try:
+        update_settings(dry_run=True)
+    except Exception as exc:  # pragma: no cover - persistence edge cases
+        log("envs.dry_run.force.error", err=str(exc))
+    else:
+        try:
+            setattr(settings, attr_name, True)
+        except Exception:
+            pass
+        try:
+            # refresh cached settings so callers observe the change
+            get_settings(force_reload=True)
+        except Exception:
+            pass
+
+
 def get_api_client(force_reload: bool = False):
     """Convenience accessor that reuses cached settings and API sessions."""
 
-    from .bybit_api import api_from_settings
+    from .bybit_api import api_from_settings, BybitCreds, get_api
 
-    return api_from_settings(get_settings(force_reload=force_reload))
+    settings = get_settings(force_reload=force_reload)
+
+    try:
+        client = api_from_settings(settings)
+    except Exception as exc:
+        message = _coerce_error_message(exc)
+        _store_api_client_error(message)
+        _force_dry_run_mode(settings, reason=message)
+        log("envs.api_client.error", err=message)
+
+        try:
+            fallback_creds = BybitCreds(key="", secret="", testnet=settings.testnet)
+            client = get_api(
+                fallback_creds,
+                recv_window=int(getattr(settings, "recv_window_ms", 15000)),
+                timeout=int(getattr(settings, "http_timeout_ms", 10000)),
+                verify_ssl=bool(getattr(settings, "verify_ssl", True)),
+            )
+        except Exception as fallback_exc:  # pragma: no cover - defensive fallback
+            log("envs.api_client.fallback.error", err=str(fallback_exc))
+            return None
+    else:
+        _store_api_client_error(None)
+
+    return client
 
 
 def active_api_key(settings: Any) -> str:

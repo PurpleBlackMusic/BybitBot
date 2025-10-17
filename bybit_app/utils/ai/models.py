@@ -268,6 +268,31 @@ def _clone_step(step: object) -> object:
     return copy.deepcopy(step)
 
 
+def _ensure_pipeline_scaler(pipeline: "Pipeline", feature_count: int) -> None:
+    """Initialise the scaler step when loading legacy or partial models."""
+
+    if feature_count <= 0:
+        return
+
+    try:
+        scaler = pipeline.named_steps.get("scaler")  # type: ignore[attr-defined]
+    except AttributeError:  # pragma: no cover - defensive fallback
+        return
+
+    if not isinstance(scaler, StandardScaler):
+        return
+
+    required = ("scale_", "mean_", "var_", "n_features_in_", "n_samples_seen_")
+    missing = any(not hasattr(scaler, attr) for attr in required)
+    mismatch = getattr(scaler, "n_features_in_", feature_count) != feature_count
+
+    if not missing and not mismatch:
+        return
+
+    fallback = np.zeros((1, feature_count), dtype=float)
+    scaler.fit(fallback)
+
+
 def clone_pipeline(pipeline: Pipeline) -> Pipeline:
     """Return a fresh copy of the provided pipeline."""
 
@@ -314,6 +339,8 @@ class MarketModel:
     def predict_proba(self, features: Mapping[str, float]) -> float:
         """Predict the probability for the provided feature mapping."""
 
+        feature_count = len(self.feature_names)
+        _ensure_pipeline_scaler(self.pipeline, feature_count)
         vector = np.array(
             [[float(features.get(name, 0.0)) for name in self.feature_names]],
             dtype=float,
@@ -1540,6 +1567,7 @@ def ensure_market_model(
     model_path: Optional[Path] = None,
     max_age: float = 3600.0,
     min_samples: int = 25,
+    limit: Optional[int] = None,
 ) -> Optional[MarketModel]:
     """Load the current model, retraining it when it is missing or stale."""
 
@@ -1567,6 +1595,7 @@ def ensure_market_model(
         ledger_path=ledger_path,
         model_path=resolved_path,
         min_samples=min_samples,
+        limit=limit,
     )
     if trained is not None:
         return trained

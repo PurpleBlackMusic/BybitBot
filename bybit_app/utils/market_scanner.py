@@ -22,6 +22,9 @@ from typing import (
     TYPE_CHECKING,
 )
 
+import numpy as np
+import pandas as pd
+
 from .bybit_api import BybitAPI
 from .ai.external import ExternalFeatureProvider
 from .ai.models import (
@@ -34,6 +37,7 @@ from .fees import fee_rate_for_symbol
 from .log import log
 from .paths import DATA_DIR
 from .market_features import build_feature_bundle
+from .ohlcv import normalise_ohlcv_frame
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
 from .trade_analytics import load_executions
@@ -80,6 +84,20 @@ _DELIST_KEYS: Tuple[str, ...] = (
 _DEFAULT_DAILY_SURGE_LIMIT = 12.0
 _DEFAULT_RSI_OVERBOUGHT = 74.0
 _DEFAULT_STOCH_OVERBOUGHT = 88.0
+
+_HOURLY_SIGNAL_CACHE_TTL = 300.0
+_VOLATILITY_CACHE_TTL = 900.0
+_HOURLY_LOOKBACK_HOURS = 180
+_MAX_CROSS_LOOKBACK = 6
+_MAX_VOL_SAMPLE = 20
+_VOLATILITY_LOOKBACK_DAYS = 30
+_RSI_CONFIRMATION_BUY = 55.0
+_RSI_CONFIRMATION_SELL = 45.0
+_MIN_HOURLY_MOMENTUM = 0.1
+_CROSS_CONFIRMATION_WINDOW = 3
+
+_HOURLY_SIGNAL_CACHE: Dict[Tuple[str, str], Tuple[float, Optional[Dict[str, object]]]] = {}
+_VOLATILITY_CACHE: Dict[str, Tuple[float, Optional[float]]] = {}
 _IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
 
 
@@ -358,6 +376,360 @@ def _normalise_percent(value: object) -> Optional[float]:
         pct *= 100.0
     return pct
 
+
+def _ohlcv_hourly_path(data_dir: Path, symbol: str) -> Path:
+    base = Path(data_dir) / "ohlcv" / "spot" / symbol.upper()
+    return base / f"{symbol.upper()}_1h.csv"
+
+
+def _load_hourly_frame(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        return None
+    try:
+        frame = pd.read_csv(path)
+    except Exception:
+        return None
+    working = frame.copy()
+    if "start" not in working.columns:
+        if "timestamp" in working.columns:
+            working = working.rename(columns={"timestamp": "start"})
+        elif "time" in working.columns:
+            working = working.rename(columns={"time": "start"})
+    try:
+        normalised = normalise_ohlcv_frame(working, timestamp_col="start")
+    except Exception:
+        return None
+    if "close" not in normalised.columns:
+        return None
+    return normalised
+
+
+def _compute_rsi_series(closes: pd.Series, period: int = 14) -> pd.Series:
+    if closes.empty:
+        return pd.Series(dtype="float64")
+    delta = closes.diff().fillna(0.0)
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = losses.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = avg_loss.replace(0.0, np.nan)
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.fillna(50.0)
+    return rsi
+
+
+def _detect_recent_cross(diff: pd.Series) -> Tuple[Optional[str], Optional[int]]:
+    if diff.empty:
+        return None, None
+    max_offset = min(len(diff) - 1, _MAX_CROSS_LOOKBACK)
+    if max_offset <= 0:
+        return None, None
+    for offset in range(1, max_offset + 1):
+        current = diff.iloc[-offset]
+        previous = diff.iloc[-(offset + 1)]
+        if current > 0 and previous <= 0:
+            return "bullish", offset - 1
+        if current < 0 and previous >= 0:
+            return "bearish", offset - 1
+    return None, None
+
+
+def _load_hourly_indicator_bundle(
+    symbol: str,
+    *,
+    data_dir: Path = DATA_DIR,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, object]]:
+    key = (str(Path(data_dir).resolve()), symbol.upper())
+    now_ts = now if isinstance(now, (int, float)) else time.time()
+    cached = _HOURLY_SIGNAL_CACHE.get(key)
+    if cached and now_ts - cached[0] <= _HOURLY_SIGNAL_CACHE_TTL:
+        payload = cached[1]
+        return copy.deepcopy(payload) if payload is not None else None
+
+    path = _ohlcv_hourly_path(data_dir, symbol)
+    frame = _load_hourly_frame(path)
+    if frame is None or frame.empty:
+        _HOURLY_SIGNAL_CACHE[key] = (now_ts, None)
+        return None
+
+    frame = frame.tail(max(_HOURLY_LOOKBACK_HOURS + 10, 60))
+    if frame.empty or "close" not in frame.columns:
+        _HOURLY_SIGNAL_CACHE[key] = (now_ts, None)
+        return None
+
+    working = frame.set_index("start")
+    assert isinstance(working.index, pd.DatetimeIndex)
+
+    closes = working["close"].astype(float)
+    if closes.size < 55:
+        _HOURLY_SIGNAL_CACHE[key] = (now_ts, None)
+        return None
+
+    ema_fast = closes.ewm(span=21, adjust=False).mean()
+    ema_slow = closes.ewm(span=50, adjust=False).mean()
+    diff = ema_fast - ema_slow
+    cross_label, cross_age = _detect_recent_cross(diff)
+
+    rsi_series = _compute_rsi_series(closes)
+    rsi_value = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
+
+    momentum_pct: Optional[float] = None
+    if closes.size >= 2 and closes.iloc[-2] != 0:
+        momentum_pct = (closes.iloc[-1] / closes.iloc[-2] - 1.0) * 100.0
+
+    high_series = working.get("high")
+    low_series = working.get("low")
+    recent_window = working.last(f"{max(_HOURLY_LOOKBACK_HOURS, 48)}H")
+    last_close = float(closes.iloc[-1])
+    breakout = False
+    breakdown = False
+    recent_high = None
+    recent_low = None
+    if isinstance(high_series, pd.Series) and not high_series.empty:
+        recent_high = float(recent_window["high"].max()) if not recent_window.empty else None
+        if recent_high and recent_high > 0:
+            breakout = last_close >= recent_high * 0.999
+    if isinstance(low_series, pd.Series) and not low_series.empty:
+        recent_low = float(recent_window["low"].min()) if not recent_window.empty else None
+        if recent_low and recent_low > 0:
+            breakdown = last_close <= recent_low * 1.001
+
+    payload: Dict[str, object] = {
+        "ema_fast": float(ema_fast.iloc[-1]),
+        "ema_slow": float(ema_slow.iloc[-1]),
+        "ema_cross": cross_label,
+        "ema_cross_bars_ago": cross_age,
+        "ema_fast_above": bool(diff.iloc[-1] > 0),
+        "rsi": rsi_value,
+        "momentum_pct": float(momentum_pct) if momentum_pct is not None else None,
+        "breakout": breakout,
+        "breakdown": breakdown,
+        "last_close": last_close,
+    }
+    if recent_high is not None:
+        payload["recent_high"] = recent_high
+    if recent_low is not None:
+        payload["recent_low"] = recent_low
+
+    _HOURLY_SIGNAL_CACHE[key] = (now_ts, payload)
+    return copy.deepcopy(payload)
+
+
+def _sanitise_hourly_signal(bundle: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if not bundle:
+        return None
+    allowed = {
+        "ema_fast",
+        "ema_slow",
+        "ema_cross",
+        "ema_cross_bars_ago",
+        "ema_fast_above",
+        "rsi",
+        "momentum_pct",
+        "breakout",
+        "breakdown",
+        "last_close",
+        "recent_high",
+        "recent_low",
+    }
+    result: Dict[str, object] = {}
+    for key, value in bundle.items():
+        if key not in allowed:
+            continue
+        if isinstance(value, float):
+            result[key] = round(value, 6)
+        else:
+            result[key] = value
+    return result if result else None
+
+
+def _compute_dynamic_min_change(
+    data_dir: Path,
+    ratio: float,
+    fallback: float,
+    *,
+    now: Optional[float] = None,
+) -> float:
+    if ratio is None or ratio <= 0:
+        return max(fallback, 0.05)
+
+    resolved_dir = str(Path(data_dir).resolve())
+    now_ts = now if isinstance(now, (int, float)) else time.time()
+    cached = _VOLATILITY_CACHE.get(resolved_dir)
+    if cached and now_ts - cached[0] <= _VOLATILITY_CACHE_TTL:
+        cached_value = cached[1]
+        if cached_value is None:
+            return max(fallback, 0.05)
+        return max(cached_value, 0.05)
+
+    base_dir = Path(data_dir) / "ohlcv" / "spot"
+    if not base_dir.exists():
+        _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
+        return max(fallback, 0.05)
+
+    changes: List[float] = []
+    for symbol_dir in sorted(base_dir.iterdir()):
+        if not symbol_dir.is_dir():
+            continue
+        path = symbol_dir / f"{symbol_dir.name}_1h.csv"
+        frame = _load_hourly_frame(path)
+        if frame is None or frame.empty or "close" not in frame.columns:
+            continue
+        working = frame.set_index("start")
+        assert isinstance(working.index, pd.DatetimeIndex)
+        if working.empty:
+            continue
+        window_start = working.index.max() - pd.Timedelta(days=_VOLATILITY_LOOKBACK_DAYS)
+        subset = working.loc[working.index >= window_start]
+        closes = subset["close"].astype(float)
+        if closes.empty:
+            continue
+        daily = closes.resample("1D").last().dropna()
+        if daily.size <= 1:
+            continue
+        pct = daily.pct_change().dropna()
+        if pct.empty:
+            continue
+        changes.append(float(pct.abs().mean() * 100.0))
+        if len(changes) >= _MAX_VOL_SAMPLE:
+            break
+
+    if not changes:
+        _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
+        return max(fallback, 0.05)
+
+    avg_change = fmean(changes)
+    dynamic = max(avg_change * ratio, 0.0)
+    if dynamic <= 0:
+        _VOLATILITY_CACHE[resolved_dir] = (now_ts, None)
+        return max(fallback, 0.05)
+
+    final_value = max(dynamic, 0.05)
+    _VOLATILITY_CACHE[resolved_dir] = (now_ts, final_value)
+    return final_value
+
+
+def _resolve_min_turnover_threshold(
+    base_min_turnover: float,
+    rows: Sequence[Mapping[str, object]],
+    ratio: float,
+) -> float:
+    base_value = max(float(base_min_turnover or 0.0), 0.0)
+    if ratio is None or ratio <= 0:
+        return base_value
+    turnovers: List[float] = []
+    for row in rows:
+        value = _safe_float(row.get("turnover24h"))
+        if value is None or value <= 0:
+            continue
+        turnovers.append(float(value))
+    if not turnovers:
+        return base_value
+    turnovers.sort(reverse=True)
+    sample = turnovers[: _MAX_VOL_SAMPLE]
+    average = fmean(sample)
+    dynamic = average * ratio
+    if base_value > 0:
+        dynamic = max(dynamic, base_value * 0.5)
+    return max(dynamic, 0.0)
+
+
+def _estimate_top_depth_threshold(
+    rows: Sequence[Mapping[str, object]],
+    ratio: float,
+    fallback: Optional[float],
+) -> float:
+    base_value = max(float(fallback or 0.0), 0.0)
+    if ratio is None or ratio <= 0:
+        return base_value
+    totals: List[float] = []
+    for row in rows:
+        bid_price = _safe_float(row.get("bestBidPrice") or row.get("bid1Price"))
+        ask_price = _safe_float(row.get("bestAskPrice") or row.get("ask1Price"))
+        bid_size = _safe_float(row.get("bid1Size") or row.get("bidSize"))
+        ask_size = _safe_float(row.get("ask1Size") or row.get("askSize"))
+        bid_quote = (
+            bid_price * bid_size
+            if bid_price and bid_size and bid_price > 0 and bid_size > 0
+            else None
+        )
+        ask_quote = (
+            ask_price * ask_size
+            if ask_price and ask_size and ask_price > 0 and ask_size > 0
+            else None
+        )
+        total_quote: Optional[float] = None
+        if bid_quote is not None or ask_quote is not None:
+            total_quote = (bid_quote or 0.0) + (ask_quote or 0.0)
+        if total_quote is not None and total_quote > 0:
+            totals.append(float(total_quote))
+    if not totals:
+        return base_value
+    totals.sort(reverse=True)
+    sample = totals[: _MAX_VOL_SAMPLE]
+    average = fmean(sample)
+    dynamic = average * ratio
+    if base_value > 0:
+        dynamic = max(dynamic, base_value * 0.5)
+    return max(dynamic, 0.0)
+
+
+def _resolve_trend_with_confirmation(
+    change_pct: Optional[float],
+    effective_change: float,
+    indicator: Optional[Mapping[str, object]],
+    *,
+    force_include: bool = False,
+) -> str:
+    if change_pct is None:
+        return "wait"
+    if change_pct >= effective_change:
+        base_trend = "buy"
+    elif change_pct <= -effective_change:
+        base_trend = "sell"
+    else:
+        return "wait"
+
+    if force_include or not indicator:
+        return base_trend
+
+    rsi_value = indicator.get("rsi") if isinstance(indicator, Mapping) else None
+    momentum = indicator.get("momentum_pct") if isinstance(indicator, Mapping) else None
+    cross_label = indicator.get("ema_cross") if isinstance(indicator, Mapping) else None
+    cross_age = indicator.get("ema_cross_bars_ago") if isinstance(indicator, Mapping) else None
+    breakout = bool(indicator.get("breakout")) if isinstance(indicator, Mapping) else False
+    breakdown = bool(indicator.get("breakdown")) if isinstance(indicator, Mapping) else False
+
+    if isinstance(cross_age, (int, float)) and cross_age >= 0:
+        cross_recent = cross_age <= _CROSS_CONFIRMATION_WINDOW
+    else:
+        cross_recent = True if cross_label in {"bullish", "bearish"} else False
+
+    momentum_ok_buy = (
+        momentum is None
+        or (isinstance(momentum, (int, float)) and float(momentum) >= _MIN_HOURLY_MOMENTUM)
+    )
+    momentum_ok_sell = (
+        momentum is None
+        or (isinstance(momentum, (int, float)) and float(momentum) <= -_MIN_HOURLY_MOMENTUM)
+    )
+
+    if base_trend == "buy":
+        rsi_ok = isinstance(rsi_value, (int, float)) and float(rsi_value) >= _RSI_CONFIRMATION_BUY
+        if cross_label == "bullish" and cross_recent and rsi_ok and momentum_ok_buy:
+            return "buy"
+        if breakout and rsi_ok and momentum_ok_buy:
+            return "buy"
+        return "wait"
+
+    rsi_ok = isinstance(rsi_value, (int, float)) and float(rsi_value) <= _RSI_CONFIRMATION_SELL
+    if cross_label == "bearish" and cross_recent and rsi_ok and momentum_ok_sell:
+        return "sell"
+    if breakdown and rsi_ok and momentum_ok_sell:
+        return "sell"
+    return "wait"
 
 def _spread_bps(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
     if bid is None or ask is None or ask <= 0:
@@ -721,6 +1093,26 @@ def _weighted_opportunity_model(
     return probability, score, metrics
 
 
+def _resolve_correlation_value(
+    correlations: Mapping[str, object] | None, aliases: Sequence[str]
+) -> Optional[float]:
+    if not isinstance(correlations, Mapping):
+        return None
+    lowered_aliases = [alias.strip().lower() for alias in aliases if alias]
+    for key, value in correlations.items():
+        if not isinstance(key, str):
+            continue
+        cleaned = key.replace("-", "_").replace("/", "_").lower()
+        for alias in lowered_aliases:
+            if cleaned == alias:
+                return _safe_float(value)
+            if cleaned.replace("usdt", "") == alias:
+                return _safe_float(value)
+            if cleaned.endswith(alias):
+                return _safe_float(value)
+    return None
+
+
 def _model_feature_vector(
     *,
     trend: str,
@@ -1016,6 +1408,35 @@ def scan_market_opportunities(
             rows = result.get("list")  # type: ignore[assignment]
         else:
             rows = []
+    if not isinstance(rows, list):
+        rows = []
+
+    turnover_ratio = _safe_setting_float(settings, "ai_min_turnover_ratio", 0.3)
+    min_turnover = _resolve_min_turnover_threshold(min_turnover, rows, turnover_ratio)
+
+    top_quote_ratio = _safe_setting_float(settings, "ai_min_top_quote_ratio", 0.2)
+    min_top_quote = _estimate_top_depth_threshold(rows, top_quote_ratio, min_top_quote)
+
+    volatility_ratio = _safe_setting_float(
+        settings, "ai_min_change_volatility_ratio", 0.6
+    )
+    effective_change = _compute_dynamic_min_change(
+        data_dir,
+        volatility_ratio,
+        effective_change,
+    )
+
+    total_turnover_usd = 0.0
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            sym, _ = ensure_usdt_symbol(item.get("symbol"))
+            if not sym:
+                continue
+            turnover_value = _safe_float(item.get("turnover24h"))
+            if turnover_value is not None and turnover_value > 0:
+                total_turnover_usd += turnover_value
 
     def _normalise_symbol_set(symbols: Iterable[object]) -> Set[str]:
         normalised: Set[str] = set()
@@ -1030,6 +1451,13 @@ def scan_market_opportunities(
     wset = _normalise_symbol_set(whitelist or ())
     bset = _normalise_symbol_set(blacklist or ())
 
+    if settings is not None:
+        forced_candidates = _collect_symbol_candidates(
+            getattr(settings, "ai_force_include", None)
+        )
+        if forced_candidates:
+            wset.update(forced_candidates)
+
     maintenance_symbols: Set[str] = set()
     delist_symbols: Set[str] = set()
     if isinstance(snapshot, Mapping):
@@ -1039,8 +1467,41 @@ def scan_market_opportunities(
 
     outlier_symbols = _detect_outlier_symbols(rows if isinstance(rows, list) else [])
 
+    data_warning_cache: Set[Tuple[str, str]] = set()
+
+    def _log_data_warning(symbol: str, issue: str, **details: object) -> None:
+        key = (symbol, issue)
+        if not symbol or key in data_warning_cache:
+            return
+        data_warning_cache.add(key)
+        log(
+            "market_scanner.data_warning",
+            symbol=symbol,
+            issue=issue,
+            severity="warning",
+            **details,
+        )
+
+    retrain_minutes = _safe_setting_float(settings, "ai_retrain_minutes", 0.0)
+    if retrain_minutes is None or retrain_minutes <= 0:
+        retrain_interval = 7 * 24 * 3600.0
+    else:
+        retrain_interval = max(float(retrain_minutes) * 60.0, 3600.0)
+
+    training_limit_setting = _safe_setting_float(
+        settings, "ai_training_trade_limit", 0.0
+    )
+    if training_limit_setting is None or training_limit_setting <= 0:
+        training_limit = 400
+    else:
+        training_limit = max(int(training_limit_setting), 50)
+
     try:
-        model: Optional[MarketModel] = ensure_market_model(data_dir=data_dir)
+        model: Optional[MarketModel] = ensure_market_model(
+            data_dir=data_dir,
+            max_age=retrain_interval,
+            limit=training_limit,
+        )
     except Exception as exc:  # pragma: no cover - defensive logging
         log("market_scanner.model.error", err=str(exc))
         model = None
@@ -1100,6 +1561,26 @@ def scan_market_opportunities(
         bid = _safe_float(raw.get("bestBidPrice"))
         ask = _safe_float(raw.get("bestAskPrice"))
         spread_bps = _spread_bps(bid, ask)
+        if turnover is None or turnover <= 0:
+            _log_data_warning(
+                symbol,
+                "missing_turnover",
+                raw_turnover=raw.get("turnover24h"),
+            )
+        if volume is None or volume <= 0:
+            _log_data_warning(
+                symbol,
+                "missing_volume",
+                raw_volume=raw.get("volume24h"),
+            )
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            _log_data_warning(symbol, "missing_orderbook", bid=bid, ask=ask)
+
+        if total_turnover_usd > 0 and turnover is not None and turnover > 0:
+            market_dominance_pct: Optional[float] = (turnover / total_turnover_usd) * 100.0
+        else:
+            market_dominance_pct = None
+
         feature_bundle = build_feature_bundle(raw)
         blended_change = feature_bundle.get("blended_change_pct")
         volatility_pct = feature_bundle.get("volatility_pct")
@@ -1114,6 +1595,7 @@ def scan_market_opportunities(
         top_depth_imbalance = feature_bundle.get("top_depth_imbalance")
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
+        social_trend_score = feature_bundle.get("social_trend_score")
         overbought_indicators = feature_bundle.get("overbought_indicators")
         volatility_ratio_value = feature_bundle.get("volatility_ratio")
         volume_trend_value = feature_bundle.get("volume_trend")
@@ -1154,14 +1636,35 @@ def scan_market_opportunities(
             if available_quote < min_top_quote:
                 liquidity_ok = False
 
+        indicator_bundle: Optional[Dict[str, object]] = None
         if change_pct is None:
             trend = "wait"
-        elif change_pct >= effective_change:
-            trend = "buy"
-        elif change_pct <= -effective_change:
-            trend = "sell"
         else:
-            trend = "wait"
+            base_trend = "wait"
+            if change_pct >= effective_change:
+                base_trend = "buy"
+            elif change_pct <= -effective_change:
+                base_trend = "sell"
+            if base_trend in {"buy", "sell"}:
+                indicator_bundle = _load_hourly_indicator_bundle(
+                    symbol,
+                    data_dir=data_dir,
+                )
+                confirmed_trend = _resolve_trend_with_confirmation(
+                    change_pct,
+                    effective_change,
+                    indicator_bundle,
+                    force_include=force_include,
+                )
+                if confirmed_trend == "wait":
+                    if indicator_bundle is None or force_include:
+                        trend = base_trend
+                    else:
+                        trend = "wait"
+                else:
+                    trend = confirmed_trend
+            else:
+                trend = base_trend
 
         raw_change_value = _safe_float(raw.get("price24hPcnt"))
         if raw_change_value is not None and abs(raw_change_value) <= 1.0:
@@ -1412,6 +1915,18 @@ def scan_market_opportunities(
                 note_parts.append(f"CVD на стороне {side} {abs(cvd_pct):.1f}%")
         if correlation_strength is not None and correlation_strength > 0:
             note_parts.append(f"корреляция {correlation_strength * 100:.0f}%")
+        if indicator_bundle:
+            cross_label = indicator_bundle.get("ema_cross")
+            if cross_label == "bullish":
+                note_parts.append("EMA21↑EMA50")
+            elif cross_label == "bearish":
+                note_parts.append("EMA21↓EMA50")
+            rsi_hint = indicator_bundle.get("rsi")
+            if isinstance(rsi_hint, (int, float)):
+                note_parts.append(f"RSI₁ₕ≈{float(rsi_hint):.1f}")
+            momentum_hint = indicator_bundle.get("momentum_pct")
+            if isinstance(momentum_hint, (int, float)):
+                note_parts.append(f"Δ1ч≈{float(momentum_hint):+.2f}%")
         best_impulse_window = None
         best_impulse_value: Optional[float] = None
         if isinstance(volume_impulse, Mapping):
@@ -1500,6 +2015,9 @@ def scan_market_opportunities(
             "liquidity_ok": liquidity_ok,
             "min_top_quote_usd": min_top_quote if min_top_quote > 0 else None,
         }
+        hourly_signal = _sanitise_hourly_signal(indicator_bundle)
+        if hourly_signal:
+            entry["hourly_signal"] = hourly_signal
         if quote_source == "USDC" and upper_source:
             entry["quote_conversion"] = {"from": "USDC", "to": "USDT", "original": upper_source}
         entries.append(entry)
