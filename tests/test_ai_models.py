@@ -50,6 +50,16 @@ def test_model_features_layout() -> None:
         "depth_imbalance",
         "spread_bps",
         "correlation_strength",
+        "session_hour_sin",
+        "session_hour_cos",
+        "holding_period_minutes",
+        "volatility_ratio",
+        "volume_trend",
+        "order_flow_ratio",
+        "top_depth_imbalance",
+        "sentiment_score",
+        "news_heat",
+        "macro_regime_score",
     )
 
 
@@ -87,6 +97,17 @@ def test_sell_vector_contains_expected_metrics() -> None:
     assert features["turnover_log"] == pytest.approx(
         liquidity_feature(last_seen_price * 2.5)
     )
+    assert features["session_hour_sin"] == pytest.approx(0.069756, rel=1e-5)
+    assert features["session_hour_cos"] == pytest.approx(0.997564, rel=1e-5)
+    assert features["holding_period_minutes"] == pytest.approx(16.0)
+    assert features["volatility_ratio"] == pytest.approx(0.0)
+    assert features["volume_trend"] == pytest.approx(0.0)
+    assert features["macro_regime_score"] == pytest.approx(
+        math.tanh(features["multiframe_change_pct"] / 50.0)
+    )
+    assert features["order_flow_ratio"] == 0.0
+    assert features["sentiment_score"] == 0.0
+    assert features["news_heat"] == 0.0
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)

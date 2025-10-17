@@ -23,6 +23,7 @@ from typing import (
 )
 
 from .bybit_api import BybitAPI
+from .ai.external import ExternalFeatureProvider
 from .ai.models import (
     MarketModel,
     ensure_market_model,
@@ -731,6 +732,14 @@ def _model_feature_vector(
     depth_imbalance: Optional[float],
     spread_bps: Optional[float],
     correlation_strength: Optional[float],
+    order_flow_ratio: Optional[float],
+    top_depth_imbalance: Optional[float],
+    volatility_ratio: Optional[float],
+    volume_trend: Optional[float],
+    sentiment_score: Optional[float],
+    news_heat: Optional[float],
+    macro_regime_score: Optional[float],
+    event_timestamp: Optional[float],
 ) -> Dict[str, float]:
     direction = 0
     if trend == "buy":
@@ -776,6 +785,38 @@ def _model_feature_vector(
     if isinstance(correlation_strength, (int, float)):
         correlation_value = float(correlation_strength)
 
+    session_hour_sin = 0.0
+    session_hour_cos = 1.0
+    if isinstance(event_timestamp, (int, float)) and math.isfinite(event_timestamp):
+        seconds = float(event_timestamp) % 86_400.0
+        angle = (seconds / 86_400.0) * 2.0 * math.pi
+        session_hour_sin = math.sin(angle)
+        session_hour_cos = math.cos(angle)
+
+    order_flow_value = 0.0
+    if isinstance(order_flow_ratio, (int, float)):
+        order_flow_value = float(order_flow_ratio)
+        if direction != 0:
+            order_flow_value *= direction
+
+    top_depth_value = 0.0
+    if isinstance(top_depth_imbalance, (int, float)):
+        top_depth_value = float(top_depth_imbalance)
+        if direction != 0:
+            top_depth_value *= direction
+
+    volatility_ratio_value = 0.0
+    if isinstance(volatility_ratio, (int, float)):
+        volatility_ratio_value = float(volatility_ratio)
+
+    volume_trend_value = 0.0
+    if isinstance(volume_trend, (int, float)):
+        volume_trend_value = float(volume_trend)
+
+    sentiment_value = float(sentiment_score) if isinstance(sentiment_score, (int, float)) else 0.0
+    news_value = float(news_heat) if isinstance(news_heat, (int, float)) else 0.0
+    macro_value = float(macro_regime_score) if isinstance(macro_regime_score, (int, float)) else 0.0
+
     features = initialise_feature_map()
     features["directional_change_pct"] = signed_change
     features["multiframe_change_pct"] = multi_tf_value
@@ -785,6 +826,15 @@ def _model_feature_vector(
     features["depth_imbalance"] = depth_value
     features["spread_bps"] = spread_value
     features["correlation_strength"] = correlation_value
+    features["session_hour_sin"] = session_hour_sin
+    features["session_hour_cos"] = session_hour_cos
+    features["volatility_ratio"] = volatility_ratio_value
+    features["volume_trend"] = volume_trend_value
+    features["order_flow_ratio"] = order_flow_value
+    features["top_depth_imbalance"] = top_depth_value
+    features["sentiment_score"] = sentiment_value
+    features["news_heat"] = news_value
+    features["macro_regime_score"] = macro_value
     return features
 
 
@@ -995,6 +1045,17 @@ def scan_market_opportunities(
         log("market_scanner.model.error", err=str(exc))
         model = None
 
+    external_provider = ExternalFeatureProvider(data_dir=data_dir)
+    try:  # pragma: no cover - best effort logging
+        external_provider.log_health()
+    except Exception:
+        pass
+    macro_regime_hint = external_provider.macro_regime_score()
+
+    snapshot_ts = None
+    if isinstance(snapshot, Mapping):
+        snapshot_ts = _safe_float(snapshot.get("ts"))
+
     cost_profile = _resolve_trade_cost_profile(data_dir, settings, testnet)
     base_maker_fee_bps = float(cost_profile.get("maker_fee_bps", 0.0) or 0.0)
     base_taker_fee_bps = float(
@@ -1054,6 +1115,8 @@ def scan_market_opportunities(
         correlations = feature_bundle.get("correlations")
         correlation_strength = feature_bundle.get("correlation_strength")
         overbought_indicators = feature_bundle.get("overbought_indicators")
+        volatility_ratio_value = feature_bundle.get("volatility_ratio")
+        volume_trend_value = feature_bundle.get("volume_trend")
 
         rsi_value: Optional[float] = None
         stochastic_value: Optional[float] = None
@@ -1135,6 +1198,21 @@ def scan_market_opportunities(
             if strength < 0.1:
                 continue
 
+        event_ts = _safe_float(
+            raw.get("updateTime")
+            or raw.get("updatedTime")
+            or raw.get("timestamp")
+            or raw.get("time")
+        )
+        if event_ts is None:
+            event_ts = snapshot_ts
+
+        sentiment_value = external_provider.sentiment_for(symbol)
+        social_value = external_provider.social_score_for(symbol)
+        if math.isfinite(social_value):
+            sentiment_value = sentiment_value * 0.7 + social_value * 0.3
+        news_heat_value = external_provider.news_heat_for(symbol)
+
         feature_vector = _model_feature_vector(
             trend=trend,
             change_pct=change_pct,
@@ -1145,6 +1223,14 @@ def scan_market_opportunities(
             depth_imbalance=depth_imbalance,
             spread_bps=spread_bps,
             correlation_strength=correlation_strength,
+            order_flow_ratio=order_flow_ratio if isinstance(order_flow_ratio, (int, float)) else None,
+            top_depth_imbalance=top_depth_imbalance,
+            volatility_ratio=volatility_ratio_value if isinstance(volatility_ratio_value, (int, float)) else None,
+            volume_trend=volume_trend_value,
+            sentiment_score=sentiment_value,
+            news_heat=news_heat_value,
+            macro_regime_score=macro_regime_hint,
+            event_timestamp=event_ts,
         )
 
         overbought_flags: List[str] = []
