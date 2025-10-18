@@ -463,6 +463,20 @@ class BybitAPI:
             return dict(self._last_quota)
 
     @staticmethod
+    def _normalise_cursor(cursor: str | None) -> str | None:
+        if cursor is None:
+            return None
+
+        if not isinstance(cursor, str):
+            try:
+                cursor = str(cursor)
+            except Exception:
+                return None
+
+        stripped = cursor.strip()
+        return stripped or None
+
+    @staticmethod
     def _normalise_numeric_fields(payload: dict[str, object], numeric_fields: set[str]) -> None:
         for key in numeric_fields & payload.keys():
             value = payload[key]
@@ -560,10 +574,9 @@ class BybitAPI:
                 params["limit"] = int(limit)
             except (TypeError, ValueError):
                 pass
-        if cursor:
-            stripped = cursor.strip()
-            if stripped:
-                params["cursor"] = stripped
+        cursor_token = self._normalise_cursor(cursor)
+        if cursor_token:
+            params["cursor"] = cursor_token
         return self._safe_req("GET", "/v5/market/instruments-info", params=params)
 
     def tickers(self, category: str = "spot", symbol: str | None = None):
@@ -607,10 +620,9 @@ class BybitAPI:
         params = {"category": category, "openOnly": int(openOnly)}
         if symbol:
             params["symbol"] = symbol
-        if cursor:
-            stripped = cursor.strip()
-            if stripped:
-                params["cursor"] = stripped
+        cursor_token = self._normalise_cursor(cursor)
+        if cursor_token:
+            params["cursor"] = cursor_token
         return self._safe_req("GET", "/v5/order/realtime", params=params, signed=True)
 
     def execution_list(
@@ -619,7 +631,8 @@ class BybitAPI:
         symbol: str | None = None,
         start: int | None = None,
         end: int | None = None,
-        limit: int = 50,
+        limit: int | None = 50,
+        cursor: str | None = None,
     ):
         """Fetch recent trade executions for the authenticated account.
 
@@ -627,13 +640,21 @@ class BybitAPI:
         checks to confirm that real trades are flowing through the account.
         """
 
-        params: dict[str, object] = {"category": category, "limit": int(limit)}
+        params: dict[str, object] = {"category": category}
+        if limit is not None:
+            try:
+                params["limit"] = int(limit)
+            except (TypeError, ValueError):
+                pass
         if symbol:
             params["symbol"] = symbol
         if start is not None:
             params["start"] = int(start)
         if end is not None:
             params["end"] = int(end)
+        cursor_token = self._normalise_cursor(cursor)
+        if cursor_token:
+            params["cursor"] = cursor_token
         return self._safe_req("GET", "/v5/execution/list", params=params, signed=True)
 
     def fee_rate(
