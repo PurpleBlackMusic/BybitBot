@@ -32,7 +32,12 @@ from bybit_app.utils.ai.kill_switch import (
     get_state as get_kill_switch_state,
     set_pause as activate_kill_switch,
 )
-from bybit_app.utils.background import ensure_background_services
+from bybit_app.utils.background import (
+    ensure_background_services,
+    restart_automation,
+    restart_guardian,
+    restart_websockets,
+)
 from bybit_app.utils.envs import (
     CredentialValidationError,
     active_api_key,
@@ -1092,6 +1097,9 @@ def main() -> None:
     ensure_keys()
     state = st.session_state
 
+    if state.pop("_api_prompt_success", False):
+        st.success("API ключи сохранены. Фоновые сервисы перезапущены.")
+
     theme_dir = Path(__file__).resolve().parent / "ui"
     theme_files = {"dark": "theme.css", "light": "theme_light.css"}
     theme_name = str(state.get("ui_theme", "dark")).lower()
@@ -1123,6 +1131,52 @@ def main() -> None:
 
     settings = get_settings()
 
+    def _render_missing_keys_prompt(current_settings) -> None:
+        has_keys = bool(active_api_key(current_settings) and active_api_secret(current_settings))
+        if has_keys:
+            return
+
+        st.info(
+            "Чтобы бот мог размещать ордера, добавьте API ключ и секрет. "
+            "Можно открыть форму ниже или воспользоваться страницей \"✅ Подключение и состояние\"."
+        )
+        with st.expander("🔐 Добавить API ключи", expanded=True):
+            with st.form("inline_api_credentials"):
+                st.caption("Ключи сохраняются в зашифрованном виде в настройках приложения.")
+                network_options = ("Testnet", "Mainnet")
+                default_index = 0 if getattr(current_settings, "testnet", True) else 1
+                selected_network = st.radio(
+                    "Сеть для сохранения ключей",
+                    network_options,
+                    index=default_index,
+                    key="inline_api_network",
+                    horizontal=True,
+                )
+                api_key_input = st.text_input("API Key", type="password", key="inline_api_key")
+                api_secret_input = st.text_input("API Secret", type="password", key="inline_api_secret")
+                submitted = st.form_submit_button("💾 Сохранить ключи")
+                if submitted:
+                    api_key_value = api_key_input.strip()
+                    api_secret_value = api_secret_input.strip()
+                    if not api_key_value or not api_secret_value:
+                        st.error("Укажите и ключ, и секрет, чтобы продолжить.")
+                    else:
+                        target_testnet = selected_network == "Testnet"
+                        update_settings(
+                            api_key=api_key_value,
+                            api_secret=api_secret_value,
+                            testnet=target_testnet,
+                        )
+                        clear_data_caches()
+                        restart_websockets()
+                        restart_guardian()
+                        restart_automation()
+                        ensure_background_services()
+                        state["_api_prompt_success"] = True
+                        st.experimental_rerun()
+
+    _render_missing_keys_prompt(settings)
+
     with st.sidebar:
         st.header("🚀 Быстрый ордер")
         trade_ticket(
@@ -1138,54 +1192,84 @@ def main() -> None:
         st.divider()
         st.header("🛡️ Пауза и Kill-Switch")
         st.caption(
-            "Пауза временно приостанавливает сделки, а Kill-Switch останавливает бота до ручного "
-            "возобновления."
+            "Выберите режим: кратковременная пауза с автоматическим возобновлением или полная "
+            "остановка до ручного запуска (Kill-Switch)."
         )
         kill_reason = st.text_input(
             "Комментарий",
             value=state.get("kill_reason", BASE_SESSION_STATE.get("kill_reason", "Manual kill-switch")),
             key="kill_reason",
-            help="Будет прикреплён к паузе и Kill-Switch.",
+            help="Будет прикреплён к выбранному режиму остановки.",
         )
+
+        selected_mode = state.get("kill_mode", BASE_SESSION_STATE.get("kill_mode", "pause"))
+        mode_label_map = {
+            "pause": "⏸ Пауза на время",
+            "kill": "🛑 Kill-Switch (ручной перезапуск)",
+        }
+        mode = st.radio(
+            "Режим остановки",
+            options=list(mode_label_map.keys()),
+            index=0 if selected_mode == "pause" else 1,
+            format_func=lambda key: mode_label_map.get(key, key),
+            key="kill_mode",
+        )
+        if mode != "kill":
+            state.pop("kill_switch_confirm_pending", None)
+
         pause_minutes_widget = st.number_input(
             "Пауза (мин)",
             min_value=5,
             max_value=1440,
             step=5,
             value=int(state.get("pause_minutes", BASE_SESSION_STATE.get("pause_minutes", 60))),
-            disabled=kill_state.paused,
+            disabled=kill_state.paused or mode == "kill",
             key="pause_minutes",
         )
         pause_minutes = float(state.get("pause_minutes", pause_minutes_widget))
+
         if kill_state.paused:
-            st.success("Автоматизация приостановлена.")
-            if kill_state.until:
-                remaining_minutes = max((kill_state.until - time.time()) / 60.0, 0.0)
-                st.caption(f"До возобновления ≈ {remaining_minutes:.1f} мин.")
+            if getattr(kill_state, "manual", False):
+                st.warning("Kill-Switch активен — автоматизация остановлена до ручного возобновления.")
+            else:
+                st.success("Автоматизация приостановлена.")
+                if kill_state.until:
+                    remaining_minutes = max((kill_state.until - time.time()) / 60.0, 0.0)
+                    st.caption(f"До возобновления ≈ {remaining_minutes:.1f} мин.")
             if kill_state.reason:
                 st.caption(f"Причина: {kill_state.reason}")
             if st.button("▶️ Возобновить работу", use_container_width=True):
                 clear_pause()
                 _trigger_refresh()
         else:
-            if st.button("⏸ Поставить на паузу", use_container_width=True):
-                activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
-                _trigger_refresh()
+            if mode == "pause":
+                if st.button("⏸ Поставить на паузу", use_container_width=True):
+                    activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
+                    _trigger_refresh()
+            else:
+                confirm_pending = bool(state.get("kill_switch_confirm_pending", False))
+                if not confirm_pending:
+                    if st.button("🛑 Активировать Kill-Switch", use_container_width=True):
+                        state["kill_switch_confirm_pending"] = True
+                else:
+                    st.warning("Вы уверены, что хотите вручную остановить бота?")
+                    confirm_col, cancel_col = st.columns(2)
+                    if confirm_col.button(
+                        "Да, остановить",
+                        use_container_width=True,
+                        key="kill_switch_confirm_yes",
+                    ):
+                        activate_kill_switch(None, kill_reason or "Manual kill-switch")
+                        state["kill_switch_confirm_pending"] = False
+                        _trigger_refresh()
+                    if cancel_col.button(
+                        "Отмена",
+                        use_container_width=True,
+                        key="kill_switch_confirm_no",
+                    ):
+                        state["kill_switch_confirm_pending"] = False
 
-        st.subheader("🛑 Kill-Switch")
-        kill_duration = st.number_input(
-            "Kill-switch (мин)",
-            min_value=1,
-            max_value=2880,
-            step=5,
-            value=int(state.get("kill_custom_minutes", BASE_SESSION_STATE.get("kill_custom_minutes", 60))),
-            key="kill_custom_minutes",
-            help="Полная остановка до ручного включения, независимо от таймера паузы.",
-        )
-        if st.button("Активировать Kill-Switch", use_container_width=True):
-            activate_kill_switch(float(kill_duration), kill_reason or "Manual kill-switch")
-            _trigger_refresh()
-        if kill_state.paused and not kill_state.until:
+        if kill_state.paused and getattr(kill_state, "manual", False):
             st.caption("Kill-Switch активен до ручного возобновления.")
 
         st.divider()
