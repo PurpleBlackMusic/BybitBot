@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Dict
@@ -65,21 +66,20 @@ def test_cli_status_prints_testnet_configuration(
         dry_flags={True: True, False: False},
         keys={True: "TEST", False: ""},
     )
-    monkeypatch.setattr(envs, "get_settings", lambda force_reload=False: settings)
-
     events: list[tuple[str, dict]] = []
 
     def _log(event: str, **payload: dict) -> None:
         events.append((event, payload))
 
-    monkeypatch.setattr(bot, "log", _log)
-
-    exit_code = bot.main([
-        "--env",
-        "test",
-        "--status-only",
-        "--no-env-file",
-    ])
+    with bot.temporary_logger(_log), bot.temporary_settings_loader(
+        lambda force_reload=True: settings
+    ):
+        exit_code = bot.main([
+            "--env",
+            "test",
+            "--status-only",
+            "--no-env-file",
+        ])
 
     assert exit_code == 0
     out = capsys.readouterr().out
@@ -102,22 +102,21 @@ def test_cli_status_mainnet_live(
         dry_flags={True: True, False: False},
         keys={True: "", False: "MAIN"},
     )
-    monkeypatch.setattr(envs, "get_settings", lambda force_reload=False: settings)
-
     events: list[tuple[str, dict]] = []
 
     def _log(event: str, **payload: dict) -> None:
         events.append((event, payload))
 
-    monkeypatch.setattr(bot, "log", _log)
-
-    exit_code = bot.main([
-        "--env",
-        "prod",
-        "--live",
-        "--status-only",
-        "--no-env-file",
-    ])
+    with bot.temporary_logger(_log), bot.temporary_settings_loader(
+        lambda force_reload=True: settings
+    ):
+        exit_code = bot.main([
+            "--env",
+            "prod",
+            "--live",
+            "--status-only",
+            "--no-env-file",
+        ])
 
     assert exit_code == 0
     out = capsys.readouterr().out
@@ -135,7 +134,6 @@ def test_cli_invokes_background_loop_with_arguments(monkeypatch: pytest.MonkeyPa
         dry_flags={True: True, False: True},
         keys={True: "TEST", False: "ALT"},
     )
-    monkeypatch.setattr(envs, "get_settings", lambda force_reload=False: settings)
     monkeypatch.setattr(envs, "DATA_DIR", Path("/tmp"))
 
     called: Dict[str, object] = {}
@@ -145,20 +143,55 @@ def test_cli_invokes_background_loop_with_arguments(monkeypatch: pytest.MonkeyPa
         called["once"] = once
         return 7
 
-    monkeypatch.setattr(bot, "_run_background_loop", _fake_loop)
+    monkeypatch.setattr(bot._RUNNER, "run_background_loop", _fake_loop)
 
-    result = bot.main([
-        "--env",
-        "testnet",
-        "--poll",
-        "7.5",
-        "--once",
-        "--no-env-file",
-    ])
+    with bot.temporary_settings_loader(lambda force_reload=True: settings):
+        result = bot.main([
+            "--env",
+            "testnet",
+            "--poll",
+            "7.5",
+            "--once",
+            "--no-env-file",
+        ])
 
     assert result == 7
     assert called == {"poll": 7.5, "once": True}
     assert os.getenv("BYBIT_TESTNET") == "1"
+
+
+def test_cli_config_file_applies_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "bot.json"
+    config_payload = {"environment": "testnet", "dry_run": True, "poll_interval": 3.5}
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+
+    settings = DummySettings(
+        testnet=True,
+        dry_flags={True: False, False: False},
+        keys={True: "TEST", False: "ALT"},
+    )
+    monkeypatch.setattr(envs, "DATA_DIR", tmp_path)
+    called: Dict[str, object] = {}
+
+    def _fake_loop(*, poll_interval: float, once: bool) -> int:
+        called["poll"] = poll_interval
+        called["once"] = once
+        return 0
+
+    monkeypatch.setattr(bot._RUNNER, "run_background_loop", _fake_loop)
+
+    with bot.temporary_settings_loader(lambda force_reload=True: settings):
+        exit_code = bot.main([
+            "--config",
+            str(config_path),
+            "--once",
+            "--no-env-file",
+        ])
+
+    assert exit_code == 0
+    assert called == {"poll": 3.5, "once": True}
+    assert os.getenv("BYBIT_TESTNET") == "1"
+    assert os.getenv("BYBIT_ENV") == "test"
 
 
 def test_cli_accepts_sandbox_alias(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

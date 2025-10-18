@@ -1,0 +1,5 @@
+{
+  "environment": "testnet",
+  "dry_run": true,
+  "poll_interval": 12.0
+}
