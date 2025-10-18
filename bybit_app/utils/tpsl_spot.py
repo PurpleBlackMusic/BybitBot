@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,10 +18,45 @@ from .spot_rules import (
     render_spot_order_texts,
 )
 
-def place_spot_limit_with_tpsl(api: BybitAPI, symbol: str, side: str, qty: float, price: float, tp: float | None, sl: float | None, tp_order_type: str = "Market", sl_order_type: str = "Market", tp_limit: float | None = None, sl_limit: float | None = None, link_id: str | None = None, tif: str = "GTC"):
-    """Создать СПОТ лимит ордер с серверным TP/SL для UTA (v5 create order).
-    Требует: category='spot'. Если tp/sl заданы и тип=Limit — должны быть tp_limit/sl_limit.
-    Возвращает ответ API.
+
+def place_spot_limit_with_tpsl(
+    api: BybitAPI,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    tp: float | None,
+    sl: float | None,
+    tp_order_type: str = "Market",
+    sl_order_type: str = "Market",
+    tp_limit: float | None = None,
+    sl_limit: float | None = None,
+    link_id: str | None = None,
+    tif: str = "GTC",
+) -> dict[str, object]:
+    """Place a spot limit order with exchange-hosted TP/SL instructions.
+
+    Args:
+        api: API client used for submitting orders.
+        symbol: Trading pair symbol (e.g. ``BTCUSDT``).
+        side: Order side, ``buy`` or ``sell``.
+        qty: Quantity of the limit order before quantisation.
+        price: Desired limit price before quantisation.
+        tp: Optional take-profit trigger price.
+        sl: Optional stop-loss trigger price.
+        tp_order_type: Order type for the TP leg (``Market`` or ``Limit``).
+        sl_order_type: Order type for the SL leg (``Market`` or ``Limit``).
+        tp_limit: Limit price for the TP leg if ``tp_order_type`` is ``Limit``.
+        sl_limit: Limit price for the SL leg if ``sl_order_type`` is ``Limit``.
+        link_id: Optional order link identifier to correlate related orders.
+        tif: Time in force for the entry order.
+
+    Returns:
+        Raw API response dictionary from the entry order placement.
+
+    Raises:
+        ValueError: If quantisation fails, required TP/SL parameters are missing,
+            or the processed price/quantity are invalid for submission.
     """
     try:
         instrument = load_spot_instrument(api, symbol)
