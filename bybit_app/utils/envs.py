@@ -464,6 +464,7 @@ class Settings:
     freqai_feature_limit: int = 40
     freqai_top_pairs: int = 5
     freqai_prediction_path: str = ""
+    freqai_api_token: str = ""
 
     # Telegram trade notifications
     tg_trade_notifs: bool = False

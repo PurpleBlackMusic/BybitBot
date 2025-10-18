@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import secrets
 import time
 from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple
+from weakref import finalize
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 
 from ..envs import Settings, get_api_client, get_settings
 from ..market_scanner import _ledger_path_for_costs, scan_market_opportunities
@@ -27,6 +29,23 @@ def _safe_float(value: object) -> Optional[float]:
     if math.isnan(number):
         return None
     return number
+
+
+def _assign_numeric_feature(
+    target: Dict[str, object], key: str, source: object
+) -> None:
+    numeric = _safe_float(source)
+    if numeric is not None:
+        target[key] = numeric
+
+
+def _numeric_mapping(mapping: Mapping[str, object]) -> Dict[str, float]:
+    resolved: Dict[str, float] = {}
+    for key, value in mapping.items():
+        numeric = _safe_float(value)
+        if numeric is not None:
+            resolved[str(key)] = numeric
+    return resolved
 
 
 def _serialise_mapping(mapping: Mapping[str, object]) -> Dict[str, object]:
@@ -60,12 +79,8 @@ def _prediction_recency_seconds(settings: Optional[Settings]) -> Optional[float]
     numeric = _safe_float(minutes)
     if numeric is None:
         return None
-    seconds = numeric * 60.0
-    if seconds <= 0:
-        return 0.0
-    if seconds < _PREDICTION_RECENCY_SECONDS:
-        return seconds
-    return _PREDICTION_RECENCY_SECONDS
+    seconds = max(numeric * 60.0, 0.0)
+    return min(seconds, _PREDICTION_RECENCY_SECONDS)
 
 
 def _prediction_top_limit(settings: Optional[Settings]) -> Optional[int]:
@@ -84,11 +99,6 @@ def _prediction_top_limit(settings: Optional[Settings]) -> Optional[int]:
 def _features_from_entry(entry: Mapping[str, object]) -> Dict[str, object]:
     features: Dict[str, object] = {}
 
-    def _assign(key: str, source: object) -> None:
-        numeric = _safe_float(source)
-        if numeric is not None:
-            features[key] = numeric
-
     for field in (
         "turnover_usd",
         "volume",
@@ -99,57 +109,57 @@ def _features_from_entry(entry: Mapping[str, object]) -> Dict[str, object]:
         "ev_bps",
         "gross_ev_bps",
     ):
-        _assign(field, entry.get(field))
+        _assign_numeric_feature(features, field, entry.get(field))
 
     model_metrics = entry.get("model_metrics")
     if isinstance(model_metrics, Mapping):
         model_features = model_metrics.get("features")
         if isinstance(model_features, Mapping):
             for key, value in model_features.items():
-                _assign(f"model.{key}", value)
+                _assign_numeric_feature(features, f"model.{key}", value)
         fallback = model_metrics.get("fallback")
         if isinstance(fallback, Mapping):
             for key, value in fallback.items():
-                _assign(f"fallback.{key}", value)
+                _assign_numeric_feature(features, f"fallback.{key}", value)
 
     volume_impulse = entry.get("volume_impulse")
     if isinstance(volume_impulse, Mapping):
-        features["volume_impulse"] = {
-            str(window): _safe_float(value)
-            for window, value in volume_impulse.items()
-            if _safe_float(value) is not None
-        }
+        resolved_impulse = _numeric_mapping(volume_impulse)
+        if resolved_impulse:
+            features["volume_impulse"] = resolved_impulse
 
     volatility_windows = entry.get("volatility_windows")
     if isinstance(volatility_windows, Mapping):
-        features["volatility_windows"] = {
-            str(window): _safe_float(value)
-            for window, value in volatility_windows.items()
-            if _safe_float(value) is not None
-        }
+        resolved_volatility = _numeric_mapping(volatility_windows)
+        if resolved_volatility:
+            features["volatility_windows"] = resolved_volatility
 
     order_flow_ratio = entry.get("order_flow_ratio")
     if order_flow_ratio is not None:
-        _assign("order_flow_ratio", order_flow_ratio)
+        _assign_numeric_feature(features, "order_flow_ratio", order_flow_ratio)
 
     depth_imbalance = entry.get("depth_imbalance")
     if depth_imbalance is not None:
-        _assign("depth_imbalance", depth_imbalance)
+        _assign_numeric_feature(features, "depth_imbalance", depth_imbalance)
 
     top_depth = entry.get("top_depth_quote")
     if isinstance(top_depth, Mapping):
         for side in ("bid", "ask", "total"):
-            _assign(f"top_depth_quote.{side}", top_depth.get(side))
+            _assign_numeric_feature(
+                features, f"top_depth_quote.{side}", top_depth.get(side)
+            )
 
     hourly = entry.get("hourly_signal") or entry.get("hourly")
     if isinstance(hourly, Mapping):
         hourly_map = _serialise_mapping(hourly)
         if hourly_map:
             features["hourly_signal"] = hourly_map
-        _assign("rsi_hourly", hourly.get("rsi"))
-        _assign("ema_fast", hourly.get("ema_fast"))
-        _assign("ema_slow", hourly.get("ema_slow"))
-        _assign("momentum_pct", hourly.get("momentum_pct"))
+        _assign_numeric_feature(features, "rsi_hourly", hourly.get("rsi"))
+        _assign_numeric_feature(features, "ema_fast", hourly.get("ema_fast"))
+        _assign_numeric_feature(features, "ema_slow", hourly.get("ema_slow"))
+        _assign_numeric_feature(
+            features, "momentum_pct", hourly.get("momentum_pct")
+        )
 
     indicator = entry.get("overbought_indicators")
     if isinstance(indicator, Mapping):
@@ -217,10 +227,24 @@ def _predictions_summary(
     }
 
 
+def _normalise_token(raw: object) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        token = raw.strip()
+    else:
+        try:
+            token = str(raw).strip()
+        except Exception:
+            return None
+    return token or None
+
+
 def create_app(
     *,
     store: Optional[FreqAIPredictionStore] = None,
     settings_provider: SettingsProvider | None = None,
+    auth_token: Optional[str] = None,
 ) -> FastAPI:
     store_override = store
     provider = settings_provider or get_settings
@@ -233,14 +257,81 @@ def create_app(
             prediction_path=_prediction_path_from_settings(settings),
         )
 
+    override_token = _normalise_token(auth_token)
+
+    _token_cache: Dict[int, Tuple[object, Optional[str], object]] = {}
+
+    def _settings_token(settings: Optional[Settings]) -> Optional[str]:
+        if settings is None:
+            return None
+        identifier = id(settings)
+        raw = getattr(settings, "freqai_api_token", None)
+        cached = _token_cache.get(identifier)
+        if cached is not None:
+            cached_raw, cached_token, cached_finalizer = cached
+            same_raw = cached_raw is raw
+            if not same_raw:
+                try:
+                    same_raw = cached_raw == raw
+                except Exception:
+                    same_raw = False
+            if same_raw:
+                return cached_token
+            try:
+                cached_finalizer.detach()
+            except Exception:
+                pass
+        token = _normalise_token(raw)
+        _token_cache[identifier] = (
+            raw,
+            token,
+            finalize(settings, _token_cache.pop, identifier, None),
+        )
+        return token
+
+    def _require_token(
+        x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+        authorization: Optional[str] = Header(default=None),
+    ) -> Optional[Settings]:
+        settings: Optional[Settings] = None
+        expected = override_token
+        if expected is None:
+            try:
+                settings = provider()
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="settings_unavailable") from exc
+            expected = _settings_token(settings)
+        if expected is None:
+            return settings
+
+        provided = _normalise_token(x_api_token)
+        if provided is None and authorization:
+            scheme, _, param = authorization.partition(" ")
+            if scheme.lower() == "bearer":
+                provided = _normalise_token(param)
+
+        if not provided:
+            raise HTTPException(status_code=401, detail="missing_token")
+
+        try:
+            authorised = secrets.compare_digest(provided, expected)
+        except Exception:
+            authorised = False
+
+        if not authorised:
+            raise HTTPException(status_code=403, detail="invalid_token")
+
+        return settings
+
     app = FastAPI(title="BybitBot FreqAI Bridge", version="1.0.0")
 
     @app.get("/health")
-    def health() -> Dict[str, object]:
-        try:
-            settings = provider()
-        except Exception as exc:  # pragma: no cover - defensive guard
-            raise HTTPException(status_code=500, detail=f"settings_error: {exc}") from exc
+    def health(settings: Optional[Settings] = Depends(_require_token)) -> Dict[str, object]:
+        if settings is None:
+            try:
+                settings = provider()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                raise HTTPException(status_code=500, detail=f"settings_error: {exc}") from exc
 
         prediction_store = _resolve_store(settings)
         snapshot = prediction_store.snapshot()
@@ -278,11 +369,10 @@ def create_app(
         }
 
     @app.get("/predictions")
-    def get_predictions() -> Dict[str, object]:
-        settings: Optional[Settings]
-        if store_override is not None:
-            settings = None
-        else:
+    def get_predictions(
+        settings: Optional[Settings] = Depends(_require_token),
+    ) -> Dict[str, object]:
+        if settings is None and store_override is None:
             try:  # pragma: no cover - settings optional for custom paths
                 settings = provider()
             except Exception:
@@ -291,13 +381,13 @@ def create_app(
         return prediction_store.snapshot()
 
     @app.post("/predictions")
-    def post_predictions(payload: Mapping[str, object]) -> Dict[str, object]:
+    def post_predictions(
+        payload: Mapping[str, object],
+        settings: Optional[Settings] = Depends(_require_token),
+    ) -> Dict[str, object]:
         if not isinstance(payload, Mapping):
             raise HTTPException(status_code=400, detail="payload must be an object")
-        settings: Optional[Settings]
-        if store_override is not None:
-            settings = None
-        else:
+        if settings is None and store_override is None:
             try:  # pragma: no cover - settings optional for custom paths
                 settings = provider()
             except Exception:
@@ -307,11 +397,16 @@ def create_app(
         return {"status": "ok", "symbols": len(snapshot.get("pairs", {}))}
 
     @app.get("/features")
-    def features(limit: int = 25, whitelist: Optional[str] = None) -> Dict[str, object]:
-        try:
-            settings = provider()
-        except Exception as exc:  # pragma: no cover - defensive guard
-            raise HTTPException(status_code=500, detail=f"settings_error: {exc}") from exc
+    def features(
+        limit: int = 25,
+        whitelist: Optional[str] = None,
+        settings: Optional[Settings] = Depends(_require_token),
+    ) -> Dict[str, object]:
+        if settings is None:
+            try:
+                settings = provider()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                raise HTTPException(status_code=500, detail=f"settings_error: {exc}") from exc
 
         prediction_store = _resolve_store(settings)
 
@@ -387,7 +482,7 @@ def create_app(
         current_time = time.time()
 
         response = {
-            "generated_at": time.time(),
+            "generated_at": current_time,
             "count": len(pairs),
             "pairs": pairs,
             "executions_path": str(ledger_path),

@@ -70,6 +70,7 @@ def freqai_settings() -> Settings:
         ai_enabled=True,
     )
     settings.testnet = False
+    settings.freqai_api_token = "test-token"
     return settings
 
 
@@ -86,6 +87,7 @@ def test_freqai_api_features_and_predictions(tmp_path: Path, freqai_settings: Se
 
     app = create_app(store=store, settings_provider=lambda: freqai_settings)
     client = TestClient(app)
+    client.headers.update({"X-API-Token": freqai_settings.freqai_api_token})
 
     health = client.get("/health")
     assert health.status_code == 200
@@ -133,8 +135,24 @@ def test_freqai_features_reports_network_ledger(tmp_path: Path, freqai_settings:
 
     app = create_app(store=store, settings_provider=lambda: freqai_settings)
     client = TestClient(app)
+    client.headers.update({"X-API-Token": freqai_settings.freqai_api_token})
 
     response = client.get("/features", params={"limit": 5})
     assert response.status_code == 200
     payload = response.json()
     assert payload["executions_path"].endswith("executions.testnet.jsonl")
+
+
+def test_freqai_api_requires_token(tmp_path: Path, freqai_settings: Settings) -> None:
+    store = FreqAIPredictionStore(data_dir=tmp_path)
+    app = create_app(store=store, settings_provider=lambda: freqai_settings)
+    client = TestClient(app)
+
+    unauthorised = client.get("/health")
+    assert unauthorised.status_code == 401
+
+    authorised = client.get(
+        "/health",
+        headers={"X-API-Token": freqai_settings.freqai_api_token},
+    )
+    assert authorised.status_code == 200
