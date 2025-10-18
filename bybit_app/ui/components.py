@@ -582,21 +582,22 @@ def trade_ticket(
     submit_text = submit_label or ("Отправить" if compact else "Разместить маркет-ордер")
 
     with st.form(form_key):
-        symbol = st.text_input("Symbol", value=defaults["symbol"], help=help_suffix or None)
+        symbol = st.text_input("Тикер", value=defaults["symbol"], help=help_suffix or None)
         side = st.radio(
-            "Side",
+            "Сторона сделки",
             ("Buy", "Sell"),
             horizontal=True,
             index=0 if str(defaults["side"]).lower() != "sell" else 1,
+            format_func=lambda value: {"Buy": "Покупка", "Sell": "Продажа"}.get(value, str(value)),
         )
         notional = st.number_input(
-            "Notional (USDT)",
+            "Объём (USDT)",
             min_value=0.0,
             value=defaults["notional"],
             step=1.0,
         )
         tolerance = st.slider(
-            "Slippage guard (bps)",
+            "Допустимый слиппедж (б.п.)",
             min_value=0,
             max_value=500,
             value=defaults["tolerance"],
