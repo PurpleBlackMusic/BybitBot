@@ -1216,6 +1216,7 @@ def main() -> None:
             key_prefix="quick_trade",
             compact=True,
             submit_label="Отправить ордер",
+            instance="primary",
         )
 
         st.divider()
@@ -1311,6 +1312,7 @@ def main() -> None:
             key_prefix="quick_trade",
             compact=True,
             submit_label="Отправить ордер",
+            instance="secondary",
         )
 
         st.divider()
