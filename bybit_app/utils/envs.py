@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, json, re
 from dataclasses import dataclass, asdict, fields
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
 
@@ -69,6 +69,106 @@ _CACHE: dict[str, Any] = {
     "key": None,
     "api_error": None,
 }
+
+
+def _critical_snapshot(settings: Settings) -> Dict[str, Any]:
+    """Extract fields that require background restarts when changed."""
+
+    try:
+        active_key = settings.get_api_key()
+    except Exception:
+        active_key = getattr(settings, "api_key", "")
+
+    try:
+        active_secret = settings.get_api_secret()
+    except Exception:
+        active_secret = getattr(settings, "api_secret", "")
+
+    return {
+        "testnet": bool(getattr(settings, "testnet", True)),
+        "active_api_key": str(active_key or ""),
+        "active_api_secret": str(active_secret or ""),
+        "ai_enabled": bool(getattr(settings, "ai_enabled", False)),
+        "freqai_enabled": bool(getattr(settings, "freqai_enabled", False)),
+    }
+
+
+def _handle_post_update_hooks(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> None:
+    if not previous or not current or previous == current:
+        return
+
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+
+    reasons_ws: set[str] = set()
+    reasons_guardian: set[str] = set()
+    reasons_automation: set[str] = set()
+
+    if previous.get("testnet") != current.get("testnet"):
+        reason = "network"
+        reasons_ws.add(reason)
+        reasons_guardian.add(reason)
+        reasons_automation.add(reason)
+
+    if (
+        previous.get("active_api_key") != current.get("active_api_key")
+        or previous.get("active_api_secret") != current.get("active_api_secret")
+    ):
+        reason = "credentials"
+        reasons_ws.add(reason)
+        reasons_guardian.add(reason)
+
+    if previous.get("ai_enabled") != current.get("ai_enabled"):
+        reason = "ai_toggle"
+        reasons_guardian.add(reason)
+        reasons_automation.add(reason)
+
+    if previous.get("freqai_enabled") != current.get("freqai_enabled"):
+        reason = "freqai_toggle"
+        reasons_guardian.add(reason)
+
+    if not (reasons_ws or reasons_guardian or reasons_automation):
+        return
+
+    try:
+        from .background import (
+            restart_automation,
+            restart_guardian,
+            restart_websockets,
+        )
+    except Exception:
+        log("envs.settings.restart_hooks.import_error", exc_info=True)
+        return
+
+    if reasons_ws:
+        try:
+            restart_websockets()
+            log(
+                "envs.settings.restart.ws", reasons=sorted(reasons_ws)
+            )
+        except Exception:
+            log("envs.settings.restart.ws.error", exc_info=True)
+
+    if reasons_guardian:
+        try:
+            restart_guardian()
+            log(
+                "envs.settings.restart.guardian", reasons=sorted(reasons_guardian)
+            )
+        except Exception:
+            log("envs.settings.restart.guardian.error", exc_info=True)
+
+    if reasons_automation:
+        try:
+            restart_automation()
+            log(
+                "envs.settings.restart.automation",
+                reasons=sorted(reasons_automation),
+            )
+        except Exception:
+            log("envs.settings.restart.automation.error", exc_info=True)
 
 
 _TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
@@ -773,6 +873,7 @@ def get_settings(force_reload: bool = False) -> Settings:
 
 def update_settings(**kwargs) -> Settings:
     current_settings = get_settings()
+    previous_snapshot = _critical_snapshot(current_settings)
     current = asdict(current_settings)
     file_payload = _migrate_legacy_payload(_load_file())
     raw_env = _read_env()
@@ -880,7 +981,16 @@ def update_settings(**kwargs) -> Settings:
     refreshed = Settings(**_filter_fields(current))
     file_mtime = _current_file_mtime()
     env_sig = _env_signature(_read_env())
-    return _set_cache(refreshed, _cache_key(file_mtime, env_sig))
+    cached = _set_cache(refreshed, _cache_key(file_mtime, env_sig))
+
+    try:
+        refreshed_snapshot = _critical_snapshot(refreshed)
+        _handle_post_update_hooks(previous_snapshot, refreshed_snapshot)
+    except Exception:
+        # Failing the hooks should not break settings persistence.
+        log("envs.settings.restart_hooks.error", exc_info=True)
+
+    return cached
 
 
 def validate_runtime_credentials(settings: Optional[Settings] = None) -> None:
