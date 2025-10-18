@@ -21,6 +21,21 @@ BASE_SESSION_STATE: dict[str, Any] = {
     "trade_tolerance_bps": 50.0,
     "trade_feedback": None,
     "logs_level": "INFO",
+    "logs_limit": 400,
+    "ui_theme": "dark",
+    "signals_actionable_only": False,
+    "signals_ready_only": False,
+    "signals_hide_skipped": False,
+    "signals_min_ev": 0.0,
+    "signals_min_probability": 0.0,
+    "pause_minutes": 60,
+    "kill_reason": "Manual kill-switch",
+    "kill_custom_minutes": 60,
+    "quick_trade_symbol": "BTCUSDT",
+    "quick_trade_side": "Buy",
+    "quick_trade_notional": 100.0,
+    "quick_trade_tolerance_bps": 50.0,
+    "quick_trade_feedback": None,
 }
 
 
