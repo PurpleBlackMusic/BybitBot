@@ -49,6 +49,7 @@ from bybit_app.ui.state import (
     cached_preflight_snapshot,
     cached_ws_snapshot,
     clear_data_caches,
+    get_auto_refresh_holds,
     ensure_keys,
 )
 from bybit_app.ui.components import (
@@ -199,10 +200,16 @@ def render_status(settings) -> None:
             f"API key: {'✅' if api_key_value else '❌'} · Secret: {'✅' if api_secret_value else '❌'} · Настройки обновлены: {last_update}"
         )
 
-        if not ok:
-            st.warning(
-                "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
-            )
+    if not ok:
+        st.warning(
+            "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
+        )
+        navigation_link(
+            "pages/00_✅_Подключение_и_Состояние.py",
+            label="Настроить подключение",
+            icon="🔌",
+            key="dashboard_setup_link",
+        )
 
 
 def _format_seconds_ago(value: object | None) -> str:
@@ -843,11 +850,24 @@ def render_onboarding() -> None:
 
 def render_shortcuts() -> None:
     st.subheader("Основные разделы")
+    st.caption(
+        "Не знаете, где искать нужный инструмент? Эти кнопки откроют ключевые рабочие страницы."
+    )
     shortcuts = [
         (
             "🔌 Подключение",
             "pages/00_✅_Подключение_и_Состояние.py",
             "API ключи, проверка связи и режим DRY-RUN.",
+        ),
+        (
+            "⚙️ Настройки",
+            "pages/02_⚙️_Настройки.py",
+            "Порог сигналов, торговые режимы и лимиты риска.",
+        ),
+        (
+            "🛡 Риск-менеджмент",
+            "pages/05_🧮_Portfolio_Risk_Spot.py",
+            "Контроль экспозиции и баланс портфеля.",
         ),
         (
             "🧭 Простой режим",
@@ -1095,6 +1115,7 @@ def main() -> None:
 
     auto_enabled = bool(state.get("auto_refresh_enabled", BASE_SESSION_STATE["auto_refresh_enabled"]))
     refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
+    auto_holds = get_auto_refresh_holds(state)
 
     def _trigger_refresh() -> None:
         clear_data_caches()
@@ -1202,7 +1223,12 @@ def main() -> None:
 
         st.divider()
         st.header("⏱ Обновление данных")
-        auto_enabled = st.toggle("Автообновление", value=auto_enabled)
+        auto_enabled = st.toggle(
+            "Автообновление",
+            value=auto_enabled,
+            help="При включении страница периодически перезагружается для обновления данных. "
+            "Отключайте автообновление, если заполняете формы вручную.",
+        )
         refresh_interval = st.slider("Интервал, сек", min_value=5, max_value=120, value=refresh_interval)
         refresh_now = st.button("Обновить сейчас", use_container_width=True)
         state["auto_refresh_enabled"] = auto_enabled
@@ -1211,8 +1237,15 @@ def main() -> None:
             _trigger_refresh()
         if not auto_enabled:
             st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
+        elif auto_holds:
+            st.caption(
+                "Автообновление временно приостановлено: "
+                + "; ".join(auto_holds)
+            )
 
-    if auto_enabled:
+    effective_auto_refresh = auto_enabled and not auto_holds
+
+    if effective_auto_refresh:
         auto_refresh(refresh_interval, key="home_auto_refresh_v2")
 
     guardian_snapshot = cached_guardian_snapshot()
@@ -1254,7 +1287,7 @@ def main() -> None:
         "min_probability": _state_float("signals_min_probability", 0.0),
     }
 
-    tabs = st.tabs(["Dashboard", "Signals", "Orders", "Wallet", "Settings", "Logs"])
+    tabs = st.tabs(["Обзор", "Сигналы", "Ордера", "Кошелёк", "Настройки", "Логи"])
 
     with tabs[0]:
         status_bar(
@@ -1269,6 +1302,7 @@ def main() -> None:
             st.info(
                 "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
             )
+        render_shortcuts()
         st.markdown("### Быстрые действия")
         if actions:
             for action in actions:
