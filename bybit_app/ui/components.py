@@ -33,7 +33,12 @@ from bybit_app.utils.formatting import (
     format_quantity,
     format_datetime,
 )
-from bybit_app.ui.state import note_user_interaction, track_value_change
+from bybit_app.ui.state import (
+    clear_auto_refresh_hold,
+    note_user_interaction,
+    set_auto_refresh_hold,
+    track_value_change,
+)
 _STATUS_BADGE_CSS = """
 <style>
 .status-badge{padding:0.5rem;border-radius:0.75rem;background-color:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.2);margin-bottom:0.5rem;}
@@ -1121,17 +1126,28 @@ def trade_ticket(
     key_prefix: str = "trade",
     compact: bool = False,
     submit_label: str | None = None,
+    instance: str | None = None,
 ) -> None:
-    """Render an interactive trade ticket tied to ``place_spot_market_with_tolerance``."""
+    """Render an interactive trade ticket tied to ``place_spot_market_with_tolerance``.
+
+    The ``instance`` parameter allows hosting multiple tickets with the same ``key_prefix``
+    on a single page without causing Streamlit widget key collisions.
+    """
 
     heading = "⚡ Быстрый ордер" if compact else "🛒 Ордер"
     st.subheader(heading)
     if on_success is None:
         on_success = []
 
+    instance_suffix = instance.strip() if isinstance(instance, str) else ""
+    if instance_suffix:
+        base_prefix = f"{key_prefix}_{instance_suffix}" if key_prefix else instance_suffix
+    else:
+        base_prefix = key_prefix
+
     def _state_key(suffix: str) -> str:
         suffix = suffix.lstrip("_")
-        return f"{key_prefix}_{suffix}" if key_prefix else suffix
+        return f"{base_prefix}_{suffix}" if base_prefix else suffix
 
     defaults = {
         "symbol": state.get(_state_key("symbol"), "BTCUSDT"),
@@ -1140,7 +1156,7 @@ def trade_ticket(
         "tolerance": int(state.get(_state_key("tolerance_bps"), 50) or 0),
     }
 
-    form_key = f"{key_prefix}-ticket-form" if key_prefix else "trade-ticket-form"
+    form_key = f"{base_prefix}-ticket-form" if base_prefix else "trade-ticket-form"
     submit_text = submit_label or ("Отправить" if compact else "Разместить маркет-ордер")
 
     hold_key = _state_key("auto_refresh_hold")
