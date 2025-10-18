@@ -119,6 +119,7 @@ def _handle_post_update_hooks(
         reason = "credentials"
         reasons_ws.add(reason)
         reasons_guardian.add(reason)
+        reasons_automation.add(reason)
 
     if previous.get("ai_enabled") != current.get("ai_enabled"):
         reason = "ai_toggle"
