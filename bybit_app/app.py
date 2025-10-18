@@ -1081,9 +1081,17 @@ def render_tips(settings, brief: Mapping[str, object] | None) -> None:
             st.warning("DRY-RUN выключен. Проверьте лимиты риска перед запуском торговых сценариев.")
         status_age = _safe_float(brief.get("status_age") if isinstance(brief, Mapping) else None, None)
         if status_age is not None and status_age > 300:
-            st.error("Данные сигнала устарели. Проверьте, что пайплайн сигналов работает корректно.")
+            st.error(
+                "Данные сигналов не обновлялись более 5 минут. Нажмите «Обновить сейчас» или убедитесь, что процесс обновления сигналов запущен.",
+            )
         if not (active_api_key(settings) and active_api_secret(settings)):
-            st.warning("API ключи не добавлены: без них торговля невозможна.")
+            st.error("API ключи не указаны — торговля недоступна, пока вы не добавите их.")
+            navigation_link(
+                "pages/00_✅_Подключение_и_Состояние.py",
+                label="Добавить API ключи",
+                icon="🔑",
+                key="tips_api_keys_link",
+            )
 
 
 def main() -> None:
@@ -1117,8 +1125,10 @@ def main() -> None:
     refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
     auto_holds = get_auto_refresh_holds(state)
 
-    def _trigger_refresh() -> None:
+    def _trigger_refresh(*, delay: float = 0.0) -> None:
         clear_data_caches()
+        if delay > 0:
+            time.sleep(delay)
         st.experimental_rerun()
 
     settings = get_settings()
@@ -1155,6 +1165,7 @@ def main() -> None:
             value=int(state.get("pause_minutes", BASE_SESSION_STATE.get("pause_minutes", 60))),
             disabled=kill_state.paused,
             key="pause_minutes",
+            help="Включить паузу автоматики на заданное количество минут.",
         )
         pause_minutes = float(state.get("pause_minutes", pause_minutes_widget))
         if kill_state.paused:
@@ -1174,13 +1185,13 @@ def main() -> None:
 
         st.subheader("🛑 Kill-Switch")
         kill_duration = st.number_input(
-            "Kill-switch (мин)",
+            "Kill-switch: длительность паузы (мин)",
             min_value=1,
             max_value=2880,
             step=5,
             value=int(state.get("kill_custom_minutes", BASE_SESSION_STATE.get("kill_custom_minutes", 60))),
             key="kill_custom_minutes",
-            help="Полная остановка до ручного включения, независимо от таймера паузы.",
+            help="Сколько минут бот будет на паузе после аварийной остановки.",
         )
         if st.button("Активировать Kill-Switch", use_container_width=True):
             activate_kill_switch(float(kill_duration), kill_reason or "Manual kill-switch")
@@ -1189,21 +1200,35 @@ def main() -> None:
             st.caption("Kill-Switch активен до ручного возобновления.")
 
         st.divider()
+        trade_ticket(
+            settings=settings,
+            client_factory=cached_api_client,
+            state=state,
+            on_success=[lambda: _trigger_refresh(delay=1.0)],
+            key_prefix="quick_trade",
+            compact=True,
+            submit_label="Отправить ордер",
+        )
+
+        st.divider()
         st.header("🌐 Фильтры сигналов")
         actionable_only = st.checkbox(
             "Только actionable",
             value=bool(state.get("signals_actionable_only", False)),
             key="signals_actionable_only",
+            help="Показывать только сигналы, по которым можно действовать прямо сейчас.",
         )
         ready_only = st.checkbox(
             "Только готовые",
             value=bool(state.get("signals_ready_only", False)),
             key="signals_ready_only",
+            help="Оставлять только сигналы, прошедшие подготовку Guardian Bot.",
         )
         hide_skipped = st.checkbox(
             "Скрыть пропуски",
             value=bool(state.get("signals_hide_skipped", False)),
             key="signals_hide_skipped",
+            help="Скрывать сигналы, пропущенные из-за лимитов риска.",
         )
         min_ev = st.number_input(
             "Мин. EV (bps)",
@@ -1211,6 +1236,7 @@ def main() -> None:
             step=1.0,
             value=float(state.get("signals_min_ev", 0.0)),
             key="signals_min_ev",
+            help="Минимальная ожидаемая выгода в базисных пунктах (1 б.п. = 0.01%).",
         )
         min_prob = st.slider(
             "Мин. вероятность (%)",
@@ -1219,6 +1245,7 @@ def main() -> None:
             step=1.0,
             value=float(state.get("signals_min_probability", 0.0)),
             key="signals_min_probability",
+            help="Минимальная вероятность, при которой сигнал попадёт в список.",
         )
 
         st.divider()
@@ -1226,10 +1253,15 @@ def main() -> None:
         auto_enabled = st.toggle(
             "Автообновление",
             value=auto_enabled,
-            help="При включении страница периодически перезагружается для обновления данных. "
-            "Отключайте автообновление, если заполняете формы вручную.",
+            help="Автоматически обновлять данные без ручного вмешательства.",
         )
-        refresh_interval = st.slider("Интервал, сек", min_value=5, max_value=120, value=refresh_interval)
+        refresh_interval = st.slider(
+            "Интервал, сек",
+            min_value=5,
+            max_value=120,
+            value=refresh_interval,
+            help="Как часто обновлять данные при активном автообновлении.",
+        )
         refresh_now = st.button("Обновить сейчас", use_container_width=True)
         state["auto_refresh_enabled"] = auto_enabled
         state["refresh_interval"] = refresh_interval
@@ -1266,11 +1298,19 @@ def main() -> None:
 
     guardian_error = guardian_snapshot.get("error")
     if guardian_error:
-        show_error_banner(str(guardian_error), title="Guardian background worker")
+        show_error_banner(
+            "Фоновый процесс Guardian сообщил об ошибке. Проверьте логи и перезапустите автоматику при необходимости.",
+            title="Фоновый сервис Guardian",
+            details=str(guardian_error),
+        )
 
     preflight_error = preflight_snapshot.get("error")
     if preflight_error:
-        show_error_banner(str(preflight_error), title="Preflight")
+        show_error_banner(
+            "Проверка перед запуском завершилась с ошибкой. Проверьте настройки и повторите попытку.",
+            title="Проверка перед запуском",
+            details=str(preflight_error),
+        )
 
     def _state_float(key: str, default: float = 0.0) -> float:
         value = state.get(key, default)
@@ -1365,7 +1405,7 @@ def main() -> None:
             settings,
             client_factory=cached_api_client,
             state=state,
-            on_success=[_trigger_refresh],
+            on_success=[lambda: _trigger_refresh(delay=1.0)],
         )
 
     with tabs[3]:
@@ -1379,15 +1419,56 @@ def main() -> None:
         kill_streak = int(getattr(settings, "ai_kill_switch_loss_streak", 0) or 0)
         kill_cooldown = float(getattr(settings, "ai_kill_switch_cooldown_min", 60.0) or 0.0)
 
-        buy_value = st.slider("Порог покупки (%)", min_value=40.0, max_value=90.0, value=buy_threshold, step=0.5)
-        sell_value = st.slider("Порог продажи (%)", min_value=10.0, max_value=60.0, value=sell_threshold, step=0.5)
-        ev_value = st.number_input("Минимальная выгода (bps)", min_value=0.0, value=min_ev, step=1.0)
-        kill_streak_value = st.number_input("Kill-switch: серия убыточных сделок", min_value=0, value=kill_streak, step=1)
-        kill_cooldown_value = st.number_input("Kill-switch: пауза (мин)", min_value=0.0, value=kill_cooldown, step=5.0)
+        buy_value = st.slider(
+            "Порог покупки (%)",
+            min_value=40.0,
+            max_value=90.0,
+            value=buy_threshold,
+            step=0.5,
+            help="Если вероятность сигнала превышает порог, бот готов рассматривать покупку.",
+        )
+        sell_value = st.slider(
+            "Порог продажи (%)",
+            min_value=10.0,
+            max_value=60.0,
+            value=sell_threshold,
+            step=0.5,
+            help="Если вероятность падает ниже порога, бот готов закрывать позицию.",
+        )
+        ev_value = st.number_input(
+            "Минимальная выгода (bps)",
+            min_value=0.0,
+            value=min_ev,
+            step=1.0,
+            help="Минимальная ожидаемая выгода в базисных пунктах (1 б.п. = 0.01%).",
+        )
+        kill_streak_value = st.number_input(
+            "Kill-switch: серия убыточных сделок",
+            min_value=0,
+            value=kill_streak,
+            step=1,
+            help="После скольких убыточных сделок подряд включать аварийную паузу.",
+        )
+        kill_cooldown_value = st.number_input(
+            "Kill-switch: пауза (мин)",
+            min_value=0.0,
+            value=kill_cooldown,
+            step=5.0,
+            help="Сколько минут ждать перед возобновлением после срабатывания kill-switch.",
+        )
 
         st.subheader("Режим работы")
-        dry_run_value = st.toggle("Учебный режим (DRY-RUN)", value=active_dry_run(settings))
-        network_value = st.selectbox("Сеть", ["Testnet", "Mainnet"], index=0 if settings.testnet else 1)
+        dry_run_value = st.toggle(
+            "Учебный режим (DRY-RUN)",
+            value=active_dry_run(settings),
+            help="В тестовом режиме сделки не отправляются на биржу.",
+        )
+        network_value = st.selectbox(
+            "Сеть",
+            ["Testnet", "Mainnet"],
+            index=0 if settings.testnet else 1,
+            help="Выберите торговую среду: тестовую или основную.",
+        )
 
         st.subheader("Интерфейс")
         refresh_slider = st.slider("Интервал автообновления (сек)", min_value=5, max_value=120, value=refresh_interval, key="settings_refresh_interval")
