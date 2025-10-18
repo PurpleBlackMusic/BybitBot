@@ -1,25 +1,24 @@
 from __future__ import annotations
-import hmac, hashlib, json, time, uuid
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode
+
+import hmac
+import hashlib
+import json
+import random
 import threading
-import requests
-from functools import lru_cache
+import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
-from tenacity import (
-    RetryCallState,
-    RetryError,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-    wait_random,
-)
+from email.utils import parsedate_to_datetime
+
+import requests
 
 if TYPE_CHECKING:
     from .envs import Settings
@@ -42,9 +41,160 @@ from .time_sync import SyncedTimestamp, invalidate_synced_clock, synced_timestam
 class _RetryableRequestError(RuntimeError):
     """Internal marker for retryable network or exchange failures."""
 
-    def __init__(self, message: str, *, meta: Mapping[str, Any] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        meta: Mapping[str, Any] | None = None,
+        retry_after: object | None = None,
+    ) -> None:
         super().__init__(message)
         self.meta = dict(meta or {})
+        hint_source = retry_after
+        if hint_source is None and "retry_after" in self.meta:
+            hint_source = self.meta["retry_after"]
+        parsed_hint = _coerce_positive_seconds(hint_source)
+        self.retry_after: float | None = parsed_hint
+        if parsed_hint is not None:
+            self.meta["retry_after"] = parsed_hint
+            # Preserve a snake_case copy for programmatic access alongside the
+            # camelCase variant emitted in structured logs.
+            self.meta.setdefault("retry_after_seconds", parsed_hint)
+
+
+def _coerce_positive_seconds(value: object | None) -> float | None:
+    """Return a positive float for delay values, falling back to ``None``."""
+
+    if value is None:
+        return None
+
+    candidate: float | None
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            candidate = float(text)
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(text)
+            except (TypeError, ValueError):
+                return None
+            else:
+                candidate = (parsed.timestamp() - time.time()) if parsed is not None else None
+
+    if candidate is None:
+        return None
+
+    if candidate > 1e12:
+        candidate = candidate / 1000.0
+
+    if candidate <= 0:
+        return None
+
+    return float(candidate)
+
+
+def _retry_delay_from_headers(response: requests.Response | None) -> float | None:
+    """Inspect response headers for retry hints (Retry-After, rate-limit reset)."""
+
+    if response is None:
+        return None
+
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+
+    lower = {str(key).lower(): value for key, value in headers.items() if key}
+
+    for header in ("retry-after", "x-bapi-retry-after", "x-ratelimit-reset-after"):
+        if header in lower:
+            delay = _coerce_positive_seconds(lower[header])
+            if delay is not None:
+                return delay
+
+    reset_timestamp = lower.get("x-bapi-limit-reset-timestamp")
+    delay = _coerce_positive_seconds(reset_timestamp)
+    if delay is not None:
+        # Header contains absolute timestamp in seconds; convert to delta.
+        delta = delay - time.time()
+        if delta > 0:
+            return delta
+
+    window = lower.get("x-bapi-limit-reset") or lower.get("x-ratelimit-reset")
+    delay = _coerce_positive_seconds(window)
+    if delay is not None:
+        return delay
+
+    return None
+
+
+def _retry_delay_from_payload(payload: Mapping[str, object] | None) -> float | None:
+    """Return retry delay derived from Bybit's structured error payload."""
+
+    if not isinstance(payload, Mapping):
+        return None
+
+    ret_ext = payload.get("retExtInfo")
+    if isinstance(ret_ext, Mapping):
+        for key in ("retryAfter", "timeInterval", "period"):
+            delay = _coerce_positive_seconds(ret_ext.get(key))
+            if delay is not None:
+                return delay
+
+    return None
+
+
+def _compute_retry_delay(
+    attempt: int,
+    *,
+    retry_after: float | None,
+    minimum: float = 0.5,
+    maximum: float = 30.0,
+    base: float = 0.5,
+    backoff_cap: float = 5.0,
+    growth: float = 2.0,
+    jitter: float = 0.5,
+) -> float:
+    """Return an exponential backoff delay with jitter respecting retry hints."""
+
+    retry_hint = None
+    if retry_after is not None:
+        try:
+            retry_hint = float(retry_after)
+        except (TypeError, ValueError):
+            retry_hint = None
+        else:
+            if retry_hint <= 0:
+                retry_hint = None
+
+    try:
+        attempt_index = max(int(attempt) - 1, 0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        attempt_index = 0
+
+    backoff = base * (growth ** attempt_index)
+    if backoff_cap is not None:
+        backoff = min(backoff, float(backoff_cap))
+
+    minimum_delay = float(minimum)
+    delay = max(backoff, minimum_delay)
+    use_jitter = True
+    if retry_hint is not None and retry_hint > delay:
+        delay = retry_hint
+        use_jitter = False
+
+    if use_jitter and jitter and jitter > 0:
+        delay += random.random() * float(jitter)
+        if retry_hint is not None:
+            delay = max(delay, retry_hint)
+
+    if maximum is not None:
+        delay = min(delay, float(maximum))
+
+    return max(delay, 0.0)
 
 
 class _TTLCache:
@@ -310,31 +460,8 @@ class BybitAPI:
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
         max_attempts = 5 if signed else 3
-        wait_strategy = wait_exponential(multiplier=0.5, max=5.0) + wait_random(0.0, 0.5)
 
-        def _log_retry(retry_state: RetryCallState) -> None:
-            if retry_state.outcome.failed:
-                exc = retry_state.outcome.exception()
-                if isinstance(exc, _RetryableRequestError):
-                    meta = dict(exc.meta)
-                    meta.update(
-                        {
-                            "attempt": retry_state.attempt_number,
-                            "maxAttempts": max_attempts,
-                            "method": method,
-                            "path": path,
-                        }
-                    )
-                    log("bybit.request.retry", **meta)
-
-        @retry(
-            reraise=True,
-            wait=wait_strategy,
-            stop=stop_after_attempt(max_attempts),
-            retry=retry_if_exception_type(_RetryableRequestError),
-            after=_log_retry,
-        )
-        def _execute():
+        def _perform_once():
             self._guard_quota(path, signed=signed)
             try:
                 resp = self._req(method, path, params=params, body=body, signed=signed)
@@ -360,13 +487,18 @@ class BybitAPI:
                         f" ({message})"
                     ) from exc
 
+                retry_after = _retry_delay_from_headers(response)
+
                 meta = {"status": status_code, "message": message}
+                if retry_after is not None:
+                    meta["retry_after"] = retry_after
                 log("bybit.http_error", method=method, path=path, **meta)
 
                 if status_code in {429, 503}:
                     raise _RetryableRequestError(
                         f"HTTP error {status_code or 'unknown'} while calling {path}: {message}",
                         meta=meta,
+                        retry_after=retry_after,
                     ) from exc
 
                 raise RuntimeError(
@@ -401,17 +533,49 @@ class BybitAPI:
                 invalidate_synced_clock(self.base)
                 self._timestamp_ms(force_refresh=True)
             if policy.retryable:
-                raise _RetryableRequestError(message, meta=error_meta)
+                retry_after = _retry_delay_from_payload(resp)
+                if retry_after is not None:
+                    error_meta = dict(error_meta)
+                    error_meta["retry_after"] = retry_after
+                raise _RetryableRequestError(
+                    message,
+                    meta=error_meta,
+                    retry_after=retry_after,
+                )
 
             raise RuntimeError(message)
 
-        try:
-            return _execute()
-        except RetryError as exc:
-            final = exc.last_attempt.exception()
-            if isinstance(final, BaseException):
-                raise final
-            raise
+        attempt = 1
+        while True:
+            try:
+                return _perform_once()
+            except _RetryableRequestError as exc:
+                meta = dict(exc.meta)
+                retry_hint = exc.retry_after
+                if retry_hint is None:
+                    retry_hint = _coerce_positive_seconds(meta.get("retry_after"))
+                if retry_hint is not None:
+                    meta["retry_after"] = retry_hint
+                    meta["retry_after_seconds"] = retry_hint
+                    meta["retryAfterSeconds"] = round(retry_hint, 3)
+                meta.update(
+                    {
+                        "attempt": attempt,
+                        "maxAttempts": max_attempts,
+                        "method": method,
+                        "path": path,
+                    }
+                )
+                log("bybit.request.retry", **meta)
+
+                if attempt >= max_attempts:
+                    raise
+
+                delay = _compute_retry_delay(attempt, retry_after=retry_hint)
+                if delay > 0:
+                    time.sleep(delay)
+
+                attempt += 1
 
     def _guard_quota(self, path: str, *, signed: bool) -> None:
         nanny = getattr(self, "_api_nanny", None)

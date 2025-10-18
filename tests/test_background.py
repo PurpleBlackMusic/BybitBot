@@ -563,3 +563,58 @@ def test_preflight_snapshot_exposes_state(monkeypatch: pytest.MonkeyPatch) -> No
     assert snapshot["ok"] is True
     assert snapshot["state"]["ok"] is True
     assert snapshot["realtime"]["ok"] is True
+
+
+def test_watchdog_tick_handles_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+
+    calls = {"ws": 0, "automation": 0, "guardian": 0}
+
+    def ws_started(*_: object, **__: object) -> bool:
+        calls["ws"] += 1
+        if calls["ws"] == 1:
+            raise RuntimeError("ws down")
+        return True
+
+    def automation_loop(*_: object, **__: object) -> bool:
+        calls["automation"] += 1
+        return True
+
+    def guardian_worker(*_: object, **__: object) -> bool:
+        calls["guardian"] += 1
+        return True
+
+    svc.ensure_ws_started = ws_started  # type: ignore[assignment]
+    svc.ensure_automation_loop = automation_loop  # type: ignore[assignment]
+    svc.ensure_guardian_worker = guardian_worker  # type: ignore[assignment]
+
+    svc._watchdog_tick()
+    svc._watchdog_tick()
+
+    assert calls["ws"] >= 2
+    assert calls["automation"] == 2
+    assert calls["guardian"] == 2
+
+
+def test_watchdog_thread_runs_periodically(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _make_service(monkeypatch)
+
+    tick_events: list[float] = []
+    ready = threading.Event()
+
+    def fake_tick() -> None:
+        tick_events.append(time.time())
+        if len(tick_events) >= 2:
+            ready.set()
+
+    svc._watchdog_interval = 0.05
+    monkeypatch.setattr(svc, "_watchdog_tick", fake_tick)
+
+    svc._ensure_watchdog()
+
+    try:
+        assert ready.wait(timeout=2.0), "watchdog thread did not tick twice"
+    finally:
+        svc.shutdown(timeout=1.0)
+
+    assert len(tick_events) >= 2

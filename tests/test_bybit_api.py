@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 import bybit_app.utils.bybit_api as bybit_api_module
-from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
+from bybit_app.utils.bybit_api import (
+    BybitAPI,
+    BybitCreds,
+    _RetryableRequestError,
+    _compute_retry_delay,
+)
 from bybit_app.utils.time_sync import SyncedTimestamp
 from bybit_app.utils.helpers import ensure_link_id
 
@@ -190,6 +197,14 @@ def test_batch_cancel_rejects_empty_payload() -> None:
         api.batch_cancel(category="spot", request=[])
 
     assert "non-empty" in str(excinfo.value)
+
+
+def test_retryable_error_normalises_retry_after() -> None:
+    err = _RetryableRequestError("boom", meta={"retry_after": "2.5"})
+
+    assert err.retry_after == pytest.approx(2.5)
+    assert err.meta["retry_after"] == pytest.approx(2.5)
+    assert err.meta["retry_after_seconds"] == pytest.approx(2.5)
 
 
 def test_batch_cancel_rejects_non_mapping_entries() -> None:
@@ -1395,3 +1410,67 @@ def test_batch_place_rejects_invalid_side() -> None:
         )
 
     assert "side" in str(excinfo.value)
+
+
+def test_compute_retry_delay_uses_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bybit_api_module.random, "random", lambda: 0.0)
+
+    delay = _compute_retry_delay(1, retry_after=2.75, maximum=10.0)
+
+    assert delay == pytest.approx(2.75)
+
+
+def test_compute_retry_delay_skips_jitter_when_hint_dominates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    def fake_random() -> float:
+        calls.append(1.0)
+        return 1.0
+
+    monkeypatch.setattr(bybit_api_module.random, "random", fake_random)
+
+    delay = _compute_retry_delay(1, retry_after=4.0, maximum=10.0)
+
+    assert delay == pytest.approx(4.0)
+    assert not calls, "Expected jitter to be skipped when server hint dominates"
+
+
+def test_compute_retry_delay_respects_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bybit_api_module.random, "random", lambda: 0.0)
+
+    first = _compute_retry_delay(1, retry_after=None, maximum=10.0)
+    second = _compute_retry_delay(2, retry_after=None, maximum=10.0)
+    third = _compute_retry_delay(5, retry_after=None, maximum=10.0)
+
+    assert first == pytest.approx(0.5)
+    assert second > first
+    assert third <= 5.0
+
+
+def test_retry_delay_from_headers_prefers_retry_after() -> None:
+    response = MagicMock()
+    response.headers = {"Retry-After": "3"}
+
+    delay = bybit_api_module._retry_delay_from_headers(response)
+
+    assert delay == pytest.approx(3.0)
+
+
+def test_retry_delay_from_headers_supports_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = time.time()
+    response = MagicMock()
+    response.headers = {"X-Bapi-Limit-Reset-Timestamp": str(now + 5)}
+
+    delay = bybit_api_module._retry_delay_from_headers(response)
+
+    assert delay is not None and delay == pytest.approx(5.0, abs=0.25)
+
+
+def test_retry_delay_from_payload_reads_ext_info() -> None:
+    payload = {"retExtInfo": {"retryAfter": "4.2"}}
+
+    delay = bybit_api_module._retry_delay_from_payload(payload)
+
+    assert delay == pytest.approx(4.2)
