@@ -9,7 +9,8 @@ from .envs import get_api_client, get_settings, creds_ok
 from .guardian_bot import GuardianBot
 from .hygiene import cancel_stale_orders, cancel_twap_leftovers
 from .log import log
-from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
+from .automation_loop import AutomationLoop
+from .signal_executor import ExecutionResult, SignalExecutor
 from .ws_manager import manager as ws_manager
 from .realtime_cache import get_realtime_cache
 from .preflight import collect_preflight_snapshot

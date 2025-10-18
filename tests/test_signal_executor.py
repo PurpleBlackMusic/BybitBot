@@ -15,11 +15,8 @@ import bybit_app.utils.ws_manager as ws_manager_module
 import bybit_app.utils.spot_pnl as spot_pnl_module
 import bybit_app.utils.spot_fifo as spot_fifo_module
 from bybit_app.utils.envs import Settings
-from bybit_app.utils.signal_executor import (
-    AutomationLoop,
-    ExecutionResult,
-    SignalExecutor,
-)
+from bybit_app.utils.automation_loop import AutomationLoop
+from bybit_app.utils.signal_executor import ExecutionResult, SignalExecutor
 from bybit_app.utils.ai.kill_switch import KillSwitchState
 from bybit_app.utils.self_learning import TradePerformanceSnapshot
 from bybit_app.utils.spot_market import (

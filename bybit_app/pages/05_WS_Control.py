@@ -1,3 +1,11 @@
+"""Control the background WebSocket manager from the UI.
+
+The file name intentionally avoids non-ASCII characters so that developers on
+platforms with limited Unicode support can work with the project without
+renaming files locally.  The visible page title still uses the localized
+variant to preserve the existing UX.
+"""
+
 from __future__ import annotations
 import streamlit as st
 import threading

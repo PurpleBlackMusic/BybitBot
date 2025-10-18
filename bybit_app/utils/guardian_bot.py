@@ -4265,7 +4265,8 @@ class GuardianBot:
     ):
         """Return a continuous executor that keeps trading until stopped."""
 
-        from .signal_executor import AutomationLoop, SignalExecutor
+        from .automation_loop import AutomationLoop
+        from .signal_executor import SignalExecutor
 
         executor = SignalExecutor(self)
         return AutomationLoop(
