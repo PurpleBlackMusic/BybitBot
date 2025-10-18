@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import time
+from uuid import uuid4
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, get_args
+import json
+from string import Template
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +27,13 @@ from bybit_app.utils.spot_market import (
     prepare_spot_market_order,
     prepare_spot_trade_snapshot,
 )
+from bybit_app.utils.formatting import (
+    format_money,
+    format_percent,
+    format_quantity,
+    format_datetime,
+)
+from bybit_app.ui.state import note_user_interaction, track_value_change
 _STATUS_BADGE_CSS = """
 <style>
 .status-badge{padding:0.5rem;border-radius:0.75rem;background-color:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.2);margin-bottom:0.5rem;}
@@ -84,6 +95,284 @@ def _render_badge_grid(badges: Sequence[StatusBadge], *, columns: int = 4) -> No
                 st.markdown(badge.render(), unsafe_allow_html=True)
 
 
+def command_palette(
+    shortcuts: Sequence[tuple[str, str, str]], *, key: str = "command_palette"
+) -> None:
+    """Inject a lightweight command palette bound to ``Ctrl/Cmd + K``."""
+
+    if not shortcuts:
+        return
+
+    flag = f"_bybit_{key}_injected"
+    if st.session_state.get(flag):
+        return
+
+    items: list[dict[str, str]] = []
+    for label, page, description in shortcuts:
+        path = str(page)
+        target = "page"
+        if isinstance(page, str) and page.startswith("#"):
+            slug = page.lstrip("#")
+            target = "anchor"
+        else:
+            slug = page_slug_from_path(page)
+        items.append(
+            {
+                "label": str(label),
+                "slug": slug,
+                "description": str(description),
+                "path": path,
+                "target": target,
+            }
+        )
+
+    if not items:
+        return
+
+    palette_id = f"bybit-cmd-{uuid4().hex}"
+    data_json = json.dumps(items)
+    st.session_state[flag] = True
+
+    template = Template(
+        """
+    <style>
+    #$palette_id {
+        position: fixed;
+        inset: 0;
+        display: none;
+        align-items: flex-start;
+        justify-content: center;
+        padding-top: 10vh;
+        z-index: 1000;
+        background: rgba(15, 23, 42, 0.35);
+        backdrop-filter: blur(2px);
+    }
+    #$palette_id.is-visible {
+        display: flex;
+    }
+    #$palette_id .palette-panel {
+        width: min(520px, 90vw);
+        background: rgba(15, 23, 42, 0.97);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        border-radius: 16px;
+        padding: 1rem;
+        box-shadow: 0 20px 45px rgba(15, 23, 42, 0.45);
+        color: #f8fafc;
+        font-family: inherit;
+    }
+    #$palette_id .palette-search {
+        width: 100%;
+        padding: 0.6rem 0.75rem;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.7);
+        color: inherit;
+        font-size: 1rem;
+        outline: none;
+        margin-bottom: 0.75rem;
+    }
+    #$palette_id .palette-search::placeholder {
+        color: rgba(148, 163, 184, 0.9);
+    }
+    #$palette_id .palette-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        max-height: 60vh;
+        overflow-y: auto;
+    }
+    #$palette_id .palette-item {
+        padding: 0.55rem 0.75rem;
+        border-radius: 10px;
+        cursor: pointer;
+        display: flex;
+        flex-direction: column;
+        gap: 0.2rem;
+        transition: background 80ms ease;
+    }
+    #$palette_id .palette-item[aria-selected="true"] {
+        background: rgba(14, 165, 233, 0.25);
+        border: 1px solid rgba(56, 189, 248, 0.4);
+    }
+    #$palette_id .palette-item:not([aria-selected="true"]):hover {
+        background: rgba(148, 163, 184, 0.16);
+    }
+    #$palette_id .palette-label {
+        font-weight: 600;
+        font-size: 1rem;
+    }
+    #$palette_id .palette-description {
+        font-size: 0.85rem;
+        color: rgba(226, 232, 240, 0.85);
+    }
+    </style>
+    <div id="$palette_id" class="bybit-command-palette" aria-hidden="true">
+        <div class="palette-panel" role="dialog" aria-modal="true">
+            <input class="palette-search" type="text" placeholder="Куда перейти? (Ctrl/Cmd + K)" />
+            <ul class="palette-list" role="listbox"></ul>
+        </div>
+    </div>
+    <script>
+    (function() {
+        const items = $data_json;
+        const palette = document.getElementById('$palette_id');
+        if (!palette || !Array.isArray(items) || !items.length) {
+            return;
+        }
+        const input = palette.querySelector('.palette-search');
+        const list = palette.querySelector('.palette-list');
+        let filtered = items.slice();
+        let activeIndex = 0;
+        let open = false;
+
+        function closePalette() {
+            open = false;
+            palette.classList.remove('is-visible');
+            palette.setAttribute('aria-hidden', 'true');
+        }
+
+        function selectIndex(index) {
+            const options = list.querySelectorAll('.palette-item');
+            options.forEach((option, optionIndex) => {
+                option.setAttribute('aria-selected', optionIndex === index ? 'true' : 'false');
+            });
+            activeIndex = index;
+        }
+
+        function navigateTo(item) {
+            if (!item) {
+                return;
+            }
+            if (item.target === 'anchor' && item.path) {
+                closePalette();
+                const hash = item.path.startsWith('#') ? item.path : '#' + item.path;
+                setTimeout(() => {
+                    window.location.hash = hash;
+                }, 0);
+                return;
+            }
+            const url = new URL(window.location.href);
+            if (item.slug) {
+                url.searchParams.set('page', item.slug);
+            } else if (item.path) {
+                url.searchParams.set('page', item.path);
+            }
+            window.location.href = url.toString();
+        }
+
+        function renderList() {
+            list.innerHTML = '';
+            filtered.forEach((item, index) => {
+                const element = document.createElement('li');
+                element.className = 'palette-item';
+                element.setAttribute('role', 'option');
+                element.dataset.index = String(index);
+                element.innerHTML =
+                    '<span class="palette-label">' + item.label + '</span>' +
+                    '<span class="palette-description">' + item.description + '</span>';
+                list.appendChild(element);
+            });
+            if (!filtered.length) {
+                const empty = document.createElement('li');
+                empty.className = 'palette-item';
+                empty.textContent = 'Не найдено подходящих разделов';
+                empty.setAttribute('aria-disabled', 'true');
+                list.appendChild(empty);
+                activeIndex = -1;
+                return;
+            }
+            const boundedIndex = Math.max(0, Math.min(activeIndex, filtered.length - 1));
+            selectIndex(boundedIndex);
+        }
+
+        function openPalette() {
+            open = true;
+            palette.classList.add('is-visible');
+            palette.setAttribute('aria-hidden', 'false');
+            filtered = items.slice();
+            activeIndex = 0;
+            renderList();
+            setTimeout(() => input.focus(), 0);
+        }
+
+        input.addEventListener('input', (event) => {
+            const value = String(event.target.value || '').trim().toLowerCase();
+            filtered = items.filter((item) => {
+                const slugMatch = item.slug && item.slug.toLowerCase().includes(value);
+                const pathMatch = item.path && item.path.toLowerCase().includes(value);
+                return (
+                    item.label.toLowerCase().includes(value) ||
+                    item.description.toLowerCase().includes(value) ||
+                    slugMatch ||
+                    pathMatch
+                );
+            });
+            activeIndex = 0;
+            renderList();
+        });
+
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                if (!filtered.length) {
+                    return;
+                }
+                const next = (activeIndex + 1) % filtered.length;
+                selectIndex(next);
+            } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                if (!filtered.length) {
+                    return;
+                }
+                const prev = (activeIndex - 1 + filtered.length) % filtered.length;
+                selectIndex(prev);
+            } else if (event.key === 'Enter') {
+                event.preventDefault();
+                if (activeIndex >= 0 && filtered[activeIndex]) {
+                    navigateTo(filtered[activeIndex]);
+                }
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                closePalette();
+            }
+        });
+
+        list.addEventListener('click', (event) => {
+            const target = event.target.closest('.palette-item');
+            if (!target) {
+                return;
+            }
+            const index = Number(target.dataset.index);
+            if (!Number.isNaN(index) && filtered[index]) {
+                navigateTo(filtered[index]);
+            }
+        });
+
+        document.addEventListener('keydown', (event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+                event.preventDefault();
+                if (open) {
+                    closePalette();
+                } else {
+                    openPalette();
+                }
+            } else if (event.key === 'Escape' && open) {
+                closePalette();
+            }
+        });
+
+        palette.addEventListener('click', (event) => {
+            if (event.target === palette) {
+                closePalette();
+            }
+        });
+    })();
+    </script>
+    """
+    )
+    html = template.substitute(palette_id=palette_id, data_json=data_json)
+
+    st.markdown(html, unsafe_allow_html=True)
 def _format_age(seconds: object) -> str:
     try:
         value = float(seconds)
@@ -575,7 +864,97 @@ def signals_table(
     )
 
 
-def orders_table(report: Mapping[str, Any]) -> None:
+_OPTIMISTIC_ORDERS_KEY = "_optimistic_orders"
+_OPTIMISTIC_TTL = 120.0  # seconds
+
+
+def _state_container(state: Any | None = None):
+    return state if state is not None else st.session_state
+
+
+def _optimistic_orders(state: Any | None = None) -> list[dict[str, Any]]:
+    holder = _state_container(state)
+    orders = holder.get(_OPTIMISTIC_ORDERS_KEY, [])
+    if isinstance(orders, list):
+        return [order for order in orders if isinstance(order, dict)]
+    return []
+
+
+def _record_optimistic_order(
+    *,
+    state: Any | None,
+    symbol: str,
+    side: str,
+    qty: Any,
+    price: Any,
+    notional: Any,
+) -> str:
+    """Store optimistic order metadata in the session state."""
+
+    token = uuid4().hex
+    entry = {
+        "token": token,
+        "symbol": symbol,
+        "side": side.capitalize(),
+        "qty": qty,
+        "price": price,
+        "notional": notional,
+        "status": "pending",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    holder = _state_container(state)
+    existing = _optimistic_orders(holder)
+    holder[_OPTIMISTIC_ORDERS_KEY] = existing + [entry]
+    return token
+
+
+def _update_optimistic_order(
+    token: str,
+    *,
+    state: Any | None,
+    status: str,
+    message: str | None = None,
+) -> None:
+    holder = _state_container(state)
+    orders = _optimistic_orders(holder)
+    updated: list[dict[str, Any]] = []
+    now = time.time()
+    for entry in orders:
+        if entry.get("token") != token:
+            if now - float(entry.get("created_at", 0.0)) < _OPTIMISTIC_TTL:
+                updated.append(entry)
+            continue
+        entry = dict(entry)
+        entry["status"] = status
+        if message:
+            entry["message"] = message
+        entry["updated_at"] = now
+        updated.append(entry)
+    holder[_OPTIMISTIC_ORDERS_KEY] = updated
+
+
+def _cleanup_optimistic_orders(state: Any | None = None) -> None:
+    holder = _state_container(state)
+    orders = _optimistic_orders(holder)
+    if not orders:
+        return
+    now = time.time()
+    holder[_OPTIMISTIC_ORDERS_KEY] = [
+        order
+        for order in orders
+        if now - float(order.get("updated_at", order.get("created_at", 0.0))) < _OPTIMISTIC_TTL
+    ]
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def orders_table(report: Mapping[str, Any], *, state: Any | None = None) -> None:
     """Show recent trades and current positions."""
 
     st.subheader("🧾 Orders & Trades")
@@ -583,17 +962,98 @@ def orders_table(report: Mapping[str, Any]) -> None:
     positions = portfolio.get("positions") if isinstance(portfolio, Mapping) else []
     recent_trades = report.get("recent_trades") if isinstance(report, Mapping) else []
 
+    _cleanup_optimistic_orders(state)
+    optimistic = _optimistic_orders(state)
+
     cols = st.columns(2)
     with cols[0]:
         st.markdown("**Open positions**")
         if positions:
-            st.dataframe(pd.DataFrame(positions), hide_index=True, use_container_width=True)
+            positions_frame = pd.DataFrame(positions)
+            st.dataframe(
+                positions_frame,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "symbol": st.column_config.TextColumn("Symbol"),
+                    "qty": st.column_config.NumberColumn("Qty", format="%.4f"),
+                    "avg_cost": st.column_config.NumberColumn("Avg cost", format="%.4f"),
+                    "notional": st.column_config.NumberColumn("Notional", format="%.2f"),
+                    "realized_pnl": st.column_config.NumberColumn("Realized PnL", format="%.2f"),
+                },
+            )
         else:
             st.caption("Нет открытых позиций.")
     with cols[1]:
         st.markdown("**Recent trades**")
-        if recent_trades:
-            st.dataframe(pd.DataFrame(recent_trades), hide_index=True, use_container_width=True)
+        if recent_trades or optimistic:
+            trades_frame = pd.DataFrame(recent_trades)
+            if optimistic:
+                optimistic_frame = pd.DataFrame(optimistic)
+                if "when" not in optimistic_frame.columns:
+                    optimistic_frame["when"] = format_datetime(datetime.now(timezone.utc))
+                optimistic_frame["status"] = optimistic_frame.get("status", "pending")
+                trades_frame = pd.concat([optimistic_frame, trades_frame], ignore_index=True, sort=False)
+            if "status" not in trades_frame.columns:
+                trades_frame["status"] = "done"
+
+            if {"qty", "price"}.issubset(trades_frame.columns) and "notional" not in trades_frame.columns:
+                try:
+                    qty_numeric = pd.to_numeric(trades_frame["qty"], errors="coerce")
+                    price_numeric = pd.to_numeric(trades_frame["price"], errors="coerce")
+                    trades_frame["notional"] = qty_numeric * price_numeric
+                except Exception:
+                    pass
+
+            def _status_style(value: str) -> str:
+                tone = str(value or "").lower()
+                if tone in {"pending", "sending"}:
+                    color = "rgba(56,189,248,0.2)"
+                    border = "rgba(56,189,248,0.4)"
+                    text = "#0369a1"
+                    label = "В обработке"
+                elif tone in {"failed", "error"}:
+                    color = "rgba(248,113,113,0.2)"
+                    border = "rgba(248,113,113,0.4)"
+                    text = "#b91c1c"
+                    label = "Ошибка"
+                else:
+                    color = "rgba(74,222,128,0.25)"
+                    border = "rgba(74,222,128,0.5)"
+                    text = "#166534"
+                    label = "Исполнено"
+                return (
+                    f"background-color:{color};color:{text};"
+                    f"border:1px solid {border};border-radius:1rem;padding:0.15rem 0.6rem;"
+                    f"font-weight:600;text-align:center;"
+                ), label
+
+            status_labels: list[str] = []
+            status_styles: list[str] = []
+            for tone in trades_frame["status"].tolist():
+                style, label = _status_style(str(tone))
+                status_styles.append(style)
+                status_labels.append(label)
+            trades_frame["status"] = status_labels
+
+            formatter_map: dict[str, Callable[[Any], str]] = {}
+            if "qty" in trades_frame.columns:
+                formatter_map["qty"] = lambda value: format_quantity(value) if pd.notna(value) else "—"
+            if "price" in trades_frame.columns:
+                formatter_map["price"] = lambda value: format_money(value, currency="", precision=4)
+            if "fee" in trades_frame.columns:
+                formatter_map["fee"] = lambda value: format_money(value, currency="", precision=4)
+            if "notional" in trades_frame.columns:
+                formatter_map["notional"] = lambda value: format_money(value, precision=2)
+
+            styled = trades_frame.style.format(formatter_map)
+            styled = styled.set_properties(subset=["status"], **{"font-weight": "600"})
+
+            def _apply_status(_: pd.Series) -> list[str]:
+                return status_styles
+
+            styled = styled.apply(_apply_status, subset=["status"], axis=0)
+            st.dataframe(styled, hide_index=True, use_container_width=True)
         else:
             st.caption("Сделок пока не было.")
 
@@ -610,13 +1070,32 @@ def wallet_overview(report: Mapping[str, Any]) -> None:
     equity = totals.get("total_equity") or totals.get("equity")
     available = totals.get("available_balance") or totals.get("available")
     reserve = totals.get("cash_reserve_pct") or totals.get("reserve_pct")
-    cols[0].metric("Equity", f"{equity:,.2f}" if equity else "—")
-    cols[1].metric("Available", f"{available:,.2f}" if available else "—")
-    cols[2].metric("Reserve %", f"{reserve:.1f}%" if isinstance(reserve, (int, float)) else "—")
+    cols[0].metric("Equity", format_money(equity))
+    cols[1].metric("Available", format_money(available))
+    if reserve is None:
+        reserve_display = "—"
+    else:
+        reserve_value = float(reserve) if isinstance(reserve, (int, float)) else reserve
+        if isinstance(reserve_value, (int, float)) and reserve_value <= 1:
+            reserve_value = reserve_value * 100
+        reserve_display = format_percent(reserve_value)
+    cols[2].metric("Reserve %", reserve_display)
 
     if positions:
         st.markdown("**Positions**")
-        st.dataframe(pd.DataFrame(positions), hide_index=True, use_container_width=True)
+        frame = pd.DataFrame(positions)
+        st.dataframe(
+            frame,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "symbol": st.column_config.TextColumn("Symbol"),
+                "qty": st.column_config.NumberColumn("Qty", format="%.4f"),
+                "avg_cost": st.column_config.NumberColumn("Avg cost", format="%.4f"),
+                "notional": st.column_config.NumberColumn("Notional", format="%.2f"),
+                "realized_pnl": st.column_config.NumberColumn("Realized PnL", format="%.2f"),
+            },
+        )
     else:
         st.caption("Активных позиций нет.")
 
@@ -672,6 +1151,13 @@ def trade_ticket(
     )
     pause_checkbox_key = _state_key("auto_pause")
     pause_active = st.checkbox(pause_label, key=pause_checkbox_key, help=pause_help)
+    track_value_change(
+        state,
+        pause_checkbox_key,
+        pause_active,
+        reason="Настройки формы ордера обновлены",
+        cooldown=4.0,
+    )
     pause_reason = "Форма быстрого ордера открыта" if compact else "Форма ордера открыта"
     if pause_active:
         set_auto_refresh_hold(hold_key, pause_reason)
@@ -724,6 +1210,8 @@ def trade_ticket(
     state[_state_key("tolerance_bps")] = tolerance
     state[feedback_key] = None
 
+    note_user_interaction("Отправлена форма ордера", cooldown=8.0)
+
     if not cleaned_symbol:
         show_error_banner("Укажите символ спот-торговли, например BTCUSDT.")
         return
@@ -755,6 +1243,7 @@ def trade_ticket(
             )
         return
 
+    optimistic_token: str | None = None
     try:
         snapshot = prepare_spot_trade_snapshot(client, cleaned_symbol)
         prepared = prepare_spot_market_order(
@@ -771,6 +1260,14 @@ def trade_ticket(
             limits=snapshot.limits,
             settings=settings,
         )
+        optimistic_token = _record_optimistic_order(
+            state=state,
+            symbol=cleaned_symbol,
+            side=side,
+            qty=_to_float(prepared.audit.get("order_qty_base")),
+            price=_to_float(prepared.audit.get("price_used") or prepared.audit.get("limit_price")),
+            notional=_to_float(prepared.audit.get("order_notional")),
+        )
         response = place_spot_market_with_tolerance(
             client,
             cleaned_symbol,
@@ -786,11 +1283,23 @@ def trade_ticket(
             settings=settings,
         )
     except OrderValidationError as exc:
+        if optimistic_token:
+            _update_optimistic_order(optimistic_token, state=state, status="failed", message=str(exc))
         show_error_banner(str(exc), details=_validation_details(exc))
         return
     except Exception as exc:  # pragma: no cover - defensive
+        if optimistic_token:
+            _update_optimistic_order(optimistic_token, state=state, status="failed", message=str(exc))
         show_error_banner("Не удалось разместить ордер.", details=str(exc))
         return
+
+    if optimistic_token:
+        _update_optimistic_order(
+            optimistic_token,
+            state=state,
+            status="done",
+            message="Маркет-ордер отправлен на биржу",
+        )
 
     feedback = {
         "message": "Маркет-ордер отправлен на биржу.",

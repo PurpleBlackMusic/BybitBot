@@ -27,6 +27,7 @@ from bybit_app.utils.ui import (
     safe_set_page_config,
     auto_refresh,
 )
+from bybit_app.utils.formatting import tabular_numeric_css
 from bybit_app.utils.ai.kill_switch import (
     clear_pause,
     get_state as get_kill_switch_state,
@@ -54,10 +55,14 @@ from bybit_app.ui.state import (
     cached_preflight_snapshot,
     cached_ws_snapshot,
     clear_data_caches,
+    get_last_interaction_timestamp,
     get_auto_refresh_holds,
+    note_user_interaction,
+    track_value_change,
     ensure_keys,
 )
 from bybit_app.ui.components import (
+    command_palette,
     log_viewer,
     metrics_strip,
     orders_table,
@@ -842,6 +847,7 @@ def render_user_actions(
 
 
 def render_onboarding() -> None:
+    st.markdown("<div id='onboarding'></div>", unsafe_allow_html=True)
     st.subheader("Первые шаги")
     st.markdown(
         """
@@ -853,12 +859,8 @@ def render_onboarding() -> None:
     )
 
 
-def render_shortcuts() -> None:
-    st.subheader("Основные разделы")
-    st.caption(
-        "Не знаете, где искать нужный инструмент? Эти кнопки откроют ключевые рабочие страницы."
-    )
-    shortcuts = [
+def primary_shortcuts() -> list[tuple[str, str, str]]:
+    return [
         (
             "🔌 Подключение",
             "pages/00_✅_Подключение_и_Состояние.py",
@@ -886,7 +888,14 @@ def render_shortcuts() -> None:
         ),
     ]
 
-    render_navigation_grid(shortcuts, columns=3, key_prefix="shortcuts")
+
+def render_shortcuts(shortcuts: Sequence[tuple[str, str, str]] | None = None) -> None:
+    st.subheader("Основные разделы")
+    st.caption(
+        "Не знаете, где искать нужный инструмент? Эти кнопки откроют ключевые рабочие страницы."
+    )
+    items = list(shortcuts) if shortcuts is not None else primary_shortcuts()
+    render_navigation_grid(items, columns=3, key_prefix="shortcuts")
 
 
 def render_data_health(health: dict[str, dict[str, object]] | None) -> None:
@@ -1120,6 +1129,9 @@ def main() -> None:
         except Exception:  # pragma: no cover - IO errors
             pass
 
+    # Ensure numeric values line up across tables and metrics.
+    st.markdown(tabular_numeric_css(), unsafe_allow_html=True)
+
     try:
         validate_runtime_credentials()
     except CredentialValidationError as cred_err:
@@ -1140,6 +1152,13 @@ def main() -> None:
         st.experimental_rerun()
 
     settings = get_settings()
+    shortcuts = primary_shortcuts()
+    in_page_shortcuts = [
+        ("🟢 Обзор: статус", "#status-bar", "Прокрутить к статус-бару здоровья бота."),
+        ("⚡ Обзор: быстрые действия", "#quick-actions", "Перейти к списку рекомендаций и CTA."),
+        ("🚀 Обзор: онбординг", "#onboarding", "Шаги быстрого запуска и подсказки."),
+    ]
+    command_palette(shortcuts + in_page_shortcuts)
 
     def _render_missing_keys_prompt(current_settings) -> None:
         has_keys = bool(active_api_key(current_settings) and active_api_secret(current_settings))
@@ -1302,17 +1321,38 @@ def main() -> None:
             key="signals_actionable_only",
             help="Показывать только сигналы, по которым можно действовать прямо сейчас.",
         )
+        track_value_change(
+            state,
+            "signals_actionable_only",
+            actionable_only,
+            reason="Фильтры сигналов обновлены",
+            cooldown=3.0,
+        )
         ready_only = st.checkbox(
             "Только готовые",
             value=bool(state.get("signals_ready_only", False)),
             key="signals_ready_only",
             help="Оставлять только сигналы, прошедшие подготовку Guardian Bot.",
         )
+        track_value_change(
+            state,
+            "signals_ready_only",
+            ready_only,
+            reason="Фильтры сигналов обновлены",
+            cooldown=3.0,
+        )
         hide_skipped = st.checkbox(
             "Скрыть пропуски",
             value=bool(state.get("signals_hide_skipped", False)),
             key="signals_hide_skipped",
             help="Скрывать сигналы, пропущенные из-за лимитов риска.",
+        )
+        track_value_change(
+            state,
+            "signals_hide_skipped",
+            hide_skipped,
+            reason="Фильтры сигналов обновлены",
+            cooldown=3.0,
         )
         min_ev = st.number_input(
             "Мин. EV (bps)",
@@ -1321,6 +1361,13 @@ def main() -> None:
             value=float(state.get("signals_min_ev", 0.0)),
             key="signals_min_ev",
             help="Минимальная ожидаемая выгода в базисных пунктах (1 б.п. = 0.01%).",
+        )
+        track_value_change(
+            state,
+            "signals_min_ev",
+            float(min_ev),
+            reason="Фильтры сигналов обновлены",
+            cooldown=3.0,
         )
         min_prob = st.slider(
             "Мин. вероятность (%)",
@@ -1331,6 +1378,13 @@ def main() -> None:
             key="signals_min_probability",
             help="Минимальная вероятность, при которой сигнал попадёт в список.",
         )
+        track_value_change(
+            state,
+            "signals_min_probability",
+            float(min_prob),
+            reason="Фильтры сигналов обновлены",
+            cooldown=3.0,
+        )
 
         st.divider()
         st.header("⏱ Обновление данных")
@@ -1339,6 +1393,13 @@ def main() -> None:
             value=auto_enabled,
             help="Автоматически обновлять данные без ручного вмешательства.",
         )
+        track_value_change(
+            state,
+            "auto_refresh_enabled",
+            auto_enabled,
+            reason="Настройки автообновления изменены",
+            cooldown=4.0,
+        )
         refresh_interval = st.slider(
             "Интервал, сек",
             min_value=5,
@@ -1346,11 +1407,62 @@ def main() -> None:
             value=refresh_interval,
             help="Как часто обновлять данные при активном автообновлении.",
         )
+        track_value_change(
+            state,
+            "refresh_interval",
+            refresh_interval,
+            reason="Настройки автообновления изменены",
+            cooldown=4.0,
+        )
+        idle_interval_default = int(
+            state.get("refresh_idle_interval", BASE_SESSION_STATE.get("refresh_idle_interval", 8))
+        )
+        idle_interval = st.slider(
+            "Когда просто смотрю (сек)",
+            min_value=3,
+            max_value=60,
+            value=idle_interval_default,
+            help="Интервал обновления, когда вы наблюдаете за дашбордом без активных действий.",
+        )
+        track_value_change(
+            state,
+            "refresh_idle_interval",
+            idle_interval,
+            reason="Настройки автообновления изменены",
+            cooldown=4.0,
+        )
+        idle_after_default = int(
+            state.get("refresh_idle_after", BASE_SESSION_STATE.get("refresh_idle_after", 45.0))
+        )
+        idle_after = st.slider(
+            "Переход в наблюдение через (сек)",
+            min_value=10,
+            max_value=300,
+            step=5,
+            value=idle_after_default,
+            help="Через сколько секунд без взаимодействий ускорять обновления.",
+        )
+        track_value_change(
+            state,
+            "refresh_idle_after",
+            float(idle_after),
+            reason="Настройки автообновления изменены",
+            cooldown=4.0,
+        )
         refresh_now = st.button("Обновить сейчас", use_container_width=True)
         state["auto_refresh_enabled"] = auto_enabled
         state["refresh_interval"] = refresh_interval
+        state["refresh_idle_interval"] = int(idle_interval)
+        state["refresh_idle_after"] = float(idle_after)
         if refresh_now:
+            note_user_interaction("Ручное обновление", cooldown=1.0)
             _trigger_refresh()
+
+        last_interaction_ts = get_last_interaction_timestamp(state)
+        elapsed_since_interaction = None
+        if last_interaction_ts is not None:
+            elapsed_since_interaction = max(time.time() - last_interaction_ts, 0.0)
+
         if not auto_enabled:
             st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
         elif auto_holds:
@@ -1358,11 +1470,28 @@ def main() -> None:
                 "Автообновление временно приостановлено: "
                 + "; ".join(auto_holds)
             )
+        else:
+            use_idle_mode = (
+                elapsed_since_interaction is None
+                or elapsed_since_interaction >= float(idle_after)
+            )
+            current_interval = idle_interval if use_idle_mode else refresh_interval
+            mode_label = "наблюдение" if use_idle_mode else "активный ввод"
+            st.caption(
+                f"Сейчас: каждые {int(current_interval)} с ({mode_label})."
+            )
 
     effective_auto_refresh = auto_enabled and not auto_holds
 
+    adaptive_interval = max(1, int(refresh_interval))
+    idle_interval_seconds = max(1, int(state.get("refresh_idle_interval", 8)))
+    idle_after_seconds = float(state.get("refresh_idle_after", 45.0))
+    last_interaction_ts = get_last_interaction_timestamp(state)
+    if last_interaction_ts is None or (time.time() - last_interaction_ts) >= idle_after_seconds:
+        adaptive_interval = idle_interval_seconds
+
     if effective_auto_refresh:
-        auto_refresh(refresh_interval, key="home_auto_refresh_v2")
+        auto_refresh(adaptive_interval, key="home_auto_refresh_v2")
 
     guardian_snapshot = cached_guardian_snapshot()
     ws_snapshot = cached_ws_snapshot()
@@ -1414,6 +1543,7 @@ def main() -> None:
     tabs = st.tabs(["Обзор", "Сигналы", "Ордера", "Кошелёк", "Настройки", "Логи"])
 
     with tabs[0]:
+        st.markdown("<div id='status-bar'></div>", unsafe_allow_html=True)
         status_bar(
             settings,
             guardian_snapshot=guardian_snapshot,
@@ -1426,7 +1556,8 @@ def main() -> None:
             st.info(
                 "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
             )
-        render_shortcuts()
+        render_shortcuts(shortcuts)
+        st.markdown("<div id='quick-actions'></div>", unsafe_allow_html=True)
         st.markdown("### Быстрые действия")
         if actions:
             for action in actions:
@@ -1483,7 +1614,7 @@ def main() -> None:
             )
 
     with tabs[2]:
-        orders_table(report)
+        orders_table(report, state=state)
 
         trade_ticket(
             settings,
