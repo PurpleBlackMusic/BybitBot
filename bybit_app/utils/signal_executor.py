@@ -80,6 +80,7 @@ from .signal_helpers import (
     _safe_float,
     _safe_symbol,
     _store_partial_attempts,
+    _TIF_ALIAS_MAP,
 )
 from .price_limit_backoff import (
     PRICE_LIMIT_LIQUIDITY_TTL,
@@ -105,7 +106,7 @@ _DUST_MIN_QUOTE = Decimal("0.00000001")
 _IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
 _MIN_QUOTE_RESERVE_PCT = 2.0
 
-@dataclass
+@dataclass(slots=True)
 class ExecutionResult:
     """Outcome of a single automation pass."""
 
@@ -3430,8 +3431,7 @@ class SignalExecutor:
         time_in_force = "GTC"
         if isinstance(tif_candidate, str) and tif_candidate.strip():
             tif_upper = tif_candidate.strip().upper()
-            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
-            time_in_force = mapping.get(tif_upper, tif_upper)
+            time_in_force = _TIF_ALIAS_MAP.get(tif_upper, tif_upper)
 
         fee_guard_fraction = resolve_fee_guard_fraction(settings)
         aggregated: list[Dict[str, object]] = []

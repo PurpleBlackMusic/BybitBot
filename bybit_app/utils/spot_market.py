@@ -15,6 +15,7 @@ from . import validators
 from .envs import Settings
 from .paths import CACHE_DIR
 from .precision import ceil_qty_to_min_notional, format_to_step, quantize_to_step
+from .signal_helpers import _TIF_ALIAS_MAP
 from .bybit_errors import parse_bybit_error_message
 
 _MIN_QUOTE = Decimal("5")
@@ -2451,8 +2452,7 @@ def prepare_spot_market_order(
             tif_candidate = getattr(settings, "spot_limit_tif", None)
         if isinstance(tif_candidate, str) and tif_candidate.strip():
             tif_upper = tif_candidate.strip().upper()
-            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
-            time_in_force = mapping.get(tif_upper, tif_upper)
+            time_in_force = _TIF_ALIAS_MAP.get(tif_upper, tif_upper)
         allow_partial_fills = bool(getattr(settings, "allow_partial_fills", True))
         reprice_after_raw = getattr(settings, "reprice_unfilled_after_sec", None)
         if isinstance(reprice_after_raw, (int, float)) and reprice_after_raw >= 0:
@@ -3037,8 +3037,7 @@ def prepare_spot_market_order(
             tif_candidate = getattr(settings, "spot_limit_tif", None)
         if isinstance(tif_candidate, str) and tif_candidate.strip():
             tif_upper = tif_candidate.strip().upper()
-            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
-            time_in_force = mapping.get(tif_upper, tif_upper)
+            time_in_force = _TIF_ALIAS_MAP.get(tif_upper, tif_upper)
         allow_partial_fills = bool(getattr(settings, "allow_partial_fills", True))
         reprice_after_raw = getattr(settings, "reprice_unfilled_after_sec", None)
         if isinstance(reprice_after_raw, (int, float)) and reprice_after_raw >= 0:

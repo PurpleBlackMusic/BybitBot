@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
+from functools import lru_cache
 import math
 import re
 from typing import Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple, List
@@ -21,7 +22,12 @@ from .bybit_errors import parse_bybit_error_message
 from .precision import format_to_step, quantize_to_step
 from .pnl import execution_fee_in_quote
 
-_DEFAULT_DECIMAL_STEP = Decimal("0.00000001")
+_DECIMAL_ZERO = Decimal("0")
+_DECIMAL_ONE = Decimal("1")
+_DECIMAL_TICK = Decimal("0.00000001")
+_DECIMAL_BASIS_POINT = Decimal("0.0001")
+_DEFAULT_DECIMAL_STEP = _DECIMAL_TICK
+_SEQUENCE_SPLIT_RE = re.compile(r"[;,]")
 
 # Bybit restricts the percent tolerance that can be supplied alongside market
 # orders.  The range is kept here so that both the executor and potential future
@@ -29,23 +35,41 @@ _DEFAULT_DECIMAL_STEP = Decimal("0.00000001")
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
 
+# Normalise the user provided time-in-force aliases into the string values
+# accepted by the Bybit API.
+_TIF_ALIAS_MAP = {
+    "POSTONLY": "PostOnly",
+    "IOC": "IOC",
+    "FOK": "FOK",
+    "GTC": "GTC",
+}
+
 # Certain Bybit error codes should not trigger aggressive retry logic when a
 # take-profit ladder is being submitted.  Keeping the allow list close to the
 # helper that parses the error keeps the intent explicit.
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
-def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
+def _decimal_from(value: object, default: Decimal = _DECIMAL_ZERO) -> Decimal:
     """Return a :class:`Decimal` instance for ``value`` or ``default``."""
 
     if value is None:
         return default
     if isinstance(value, Decimal):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int):
         try:
-            return Decimal(str(value))
+            return Decimal(value)
         except (InvalidOperation, ValueError):
+            return default
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return default
+        try:
+            return Decimal.from_float(value)
+        except (InvalidOperation, ValueError, TypeError):
             return default
     if isinstance(value, str):
         text = value.strip()
@@ -81,20 +105,36 @@ def _parse_decimal_sequence(raw: object) -> list[Decimal]:
     if raw is None:
         return []
     if isinstance(raw, str):
-        tokens = [token.strip() for token in re.split(r"[;,]", raw) if token.strip()]
-    elif isinstance(raw, Sequence):
+        text = raw.strip()
+        if not text:
+            return []
+        return list(_parse_decimal_sequence_from_text(text))
+    if isinstance(raw, Sequence):
         tokens = list(raw)
     else:
         tokens = [raw]
     values: list[Decimal] = []
+    decimal_from = _decimal_from
     for token in tokens:
         candidate = token
         if isinstance(candidate, str):
             candidate = candidate.strip()
-        dec = _decimal_from(candidate)
+        dec = decimal_from(candidate)
         if dec > 0:
             values.append(dec)
     return values
+
+
+@lru_cache(maxsize=256)
+def _parse_decimal_sequence_from_text(text: str) -> tuple[Decimal, ...]:
+    tokens = [token.strip() for token in _SEQUENCE_SPLIT_RE.split(text) if token.strip()]
+    values: list[Decimal] = []
+    decimal_from = _decimal_from
+    for token in tokens:
+        dec = decimal_from(token)
+        if dec > 0:
+            values.append(dec)
+    return tuple(values)
 
 
 def _infer_price_step(audit: Mapping[str, object] | None) -> Decimal:
@@ -117,8 +157,8 @@ def _infer_price_step(audit: Mapping[str, object] | None) -> Decimal:
             continue
         exponent = value.normalize().as_tuple().exponent
         if exponent < 0:
-            return Decimal("1").scaleb(exponent)
-    return _DEFAULT_DECIMAL_STEP
+            return _DECIMAL_ONE.scaleb(exponent)
+    return _DECIMAL_TICK
 
 
 def _round_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decimal:
@@ -484,7 +524,7 @@ def _store_partial_attempts(
     local["attempts"] = list(attempts)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _LadderStep:
     """Describe a single rung within the take-profit ladder."""
 
@@ -495,7 +535,7 @@ class _LadderStep:
     def profit_fraction(self) -> Decimal:
         """Return the step profit expressed as a fraction for convenience."""
 
-        return self.profit_bps / Decimal("10000")
+        return self.profit_bps * _DECIMAL_BASIS_POINT
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -559,10 +599,12 @@ __all__ = [
     "_format_price_step",
     "_infer_price_step",
     "_normalise_slippage_percent",
+    "_parse_decimal_sequence_from_text",
     "_parse_decimal_sequence",
     "_partial_attempts",
     "_round_to_step",
     "_safe_float",
     "_safe_symbol",
     "_store_partial_attempts",
+    "_TIF_ALIAS_MAP",
 ]
