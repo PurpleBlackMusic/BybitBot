@@ -1,24 +1,87 @@
 """Composable Streamlit components used across the dashboard tabs."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+import time
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence, get_args
 
 import pandas as pd
 import streamlit as st
 
+from bybit_app.utils.ai.kill_switch import KillSwitchState
 from bybit_app.utils.envs import (
     active_api_key,
     active_api_secret,
     active_dry_run,
     last_api_client_error,
 )
+from bybit_app.utils.ui import build_pill
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     place_spot_market_with_tolerance,
     prepare_spot_market_order,
     prepare_spot_trade_snapshot,
 )
+_STATUS_BADGE_CSS = """
+<style>
+.status-badge{padding:0.5rem;border-radius:0.75rem;background-color:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.2);margin-bottom:0.5rem;}
+.status-badge__label{display:block;margin-bottom:0.2rem;}
+.status-badge__value{font-weight:600;font-size:1.05rem;margin-top:0.25rem;}
+.status-badge small{display:block;color:rgba(148,163,184,0.85);}
+</style>
+"""
+BadgeTone = Literal["neutral", "success", "warning", "danger", "info"]
+_VALID_BADGE_TONES = set(get_args(BadgeTone))
+
+
+@dataclass(frozen=True)
+class StatusBadge:
+    """Immutable description of a status badge rendered in the dashboard header."""
+
+    label: str
+    value: str
+    tone: BadgeTone = "neutral"
+    caption: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", str(self.value))
+        object.__setattr__(self, "caption", str(self.caption or ""))
+        if self.tone not in _VALID_BADGE_TONES:
+            object.__setattr__(self, "tone", "neutral")
+
+    def render(self) -> str:
+        pill = build_pill(self.label, tone=self.tone)
+        caption_html = f"<small>{self.caption}</small>" if self.caption else ""
+        return (
+            "<div class='status-badge'>"
+            f"<div class='status-badge__label'>{pill}</div>"
+            f"<div class='status-badge__value'>{self.value}</div>"
+            f"{caption_html}"
+            "</div>"
+        )
+
+
+def _ensure_status_badge_css() -> None:
+    """Inject badge styling once per session to avoid duplicate style blocks."""
+
+    flag = "_status_badge_css_injected"
+    if st.session_state.get(flag):
+        return
+    st.session_state[flag] = True
+    st.markdown(_STATUS_BADGE_CSS, unsafe_allow_html=True)
+
+
+def _render_badge_grid(badges: Sequence[StatusBadge], *, columns: int = 4) -> None:
+    if not badges:
+        return
+
+    for start in range(0, len(badges), columns):
+        row = badges[start : start + columns]
+        cols = st.columns(len(row))
+        for column, badge in zip(cols, row):
+            with column:
+                st.markdown(badge.render(), unsafe_allow_html=True)
 
 
 def _format_age(seconds: object) -> str:
@@ -40,6 +103,231 @@ def _format_age(seconds: object) -> str:
     return f"{days:.1f}d"
 
 
+def _coerce_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_tone(
+    value: float | None, *, warn_after: float, danger_after: float
+) -> BadgeTone:
+    if value is None:
+        return "warning"
+    if value >= danger_after:
+        return "danger"
+    if value >= warn_after:
+        return "warning"
+    return "success"
+
+
+def _numeric_tone(
+    value: Any, *, warn_at: float | None = None, danger_at: float | None = None
+) -> BadgeTone:
+    number = _coerce_float(value)
+    if number is None:
+        return "warning"
+    if danger_at is not None and number <= danger_at:
+        return "danger"
+    if warn_at is not None and number <= warn_at:
+        return "warning"
+    return "success"
+
+
+@dataclass(frozen=True)
+class _NumericBadgeSpec:
+    label: str
+    value: Any
+    warn_at: float | None = None
+    danger_at: float | None = None
+    precision: int = 2
+    caption: str = ""
+
+    def build(self) -> StatusBadge:
+        return StatusBadge(
+            self.label,
+            _format_number(self.value, precision=self.precision),
+            tone=_numeric_tone(self.value, warn_at=self.warn_at, danger_at=self.danger_at),
+            caption=self.caption,
+        )
+
+
+@dataclass(frozen=True)
+class _AgeBadgeSpec:
+    label: str
+    value: float | None
+    warn_after: float
+    danger_after: float
+    caption: str = ""
+    empty_placeholder: str = "—"
+
+    def build(self) -> StatusBadge:
+        display = _format_age(self.value) or self.empty_placeholder
+        return StatusBadge(
+            self.label,
+            display,
+            tone=_age_tone(self.value, warn_after=self.warn_after, danger_after=self.danger_after),
+            caption=self.caption,
+        )
+
+
+def _format_number(value: Any, *, precision: int = 2) -> str:
+    number = _coerce_float(value)
+    if number is None:
+        return "—"
+    return f"{number:,.{precision}f}"
+
+
+def _ensure_mapping(payload: object) -> Mapping[str, Any]:
+    if isinstance(payload, Mapping):
+        return payload
+    return {}
+
+
+@dataclass(frozen=True)
+class _StatusBarContext:
+    testnet: bool
+    dry_run: bool
+    equity: float | None
+    available: float | None
+    kill_switch: KillSwitchState
+    kill_caption: str
+    signal_age: float | None
+    signal_caption: str
+    guardian_age: float | None
+    guardian_caption: str
+    public_age: float | None
+    private_age: float | None
+    ws_caption: str
+    ws_worst_age: float | None
+
+    @classmethod
+    def from_inputs(
+        cls,
+        settings: Any,
+        guardian_snapshot: Mapping[str, Any],
+        ws_snapshot: Mapping[str, Any],
+        report: Mapping[str, Any] | None,
+        kill_switch: KillSwitchState | None,
+    ) -> "_StatusBarContext":
+        now = time.time()
+
+        guardian = _ensure_mapping(guardian_snapshot)
+        ws = _ensure_mapping(ws_snapshot)
+        report_mapping = _ensure_mapping(report)
+        portfolio = _ensure_mapping(report_mapping.get("portfolio"))
+        totals = _ensure_mapping(portfolio.get("totals"))
+
+        signal_state = _ensure_mapping(guardian.get("state"))
+        signal_age_value = _coerce_float(signal_state.get("age_seconds"))
+        signal_report = _ensure_mapping(signal_state.get("report"))
+        signal_generated = signal_report.get("generated_at") or signal_report.get("timestamp")
+        if signal_age_value is None and signal_generated is not None:
+            generated_ts = _coerce_float(signal_generated)
+            if generated_ts is not None:
+                signal_age_value = max(now - generated_ts, 0.0)
+
+        if signal_age_value is None and signal_generated:
+            signal_caption = "Время генерации неизвестно"
+        elif signal_age_value is not None:
+            signal_caption = f"обновл. {_format_age(signal_age_value)} назад"
+        else:
+            signal_caption = ""
+
+        guardian_age_value = _coerce_float(guardian.get("age_seconds"))
+        restart_count = _coerce_float(guardian.get("restart_count"))
+        guardian_caption = f"рестартов: {int(restart_count)}" if restart_count else ""
+
+        ws_status = _ensure_mapping(ws.get("status"))
+        private_age_value = _coerce_float(_ensure_mapping(ws_status.get("private")).get("age_seconds"))
+        public_age_value = _coerce_float(_ensure_mapping(ws_status.get("public")).get("age_seconds"))
+        ws_age_candidates = [value for value in (private_age_value, public_age_value) if value is not None]
+        ws_worst_age = max(ws_age_candidates) if ws_age_candidates else None
+
+        ws_age_value = _coerce_float(ws.get("age_seconds"))
+        ws_caption = f"обновл. {_format_age(ws_age_value)} назад" if ws_age_value is not None else ""
+
+        kill_state = kill_switch or KillSwitchState(paused=False, until=None, reason=None)
+        kill_caption = "Активен" if kill_state.paused else "Готов"
+        if kill_state.paused:
+            if kill_state.until:
+                remaining = max(kill_state.until - now, 0.0)
+                kill_caption = f"до {_format_age(remaining)}"
+            if kill_state.reason:
+                kill_caption += f" · {kill_state.reason}"
+
+        return cls(
+            testnet=bool(getattr(settings, "testnet", True)),
+            dry_run=active_dry_run(settings),
+            equity=_coerce_float(totals.get("total_equity") or totals.get("equity")),
+            available=_coerce_float(totals.get("available_balance") or totals.get("available")),
+            kill_switch=kill_state,
+            kill_caption=kill_caption,
+            signal_age=signal_age_value,
+            signal_caption=signal_caption,
+            guardian_age=guardian_age_value,
+            guardian_caption=guardian_caption,
+            public_age=public_age_value,
+            private_age=private_age_value,
+            ws_caption=ws_caption,
+            ws_worst_age=ws_worst_age,
+        )
+
+    def badges(self) -> list[StatusBadge]:
+        ws_value = f"pub {_format_age(self.public_age)} · priv {_format_age(self.private_age)}"
+        badge_factories: Sequence[Callable[[], StatusBadge]] = (
+            lambda: StatusBadge(
+                "Network",
+                "Testnet" if self.testnet else "Mainnet",
+                tone="warning" if self.testnet else "success",
+            ),
+            lambda: StatusBadge(
+                "Mode",
+                "DRY-RUN" if self.dry_run else "Live",
+                tone="warning" if self.dry_run else "success",
+            ),
+            lambda: _NumericBadgeSpec("Equity", self.equity, warn_at=0.0).build(),
+            lambda: _NumericBadgeSpec(
+                "Balance",
+                self.available,
+                danger_at=0.0,
+            ).build(),
+            lambda: StatusBadge(
+                "Kill-Switch",
+                "Paused" if self.kill_switch.paused else "Ready",
+                tone="danger" if self.kill_switch.paused else "success",
+                caption=self.kill_caption,
+            ),
+            lambda: _AgeBadgeSpec(
+                "Signal",
+                self.signal_age,
+                warn_after=120.0,
+                danger_after=300.0,
+                caption=self.signal_caption,
+            ).build(),
+            lambda: _AgeBadgeSpec(
+                "Guardian",
+                self.guardian_age,
+                warn_after=120.0,
+                danger_after=300.0,
+                caption=self.guardian_caption,
+            ).build(),
+            lambda: StatusBadge(
+                "WS",
+                ws_value,
+                tone=_age_tone(
+                    self.ws_worst_age,
+                    warn_after=60.0,
+                    danger_after=90.0,
+                ),
+                caption=self.ws_caption,
+            ),
+        )
+
+        return [factory() for factory in badge_factories]
+
+
 def show_error_banner(message: str, *, title: str | None = None, details: Mapping[str, Any] | str | None = None) -> None:
     """Render a consistent error banner with optional structured details."""
 
@@ -56,25 +344,29 @@ def show_error_banner(message: str, *, title: str | None = None, details: Mappin
         st.error(header or "Произошла ошибка")
 
 
-def status_bar(settings: Any, *, guardian_snapshot: Mapping[str, Any], ws_snapshot: Mapping[str, Any]) -> None:
-    """Display the high level status strip with connection and freshness hints."""
+def status_bar(
+    settings: Any,
+    *,
+    guardian_snapshot: Mapping[str, Any],
+    ws_snapshot: Mapping[str, Any],
+    report: Mapping[str, Any] | None = None,
+    kill_switch: KillSwitchState | None = None,
+) -> None:
+    """Display the high level status strip with connection, balance and latency hints."""
 
-    st.subheader("⚙️ Status")
+    st.subheader("⚙️ Системный пульс")
 
     api_error = last_api_client_error()
-    cols = st.columns(4)
-    with cols[0]:
-        st.metric("Mode", "DRY-RUN" if active_dry_run(settings) else "Live")
-    with cols[1]:
-        st.metric("Network", "Testnet" if getattr(settings, "testnet", True) else "Mainnet")
-    guardian_age = guardian_snapshot.get("age_seconds")
-    with cols[2]:
-        st.metric("Guardian", _format_age(guardian_age))
-    ws_status = ws_snapshot.get("status") if isinstance(ws_snapshot, Mapping) else {}
-    private_status = ws_status.get("private") if isinstance(ws_status, Mapping) else {}
-    private_age = private_status.get("age_seconds") if isinstance(private_status, Mapping) else None
-    with cols[3]:
-        st.metric("Private WS", _format_age(private_age))
+    context = _StatusBarContext.from_inputs(
+        settings,
+        guardian_snapshot,
+        ws_snapshot,
+        report,
+        kill_switch,
+    )
+
+    _ensure_status_badge_css()
+    _render_badge_grid(context.badges(), columns=4)
 
     has_keys = bool(active_api_key(settings) and active_api_secret(settings))
     if not has_keys:
@@ -144,7 +436,12 @@ def _normalise_priority_table(plan: Mapping[str, Any] | None) -> list[dict[str, 
     return rows
 
 
-def signals_table(plan: Mapping[str, Any] | None) -> None:
+def signals_table(
+    plan: Mapping[str, Any] | None,
+    *,
+    filters: Mapping[str, Any] | None = None,
+    table_key: str = "signals_table",
+) -> None:
     """Display the prioritised signal table with actionable context."""
 
     st.subheader("🚦 Signals")
@@ -154,10 +451,33 @@ def signals_table(plan: Mapping[str, Any] | None) -> None:
         return
 
     frame = pd.DataFrame(rows)
+    if filters:
+        if filters.get("actionable_only"):
+            frame = frame[frame["actionable"]]
+        if filters.get("ready_only"):
+            frame = frame[frame["ready"]]
+        min_ev = filters.get("min_ev_bps")
+        if isinstance(min_ev, (int, float)):
+            ev_numeric = pd.to_numeric(frame["ev_bps"], errors="coerce")
+            frame = frame[ev_numeric >= float(min_ev)]
+        min_prob = filters.get("min_probability")
+        if isinstance(min_prob, (int, float)):
+            prob_numeric = pd.to_numeric(frame["probability_pct"], errors="coerce")
+            frame = frame[prob_numeric >= float(min_prob)]
+        if filters.get("hide_skipped"):
+            frame = frame[frame["skip_reason"].fillna("").str.strip() == ""]
+
+    if frame.empty:
+        st.info("Фильтры скрыли все сигналы.")
+        return
+
+    frame = frame.sort_values(["priority", "ev_bps"], ascending=[True, False])
+
     st.dataframe(
         frame,
         use_container_width=True,
         hide_index=True,
+        key=table_key,
         column_config={
             "symbol": st.column_config.TextColumn("Symbol"),
             "priority": st.column_config.NumberColumn("Priority", format="%d"),
@@ -235,40 +555,69 @@ def trade_ticket(
     client_factory,
     state,
     on_success: Iterable[Callable[[], None]] | None = None,
+    key_prefix: str = "trade",
+    compact: bool = False,
+    submit_label: str | None = None,
 ) -> None:
     """Render an interactive trade ticket tied to ``place_spot_market_with_tolerance``."""
 
-    st.subheader("🛒 Trade Ticket")
+    heading = "⚡ Quick Ticket" if compact else "🛒 Trade Ticket"
+    st.subheader(heading)
     if on_success is None:
         on_success = []
 
+    def _state_key(suffix: str) -> str:
+        suffix = suffix.lstrip("_")
+        return f"{key_prefix}_{suffix}" if key_prefix else suffix
+
     defaults = {
-        "symbol": state.get("trade_symbol", "BTCUSDT"),
-        "side": state.get("trade_side", "Buy"),
-        "notional": float(state.get("trade_notional", 100.0) or 0.0),
-        "tolerance": int(state.get("trade_tolerance_bps", 50) or 0),
+        "symbol": state.get(_state_key("symbol"), "BTCUSDT"),
+        "side": state.get(_state_key("side"), "Buy"),
+        "notional": float(state.get(_state_key("notional"), 100.0) or 0.0),
+        "tolerance": int(state.get(_state_key("tolerance_bps"), 50) or 0),
     }
 
-    with st.form("trade-ticket-form"):
-        symbol = st.text_input("Symbol", value=defaults["symbol"], help="Например BTCUSDT")
-        side = st.radio("Side", ("Buy", "Sell"), horizontal=True, index=0 if defaults["side"].lower() != "sell" else 1)
-        notional = st.number_input("Notional (USDT)", min_value=0.0, value=defaults["notional"], step=1.0)
-        tolerance = st.slider("Slippage guard (bps)", min_value=0, max_value=500, value=defaults["tolerance"], help="Максимально допустимый слиппедж в базисных пунктах")
-        submitted = st.form_submit_button("Place market order")
+    help_suffix = "" if compact else "Например BTCUSDT"
+    form_key = f"{key_prefix}-ticket-form" if key_prefix else "trade-ticket-form"
+    submit_text = submit_label or ("Отправить" if compact else "Place market order")
 
+    with st.form(form_key):
+        symbol = st.text_input("Symbol", value=defaults["symbol"], help=help_suffix or None)
+        side = st.radio(
+            "Side",
+            ("Buy", "Sell"),
+            horizontal=True,
+            index=0 if str(defaults["side"]).lower() != "sell" else 1,
+        )
+        notional = st.number_input(
+            "Notional (USDT)",
+            min_value=0.0,
+            value=defaults["notional"],
+            step=1.0,
+        )
+        tolerance = st.slider(
+            "Slippage guard (bps)",
+            min_value=0,
+            max_value=500,
+            value=defaults["tolerance"],
+            help="Максимально допустимый слиппедж в базисных пунктах",
+        )
+        submitted = st.form_submit_button(submit_text)
+
+    feedback_key = _state_key("feedback")
     if not submitted:
-        feedback = state.get("trade_feedback")
+        feedback = state.get(feedback_key)
         if isinstance(feedback, Mapping):
             st.success(feedback.get("message", "Ордер подготовлен."))
             st.json(feedback.get("audit"), expanded=False)
         return
 
     cleaned_symbol = symbol.strip().upper()
-    state["trade_symbol"] = cleaned_symbol or defaults["symbol"]
-    state["trade_side"] = side
-    state["trade_notional"] = notional
-    state["trade_tolerance_bps"] = tolerance
-    state["trade_feedback"] = None
+    state[_state_key("symbol")] = cleaned_symbol or defaults["symbol"]
+    state[_state_key("side")] = side
+    state[_state_key("notional")] = notional
+    state[_state_key("tolerance_bps")] = tolerance
+    state[feedback_key] = None
 
     if not cleaned_symbol:
         show_error_banner("Укажите символ спот-торговли, например BTCUSDT.")
@@ -324,7 +673,7 @@ def trade_ticket(
         "audit": prepared.audit,
         "response": response,
     }
-    state["trade_feedback"] = feedback
+    state[feedback_key] = feedback
     st.success(feedback["message"])
     with st.expander("Order audit", expanded=False):
         st.json(prepared.audit, expanded=False)
@@ -339,19 +688,39 @@ def trade_ticket(
             continue
 
 
-def log_viewer(path: Path | str, *, limit: int = 400, state=None) -> None:
-    """Show the tail of the application log file."""
+def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> None:
+    """Show the tail of the application log file with lightweight filtering."""
 
     st.subheader("🪵 Logs")
-    level_placeholder = st.selectbox(
-        "Log level",
-        ("TRACE", "DEBUG", "INFO", "WARNING", "ERROR"),
-        index=2,
-        disabled=True,
-        help="Фильтр появится в следующих релизах",
+
+    def _state_get(key: str, default: Any = None) -> Any:
+        if state is None:
+            return default
+        getter = getattr(state, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        try:
+            return state[key]
+        except Exception:
+            return default
+
+    level_options = ("ALL", "INFO", "WARNING", "ERROR")
+    stored_level = _state_get("logs_level")
+    level_index = level_options.index(stored_level) if stored_level in level_options else 0
+    level = st.selectbox("Log level", level_options, index=level_index)
+
+    stored_limit = _state_get("logs_limit")
+    limit = st.slider(
+        "Количество строк",
+        min_value=50,
+        max_value=2000,
+        step=50,
+        value=int(stored_limit) if isinstance(stored_limit, (int, float)) else default_limit,
     )
+
     if state is not None:
-        state["logs_level"] = level_placeholder
+        state["logs_level"] = level
+        state["logs_limit"] = limit
 
     path_obj = Path(path)
     if not path_obj.exists():
@@ -359,10 +728,22 @@ def log_viewer(path: Path | str, *, limit: int = 400, state=None) -> None:
         return
 
     try:
-        lines = path_obj.read_text(encoding="utf-8").splitlines()[-limit:]
+        lines = path_obj.read_text(encoding="utf-8").splitlines()
     except Exception as exc:  # pragma: no cover - filesystem edge cases
         show_error_banner("Не удалось прочитать журнал.", details=str(exc))
         return
 
-    content = "\n".join(lines)
-    st.text_area("Последние события", value=content, height=320)
+    tail_scope = lines[-2000:] if len(lines) > 2000 else lines
+    if level != "ALL":
+        needle = level.upper()
+        filtered = [line for line in tail_scope if needle in line.upper()]
+    else:
+        filtered = tail_scope
+
+    content_lines = filtered[-limit:]
+    if not content_lines:
+        st.info("Нет записей выбранного уровня за последние строки.")
+        return
+
+    content = "\n".join(content_lines)
+    st.text_area("Последние события", value=content, height=320, key="logs_tail")

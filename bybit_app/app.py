@@ -5,7 +5,9 @@ import re
 import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -24,6 +26,11 @@ from bybit_app.utils.ui import (
     page_slug_from_path,
     safe_set_page_config,
     auto_refresh,
+)
+from bybit_app.utils.ai.kill_switch import (
+    clear_pause,
+    get_state as get_kill_switch_state,
+    set_pause as activate_kill_switch,
 )
 from bybit_app.utils.background import ensure_background_services
 from bybit_app.utils.envs import (
@@ -438,132 +445,164 @@ def _normalise_watchlist(watchlist: object) -> list[Mapping[str, object] | objec
     return [watchlist]
 
 
-def collect_user_actions(
-    settings,
-    brief: Mapping[str, object] | None,
-    health: dict[str, dict[str, object]] | None,
-    watchlist: Sequence[object] | None,
-) -> list[dict[str, object]]:
-    """Compile context-aware next steps for the home dashboard."""
+_TONE_ICON_MAP: dict[str, str] = {
+    "danger": "⛔",
+    "warning": "⚠️",
+    "info": "ℹ️",
+    "success": "✅",
+}
 
-    actions: list[dict[str, object]] = []
-    seen: dict[tuple[str, str], dict[str, object]] = {}
-    order_counter = 0
+def _combine_descriptions(primary: str, extra: str) -> str:
+    primary = (primary or "").strip()
+    extra = (extra or "").strip()
+    if not extra:
+        return primary
+    if not primary:
+        return extra
+    if extra.lower() == primary.lower():
+        return primary
+    if extra in primary:
+        return primary
+    if primary in extra:
+        return extra
+    joiner = " " if primary.endswith((".", "!", "?", ":", "—", "-", "–")) else " · "
+    return f"{primary}{joiner}{extra}".strip()
 
-    brief_map = dict(brief) if isinstance(brief, Mapping) else {}
-    brief_caution = str(brief_map.get("caution") or "").strip()
-    brief_status_age = _safe_float(brief_map.get("status_age"), None)
 
-    def _next_order() -> int:
-        nonlocal order_counter
-        order_counter += 1
-        return order_counter
+def _format_details(details: object) -> str:
+    if not details:
+        return ""
+    if isinstance(details, str):
+        return details
+    if isinstance(details, Mapping):
+        return "; ".join(f"{key}: {value}".strip() for key, value in details.items() if str(value).strip())
+    if isinstance(details, Sequence) and not isinstance(details, (str, bytes)):
+        return "; ".join(str(item) for item in details)
+    return str(details)
 
-    def _combine_descriptions(primary: str, extra: str) -> str:
-        primary = (primary or "").strip()
-        extra = (extra or "").strip()
-        if not extra:
-            return primary
-        if not primary:
-            return extra
-        if extra.lower() == primary.lower():
-            return primary
-        if extra in primary:
-            return primary
-        if primary in extra:
-            return extra
-        joiner = " " if primary.endswith((".", "!", "?", ":", "—", "-", "–")) else " · "
-        return f"{primary}{joiner}{extra}".strip()
 
-    def _merge_action(existing: dict[str, object], incoming: dict[str, object]) -> None:
-        existing_priority = existing.get("priority", 1)
-        incoming_priority = incoming.get("priority", 1)
-        if incoming_priority < existing_priority:
-            incoming_desc = _combine_descriptions(
-                str(incoming.get("description") or ""),
-                str(existing.get("description") or ""),
-            )
-            incoming["description"] = incoming_desc
-            existing.update(incoming)
-        else:
-            existing["description"] = _combine_descriptions(
-                str(existing.get("description") or ""),
-                str(incoming.get("description") or ""),
-            )
-            if not existing.get("page") and incoming.get("page"):
-                existing["page"] = incoming["page"]
-            if not existing.get("page_label") and incoming.get("page_label"):
-                existing["page_label"] = incoming["page_label"]
-            existing_order = existing.get("_order")
-            incoming_order = incoming.get("_order")
-            if isinstance(existing_order, int) and isinstance(incoming_order, int):
-                existing["_order"] = min(existing_order, incoming_order)
+def _normalise_step_item(item: object) -> str | None:
+    if isinstance(item, Mapping):
+        for key in ("title", "text", "description", "label", "message"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        values = [str(value).strip() for value in item.values() if str(value).strip()]
+        if values:
+            return " ".join(values)
+        return None
+    if isinstance(item, (str, bytes)):
+        text = item.decode() if isinstance(item, bytes) else item
+    else:
+        text = str(item)
+    text = text.strip()
+    return text or None
 
-    def _normalise_step_item(item: object) -> str | None:
-        if isinstance(item, Mapping):
-            for key in ("title", "text", "description", "label", "message"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-            values = [str(value).strip() for value in item.values() if str(value).strip()]
-            if values:
-                return " ".join(values)
-            return None
-        if isinstance(item, (str, bytes)):
-            text = item.decode() if isinstance(item, bytes) else item
-        else:
-            text = str(item)
-        text = text.strip()
-        return text or None
 
-    def _normalise_steps(raw: object) -> list[str]:
-        if not raw:
-            return []
-        if isinstance(raw, str):
-            parts = [
-                part.strip(" •-–—")
-                for part in re.split(r"[\n;,•·]+", raw)
-                if part.strip(" •-–—")
-            ]
-            return parts
-        if isinstance(raw, Mapping):
-            return [
-                f"{key}: {value}".strip()
-                for key, value in raw.items()
-                if str(value).strip()
-            ]
-        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            steps: list[str] = []
-            for item in raw:
-                normalised = _normalise_step_item(item)
-                if normalised:
-                    steps.append(normalised)
-            return steps
-        if isinstance(raw, Iterable) and not isinstance(raw, (str, bytes)):
-            return [
-                step
-                for item in raw
-                if (step := _normalise_step_item(item))
-            ]
-        normalised = _normalise_step_item(raw)
-        return [normalised] if normalised else []
-
-    def _collect_steps(info: Mapping[str, object]) -> list[str]:
-        fields = ("checklist", "steps", "actions", "remediation", "recommendations")
+def _normalise_steps(raw: object) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        parts = [
+            part.strip(" •-–—")
+            for part in re.split(r"[\n;,•·]+", raw)
+            if part.strip(" •-–—")
+        ]
+        return parts
+    if isinstance(raw, Mapping):
+        return [
+            f"{key}: {value}".strip()
+            for key, value in raw.items()
+            if str(value).strip()
+        ]
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
         steps: list[str] = []
-        for field in fields:
-            steps.extend(_normalise_steps(info.get(field)))
-        deduped: list[str] = []
-        seen_keys: set[str] = set()
-        for step in steps:
-            lowered = step.lower()
-            if lowered in seen_keys:
-                continue
-            seen_keys.add(lowered)
-            deduped.append(step)
-        return deduped
+        for item in raw:
+            normalised = _normalise_step_item(item)
+            if normalised:
+                steps.append(normalised)
+        return steps
+    if isinstance(raw, Iterable) and not isinstance(raw, (str, bytes)):
+        return [
+            step
+            for item in raw
+            if (step := _normalise_step_item(item))
+        ]
+    normalised = _normalise_step_item(raw)
+    return [normalised] if normalised else []
+
+
+def _collect_steps(info: Mapping[str, Any]) -> list[str]:
+    fields = ("checklist", "steps", "actions", "remediation", "recommendations")
+    steps: list[str] = []
+    for field in fields:
+        steps.extend(_normalise_steps(info.get(field)))
+    deduped: list[str] = []
+    seen_keys: set[str] = set()
+    for step in steps:
+        lowered = step.lower()
+        if lowered in seen_keys:
+            continue
+        seen_keys.add(lowered)
+        deduped.append(step)
+    return deduped
+
+
+@dataclass
+class _ActionCandidate:
+    title: str
+    description: str
+    icon: str
+    tone: str
+    page: str | None
+    page_label: str | None
+    priority: int
+    order: int
+
+    def merge_with(self, other: "_ActionCandidate") -> None:
+        if other.priority < self.priority:
+            combined = _combine_descriptions(other.description, self.description)
+            self.title = other.title
+            self.description = combined
+            self.icon = other.icon
+            self.tone = other.tone
+            self.page = other.page
+            self.page_label = other.page_label
+            self.priority = other.priority
+            self.order = min(self.order, other.order)
+            return
+
+        self.description = _combine_descriptions(self.description, other.description)
+        if not self.page and other.page:
+            self.page = other.page
+        if not self.page_label and other.page_label:
+            self.page_label = other.page_label
+        self.order = min(self.order, other.order)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "title": self.title,
+            "description": self.description,
+            "icon": self.icon,
+            "tone": self.tone,
+            "page": self.page,
+            "page_label": self.page_label,
+            "priority": self.priority,
+        }
+
+
+class _ActionBuilder:
+    def __init__(self) -> None:
+        self._actions: list[_ActionCandidate] = []
+        self._seen: dict[tuple[str, str], _ActionCandidate] = {}
+        self._order = 0
+
+    def _next_order(self) -> int:
+        self._order += 1
+        return self._order
 
     def add(
+        self,
         title: str,
         description: str,
         *,
@@ -575,32 +614,53 @@ def collect_user_actions(
         identity_hint: tuple[str, str] | None = None,
     ) -> None:
         resolved_tone = _normalise_tone(tone)
-        resolved_icon = icon or {"danger": "⛔", "warning": "⚠️", "info": "ℹ️", "success": "✅"}[resolved_tone]
+        resolved_icon = icon or _TONE_ICON_MAP.get(resolved_tone, "⚠️")
         resolved_priority = priority if priority is not None else _tone_priority(resolved_tone)
         identity = identity_hint or (title.strip(), description.strip())
-        payload = {
-            "title": title,
-            "description": description,
-            "icon": resolved_icon,
-            "tone": resolved_tone,
-            "page": page,
-            "page_label": page_label,
-            "priority": resolved_priority,
-            "_order": _next_order(),
-        }
-        existing = seen.get(identity)
+        candidate = _ActionCandidate(
+            title=title,
+            description=description,
+            icon=resolved_icon,
+            tone=resolved_tone,
+            page=page,
+            page_label=page_label,
+            priority=resolved_priority,
+            order=self._next_order(),
+        )
+
+        existing = self._seen.get(identity)
         if existing is not None:
-            _merge_action(existing, payload)
+            existing.merge_with(candidate)
             return
-        seen[identity] = payload
-        actions.append(payload)
+
+        self._seen[identity] = candidate
+        self._actions.append(candidate)
+
+    def as_list(self) -> list[dict[str, Any]]:
+        ordered = sorted(self._actions, key=lambda item: (item.priority, item.order))
+        return [item.to_dict() for item in ordered]
+
+
+def collect_user_actions(
+    settings,
+    brief: Mapping[str, object] | None,
+    health: dict[str, dict[str, object]] | None,
+    watchlist: Sequence[object] | None,
+) -> list[dict[str, object]]:
+    """Compile context-aware next steps for the home dashboard."""
+
+    builder = _ActionBuilder()
+
+    brief_map = dict(brief) if isinstance(brief, Mapping) else {}
+    brief_caution = str(brief_map.get("caution") or "").strip()
+    brief_status_age = _safe_float(brief_map.get("status_age"), None)
 
     has_keys = bool(active_api_key(settings) and active_api_secret(settings))
     dry_run_enabled = bool(active_dry_run(settings))
     reserve_pct = getattr(settings, "spot_cash_reserve_pct", None)
 
     if not has_keys:
-        add(
+        builder.add(
             "Добавьте API ключи",
             "Сохраните ключ и секрет Bybit в разделе подключения, чтобы бот смог размещать ордера.",
             icon="🔑",
@@ -610,7 +670,7 @@ def collect_user_actions(
         )
     else:
         if dry_run_enabled:
-            add(
+            builder.add(
                 "DRY-RUN активен",
                 "Живые заявки не отправляются. Отключите учебный режим, когда будете готовы к реальной торговле.",
                 icon="🧪",
@@ -620,7 +680,7 @@ def collect_user_actions(
             )
 
     if isinstance(reserve_pct, (int, float)) and reserve_pct < 10:
-        add(
+        builder.add(
             "Резерв кэша ниже рекомендации",
             f"Сейчас отложено {reserve_pct:.0f}% — держите не меньше 10%, чтобы бот не истощил депозит.",
             icon="💧",
@@ -630,7 +690,7 @@ def collect_user_actions(
         )
 
     if brief_caution:
-        add(
+        builder.add(
             "Проверка сигнала",
             brief_caution,
             icon="🛟",
@@ -640,7 +700,7 @@ def collect_user_actions(
         )
 
     if brief_status_age is not None and brief_status_age > 300:
-        add(
+        builder.add(
             "Сигнал устарел",
             "Данные не обновлялись более пяти минут — перезапустите источник или обновите пайплайн сигналов.",
             icon="⏱",
@@ -659,17 +719,6 @@ def collect_user_actions(
     priority_lookup: dict[str, int] = {
         "ai_signal": -1,
     }
-
-    def _format_details(details: object) -> str:
-        if not details:
-            return ""
-        if isinstance(details, str):
-            return details
-        if isinstance(details, Mapping):
-            return "; ".join(f"{key}: {value}" for key, value in details.items())
-        if isinstance(details, Sequence) and not isinstance(details, (str, bytes)):
-            return "; ".join(str(item) for item in details)
-        return str(details)
 
     for key, info in health_map.items():
         if not isinstance(info, Mapping):
@@ -711,7 +760,7 @@ def collect_user_actions(
                 steps_text += f" (+{len(steps) - limit})"
             description = _combine_descriptions(description, steps_text)
 
-        add(
+        builder.add(
             title,
             description,
             icon=icon,
@@ -733,7 +782,7 @@ def collect_user_actions(
         )
 
     if not watchlist:
-        add(
+        builder.add(
             "Добавьте пары в наблюдение",
             "Список пуст — соберите рабочий универсум через Universe Builder или добавьте тикеры вручную.",
             icon="👀",
@@ -742,10 +791,7 @@ def collect_user_actions(
             page_label="Открыть Universe Builder",
         )
 
-    actions.sort(key=lambda item: (item.get("priority", 1), item.get("_order", 0)))
-    for action in actions:
-        action.pop("_order", None)
-    return actions
+    return builder.as_list()
 
 
 def render_user_actions(
@@ -1024,8 +1070,14 @@ def main() -> None:
     safe_set_page_config(page_title="Bybit Spot Guardian", page_icon="🧠", layout="wide")
 
     ensure_keys()
+    state = st.session_state
 
-    theme_path = Path(__file__).resolve().parent / "ui" / "theme.css"
+    theme_dir = Path(__file__).resolve().parent / "ui"
+    theme_files = {"dark": "theme.css", "light": "theme_light.css"}
+    theme_name = str(state.get("ui_theme", "dark")).lower()
+    theme_path = theme_dir / theme_files.get(theme_name, "theme.css")
+    if not theme_path.exists():
+        theme_path = theme_dir / "theme.css"
     if theme_path.exists():
         try:
             inject_css(theme_path.read_text(encoding="utf-8"))
@@ -1039,28 +1091,125 @@ def main() -> None:
 
     ensure_background_services()
 
-    state = st.session_state
+    kill_state = get_kill_switch_state()
 
     auto_enabled = bool(state.get("auto_refresh_enabled", BASE_SESSION_STATE["auto_refresh_enabled"]))
     refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
 
+    def _trigger_refresh() -> None:
+        clear_data_caches()
+        st.experimental_rerun()
+
+    settings = get_settings()
+
     with st.sidebar:
+        st.header("🚀 Управление")
+        kill_reason = st.text_input(
+            "Комментарий",
+            value=state.get("kill_reason", BASE_SESSION_STATE.get("kill_reason", "Manual kill-switch")),
+            key="kill_reason",
+            help="Будет прикреплён к паузе и Kill-Switch.",
+        )
+        pause_minutes_widget = st.number_input(
+            "Пауза (мин)",
+            min_value=5,
+            max_value=1440,
+            step=5,
+            value=int(state.get("pause_minutes", BASE_SESSION_STATE.get("pause_minutes", 60))),
+            disabled=kill_state.paused,
+            key="pause_minutes",
+        )
+        pause_minutes = float(state.get("pause_minutes", pause_minutes_widget))
+        if kill_state.paused:
+            st.success("Автоматизация приостановлена.")
+            if kill_state.until:
+                remaining_minutes = max((kill_state.until - time.time()) / 60.0, 0.0)
+                st.caption(f"До возобновления ≈ {remaining_minutes:.1f} мин.")
+            if kill_state.reason:
+                st.caption(f"Причина: {kill_state.reason}")
+            if st.button("▶️ Возобновить работу", use_container_width=True):
+                clear_pause()
+                _trigger_refresh()
+        else:
+            if st.button("⏸ Поставить на паузу", use_container_width=True):
+                activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
+                _trigger_refresh()
+
+        st.divider()
+        st.header("🛑 Kill-Switch")
+        kill_duration = st.number_input(
+            "Kill-switch (мин)",
+            min_value=1,
+            max_value=2880,
+            step=5,
+            value=int(state.get("kill_custom_minutes", BASE_SESSION_STATE.get("kill_custom_minutes", 60))),
+            key="kill_custom_minutes",
+        )
+        if st.button("Активировать Kill-Switch", use_container_width=True):
+            activate_kill_switch(float(kill_duration), kill_reason or "Manual kill-switch")
+            _trigger_refresh()
+        if kill_state.paused and not kill_state.until:
+            st.caption("Kill-Switch активен до ручного возобновления.")
+
+        st.divider()
+        trade_ticket(
+            settings=settings,
+            client_factory=cached_api_client,
+            state=state,
+            on_success=[_trigger_refresh],
+            key_prefix="quick_trade",
+            compact=True,
+            submit_label="Отправить ордер",
+        )
+
+        st.divider()
+        st.header("🌐 Фильтры сигналов")
+        actionable_only = st.checkbox(
+            "Только actionable",
+            value=bool(state.get("signals_actionable_only", False)),
+            key="signals_actionable_only",
+        )
+        ready_only = st.checkbox(
+            "Только готовые",
+            value=bool(state.get("signals_ready_only", False)),
+            key="signals_ready_only",
+        )
+        hide_skipped = st.checkbox(
+            "Скрыть пропуски",
+            value=bool(state.get("signals_hide_skipped", False)),
+            key="signals_hide_skipped",
+        )
+        min_ev = st.number_input(
+            "Мин. EV (bps)",
+            min_value=0.0,
+            step=1.0,
+            value=float(state.get("signals_min_ev", 0.0)),
+            key="signals_min_ev",
+        )
+        min_prob = st.slider(
+            "Мин. вероятность (%)",
+            min_value=0.0,
+            max_value=100.0,
+            step=1.0,
+            value=float(state.get("signals_min_probability", 0.0)),
+            key="signals_min_probability",
+        )
+
+        st.divider()
         st.header("⏱ Обновление данных")
         auto_enabled = st.toggle("Автообновление", value=auto_enabled)
         refresh_interval = st.slider("Интервал, сек", min_value=5, max_value=120, value=refresh_interval)
-        refresh_now = st.button("Обновить сейчас")
+        refresh_now = st.button("Обновить сейчас", use_container_width=True)
         state["auto_refresh_enabled"] = auto_enabled
         state["refresh_interval"] = refresh_interval
         if refresh_now:
-            clear_data_caches()
-            st.experimental_rerun()
+            _trigger_refresh()
         if not auto_enabled:
             st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
 
     if auto_enabled:
         auto_refresh(refresh_interval, key="home_auto_refresh_v2")
 
-    settings = get_settings()
     guardian_snapshot = cached_guardian_snapshot()
     ws_snapshot = cached_ws_snapshot()
     preflight_snapshot = cached_preflight_snapshot()
@@ -1085,10 +1234,31 @@ def main() -> None:
     if preflight_error:
         show_error_banner(str(preflight_error), title="Preflight")
 
+    def _state_float(key: str, default: float = 0.0) -> float:
+        value = state.get(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    signal_filters = {
+        "actionable_only": bool(state.get("signals_actionable_only", False)),
+        "ready_only": bool(state.get("signals_ready_only", False)),
+        "hide_skipped": bool(state.get("signals_hide_skipped", False)),
+        "min_ev_bps": _state_float("signals_min_ev", 0.0),
+        "min_probability": _state_float("signals_min_probability", 0.0),
+    }
+
     tabs = st.tabs(["Dashboard", "Signals", "Orders", "Wallet", "Settings", "Logs"])
 
     with tabs[0]:
-        status_bar(settings, guardian_snapshot=guardian_snapshot, ws_snapshot=ws_snapshot)
+        status_bar(
+            settings,
+            guardian_snapshot=guardian_snapshot,
+            ws_snapshot=ws_snapshot,
+            report=report,
+            kill_switch=kill_state,
+        )
         metrics_strip(report)
         if not guardian_state:
             st.info(
@@ -1121,10 +1291,19 @@ def main() -> None:
             st.success("Все проверки зелёные — можно сосредоточиться на торговле.")
         if watchlist:
             st.markdown("### Наблюдаемые активы")
-            st.dataframe(arrow_safe(pd.DataFrame(watchlist)), hide_index=True, use_container_width=True)
+            st.dataframe(
+                arrow_safe(pd.DataFrame(watchlist)),
+                hide_index=True,
+                use_container_width=True,
+                key="dashboard_watchlist",
+            )
 
     with tabs[1]:
-        signals_table(report.get("symbol_plan") if isinstance(report, Mapping) else {})
+        signals_table(
+            report.get("symbol_plan") if isinstance(report, Mapping) else {},
+            filters=signal_filters,
+            table_key="signals_table_main",
+        )
         caution = ""
         if isinstance(brief_payload, Mapping):
             caution = str(brief_payload.get("caution") or "").strip()
@@ -1133,20 +1312,21 @@ def main() -> None:
         if watchlist:
             st.divider()
             st.markdown("**Watchlist**")
-            st.dataframe(arrow_safe(pd.DataFrame(watchlist)), hide_index=True, use_container_width=True)
+            st.dataframe(
+                arrow_safe(pd.DataFrame(watchlist)),
+                hide_index=True,
+                use_container_width=True,
+                key="signals_watchlist",
+            )
 
     with tabs[2]:
         orders_table(report)
-
-        def _refresh_after_trade() -> None:
-            clear_data_caches()
-            st.experimental_rerun()
 
         trade_ticket(
             settings,
             client_factory=cached_api_client,
             state=state,
-            on_success=[_refresh_after_trade],
+            on_success=[_trigger_refresh],
         )
 
     with tabs[3]:
@@ -1174,6 +1354,21 @@ def main() -> None:
         refresh_slider = st.slider("Интервал автообновления (сек)", min_value=5, max_value=120, value=refresh_interval, key="settings_refresh_interval")
         if refresh_slider != state.get("refresh_interval"):
             state["refresh_interval"] = refresh_slider
+        theme_options = [("dark", "Тёмная тема"), ("light", "Светлая тема")]
+        current_theme_index = next((index for index, (value, _) in enumerate(theme_options) if value == theme_name), 0)
+        selected_theme = st.selectbox(
+            "Тема интерфейса",
+            theme_options,
+            index=current_theme_index,
+            format_func=lambda item: item[1],
+        )
+        if isinstance(selected_theme, tuple):
+            chosen_theme = selected_theme[0]
+        else:
+            chosen_theme = theme_name
+        if chosen_theme != theme_name:
+            state["ui_theme"] = chosen_theme
+            st.experimental_rerun()
 
         if st.button("Сохранить настройки"):
             update_settings(

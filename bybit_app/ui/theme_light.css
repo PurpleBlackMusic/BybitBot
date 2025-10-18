@@ -1,0 +1,60 @@
+:root {
+    color-scheme: light;
+}
+
+html, body {
+    background-color: #f8fafc;
+    color: #0f172a;
+}
+
+section[data-testid="stSidebar"] {
+    background-color: #f1f5f9;
+}
+
+.stMetric label {
+    color: #475569;
+    font-weight: 600;
+}
+
+.stMetric .stMetric-value {
+    color: #0f172a;
+}
+
+[data-testid="stHeader"] {
+    background-color: transparent;
+}
+
+.stTabs [data-baseweb="tab"] {
+    font-weight: 600;
+}
+
+.stTabs [data-baseweb="tab"]:hover {
+    color: #0284c7;
+}
+
+.stDataFrame th {
+    background-color: rgba(148, 163, 184, 0.4);
+    color: #0f172a;
+}
+
+.stDataFrame tbody tr:nth-child(even) {
+    background-color: rgba(226, 232, 240, 0.6);
+}
+
+.stDataFrame tbody tr:nth-child(odd) {
+    background-color: rgba(203, 213, 225, 0.6);
+}
+
+.stTextArea textarea {
+    background-color: rgba(241, 245, 249, 0.8);
+    color: #0f172a;
+}
+
+.stSelectbox div[data-baseweb="select"] > div {
+    background-color: rgba(226, 232, 240, 0.7);
+}
+
+.stButton>button {
+    border-radius: 999px;
+    font-weight: 600;
+}
