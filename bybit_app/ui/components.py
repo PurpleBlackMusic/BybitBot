@@ -1,4 +1,5 @@
 """Composable Streamlit components used across the dashboard tabs."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from bybit_app.ui.state import (
     set_auto_refresh_hold,
     track_value_change,
 )
+
 _STATUS_BADGE_CSS = """
 <style>
 .status-badge{padding:0.5rem;border-radius:0.75rem;background-color:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.2);margin-bottom:0.5rem;}
@@ -378,6 +380,8 @@ def command_palette(
     html = template.substitute(palette_id=palette_id, data_json=data_json)
 
     st.markdown(html, unsafe_allow_html=True)
+
+
 def _format_age(seconds: object) -> str:
     try:
         value = float(seconds)
@@ -442,7 +446,9 @@ class _NumericBadgeSpec:
         return StatusBadge(
             self.label,
             _format_number(self.value, precision=self.precision),
-            tone=_numeric_tone(self.value, warn_at=self.warn_at, danger_at=self.danger_at),
+            tone=_numeric_tone(
+                self.value, warn_at=self.warn_at, danger_at=self.danger_at
+            ),
             caption=self.caption,
         )
 
@@ -461,7 +467,9 @@ class _AgeBadgeSpec:
         return StatusBadge(
             self.label,
             display,
-            tone=_age_tone(self.value, warn_after=self.warn_after, danger_after=self.danger_after),
+            tone=_age_tone(
+                self.value, warn_after=self.warn_after, danger_after=self.danger_after
+            ),
             caption=self.caption,
         )
 
@@ -569,7 +577,9 @@ class _StatusBarContext:
         signal_state = _ensure_mapping(guardian.get("state"))
         signal_age_value = _coerce_float(signal_state.get("age_seconds"))
         signal_report = _ensure_mapping(signal_state.get("report"))
-        signal_generated = signal_report.get("generated_at") or signal_report.get("timestamp")
+        signal_generated = signal_report.get("generated_at") or signal_report.get(
+            "timestamp"
+        )
         if signal_age_value is None and signal_generated is not None:
             generated_ts = _coerce_float(signal_generated)
             if generated_ts is not None:
@@ -587,15 +597,29 @@ class _StatusBarContext:
         guardian_caption = f"рестартов: {int(restart_count)}" if restart_count else ""
 
         ws_status = _ensure_mapping(ws.get("status"))
-        private_age_value = _coerce_float(_ensure_mapping(ws_status.get("private")).get("age_seconds"))
-        public_age_value = _coerce_float(_ensure_mapping(ws_status.get("public")).get("age_seconds"))
-        ws_age_candidates = [value for value in (private_age_value, public_age_value) if value is not None]
+        private_age_value = _coerce_float(
+            _ensure_mapping(ws_status.get("private")).get("age_seconds")
+        )
+        public_age_value = _coerce_float(
+            _ensure_mapping(ws_status.get("public")).get("age_seconds")
+        )
+        ws_age_candidates = [
+            value
+            for value in (private_age_value, public_age_value)
+            if value is not None
+        ]
         ws_worst_age = max(ws_age_candidates) if ws_age_candidates else None
 
         ws_age_value = _coerce_float(ws.get("age_seconds"))
-        ws_caption = f"обновл. {_format_age(ws_age_value)} назад" if ws_age_value is not None else ""
+        ws_caption = (
+            f"обновл. {_format_age(ws_age_value)} назад"
+            if ws_age_value is not None
+            else ""
+        )
 
-        kill_state = kill_switch or KillSwitchState(paused=False, until=None, reason=None, manual=False)
+        kill_state = kill_switch or KillSwitchState(
+            paused=False, until=None, reason=None, manual=False
+        )
         kill_caption = "Готов"
         if kill_state.paused:
             if getattr(kill_state, "manual", False):
@@ -612,7 +636,9 @@ class _StatusBarContext:
             testnet=bool(getattr(settings, "testnet", True)),
             dry_run=active_dry_run(settings),
             equity=_coerce_float(totals.get("total_equity") or totals.get("equity")),
-            available=_coerce_float(totals.get("available_balance") or totals.get("available")),
+            available=_coerce_float(
+                totals.get("available_balance") or totals.get("available")
+            ),
             kill_switch=kill_state,
             kill_caption=kill_caption,
             automation_ok=automation_ok,
@@ -631,7 +657,9 @@ class _StatusBarContext:
         )
 
     def badges(self) -> list[StatusBadge]:
-        ws_value = f"pub {_format_age(self.public_age)} · priv {_format_age(self.private_age)}"
+        ws_value = (
+            f"pub {_format_age(self.public_age)} · priv {_format_age(self.private_age)}"
+        )
         badge_factories: Sequence[Callable[[], StatusBadge]] = (
             lambda: StatusBadge(
                 "Network",
@@ -657,7 +685,9 @@ class _StatusBarContext:
             ),
             lambda: StatusBadge(
                 "Auto",
-                "Готов" if self.automation_ready else ("Вкл." if self.automation_ok else "Выкл."),
+                "Готов"
+                if self.automation_ready
+                else ("Вкл." if self.automation_ok else "Выкл."),
                 tone="success" if self.automation_ok else "warning",
                 caption=self.automation_caption,
             ),
@@ -696,7 +726,12 @@ class _StatusBarContext:
         return [factory() for factory in badge_factories]
 
 
-def show_error_banner(message: str, *, title: str | None = None, details: Mapping[str, Any] | str | None = None) -> None:
+def show_error_banner(
+    message: str,
+    *,
+    title: str | None = None,
+    details: Mapping[str, Any] | str | None = None,
+) -> None:
     """Render a consistent error banner with optional structured details."""
 
     header = message.strip()
@@ -774,8 +809,20 @@ def metrics_strip(report: Mapping[str, Any]) -> None:
     actionable = stats.get("actionable_count") if isinstance(stats, Mapping) else 0
     ready = stats.get("ready_count") if isinstance(stats, Mapping) else 0
     positions = stats.get("position_count") if isinstance(stats, Mapping) else 0
-    limit = stats.get("limit") if isinstance(stats, Mapping) else plan.get("limit") if isinstance(plan, Mapping) else 0
-    equity = totals.get("total_equity") if isinstance(totals, Mapping) else totals.get("equity") if isinstance(totals, Mapping) else None
+    limit = (
+        stats.get("limit")
+        if isinstance(stats, Mapping)
+        else plan.get("limit")
+        if isinstance(plan, Mapping)
+        else 0
+    )
+    equity = (
+        totals.get("total_equity")
+        if isinstance(totals, Mapping)
+        else totals.get("equity")
+        if isinstance(totals, Mapping)
+        else None
+    )
     pnl = totals.get("realized_pnl") if isinstance(totals, Mapping) else None
 
     cols = st.columns(4)
@@ -948,7 +995,8 @@ def _cleanup_optimistic_orders(state: Any | None = None) -> None:
     holder[_OPTIMISTIC_ORDERS_KEY] = [
         order
         for order in orders
-        if now - float(order.get("updated_at", order.get("created_at", 0.0))) < _OPTIMISTIC_TTL
+        if now - float(order.get("updated_at", order.get("created_at", 0.0)))
+        < _OPTIMISTIC_TTL
     ]
 
 
@@ -982,9 +1030,15 @@ def orders_table(report: Mapping[str, Any], *, state: Any | None = None) -> None
                 column_config={
                     "symbol": st.column_config.TextColumn("Symbol"),
                     "qty": st.column_config.NumberColumn("Qty", format="%.4f"),
-                    "avg_cost": st.column_config.NumberColumn("Avg cost", format="%.4f"),
-                    "notional": st.column_config.NumberColumn("Notional", format="%.2f"),
-                    "realized_pnl": st.column_config.NumberColumn("Realized PnL", format="%.2f"),
+                    "avg_cost": st.column_config.NumberColumn(
+                        "Avg cost", format="%.4f"
+                    ),
+                    "notional": st.column_config.NumberColumn(
+                        "Notional", format="%.2f"
+                    ),
+                    "realized_pnl": st.column_config.NumberColumn(
+                        "Realized PnL", format="%.2f"
+                    ),
                 },
             )
         else:
@@ -996,16 +1050,24 @@ def orders_table(report: Mapping[str, Any], *, state: Any | None = None) -> None
             if optimistic:
                 optimistic_frame = pd.DataFrame(optimistic)
                 if "when" not in optimistic_frame.columns:
-                    optimistic_frame["when"] = format_datetime(datetime.now(timezone.utc))
+                    optimistic_frame["when"] = format_datetime(
+                        datetime.now(timezone.utc)
+                    )
                 optimistic_frame["status"] = optimistic_frame.get("status", "pending")
-                trades_frame = pd.concat([optimistic_frame, trades_frame], ignore_index=True, sort=False)
+                trades_frame = pd.concat(
+                    [optimistic_frame, trades_frame], ignore_index=True, sort=False
+                )
             if "status" not in trades_frame.columns:
                 trades_frame["status"] = "done"
 
-            if {"qty", "price"}.issubset(trades_frame.columns) and "notional" not in trades_frame.columns:
+            if {"qty", "price"}.issubset(
+                trades_frame.columns
+            ) and "notional" not in trades_frame.columns:
                 try:
                     qty_numeric = pd.to_numeric(trades_frame["qty"], errors="coerce")
-                    price_numeric = pd.to_numeric(trades_frame["price"], errors="coerce")
+                    price_numeric = pd.to_numeric(
+                        trades_frame["price"], errors="coerce"
+                    )
                     trades_frame["notional"] = qty_numeric * price_numeric
                 except Exception:
                     pass
@@ -1043,13 +1105,21 @@ def orders_table(report: Mapping[str, Any], *, state: Any | None = None) -> None
 
             formatter_map: dict[str, Callable[[Any], str]] = {}
             if "qty" in trades_frame.columns:
-                formatter_map["qty"] = lambda value: format_quantity(value) if pd.notna(value) else "—"
+                formatter_map["qty"] = (
+                    lambda value: format_quantity(value) if pd.notna(value) else "—"
+                )
             if "price" in trades_frame.columns:
-                formatter_map["price"] = lambda value: format_money(value, currency="", precision=4)
+                formatter_map["price"] = lambda value: format_money(
+                    value, currency="", precision=4
+                )
             if "fee" in trades_frame.columns:
-                formatter_map["fee"] = lambda value: format_money(value, currency="", precision=4)
+                formatter_map["fee"] = lambda value: format_money(
+                    value, currency="", precision=4
+                )
             if "notional" in trades_frame.columns:
-                formatter_map["notional"] = lambda value: format_money(value, precision=2)
+                formatter_map["notional"] = lambda value: format_money(
+                    value, precision=2
+                )
 
             styled = trades_frame.style.format(formatter_map)
             styled = styled.set_properties(subset=["status"], **{"font-weight": "600"})
@@ -1098,13 +1168,27 @@ def wallet_overview(report: Mapping[str, Any]) -> None:
                 "qty": st.column_config.NumberColumn("Qty", format="%.4f"),
                 "avg_cost": st.column_config.NumberColumn("Avg cost", format="%.4f"),
                 "notional": st.column_config.NumberColumn("Notional", format="%.2f"),
-                "realized_pnl": st.column_config.NumberColumn("Realized PnL", format="%.2f"),
+                "realized_pnl": st.column_config.NumberColumn(
+                    "Realized PnL", format="%.2f"
+                ),
             },
         )
     else:
         st.caption("Активных позиций нет.")
 
-    extras = {key: value for key, value in totals.items() if key not in {"total_equity", "equity", "available_balance", "available", "cash_reserve_pct", "reserve_pct"}}
+    extras = {
+        key: value
+        for key, value in totals.items()
+        if key
+        not in {
+            "total_equity",
+            "equity",
+            "available_balance",
+            "available",
+            "cash_reserve_pct",
+            "reserve_pct",
+        }
+    }
     if extras:
         st.markdown("**Totals context**")
         st.json(extras, expanded=False)
@@ -1141,7 +1225,9 @@ def trade_ticket(
 
     instance_suffix = instance.strip() if isinstance(instance, str) else ""
     if instance_suffix:
-        base_prefix = f"{key_prefix}_{instance_suffix}" if key_prefix else instance_suffix
+        base_prefix = (
+            f"{key_prefix}_{instance_suffix}" if key_prefix else instance_suffix
+        )
     else:
         base_prefix = key_prefix
 
@@ -1157,7 +1243,9 @@ def trade_ticket(
     }
 
     form_key = f"{base_prefix}-ticket-form" if base_prefix else "trade-ticket-form"
-    submit_text = submit_label or ("Отправить" if compact else "Разместить маркет-ордер")
+    submit_text = submit_label or (
+        "Отправить" if compact else "Разместить маркет-ордер"
+    )
 
     hold_key = _state_key("auto_refresh_hold")
     pause_label = "При заполнении ордера приостановить автообновление"
@@ -1174,13 +1262,19 @@ def trade_ticket(
         reason="Настройки формы ордера обновлены",
         cooldown=4.0,
     )
-    pause_reason = "Форма быстрого ордера открыта" if compact else "Форма ордера открыта"
+    pause_reason = (
+        "Форма быстрого ордера открыта" if compact else "Форма ордера открыта"
+    )
     if pause_active:
         set_auto_refresh_hold(hold_key, pause_reason)
-        st.caption("Автообновление приостановлено до отправки формы или отключения флажка.")
+        st.caption(
+            "Автообновление приостановлено до отправки формы или отключения флажка."
+        )
     else:
         clear_auto_refresh_hold(hold_key)
-        st.caption("Убедитесь, что автообновление отключено во время ручного ввода чувствительных данных.")
+        st.caption(
+            "Убедитесь, что автообновление отключено во время ручного ввода чувствительных данных."
+        )
 
     with st.form(form_key):
         symbol = st.text_input(
@@ -1281,7 +1375,9 @@ def trade_ticket(
             symbol=cleaned_symbol,
             side=side,
             qty=_to_float(prepared.audit.get("order_qty_base")),
-            price=_to_float(prepared.audit.get("price_used") or prepared.audit.get("limit_price")),
+            price=_to_float(
+                prepared.audit.get("price_used") or prepared.audit.get("limit_price")
+            ),
             notional=_to_float(prepared.audit.get("order_notional")),
         )
         response = place_spot_market_with_tolerance(
@@ -1300,12 +1396,16 @@ def trade_ticket(
         )
     except OrderValidationError as exc:
         if optimistic_token:
-            _update_optimistic_order(optimistic_token, state=state, status="failed", message=str(exc))
+            _update_optimistic_order(
+                optimistic_token, state=state, status="failed", message=str(exc)
+            )
         show_error_banner(str(exc), details=_validation_details(exc))
         return
     except Exception as exc:  # pragma: no cover - defensive
         if optimistic_token:
-            _update_optimistic_order(optimistic_token, state=state, status="failed", message=str(exc))
+            _update_optimistic_order(
+                optimistic_token, state=state, status="failed", message=str(exc)
+            )
         show_error_banner("Не удалось разместить ордер.", details=str(exc))
         return
 
@@ -1357,7 +1457,9 @@ def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> Non
 
     level_options = ("ALL", "INFO", "WARNING", "ERROR")
     stored_level = _state_get("logs_level")
-    level_index = level_options.index(stored_level) if stored_level in level_options else 0
+    level_index = (
+        level_options.index(stored_level) if stored_level in level_options else 0
+    )
     level = st.selectbox("Log level", level_options, index=level_index)
 
     stored_limit = _state_get("logs_limit")
@@ -1366,7 +1468,9 @@ def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> Non
         min_value=50,
         max_value=2000,
         step=50,
-        value=int(stored_limit) if isinstance(stored_limit, (int, float)) else default_limit,
+        value=int(stored_limit)
+        if isinstance(stored_limit, (int, float))
+        else default_limit,
     )
     stored_query = _state_get("logs_query", "")
     search_query = st.text_input("Поиск по журналу", value=str(stored_query or ""))

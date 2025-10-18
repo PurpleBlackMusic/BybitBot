@@ -7,13 +7,13 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence
 
 from .file_io import tail_lines
 from .pnl import _ledger_path_for, execution_fee_in_quote
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExecutionRecord:
     """Normalised execution details used for analytics."""
 
@@ -25,10 +25,58 @@ class ExecutionRecord:
     raw_fee: float = 0.0
     is_maker: Optional[bool] = None
     timestamp: Optional[datetime] = None
+    timestamp_ts: Optional[float] = None
+    is_buy: bool = False
+    is_sell: bool = False
+    _notional: Optional[float] = None
 
     @property
     def notional(self) -> float:
-        return abs(self.qty) * self.price
+        cached = self._notional
+        if cached is not None:
+            return cached
+        notional = abs(self.qty) * self.price
+        object.__setattr__(self, "_notional", notional)
+        return notional
+
+    def __post_init__(self) -> None:
+        if self.timestamp is not None and self.timestamp_ts is None:
+            object.__setattr__(self, "timestamp_ts", self.timestamp.timestamp())
+        if self._notional is None:
+            object.__setattr__(self, "_notional", abs(self.qty) * self.price)
+        side = self.side
+        object.__setattr__(self, "is_buy", side == "buy")
+        object.__setattr__(self, "is_sell", side == "sell")
+
+
+@dataclass(slots=True)
+class _PerSymbolStats:
+    """Mutable per-symbol aggregates accumulated during a single pass."""
+
+    symbol: str
+    trades: int = 0
+    volume: float = 0.0
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+
+    def register(self, is_buy: bool, is_sell: bool, notional: float) -> None:
+        self.trades += 1
+        self.volume += notional
+        if is_buy:
+            self.buy_volume += notional
+        elif is_sell:
+            self.sell_volume += notional
+
+    def to_summary(self) -> dict[str, float | int]:
+        volume = self.volume
+        buy_share = (self.buy_volume / volume) if volume else 0.0
+        return {
+            "symbol": self.symbol,
+            "trades": int(self.trades),
+            "volume": volume,
+            "volume_human": f"{volume:,.2f} USDT".replace(",", " "),
+            "buy_share": buy_share,
+        }
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -113,6 +161,19 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
         return None
 
     raw_fee = _to_float(payload.get("execFee") or payload.get("fee"))
+    notional = abs(qty) * price
+
+    timestamp = _parse_timestamp(
+        payload.get("execTime")
+        or payload.get("execTimeNs")
+        or payload.get("transactTime")
+        or payload.get("tradeTime")
+        or payload.get("created_at")
+    )
+    timestamp_ts = timestamp.timestamp() if timestamp is not None else None
+
+    is_buy = side == "buy"
+    is_sell = side == "sell"
 
     return ExecutionRecord(
         symbol=symbol,
@@ -122,13 +183,11 @@ def normalise_execution_payload(payload: Mapping[str, object]) -> Optional[Execu
         fee=execution_fee_in_quote(payload, price=price),
         raw_fee=raw_fee,
         is_maker=_parse_is_maker(payload.get("isMaker")),
-        timestamp=_parse_timestamp(
-            payload.get("execTime")
-            or payload.get("execTimeNs")
-            or payload.get("transactTime")
-            or payload.get("tradeTime")
-            or payload.get("created_at")
-        ),
+        timestamp=timestamp,
+        timestamp_ts=timestamp_ts,
+        is_buy=is_buy,
+        is_sell=is_sell,
+        _notional=notional,
     )
 
 
@@ -167,27 +226,6 @@ def load_executions(
     return records
 
 
-def _maker_ratio(records: Sequence[ExecutionRecord]) -> float:
-    maker_notional = sum(
-        record.notional for record in records if record.is_maker is True
-    )
-    taker_notional = sum(
-        record.notional for record in records if record.is_maker is False
-    )
-    total = maker_notional + taker_notional
-    if total <= 0:
-        return 0.0
-    return maker_notional / total
-
-
-def _activity_breakdown(records: Sequence[ExecutionRecord]) -> Tuple[int, int, int]:
-    now = datetime.now(timezone.utc)
-    last_15 = sum(1 for record in records if record.timestamp and (now - record.timestamp).total_seconds() <= 900)
-    last_hour = sum(1 for record in records if record.timestamp and (now - record.timestamp).total_seconds() <= 3600)
-    last_day = sum(1 for record in records if record.timestamp and (now - record.timestamp).total_seconds() <= 86400)
-    return last_15, last_hour, last_day
-
-
 def aggregate_execution_metrics(records: Sequence[ExecutionRecord]) -> dict:
     """Return aggregated metrics ready for dashboards and chats."""
 
@@ -209,52 +247,87 @@ def aggregate_execution_metrics(records: Sequence[ExecutionRecord]) -> dict:
             "per_symbol": [],
         }
 
-    total_volume = sum(record.notional for record in records)
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     trades = len(records)
-    avg_trade_value = total_volume / trades if trades else 0.0
-    buy_volume = sum(record.notional for record in records if record.side == "buy")
-    sell_volume = sum(record.notional for record in records if record.side == "sell")
-    fees_paid = sum(record.fee for record in records)
-    symbols = sorted({record.symbol for record in records})
+    total_volume = 0.0
+    buy_volume = 0.0
+    sell_volume = 0.0
+    fees_paid = 0.0
+    maker_notional = 0.0
+    taker_notional = 0.0
+    last_15 = 0
+    last_hour = 0
+    last_day = 0
+    per_symbol_map: dict[str, _PerSymbolStats] = {}
+    last_trade_ts: Optional[float] = None
 
-    timestamps = [record.timestamp for record in records if record.timestamp is not None]
-    if timestamps:
-        last_trade = max(timestamps)
-        last_trade_at = last_trade.strftime("%d.%m %H:%M")
-        last_trade_ts = last_trade.timestamp()
+    cutoff_15m = now_ts - 900.0
+    cutoff_hour = now_ts - 3600.0
+    cutoff_day = now_ts - 86400.0
+
+    get_stats = per_symbol_map.get
+    for record in records:
+        notional = record.notional
+        total_volume += notional
+        fees_paid += record.fee
+
+        is_buy = record.is_buy
+        is_sell = record.is_sell
+        if is_buy:
+            buy_volume += notional
+        elif is_sell:
+            sell_volume += notional
+
+        if record.is_maker is True:
+            maker_notional += notional
+        elif record.is_maker is False:
+            taker_notional += notional
+
+        symbol = record.symbol
+        stats = get_stats(symbol)
+        if stats is None:
+            stats = per_symbol_map[symbol] = _PerSymbolStats(symbol)
+        stats.register(is_buy, is_sell, notional)
+
+        ts_value = record.timestamp_ts
+        if ts_value is None:
+            timestamp = record.timestamp
+            if timestamp is not None:
+                ts_value = timestamp.timestamp()
+
+        if ts_value is not None:
+            if last_trade_ts is None or ts_value > last_trade_ts:
+                last_trade_ts = ts_value
+
+            if ts_value >= cutoff_15m:
+                last_15 += 1
+            if ts_value >= cutoff_hour:
+                last_hour += 1
+            if ts_value >= cutoff_day:
+                last_day += 1
+
+    per_symbol = [
+        stats.to_summary()
+        for stats in sorted(
+            per_symbol_map.values(),
+            key=lambda item: item.volume,
+            reverse=True,
+        )
+    ]
+
+    avg_trade_value = total_volume / trades if trades else 0.0
+    symbols = sorted(per_symbol_map)
+
+    if last_trade_ts is not None:
+        last_trade_at = datetime.fromtimestamp(last_trade_ts, tz=timezone.utc).strftime(
+            "%d.%m %H:%M"
+        )
     else:
         last_trade_at = "—"
-        last_trade_ts = None
 
-    last_15, last_hour, last_day = _activity_breakdown(records)
-
-    per_symbol_map: dict[str, dict[str, float | int]] = {}
-    for record in records:
-        stats = per_symbol_map.setdefault(
-            record.symbol,
-            {"trades": 0, "volume": 0.0, "buy_volume": 0.0, "sell_volume": 0.0},
-        )
-        stats["trades"] += 1
-        stats["volume"] += record.notional
-        if record.side == "buy":
-            stats["buy_volume"] += record.notional
-        elif record.side == "sell":
-            stats["sell_volume"] += record.notional
-
-    per_symbol = []
-    for symbol in sorted(per_symbol_map, key=lambda name: per_symbol_map[name]["volume"], reverse=True):
-        stats = per_symbol_map[symbol]
-        volume = stats["volume"] or 0.0
-        buy_share = (stats["buy_volume"] / volume) if volume else 0.0
-        per_symbol.append(
-            {
-                "symbol": symbol,
-                "trades": int(stats["trades"]),
-                "volume": volume,
-                "volume_human": f"{volume:,.2f} USDT".replace(",", " "),
-                "buy_share": buy_share,
-            }
-        )
+    total_maker_taker = maker_notional + taker_notional
+    maker_ratio = maker_notional / total_maker_taker if total_maker_taker > 0 else 0.0
 
     return {
         "trades": trades,
@@ -263,7 +336,7 @@ def aggregate_execution_metrics(records: Sequence[ExecutionRecord]) -> dict:
         "gross_volume_human": f"{total_volume:,.2f} USDT".replace(",", " "),
         "avg_trade_value": avg_trade_value,
         "avg_trade_value_human": f"{avg_trade_value:,.2f} USDT".replace(",", " "),
-        "maker_ratio": _maker_ratio(records),
+        "maker_ratio": maker_ratio,
         "fees_paid": fees_paid,
         "fees_paid_human": f"{fees_paid:,.4f} USDT".replace(",", " "),
         "buy_volume": buy_volume,

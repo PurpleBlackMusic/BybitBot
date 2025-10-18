@@ -560,12 +560,20 @@ class BackgroundServices:
         interval = max(float(self._watchdog_interval), 0.5)
         backoff = 0.0
         log("background.watchdog.start", interval=interval)
+        first_tick = True
         try:
             while not stop_event.is_set():
-                if backoff > 0.0:
-                    wait_for = min(backoff, self._watchdog_backoff_cap)
-                    if stop_event.wait(timeout=wait_for):
-                        break
+                if first_tick:
+                    delay = interval
+                    first_tick = False
+                elif backoff > 0.0:
+                    delay = min(backoff, self._watchdog_backoff_cap)
+                else:
+                    delay = 0.0
+
+                if delay > 0.0 and stop_event.wait(timeout=delay):
+                    break
+
                 try:
                     self._watchdog_tick()
                 except Exception as exc:  # pragma: no cover - defensive guard

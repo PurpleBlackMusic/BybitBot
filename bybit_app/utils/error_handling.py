@@ -14,11 +14,14 @@ from .telegram_notify import enqueue_telegram_message
 from .background import restart_automation, restart_guardian, restart_websockets
 
 _installed = False
-_previous_sys_hook: Callable[[type[BaseException], BaseException, TracebackType | None], None] | None = None
+_previous_sys_hook: (
+    Callable[[type[BaseException], BaseException, TracebackType | None], None] | None
+) = None
 _previous_thread_hook: Callable[[threading.ExceptHookArgs], None] | None = None
 _original_new_event_loop: Callable[[], asyncio.AbstractEventLoop] | None = None
 _policy_patched = False
-_asyncio_previous_handlers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Callable[[asyncio.AbstractEventLoop, Dict[str, object]], None] | None]" = weakref.WeakKeyDictionary()
+_AsyncHandler = Callable[[asyncio.AbstractEventLoop, Dict[str, object]], None] | None
+_asyncio_previous_handlers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _AsyncHandler]" = weakref.WeakKeyDictionary()
 
 _TELEGRAM_LIMIT = 3600
 _TRACEBACK_TAIL = 1600
@@ -135,7 +138,9 @@ def _attach_asyncio_handler(loop: asyncio.AbstractEventLoop) -> None:
     previous = loop.get_exception_handler()
     _asyncio_previous_handlers[loop] = previous
 
-    def _handler(current_loop: asyncio.AbstractEventLoop, context: Dict[str, object]) -> None:
+    def _handler(
+        current_loop: asyncio.AbstractEventLoop, context: Dict[str, object]
+    ) -> None:
         try:
             _handle_asyncio_exception(current_loop, context)
         finally:
@@ -208,7 +213,9 @@ def _handle_asyncio_exception(
         _log_asyncio_message(message, normalised_context)
 
 
-def _log_asyncio_message(message: str | None, context: Mapping[str, object] | None) -> None:
+def _log_asyncio_message(
+    message: str | None, context: Mapping[str, object] | None
+) -> None:
     payload: Dict[str, object] = {"origin": "asyncio"}
     if message:
         payload["message"] = message
@@ -255,7 +262,11 @@ def _process_exception(
         payload["context"] = context
 
     try:
-        log("runtime.unhandled_exception", exc=(exc_type, exc_value, exc_traceback), **payload)
+        log(
+            "runtime.unhandled_exception",
+            exc=(exc_type, exc_value, exc_traceback),
+            **payload,
+        )
     except Exception:
         pass
 
@@ -352,7 +363,9 @@ def _build_exception_message(
 
     exception_line = f"{exc_type.__name__}: {_coerce_str(exc_value)}"
 
-    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback)).strip()
+    tb_text = "".join(
+        traceback.format_exception(exc_type, exc_value, exc_traceback)
+    ).strip()
     tb_text = _trim_traceback(tb_text)
 
     parts = [headline, exception_line]
@@ -432,4 +445,3 @@ def _is_ignorable(exc_type: type[BaseException]) -> bool:
         return issubclass(exc_type, (KeyboardInterrupt, SystemExit))
     except Exception:
         return False
-

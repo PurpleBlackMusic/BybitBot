@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import streamlit as st, pandas as pd
 from utils.dataframe import arrow_safe
@@ -15,8 +14,22 @@ else:
     st.dataframe(arrow_safe(df), use_container_width=True)
     st.caption("Порог = 1.1 × p75 реализованного импакта, но не ниже 5 bps.")
     s = get_settings()
-    sym = st.text_input("Символ для применения (точно как в отчёте)", value=(list(rep.keys())[0] if rep else "BTCUSDT")).upper().strip()
-    lim = st.number_input("Новый лимит импакта (bps)", 1.0, 200.0, float(df.loc[sym, "suggest_limit_bps"]) if rep and sym in df.index and df.loc[sym, "suggest_limit_bps"] else 25.0)
+    sym = (
+        st.text_input(
+            "Символ для применения (точно как в отчёте)",
+            value=(list(rep.keys())[0] if rep else "BTCUSDT"),
+        )
+        .upper()
+        .strip()
+    )
+    lim = st.number_input(
+        "Новый лимит импакта (bps)",
+        1.0,
+        200.0,
+        float(df.loc[sym, "suggest_limit_bps"])
+        if rep and sym in df.index and df.loc[sym, "suggest_limit_bps"]
+        else 25.0,
+    )
     if st.button("💾 Применить как общий лимит (spot)"):
         update_settings(spot_max_impact_bps=float(lim))
         st.success(f"Установлен общий лимит импакта: {lim} bps")

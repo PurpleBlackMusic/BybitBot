@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import inspect
@@ -259,7 +258,9 @@ def auto_refresh(interval_seconds: float, *, key: str | None = None) -> None:
     st.markdown(script, unsafe_allow_html=True)
 
 
-def _normalise_query_params(params: Mapping[str, Iterable[str] | str]) -> dict[str, list[str]]:
+def _normalise_query_params(
+    params: Mapping[str, Iterable[str] | str],
+) -> dict[str, list[str]]:
     normalised: dict[str, list[str]] = {}
     for key, value in params.items():
         if isinstance(value, str):
@@ -360,10 +361,12 @@ def page_slug_from_path(page: str) -> str:
     slug = parts[1] if len(parts) == 2 else stem
     return slug.replace("_", " ").strip()
 
+
 def section(title: str, help: str | None = None):
     st.markdown(f"### {title}")
     if help:
         st.caption(help)
+
 
 def labeled_value(label: str, value):
     st.markdown(f"**{label}:** `{value}`")
@@ -377,19 +380,81 @@ def inject_css(css: str | None = None, *, include_default: bool = True):
     """
 
     default_css = """
-    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-    .stMetric { border-radius: 12px; padding: 0.25rem 0.5rem; }
-    pre, code { font-size: 0.875rem; }
-    .bybit-pill { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.35rem 0.75rem; border-radius: 999px; font-weight: 600; font-size: 0.85rem; background: rgba(148, 163, 184, 0.22); color: inherit; }
-    .bybit-pill--success { background: rgba(16, 185, 129, 0.2); }
-    .bybit-pill--warning { background: rgba(250, 204, 21, 0.25); }
-    .bybit-pill--danger { background: rgba(248, 113, 113, 0.22); }
-    .bybit-status { border-radius: 16px; padding: 1rem 1.1rem; border: 1px solid rgba(148, 163, 184, 0.25); background: rgba(148, 163, 184, 0.12); }
-    .bybit-status--success { border-color: rgba(16, 185, 129, 0.35); background: rgba(16, 185, 129, 0.12); }
-    .bybit-status--warning { border-color: rgba(250, 204, 21, 0.35); background: rgba(250, 204, 21, 0.12); }
-    .bybit-status--danger { border-color: rgba(248, 113, 113, 0.35); background: rgba(248, 113, 113, 0.14); }
-    .bybit-status__title { font-size: 1rem; font-weight: 600; margin-bottom: 0.35rem; display: flex; gap: 0.4rem; align-items: center; }
-    .bybit-status p { margin: 0; font-size: 0.9rem; opacity: 0.85; }
+    .block-container {
+        padding-top: 1.2rem;
+        padding-bottom: 2rem;
+    }
+
+    .stMetric {
+        border-radius: 12px;
+        padding: 0.25rem 0.5rem;
+    }
+
+    pre,
+    code {
+        font-size: 0.875rem;
+    }
+
+    .bybit-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.35rem 0.75rem;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 0.85rem;
+        background: rgba(148, 163, 184, 0.22);
+        color: inherit;
+    }
+
+    .bybit-pill--success {
+        background: rgba(16, 185, 129, 0.2);
+    }
+
+    .bybit-pill--warning {
+        background: rgba(250, 204, 21, 0.25);
+    }
+
+    .bybit-pill--danger {
+        background: rgba(248, 113, 113, 0.22);
+    }
+
+    .bybit-status {
+        border-radius: 16px;
+        padding: 1rem 1.1rem;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(148, 163, 184, 0.12);
+    }
+
+    .bybit-status--success {
+        border-color: rgba(16, 185, 129, 0.35);
+        background: rgba(16, 185, 129, 0.12);
+    }
+
+    .bybit-status--warning {
+        border-color: rgba(250, 204, 21, 0.35);
+        background: rgba(250, 204, 21, 0.12);
+    }
+
+    .bybit-status--danger {
+        border-color: rgba(248, 113, 113, 0.35);
+        background: rgba(248, 113, 113, 0.14);
+    }
+
+    .bybit-status__title {
+        font-size: 1rem;
+        font-weight: 600;
+        margin-bottom: 0.35rem;
+        display: flex;
+        gap: 0.4rem;
+        align-items: center;
+    }
+
+    .bybit-status p {
+        margin: 0;
+        font-size: 0.9rem;
+        opacity: 0.85;
+    }
     """
 
     rules = default_css if include_default else ""
@@ -412,7 +477,9 @@ def build_pill(label: str, *, icon: str | None = None, tone: str = "neutral") ->
     return f'<span class="bybit-pill {tone_class}">{icon_part}{label}</span>'
 
 
-def build_status_card(title: str, description: str, *, icon: str | None = None, tone: str = "neutral") -> str:
+def build_status_card(
+    title: str, description: str, *, icon: str | None = None, tone: str = "neutral"
+) -> str:
     """Возвращает HTML карточки статуса с фирменными стилями."""
 
     tone = tone.lower()
@@ -525,7 +592,9 @@ def _resolve_page_location(page: str) -> str:
     return page
 
 
-def navigation_link(page: str, *, label: str, icon: str | None = None, key: str | None = None) -> None:
+def navigation_link(
+    page: str, *, label: str, icon: str | None = None, key: str | None = None
+) -> None:
     """Render a navigation shortcut that works across Streamlit versions."""
 
     page_link = getattr(st, "page_link", None)
@@ -568,5 +637,7 @@ def navigation_link(page: str, *, label: str, icon: str | None = None, key: str 
 
     hint_key = "_bybit_nav_hint_shown"
     if not st.session_state.get(hint_key):
-        st.caption("Обновите Streamlit до 1.25+, чтобы получить родные кнопки навигации.")
+        st.caption(
+            "Обновите Streamlit до 1.25+, чтобы получить родные кнопки навигации."
+        )
         st.session_state[hint_key] = True
