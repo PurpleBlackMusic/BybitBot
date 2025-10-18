@@ -474,7 +474,6 @@ class BackgroundServices:
             self._automation_error = None
 
             state: Dict[str, Any] = {}
-            state["executor"] = executor
             self._automation_state = state
             self._automation_executor = executor
             self._automation_sweeper = {}
@@ -593,7 +592,6 @@ class BackgroundServices:
                 "ts": ts,
             }
             with self._automation_lock:
-                state["executor"] = self._automation_executor
                 self._automation_state = state
                 self._automation_last_cycle = ts
 
