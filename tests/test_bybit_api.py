@@ -978,6 +978,66 @@ def test_place_order_self_check_handles_order_id(monkeypatch) -> None:
     assert payload["status"] == "PartiallyFilled"
 
 
+def test_execution_list_supports_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update(
+            {
+                "method": method,
+                "path": path,
+                "params": params,
+                "body": body,
+                "signed": signed,
+            }
+        )
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    api.execution_list(
+        category="spot",
+        symbol="BTCUSDT",
+        limit=200,
+        cursor="  next-page  ",
+        start=123,
+        end=456,
+    )
+
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/v5/execution/list"
+    assert captured["signed"] is True
+    params = captured["params"]
+    assert params["category"] == "spot"
+    assert params["symbol"] == "BTCUSDT"
+    assert params["limit"] == 200
+    assert params["cursor"] == "next-page"
+    assert params["start"] == 123
+    assert params["end"] == 456
+
+
+def test_execution_list_ignores_blank_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        captured.update({"method": method, "path": path, "params": params or {}})
+        return {"retCode": 0}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+
+    api.execution_list(category="linear", cursor="   ", limit=None)
+
+    assert captured["path"] == "/v5/execution/list"
+    params = captured["params"]
+    assert params["category"] == "linear"
+    assert "cursor" not in params
+    assert "limit" not in params
+
+
 def test_place_order_self_check_allows_immediate_fill(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
