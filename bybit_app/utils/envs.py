@@ -1,11 +1,17 @@
 from __future__ import annotations
 import os, json, re
-from dataclasses import dataclass, asdict, fields
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from dataclasses import dataclass, asdict, fields, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
-CacheKey = Tuple[Optional[float], Tuple[Tuple[str, Any], ...]]
+CacheKey = Tuple[Tuple[Optional[float], Optional[float], Optional[float]], Tuple[Tuple[str, Any], ...]]
 
-from .paths import DATA_DIR, SETTINGS_FILE
+from .paths import (
+    DATA_DIR,
+    SETTINGS_FILE,
+    SETTINGS_MAINNET_FILE,
+    SETTINGS_TESTNET_FILE,
+)
 from .log import log
 
 
@@ -200,6 +206,84 @@ _SETTINGS_BOOL_FIELDS = {
     "freqai_enabled",
 }
 
+_PROFILE_ALLOWED_PREFIXES = ("ai_", "spot_", "twap_")
+_PROFILE_ALLOWED_FIELDS = {
+    "order_time_in_force",
+    "allow_partial_fills",
+    "reprice_unfilled_after_sec",
+    "max_amendments",
+}
+
+_BOOL_ENV_KEYS: Tuple[str, ...] = (
+    "testnet",
+    "verify_ssl",
+    "dry_run",
+    "dry_run_mainnet",
+    "dry_run_testnet",
+    "ai_enabled",
+    "ai_live_only",
+    "ai_market_scan_enabled",
+    "twap_enabled",
+    "heartbeat_enabled",
+    "ws_autostart",
+    "spot_server_tpsl",
+    "spot_cash_only",
+)
+
+_INT_ENV_KEYS: Tuple[str, ...] = (
+    "ai_horizon_bars",
+    "ai_max_slippage_bps",
+    "ai_slippage_bps",
+    "ai_kill_switch_loss_streak",
+    "ai_max_concurrent",
+    "ai_retrain_minutes",
+    "ai_training_trade_limit",
+    "recv_window_ms",
+    "http_timeout_ms",
+    "twap_slices",
+    "twap_interval_sec",
+    "twap_child_secs",
+    "heartbeat_interval_min",
+    "heartbeat_minutes",
+    "execution_watchdog_max_age_sec",
+)
+
+_FLOAT_ENV_KEYS: Tuple[str, ...] = (
+    "ai_fee_bps",
+    "ai_buy_threshold",
+    "ai_sell_threshold",
+    "ai_risk_per_trade_pct",
+    "ai_daily_loss_limit_pct",
+    "ai_max_trade_loss_pct",
+    "ai_portfolio_loss_limit_pct",
+    "ai_kill_switch_cooldown_min",
+    "ai_min_ev_bps",
+    "ai_signal_hysteresis",
+    "ai_max_hold_minutes",
+    "ai_min_exit_bps",
+    "ai_max_daily_surge_pct",
+    "ai_overbought_rsi_threshold",
+    "ai_overbought_stochastic_threshold",
+    "ai_min_change_volatility_ratio",
+    "ai_min_turnover_ratio",
+    "ai_min_top_quote_ratio",
+    "ai_min_top_quote_usd",
+    "twap_aggressiveness_bps",
+    "spot_cash_reserve_pct",
+    "spot_max_cap_per_trade_pct",
+    "spot_max_cap_per_symbol_pct",
+    "spot_max_portfolio_pct",
+    "spot_vol_target_pct",
+    "spot_vol_min_scale",
+    "spot_tp_fee_guard_bps",
+    "spot_impulse_stop_loss_bps",
+    "spot_stop_loss_bps",
+    "spot_trailing_stop_activation_bps",
+    "spot_trailing_stop_distance_bps",
+    "spot_tp_reprice_threshold_bps",
+    "spot_tp_reprice_qty_buffer",
+)
+
 
 def _coerce_bool(value: Any) -> bool:
     """Return a strict boolean for configuration style inputs."""
@@ -238,6 +322,8 @@ class Settings:
     recv_window_ms: int = 15000
     http_timeout_ms: int = 10000
     verify_ssl: bool = True
+    profile_testnet: Dict[str, Any] = field(default_factory=dict, repr=False)
+    profile_mainnet: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     # safety
     dry_run: bool = True
@@ -358,8 +444,32 @@ class Settings:
             setattr(self, field.name, coerced)
 
         self._sync_credentials()
+        self.profile_testnet = dict(self.profile_testnet or {})
+        self.profile_mainnet = dict(self.profile_mainnet or {})
+        self._apply_profile_overrides()
 
     # --- helpers -----------------------------------------------------
+    def _profile_payload(self, suffix: str) -> Dict[str, Any]:
+        attr = f"profile_{suffix}"
+        payload = getattr(self, attr, {}) or {}
+        if not isinstance(payload, dict):
+            try:
+                payload = dict(payload)
+            except Exception:
+                payload = {}
+        object.__setattr__(self, attr, payload)
+        return payload
+
+    def _apply_profile_overrides(self) -> None:
+        suffix = self._active_suffix()
+        profile = self._profile_payload(suffix)
+        for key, value in profile.items():
+            if not _is_profile_field(key):
+                continue
+            if value is None:
+                continue
+            object.__setattr__(self, key, value)
+
     def _active_suffix(self, testnet: Optional[bool] = None) -> str:
         base_value = getattr(self, "testnet", True)
         target = base_value if testnet is None else testnet
@@ -412,6 +522,16 @@ class Settings:
             "dry_run_testnet",
         }:
             self._sync_credentials()
+            if name == "testnet":
+                try:
+                    self._apply_profile_overrides()
+                except Exception:
+                    pass
+        if name in {"profile_testnet", "profile_mainnet"}:
+            try:
+                self._apply_profile_overrides()
+            except Exception:
+                pass
 
 
 def _migrate_legacy_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -449,10 +569,98 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _is_dry_run_configured(
+    dry_field: str,
+    file_payload: Mapping[str, Any],
+    env_overrides: Mapping[str, Any],
+    raw_env: Mapping[str, Any],
+) -> bool:
+    if dry_field in file_payload:
+        return True
+
+    if env_overrides.get(dry_field) is not None:
+        return True
+
+    dry_env_value = raw_env.get(dry_field)
+    if dry_env_value is None:
+        dry_env_value = raw_env.get("dry_run")
+
+    if dry_env_value is None:
+        return False
+
+    if isinstance(dry_env_value, str):
+        return bool(dry_env_value.strip())
+
+    return True
+
+
+def _auto_disable_dry_run(
+    payload: Dict[str, Any],
+    *,
+    target_network: bool,
+    file_payload: Mapping[str, Any],
+    env_overrides: Mapping[str, Any],
+    raw_env: Mapping[str, Any],
+    explicit_dry_run: bool,
+) -> None:
+    dry_field = _network_field("dry_run", target_network)
+    key_field = _network_field("api_key", target_network)
+    secret_field = _network_field("api_secret", target_network)
+
+    if (
+        explicit_dry_run
+        or _is_dry_run_configured(dry_field, file_payload, env_overrides, raw_env)
+    ):
+        return
+
+    if payload.get(dry_field) and payload.get(key_field) and payload.get(secret_field):
+        payload[dry_field] = False
+
+
+def _prune_empty_dry_flags(payload: Dict[str, Any]) -> None:
+    for network_flag in (True, False):
+        key_name = _network_field("api_key", network_flag)
+        secret_name = _network_field("api_secret", network_flag)
+        dry_name = _network_field("dry_run", network_flag)
+        if (
+            not payload.get(key_name)
+            and not payload.get(secret_name)
+            and payload.get(dry_name) is True
+        ):
+            payload.pop(dry_name, None)
+
+
+def _apply_active_profile_fields(
+    target: Dict[str, Any],
+    profiles: Mapping[bool, Mapping[str, Any]],
+    active_flag: bool,
+) -> None:
+    profile_payload = profiles.get(active_flag, {}) or {}
+    for key, value in profile_payload.items():
+        if _is_profile_field(key) and value is not None:
+            target[key] = value
+
+
 def _scrub_sensitive(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not payload:
         return {}
     return {k: v for k, v in payload.items() if k not in _SENSITIVE_FIELDS}
+
+
+def _is_profile_field(name: str) -> bool:
+    if not name:
+        return False
+    if name in _SENSITIVE_FIELDS:
+        return False
+    if name in _PROFILE_ALLOWED_FIELDS:
+        return True
+    return any(name.startswith(prefix) for prefix in _PROFILE_ALLOWED_PREFIXES)
+
+
+def _filter_profile_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not payload:
+        return {}
+    return {k: v for k, v in payload.items() if _is_profile_field(k)}
 
 
 def _load_file() -> Dict[str, Any]:
@@ -469,6 +677,40 @@ def _load_file() -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _profile_settings_file(testnet: bool) -> Path:
+    return SETTINGS_TESTNET_FILE if testnet else SETTINGS_MAINNET_FILE
+
+
+def _load_profile_payload(testnet: bool) -> Dict[str, Any]:
+    path = _profile_settings_file(testnet)
+    try:
+        if path.exists():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return _filter_profile_fields(payload)
+    except Exception:
+        pass
+    return {}
+
+
+def _persist_profile_payload(testnet: bool, payload: Mapping[str, Any]) -> None:
+    cleaned = _filter_profile_fields(dict(payload))
+    path = _profile_settings_file(testnet)
+    try:
+        if cleaned:
+            path.write_text(
+                json.dumps(cleaned, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        elif path.exists():
+            path.unlink()
+    except Exception:
+        log(
+            "envs.settings.profile.persist_error",
+            exc_info=True,
+            testnet=testnet,
+        )
 
 _ENV_MAP = {
     "api_key": "BYBIT_API_KEY",
@@ -635,116 +877,48 @@ def _cast_float(x: Any) -> Optional[float]:
         return None
 
 
+def _bulk_cast(target: Dict[str, Any], keys: Iterable[str], caster: Callable[[Any], Any]) -> None:
+    for name in keys:
+        target[name] = caster(target.get(name))
+
+
 def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Tuple[Tuple[str, Any], ...]]:
     raw_env = raw_env or _read_env()
     m = dict(raw_env)
 
-    m["testnet"] = _cast_bool(m.get("testnet"))
-    m["verify_ssl"] = _cast_bool(m.get("verify_ssl"))
-    m["dry_run"] = _cast_bool(m.get("dry_run"))
-    m["dry_run_mainnet"] = _cast_bool(m.get("dry_run_mainnet"))
-    m["dry_run_testnet"] = _cast_bool(m.get("dry_run_testnet"))
+    _bulk_cast(m, _BOOL_ENV_KEYS, _cast_bool)
+    _bulk_cast(m, _INT_ENV_KEYS, _cast_int)
+    _bulk_cast(m, _FLOAT_ENV_KEYS, _cast_float)
 
-    m["ai_enabled"] = _cast_bool(m.get("ai_enabled"))
-    m["ai_horizon_bars"] = _cast_int(m.get("ai_horizon_bars"))
-    m["ai_live_only"] = _cast_bool(m.get("ai_live_only"))
-    m["ai_max_slippage_bps"] = _cast_int(m.get("ai_max_slippage_bps"))
-    m["ai_fee_bps"] = _cast_float(m.get("ai_fee_bps"))
-    m["ai_buy_threshold"] = _cast_float(m.get("ai_buy_threshold"))
-    m["ai_sell_threshold"] = _cast_float(m.get("ai_sell_threshold"))
-    m["ai_slippage_bps"] = _cast_int(m.get("ai_slippage_bps"))
-    m["ai_risk_per_trade_pct"] = _cast_float(m.get("ai_risk_per_trade_pct"))
-    m["ai_daily_loss_limit_pct"] = _cast_float(m.get("ai_daily_loss_limit_pct"))
-    m["ai_max_trade_loss_pct"] = _cast_float(m.get("ai_max_trade_loss_pct"))
-    m["ai_portfolio_loss_limit_pct"] = _cast_float(
-        m.get("ai_portfolio_loss_limit_pct")
-    )
-    m["ai_kill_switch_cooldown_min"] = _cast_float(
-        m.get("ai_kill_switch_cooldown_min")
-    )
-    streak_limit = _cast_int(m.get("ai_kill_switch_loss_streak"))
+    streak_limit = m.get("ai_kill_switch_loss_streak")
     if streak_limit is not None and streak_limit < 0:
         streak_limit = 0
     m["ai_kill_switch_loss_streak"] = streak_limit
-    m["ai_min_ev_bps"] = _cast_float(m.get("ai_min_ev_bps"))
-    hysteresis = _cast_float(m.get("ai_signal_hysteresis"))
+
+    hysteresis = m.get("ai_signal_hysteresis")
     if hysteresis is not None:
         hysteresis = max(0.0, min(float(hysteresis), 0.25))
     m["ai_signal_hysteresis"] = hysteresis
-    m["ai_max_concurrent"] = _cast_int(m.get("ai_max_concurrent"))
-    m["ai_retrain_minutes"] = _cast_int(m.get("ai_retrain_minutes"))
-    m["ai_training_trade_limit"] = _cast_int(m.get("ai_training_trade_limit"))
-    m["ai_market_scan_enabled"] = _cast_bool(m.get("ai_market_scan_enabled"))
-    ai_max_hold = _cast_float(m.get("ai_max_hold_minutes"))
+
+    ai_max_hold = m.get("ai_max_hold_minutes")
     if ai_max_hold is None or ai_max_hold <= 0:
         ai_max_hold = 480.0
     else:
         ai_max_hold = max(240.0, min(float(ai_max_hold), 720.0))
     m["ai_max_hold_minutes"] = ai_max_hold
-    m["ai_min_exit_bps"] = _cast_float(m.get("ai_min_exit_bps"))
-    m["ai_max_daily_surge_pct"] = _cast_float(m.get("ai_max_daily_surge_pct"))
-    m["ai_overbought_rsi_threshold"] = _cast_float(
-        m.get("ai_overbought_rsi_threshold")
-    )
-    m["ai_overbought_stochastic_threshold"] = _cast_float(
-        m.get("ai_overbought_stochastic_threshold")
-    )
-    m["ai_min_change_volatility_ratio"] = _cast_float(
-        m.get("ai_min_change_volatility_ratio")
-    )
-    m["ai_min_turnover_ratio"] = _cast_float(m.get("ai_min_turnover_ratio"))
-    m["ai_min_top_quote_ratio"] = _cast_float(m.get("ai_min_top_quote_ratio"))
-    m["ai_min_top_quote_usd"] = _cast_float(m.get("ai_min_top_quote_usd"))
 
     for csv_field in ("ai_symbols", "ai_whitelist", "ai_force_include"):
         cleaned = _normalise_symbol_csv(m.get(csv_field))
         if cleaned is not None:
             m[csv_field] = cleaned
 
-    m["recv_window_ms"] = _cast_int(m.get("recv_window_ms"))
-    m["http_timeout_ms"] = _cast_int(m.get("http_timeout_ms"))
-    m["twap_slices"] = _cast_int(m.get("twap_slices"))
-    m["twap_interval_sec"] = _cast_int(m.get("twap_interval_sec"))
-    m["twap_child_secs"] = _cast_int(m.get("twap_child_secs"))
-    m["twap_aggressiveness_bps"] = _cast_float(m.get("twap_aggressiveness_bps"))
-    m["twap_enabled"] = _cast_bool(m.get("twap_enabled"))
-
-    m["heartbeat_enabled"] = _cast_bool(m.get("heartbeat_enabled"))
-    m["heartbeat_interval_min"] = _cast_int(m.get("heartbeat_interval_min"))
-    m["heartbeat_minutes"] = _cast_int(m.get("heartbeat_minutes"))
-    m["execution_watchdog_max_age_sec"] = _cast_int(
-        m.get("execution_watchdog_max_age_sec")
-    )
-
-    m["ws_autostart"] = _cast_bool(m.get("ws_autostart"))
-    m["spot_cash_reserve_pct"] = _cast_float(m.get("spot_cash_reserve_pct", 10.0))
-    m["spot_max_cap_per_trade_pct"] = _cast_float(m.get("spot_max_cap_per_trade_pct", 5.0))
-    m["spot_max_cap_per_symbol_pct"] = _cast_float(m.get("spot_max_cap_per_symbol_pct", 20.0))
-    m["spot_max_portfolio_pct"] = _cast_float(m.get("spot_max_portfolio_pct", 70.0))
-    m["spot_vol_target_pct"] = _cast_float(m.get("spot_vol_target_pct", 5.0))
-    m["spot_vol_min_scale"] = _cast_float(m.get("spot_vol_min_scale", 0.25))
     m["spot_limit_tif"] = m.get("spot_limit_tif") or "GTC"
     m["spot_tp_ladder_bps"] = m.get("spot_tp_ladder_bps") or "70,110,150"
     m["spot_tp_ladder_split_pct"] = m.get("spot_tp_ladder_split_pct") or "60,25,15"
-    m["spot_stop_loss_bps"] = _cast_float(m.get("spot_stop_loss_bps", 80.0))
-    m["spot_trailing_stop_activation_bps"] = _cast_float(
-        m.get("spot_trailing_stop_activation_bps", 35.0)
-    )
-    m["spot_trailing_stop_distance_bps"] = _cast_float(
-        m.get("spot_trailing_stop_distance_bps", 25.0)
-    )
-    m["spot_tp_fee_guard_bps"] = _cast_float(m.get("spot_tp_fee_guard_bps", 20.0))
-    m["spot_impulse_stop_loss_bps"] = _cast_float(
-        m.get("spot_impulse_stop_loss_bps", 80.0)
-    )
-    m["spot_server_tpsl"] = _cast_bool(m.get("spot_server_tpsl", False))
     m["spot_tpsl_tp_order_type"] = m.get("spot_tpsl_tp_order_type") or "Market"
     m["spot_tpsl_sl_order_type"] = m.get("spot_tpsl_sl_order_type") or "Market"
-    m["spot_cash_only"] = _cast_bool(m.get("spot_cash_only", True))
-    m["spot_tp_reprice_threshold_bps"] = _cast_float(
-        m.get("spot_tp_reprice_threshold_bps", 5.0)
-    )
-    buffer_val = _cast_float(m.get("spot_tp_reprice_qty_buffer"))
+
+    buffer_val = m.get("spot_tp_reprice_qty_buffer")
     if buffer_val is not None:
         m["spot_tp_reprice_qty_buffer"] = buffer_val
     else:
@@ -806,15 +980,26 @@ def _ensure_dirs() -> None:
         (DATA_DIR / d).mkdir(parents=True, exist_ok=True)
 
 
-def _current_file_mtime() -> Optional[float]:
+def _file_mtime(path: Path) -> Optional[float]:
     try:
-        return SETTINGS_FILE.stat().st_mtime
+        return path.stat().st_mtime
     except FileNotFoundError:
         return None
 
 
-def _cache_key(file_mtime: Optional[float], env_sig: Tuple[Tuple[str, Any], ...]) -> CacheKey:
-    return (file_mtime, env_sig)
+def _current_file_signature() -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    return (
+        _file_mtime(SETTINGS_FILE),
+        _file_mtime(SETTINGS_TESTNET_FILE),
+        _file_mtime(SETTINGS_MAINNET_FILE),
+    )
+
+
+def _cache_key(
+    file_signature: Tuple[Optional[float], Optional[float], Optional[float]],
+    env_sig: Tuple[Tuple[str, Any], ...],
+) -> CacheKey:
+    return (file_signature, env_sig)
 
 
 def _set_cache(settings: Settings, key: CacheKey) -> Settings:
@@ -830,10 +1015,10 @@ def _invalidate_cache() -> None:
 
 def get_settings(force_reload: bool = False) -> Settings:
     _ensure_dirs()
-    file_mtime = _current_file_mtime()
+    file_signature = _current_file_signature()
     raw_env = _read_env()
     env_overrides, env_sig = _env_overrides(raw_env)
-    key = _cache_key(file_mtime, env_sig)
+    key = _cache_key(file_signature, env_sig)
 
     cached = _CACHE.get("settings")
     if not force_reload and cached is not None and _CACHE.get("key") == key:
@@ -841,33 +1026,29 @@ def get_settings(force_reload: bool = False) -> Settings:
 
     base = asdict(Settings())
     file_payload = _migrate_legacy_payload(_load_file())
-    merged = _merge(base, _merge(file_payload, env_overrides))
+    profile_payloads = {
+        True: _filter_profile_fields(_load_profile_payload(True)),
+        False: _filter_profile_fields(_load_profile_payload(False)),
+    }
 
-    active_testnet = _coerce_bool(merged.get("testnet"))
-    dry_field = _network_field("dry_run", active_testnet)
-    key_field = _network_field("api_key", active_testnet)
-    secret_field = _network_field("api_secret", active_testnet)
+    merged_base = _merge(base, file_payload)
+    merged_env = _merge(merged_base, env_overrides)
+    active_testnet = _coerce_bool(merged_env.get("testnet"))
 
-    dry_configured = dry_field in file_payload or (
-        dry_field in env_overrides and env_overrides[dry_field] is not None
+    merged = dict(merged_base)
+    _apply_active_profile_fields(merged, profile_payloads, active_testnet)
+    merged = _merge(merged, env_overrides)
+    merged["profile_testnet"] = profile_payloads[True]
+    merged["profile_mainnet"] = profile_payloads[False]
+
+    _auto_disable_dry_run(
+        merged,
+        target_network=active_testnet,
+        file_payload=file_payload,
+        env_overrides=env_overrides,
+        raw_env=raw_env,
+        explicit_dry_run=False,
     )
-    dry_env_value = raw_env.get(dry_field)
-    if dry_env_value is None:
-        dry_env_value = raw_env.get("dry_run")
-
-    if not dry_configured and dry_env_value is not None:
-        if isinstance(dry_env_value, str):
-            dry_configured = bool(dry_env_value.strip())
-        else:
-            dry_configured = True
-
-    if (
-        not dry_configured
-        and merged.get(dry_field)
-        and merged.get(key_field)
-        and merged.get(secret_field)
-    ):
-        merged[dry_field] = False
     filtered = _filter_fields(merged)
     settings = Settings(**filtered)
     return _set_cache(settings, key)
@@ -889,6 +1070,8 @@ def update_settings(**kwargs) -> Settings:
     updates: Dict[str, Any] = {}
     sensitive_updates: Dict[str, Any] = {}
     explicit_dry_run = False
+    profile_updates: Dict[bool, Dict[str, Any]] = {True: {}, False: {}}
+    provided_credentials = {True: False, False: False}
 
     for key, value in kwargs.items():
         if value is None:
@@ -898,10 +1081,12 @@ def update_settings(**kwargs) -> Settings:
             field_name = _network_field("api_key", target_testnet)
             sensitive_updates[field_name] = value
             _apply_sensitive_update(field_name, value, alias_network=target_testnet)
+            provided_credentials[target_testnet] = provided_credentials[target_testnet] or bool(str(value).strip())
         elif key == "api_secret":
             field_name = _network_field("api_secret", target_testnet)
             sensitive_updates[field_name] = value
             _apply_sensitive_update(field_name, value, alias_network=target_testnet)
+            provided_credentials[target_testnet] = provided_credentials[target_testnet] or bool(str(value).strip())
         elif key in {
             "api_key_mainnet",
             "api_secret_mainnet",
@@ -912,6 +1097,9 @@ def update_settings(**kwargs) -> Settings:
         }:
             sensitive_updates[key] = value
             _apply_sensitive_update(key, value, alias_network=None)
+            if key.startswith("api_key_") or key.startswith("api_secret_"):
+                network_flag = key.endswith("_testnet")
+                provided_credentials[network_flag] = provided_credentials[network_flag] or bool(str(value).strip())
         elif key in _SENSITIVE_FIELDS:
             sensitive_updates[key] = value
             _apply_sensitive_update(key, value, alias_network=None)
@@ -923,52 +1111,73 @@ def update_settings(**kwargs) -> Settings:
             updates[key] = value
             if key == _network_field("dry_run", target_testnet):
                 explicit_dry_run = True
+        elif _is_profile_field(key):
+            profile_updates[target_testnet][key] = value
+            updates[key] = value
         else:
             updates[key] = value
 
     current.update(updates)
     current.update(sensitive_updates)
 
-    dry_field = _network_field("dry_run", target_testnet)
-    key_field = _network_field("api_key", target_testnet)
-    secret_field = _network_field("api_secret", target_testnet)
-
-    dry_configured = dry_field in file_payload or (
-        dry_field in env_overrides and env_overrides[dry_field] is not None
-    )
-    dry_env_value = raw_env.get(dry_field)
-    if dry_env_value is None:
-        dry_env_value = raw_env.get("dry_run")
-    if not dry_configured and dry_env_value is not None:
-        if isinstance(dry_env_value, str):
-            dry_configured = bool(dry_env_value.strip())
-        else:
-            dry_configured = True
-
-    if (
-        not explicit_dry_run
-        and not dry_configured
-        and current.get(dry_field)
-        and current.get(key_field)
-        and current.get(secret_field)
-    ):
-        current[dry_field] = False
-
+    existing_profiles = {
+        True: dict(getattr(current_settings, "profile_testnet", {}) or {}),
+        False: dict(getattr(current_settings, "profile_mainnet", {}) or {}),
+    }
     for network_flag in (True, False):
-        key_name = _network_field("api_key", network_flag)
-        secret_name = _network_field("api_secret", network_flag)
-        dry_name = _network_field("dry_run", network_flag)
+        if profile_updates[network_flag]:
+            existing_profiles[network_flag].update(profile_updates[network_flag])
+
+    current["profile_testnet"] = _filter_profile_fields(existing_profiles[True])
+    current["profile_mainnet"] = _filter_profile_fields(existing_profiles[False])
+
+    if requested_testnet is None:
         if (
-            not current.get(key_name)
-            and not current.get(secret_name)
-            and current.get(dry_name) is True
+            provided_credentials[True]
+            and not provided_credentials[False]
+            and current.get("api_key_testnet")
+            and current.get("api_secret_testnet")
         ):
-            current.pop(dry_name, None)
+            current["testnet"] = True
+            target_testnet = True
+        elif (
+            provided_credentials[False]
+            and not provided_credentials[True]
+            and current.get("api_key_mainnet")
+            and current.get("api_secret_mainnet")
+        ):
+            current["testnet"] = False
+            target_testnet = False
+
+    active_profile_flag = _coerce_bool(current.get("testnet"))
+    profiles_for_merge = {
+        True: current.get("profile_testnet", {}),
+        False: current.get("profile_mainnet", {}),
+    }
+    _apply_active_profile_fields(current, profiles_for_merge, active_profile_flag)
+
+    _auto_disable_dry_run(
+        current,
+        target_network=target_testnet,
+        file_payload=file_payload,
+        env_overrides=env_overrides,
+        raw_env=raw_env,
+        explicit_dry_run=explicit_dry_run,
+    )
+
+    _prune_empty_dry_flags(current)
 
     for legacy in ("api_key", "api_secret", "dry_run"):
         current.pop(legacy, None)
 
-    persistable = {k: v for k, v in current.items() if k not in _SENSITIVE_FIELDS}
+    _persist_profile_payload(True, current.get("profile_testnet", {}))
+    _persist_profile_payload(False, current.get("profile_mainnet", {}))
+
+    persistable = {
+        k: v
+        for k, v in current.items()
+        if k not in _SENSITIVE_FIELDS and k not in {"profile_testnet", "profile_mainnet"}
+    }
     SETTINGS_FILE.write_text(
         json.dumps(persistable, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -980,9 +1189,9 @@ def update_settings(**kwargs) -> Settings:
     except Exception:
         pass
     refreshed = Settings(**_filter_fields(current))
-    file_mtime = _current_file_mtime()
+    file_signature = _current_file_signature()
     env_sig = _env_signature(_read_env())
-    cached = _set_cache(refreshed, _cache_key(file_mtime, env_sig))
+    cached = _set_cache(refreshed, _cache_key(file_signature, env_sig))
 
     try:
         refreshed_snapshot = _critical_snapshot(refreshed)
