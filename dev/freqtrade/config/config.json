@@ -1,5 +1,5 @@
 {
-  "dry_run": true,
+  "dry_run": false,
   "dry_run_wallet": 1000,
   "stake_currency": "USDT",
   "stake_amount": "unlimited",

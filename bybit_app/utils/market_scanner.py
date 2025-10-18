@@ -1438,7 +1438,7 @@ def scan_market_opportunities(
     *,
     data_dir: Path = DATA_DIR,
     limit: int = 25,
-    min_turnover: float = 1_000_000.0,
+    min_turnover: float = 10_000.0,
     min_change_pct: float = 0.002,
     max_spread_bps: float = 60.0,
     whitelist: Iterable[str] | None = None,
