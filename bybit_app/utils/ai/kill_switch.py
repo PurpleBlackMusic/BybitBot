@@ -20,6 +20,7 @@ class KillSwitchState:
     paused: bool
     until: Optional[float]
     reason: Optional[str]
+    manual: bool = False
 
 
 def _ensure_parent() -> None:
@@ -40,12 +41,19 @@ def _load_raw() -> dict[str, object]:
     return payload
 
 
-def _write_state(until: float, reason: str, *, now: Optional[float] = None) -> None:
+def _write_state(
+    until: Optional[float],
+    reason: str,
+    *,
+    now: Optional[float] = None,
+    manual: bool = False,
+) -> None:
     _ensure_parent()
     payload = {
-        "until": float(until),
+        "until": float(until) if until is not None else None,
         "reason": str(reason) if reason else "",
         "created_at": float(now if now is not None else time.time()),
+        "manual": bool(manual),
     }
     tmp_path = _STATE_PATH.with_suffix(_STATE_PATH.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -61,6 +69,16 @@ def get_state(*, now: Optional[float] = None) -> KillSwitchState:
 
     reference = float(now if now is not None else time.time())
     payload = _load_raw()
+    manual_pause = bool(payload.get("manual"))
+
+    if manual_pause:
+        reason_value = payload.get("reason")
+        if isinstance(reason_value, str):
+            reason_text = reason_value or None
+        else:
+            reason_text = None
+        return KillSwitchState(paused=True, until=None, reason=reason_text, manual=True)
+
     try:
         until_value = float(payload.get("until", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -92,7 +110,12 @@ def clear_pause() -> None:
         return
 
 
-def set_pause(minutes: float, reason: str, *, now: Optional[float] = None) -> float:
+def set_pause(
+    minutes: Optional[float],
+    reason: str,
+    *,
+    now: Optional[float] = None,
+) -> Optional[float]:
     """Activate the kill-switch for ``minutes`` minutes.
 
     Returns the timestamp (epoch seconds) when the automation may resume.
@@ -100,6 +123,10 @@ def set_pause(minutes: float, reason: str, *, now: Optional[float] = None) -> fl
     """
 
     reference = float(now if now is not None else time.time())
+    if minutes is None:
+        _write_state(None, reason, now=reference, manual=True)
+        return None
+
     try:
         duration = float(minutes)
     except (TypeError, ValueError):

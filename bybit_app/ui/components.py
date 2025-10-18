@@ -193,6 +193,11 @@ class _StatusBarContext:
     available: float | None
     kill_switch: KillSwitchState
     kill_caption: str
+    automation_ok: bool
+    automation_ready: bool
+    automation_caption: str
+    realtime_ok: bool
+    realtime_caption: str
     signal_age: float | None
     signal_caption: str
     guardian_age: float | None
@@ -213,11 +218,59 @@ class _StatusBarContext:
     ) -> "_StatusBarContext":
         now = time.time()
 
+        def _summarise(payload: Mapping[str, Any]) -> str:
+            if not isinstance(payload, Mapping):
+                return ""
+            message = str(payload.get("message") or "").strip()
+            if message:
+                return message
+            details = payload.get("details")
+            if isinstance(details, str):
+                detail_text = details.strip()
+                if detail_text:
+                    return detail_text
+            elif isinstance(details, Sequence):
+                for entry in details:
+                    if isinstance(entry, Mapping):
+                        for key in ("title", "description", "message"):
+                            text = str(entry.get(key) or "").strip()
+                            if text:
+                                return text
+                    else:
+                        text = str(entry or "").strip()
+                        if text:
+                            return text
+            return ""
+
+        def _compact_text(value: str, *, limit: int = 120) -> str:
+            value = value.strip()
+            if len(value) <= limit:
+                return value
+            return value[: limit - 1].rstrip() + "…"
+
         guardian = _ensure_mapping(guardian_snapshot)
         ws = _ensure_mapping(ws_snapshot)
         report_mapping = _ensure_mapping(report)
         portfolio = _ensure_mapping(report_mapping.get("portfolio"))
         totals = _ensure_mapping(portfolio.get("totals"))
+        health_payload = _ensure_mapping(report_mapping.get("health"))
+        automation_payload = _ensure_mapping(health_payload.get("automation"))
+        realtime_payload = _ensure_mapping(health_payload.get("realtime_trading"))
+
+        automation_ok = bool(automation_payload.get("ok"))
+        automation_ready = bool(automation_payload.get("actionable"))
+        automation_caption = _compact_text(
+            _summarise(automation_payload) or str(automation_payload.get("title") or "")
+        )
+        if not automation_caption:
+            automation_caption = "Нет данных"
+
+        realtime_ok = bool(realtime_payload.get("ok"))
+        realtime_caption = _compact_text(
+            _summarise(realtime_payload) or str(realtime_payload.get("title") or "")
+        )
+        if not realtime_caption:
+            realtime_caption = "Нет данных"
 
         signal_state = _ensure_mapping(guardian.get("state"))
         signal_age_value = _coerce_float(signal_state.get("age_seconds"))
@@ -248,12 +301,16 @@ class _StatusBarContext:
         ws_age_value = _coerce_float(ws.get("age_seconds"))
         ws_caption = f"обновл. {_format_age(ws_age_value)} назад" if ws_age_value is not None else ""
 
-        kill_state = kill_switch or KillSwitchState(paused=False, until=None, reason=None)
-        kill_caption = "Активен" if kill_state.paused else "Готов"
+        kill_state = kill_switch or KillSwitchState(paused=False, until=None, reason=None, manual=False)
+        kill_caption = "Готов"
         if kill_state.paused:
-            if kill_state.until:
+            if getattr(kill_state, "manual", False):
+                kill_caption = "до ручного запуска"
+            elif kill_state.until:
                 remaining = max(kill_state.until - now, 0.0)
                 kill_caption = f"до {_format_age(remaining)}"
+            else:
+                kill_caption = "Активен"
             if kill_state.reason:
                 kill_caption += f" · {kill_state.reason}"
 
@@ -264,6 +321,11 @@ class _StatusBarContext:
             available=_coerce_float(totals.get("available_balance") or totals.get("available")),
             kill_switch=kill_state,
             kill_caption=kill_caption,
+            automation_ok=automation_ok,
+            automation_ready=automation_ready,
+            automation_caption=automation_caption,
+            realtime_ok=realtime_ok,
+            realtime_caption=realtime_caption,
             signal_age=signal_age_value,
             signal_caption=signal_caption,
             guardian_age=guardian_age_value,
@@ -298,6 +360,18 @@ class _StatusBarContext:
                 "Paused" if self.kill_switch.paused else "Ready",
                 tone="danger" if self.kill_switch.paused else "success",
                 caption=self.kill_caption,
+            ),
+            lambda: StatusBadge(
+                "Auto",
+                "Готов" if self.automation_ready else ("Вкл." if self.automation_ok else "Выкл."),
+                tone="success" if self.automation_ok else "warning",
+                caption=self.automation_caption,
+            ),
+            lambda: StatusBadge(
+                "Bybit",
+                "Онлайн" if self.realtime_ok else "Offline",
+                tone="success" if self.realtime_ok else "danger",
+                caption=self.realtime_caption,
             ),
             lambda: _AgeBadgeSpec(
                 "Signal",
@@ -769,10 +843,13 @@ def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> Non
         step=50,
         value=int(stored_limit) if isinstance(stored_limit, (int, float)) else default_limit,
     )
+    stored_query = _state_get("logs_query", "")
+    search_query = st.text_input("Поиск по журналу", value=str(stored_query or ""))
 
     if state is not None:
         state["logs_level"] = level
         state["logs_limit"] = limit
+        state["logs_query"] = search_query
 
     path_obj = Path(path)
     if not path_obj.exists():
@@ -780,10 +857,12 @@ def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> Non
         return
 
     try:
-        lines = path_obj.read_text(encoding="utf-8").splitlines()
+        raw_content = path_obj.read_text(encoding="utf-8")
     except Exception as exc:  # pragma: no cover - filesystem edge cases
         show_error_banner("Не удалось прочитать журнал.", details=str(exc))
         return
+
+    lines = raw_content.splitlines()
 
     tail_scope = lines[-2000:] if len(lines) > 2000 else lines
     if level != "ALL":
@@ -792,10 +871,25 @@ def log_viewer(path: Path | str, *, default_limit: int = 400, state=None) -> Non
     else:
         filtered = tail_scope
 
+    query = search_query.strip().lower()
+    if query:
+        filtered = [line for line in filtered if query in line.lower()]
+
     content_lines = filtered[-limit:]
     if not content_lines:
-        st.info("Нет записей выбранного уровня за последние строки.")
+        st.info("Нет записей, удовлетворяющих выбранным фильтрам.")
         return
 
     content = "\n".join(content_lines)
     st.text_area("Последние события", value=content, height=320, key="logs_tail")
+    display_query = search_query.strip() or "—"
+    st.caption(
+        f"Показано {len(content_lines)} из {len(filtered)} строк (уровень: {level}, поиск: '{display_query}')."
+    )
+    st.download_button(
+        "💾 Скачать лог-файл",
+        data=raw_content,
+        file_name=path_obj.name,
+        mime="text/plain",
+        use_container_width=True,
+    )

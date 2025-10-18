@@ -50,28 +50,36 @@ def _clear_wallet_cache() -> None:
 
 @pytest.fixture(autouse=True)
 def _kill_switch_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    state = {"paused": False, "until": None, "reason": None}
+    state = {"paused": False, "until": None, "reason": None, "manual": False}
 
-    def fake_set_pause(minutes: float, reason: str) -> float:
+    def fake_set_pause(minutes: float | None, reason: str) -> float | None:
+        if minutes is None:
+            state.update(paused=True, until=None, reason=reason, manual=True)
+            return None
         try:
             duration = float(minutes)
         except (TypeError, ValueError):
             duration = 0.0
         if duration <= 0.0:
-            state.update(paused=False, until=None, reason=None)
+            state.update(paused=False, until=None, reason=None, manual=False)
             return time.time()
         until = time.time() + duration * 60.0
-        state.update(paused=True, until=until, reason=reason)
+        state.update(paused=True, until=until, reason=reason, manual=False)
         return until
 
     def fake_state() -> KillSwitchState:
         until = state.get("until")
         paused = bool(state.get("paused"))
         if paused and isinstance(until, (int, float)) and until <= time.time():
-            state.update(paused=False, until=None, reason=None)
+            state.update(paused=False, until=None, reason=None, manual=False)
             paused = False
             until = None
-        return KillSwitchState(paused=paused, until=until, reason=state.get("reason"))
+        return KillSwitchState(
+            paused=paused,
+            until=until,
+            reason=state.get("reason"),
+            manual=bool(state.get("manual")),
+        )
 
     monkeypatch.setattr(signal_executor_module, "activate_kill_switch", fake_set_pause)
     monkeypatch.setattr(signal_executor_module, "kill_switch_state", fake_state)
@@ -5964,7 +5972,7 @@ def test_portfolio_loss_guard_triggers_kill_switch(
 
     captured: Dict[str, object] = {}
 
-    def fake_set_pause(minutes: float, reason: str) -> float:
+    def fake_set_pause(minutes: float | None, reason: str) -> float | None:
         captured["minutes"] = minutes
         captured["reason"] = reason
         return 1700000000.0
@@ -6013,7 +6021,7 @@ def test_loss_streak_guard_triggers_kill_switch(monkeypatch: pytest.MonkeyPatch)
 
     captured: Dict[str, object] = {}
 
-    def fake_set_pause(minutes: float, reason: str) -> float:
+    def fake_set_pause(minutes: float | None, reason: str) -> float | None:
         captured["minutes"] = minutes
         captured["reason"] = reason
         return 1700000500.0
