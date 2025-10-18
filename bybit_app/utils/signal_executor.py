@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import math
 import time
-from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from datetime import datetime, timezone
@@ -40,7 +39,6 @@ from .spot_market import (
 )
 from .pnl import (
     daily_pnl,
-    execution_fee_in_quote,
     read_ledger,
     invalidate_daily_pnl_cache,
 )
@@ -62,8 +60,10 @@ from .signal_helpers import (
     _LadderStep,
     _TP_LADDER_SKIP_CODES,
     _clamp_price_to_band,
+    _coerce_timestamp,
     _decimal_from,
     _decimal_to_float,
+    _extract_market_price,
     _extract_bybit_error_code,
     _extract_execution_totals,
     _format_bybit_error,
@@ -71,9 +71,11 @@ from .signal_helpers import (
     _format_decimal_step,
     _format_price_step,
     _infer_price_step,
+    _lookup_price_in_mapping,
     _normalise_slippage_percent,
     _parse_decimal_sequence,
     _partial_attempts,
+    _build_position_layers,
     _round_to_step,
     _safe_float,
     _safe_symbol,
@@ -127,6 +129,10 @@ class SignalExecutor:
     _format_decimal_for_meta = staticmethod(_format_decimal_for_meta)
     _partial_attempts = staticmethod(_partial_attempts)
     _store_partial_attempts = staticmethod(_store_partial_attempts)
+    _coerce_timestamp = staticmethod(_coerce_timestamp)
+    _build_position_layers = staticmethod(_build_position_layers)
+    _lookup_price_in_mapping = staticmethod(_lookup_price_in_mapping)
+    _extract_market_price = staticmethod(_extract_market_price)
 
     def __init__(self, bot, settings: Optional[Settings] = None) -> None:
         self.bot = bot
@@ -581,224 +587,6 @@ class SignalExecutor:
 
     # ------------------------------------------------------------------
     # public API
-    @staticmethod
-    def _coerce_timestamp(value: object) -> Optional[float]:
-        if value is None:
-            return None
-
-        if isinstance(value, (int, float)):
-            ts = float(value)
-        elif isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return None
-            try:
-                ts = float(text)
-            except ValueError:
-                try:
-                    parsed = datetime.fromisoformat(text)
-                except ValueError:
-                    return None
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                return parsed.timestamp()
-        elif isinstance(value, datetime):
-            parsed = value
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        else:
-            return None
-
-        if ts > 1e18:
-            ts /= 1e9
-        elif ts > 1e12:
-            ts /= 1e3
-        return ts
-
-    def _build_position_layers(
-        self, events: Iterable[Mapping[str, object]]
-    ) -> Dict[str, Dict[str, object]]:
-        states: Dict[str, Dict[str, object]] = {}
-        processed: List[Tuple[float, int, Mapping[str, object], Optional[float]]] = []
-
-        for idx, raw_event in enumerate(events or []):
-            if not isinstance(raw_event, Mapping):
-                continue
-
-            category = str(raw_event.get("category") or "spot").lower()
-            if category != "spot":
-                continue
-
-            price = _safe_float(raw_event.get("execPrice"))
-            qty = _safe_float(raw_event.get("execQty"))
-            fee = execution_fee_in_quote(raw_event, price=price)
-            side = str(raw_event.get("side") or "").lower()
-            symbol_value = raw_event.get("symbol") or raw_event.get("ticker")
-            symbol = str(symbol_value or "").strip().upper()
-
-            if not symbol or price is None or qty is None or qty <= 0 or price <= 0:
-                continue
-
-            timestamp = None
-            for key in ("execTime", "execTimeNs", "transactTime", "ts", "created_at"):
-                timestamp = self._coerce_timestamp(raw_event.get(key))
-                if timestamp is not None:
-                    break
-
-            sort_key = timestamp if timestamp is not None else float(idx)
-            processed.append((sort_key, idx, raw_event, timestamp))
-
-        processed.sort(key=lambda item: (item[0], item[1]))
-
-        for _, _, event, actual_ts in processed:
-            price = _safe_float(event.get("execPrice")) or 0.0
-            qty = _safe_float(event.get("execQty")) or 0.0
-            fee = execution_fee_in_quote(event, price=price)
-            side = str(event.get("side") or "").lower()
-            symbol_value = event.get("symbol") or event.get("ticker")
-            symbol = str(symbol_value or "").strip().upper()
-
-            if not symbol or price <= 0 or qty <= 0:
-                continue
-
-            state = states.setdefault(
-                symbol, {"layers": deque(), "position_qty": 0.0}
-            )
-            layers = state["layers"]
-            if not isinstance(layers, deque):
-                state["layers"] = layers = deque()
-
-            if side == "buy":
-                effective_cost = (price * qty + fee) / qty
-                layers.append(
-                    {"qty": float(qty), "price": float(effective_cost), "ts": actual_ts}
-                )
-                state["position_qty"] = float(state.get("position_qty", 0.0) + qty)
-                continue
-
-            if side != "sell":
-                continue
-
-            remain = float(qty)
-            while remain > 1e-12 and layers:
-                layer = layers[0]
-                layer_qty = float(layer.get("qty") or 0.0)
-                take = min(layer_qty, remain)
-                layer_qty -= take
-                remain -= take
-                state["position_qty"] = float(
-                    max(0.0, state.get("position_qty", 0.0) - take)
-                )
-                if layer_qty <= 1e-12:
-                    layers.popleft()
-                else:
-                    layer["qty"] = layer_qty
-
-        final_states: Dict[str, Dict[str, object]] = {}
-        for symbol, state in states.items():
-            layers = state.get("layers")
-            if isinstance(layers, deque):
-                final_layers = [dict(layer) for layer in layers]
-            else:
-                final_layers = []
-            final_states[symbol] = {
-                "position_qty": float(state.get("position_qty", 0.0)),
-                "layers": final_layers,
-            }
-
-        return final_states
-
-    @staticmethod
-    def _lookup_price_in_mapping(value: object, symbol: str) -> Optional[float]:
-        if value is None:
-            return None
-
-        upper_symbol = symbol.upper()
-        lower_symbol = upper_symbol.lower()
-        base_symbol = upper_symbol[:-4] if upper_symbol.endswith("USDT") else upper_symbol
-        candidates = [upper_symbol, lower_symbol, base_symbol, base_symbol.lower()]
-
-        if isinstance(value, Mapping):
-            for key in candidates:
-                if not key:
-                    continue
-                price = _safe_float(value.get(key))
-                if price is not None:
-                    return price
-
-        if isinstance(value, Sequence) and not isinstance(
-            value, (str, bytes, bytearray, memoryview)
-        ):
-            for item in value:
-                if not isinstance(item, Mapping):
-                    continue
-                item_symbol = str(item.get("symbol") or item.get("ticker") or "").strip().upper()
-                if item_symbol != upper_symbol:
-                    continue
-                for field in (
-                    "price",
-                    "last_price",
-                    "lastPrice",
-                    "mark_price",
-                    "markPrice",
-                    "close",
-                    "close_price",
-                    "closePrice",
-                ):
-                    price = _safe_float(item.get(field))
-                    if price is not None:
-                        return price
-        return None
-
-    def _extract_market_price(
-        self, summary: Mapping[str, object], symbol: str
-    ) -> Optional[float]:
-        if not isinstance(summary, Mapping):
-            return None
-
-        upper_symbol = symbol.upper()
-        summary_symbol = summary.get("symbol")
-        if isinstance(summary_symbol, str) and summary_symbol.strip().upper() == upper_symbol:
-            for field in ("price", "last_price", "lastPrice", "mark_price", "markPrice"):
-                direct_value = summary.get(field)
-                if isinstance(direct_value, Mapping):
-                    price = self._lookup_price_in_mapping(direct_value, upper_symbol)
-                else:
-                    price = _safe_float(direct_value)
-                if price is not None:
-                    return price
-
-        for key in (
-            "prices",
-            "price_map",
-            "priceMap",
-            "mark_prices",
-            "markPrices",
-            "last_prices",
-            "lastPrices",
-        ):
-            price = self._lookup_price_in_mapping(summary.get(key), upper_symbol)
-            if price is not None:
-                return price
-
-        plan = summary.get("symbol_plan")
-        if isinstance(plan, Mapping):
-            for field in ("positions", "priority_table", "priorityTable", "combined"):
-                price = self._lookup_price_in_mapping(plan.get(field), upper_symbol)
-                if price is not None:
-                    return price
-
-        price = self._lookup_price_in_mapping(summary.get("trade_candidates"), upper_symbol)
-        if price is not None:
-            return price
-
-        price = self._lookup_price_in_mapping(summary.get("watchlist"), upper_symbol)
-        if price is not None:
-            return price
-
-        return None
-
     def _live_orderbook_for_api(self, api: Optional[object]) -> Optional[LiveOrderbook]:
         if api is None or not isinstance(api, BybitAPI):
             return None
