@@ -16,6 +16,7 @@ from bybit_app.utils.envs import (
     active_dry_run,
     last_api_client_error,
 )
+from bybit_app.ui.state import clear_auto_refresh_hold, set_auto_refresh_hold
 from bybit_app.utils.ui import build_pill
 from bybit_app.utils.spot_market import (
     OrderValidationError,
@@ -581,6 +582,22 @@ def trade_ticket(
     form_key = f"{key_prefix}-ticket-form" if key_prefix else "trade-ticket-form"
     submit_text = submit_label or ("Отправить" if compact else "Разместить маркет-ордер")
 
+    hold_key = _state_key("auto_refresh_hold")
+    pause_label = "При заполнении ордера приостановить автообновление"
+    pause_help = (
+        "Предотвращает автоматическую перезагрузку страницы, пока вы вводите параметры ордера. "
+        "Снимите флажок, чтобы возобновить автообновление."
+    )
+    pause_checkbox_key = _state_key("auto_pause")
+    pause_active = st.checkbox(pause_label, key=pause_checkbox_key, help=pause_help)
+    pause_reason = "Форма быстрого ордера открыта" if compact else "Форма ордера открыта"
+    if pause_active:
+        set_auto_refresh_hold(hold_key, pause_reason)
+        st.caption("Автообновление приостановлено до отправки формы или отключения флажка.")
+    else:
+        clear_auto_refresh_hold(hold_key)
+        st.caption("Убедитесь, что автообновление отключено во время ручного ввода чувствительных данных.")
+
     with st.form(form_key):
         symbol = st.text_input("Тикер", value=defaults["symbol"], help=help_suffix or None)
         side = st.radio(
@@ -675,6 +692,8 @@ def trade_ticket(
         "response": response,
     }
     state[feedback_key] = feedback
+    state[pause_checkbox_key] = False
+    clear_auto_refresh_hold(hold_key)
     st.success(feedback["message"])
     with st.expander("Order audit", expanded=False):
         st.json(prepared.audit, expanded=False)

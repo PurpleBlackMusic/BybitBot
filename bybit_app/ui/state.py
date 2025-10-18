@@ -36,7 +36,11 @@ BASE_SESSION_STATE: dict[str, Any] = {
     "quick_trade_notional": 100.0,
     "quick_trade_tolerance_bps": 50.0,
     "quick_trade_feedback": None,
+    "trade_auto_pause": False,
+    "quick_trade_auto_pause": False,
 }
+
+_AUTO_REFRESH_HOLDS_KEY = "_auto_refresh_holds"
 
 
 def ensure_keys(overrides: Mapping[str, Any] | None = None) -> None:
@@ -100,3 +104,37 @@ def clear_data_caches() -> None:
     cached_guardian_snapshot.clear()  # type: ignore[attr-defined]
     cached_ws_snapshot.clear()  # type: ignore[attr-defined]
     cached_preflight_snapshot.clear()  # type: ignore[attr-defined]
+
+
+def set_auto_refresh_hold(key: str, reason: str | None) -> None:
+    """Register a reason to temporarily pause automatic refreshes."""
+
+    state = st.session_state
+    reason_text = str(reason or "").strip() or "Автообновление приостановлено."
+    holds = dict(state.get(_AUTO_REFRESH_HOLDS_KEY, {}))
+    holds[key] = reason_text
+    state[_AUTO_REFRESH_HOLDS_KEY] = holds
+
+
+def clear_auto_refresh_hold(key: str) -> None:
+    """Remove a previously registered auto-refresh pause."""
+
+    state = st.session_state
+    holds = dict(state.get(_AUTO_REFRESH_HOLDS_KEY, {}))
+    if key in holds:
+        holds.pop(key)
+        if holds:
+            state[_AUTO_REFRESH_HOLDS_KEY] = holds
+        else:
+            state.pop(_AUTO_REFRESH_HOLDS_KEY, None)
+
+
+def get_auto_refresh_holds(state: Mapping[str, Any] | None = None) -> list[str]:
+    """Return the list of active auto-refresh pause reasons."""
+
+    if state is None:
+        state = st.session_state
+    holds = state.get(_AUTO_REFRESH_HOLDS_KEY, {})
+    if isinstance(holds, Mapping):
+        return [str(reason) for reason in holds.values() if str(reason).strip()]
+    return []

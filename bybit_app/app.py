@@ -49,6 +49,7 @@ from bybit_app.ui.state import (
     cached_preflight_snapshot,
     cached_ws_snapshot,
     clear_data_caches,
+    get_auto_refresh_holds,
     ensure_keys,
 )
 from bybit_app.ui.components import (
@@ -1114,6 +1115,7 @@ def main() -> None:
 
     auto_enabled = bool(state.get("auto_refresh_enabled", BASE_SESSION_STATE["auto_refresh_enabled"]))
     refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
+    auto_holds = get_auto_refresh_holds(state)
 
     def _trigger_refresh() -> None:
         clear_data_caches()
@@ -1215,7 +1217,12 @@ def main() -> None:
 
         st.divider()
         st.header("⏱ Обновление данных")
-        auto_enabled = st.toggle("Автообновление", value=auto_enabled)
+        auto_enabled = st.toggle(
+            "Автообновление",
+            value=auto_enabled,
+            help="При включении страница периодически перезагружается для обновления данных. "
+            "Отключайте автообновление, если заполняете формы вручную.",
+        )
         refresh_interval = st.slider("Интервал, сек", min_value=5, max_value=120, value=refresh_interval)
         refresh_now = st.button("Обновить сейчас", use_container_width=True)
         state["auto_refresh_enabled"] = auto_enabled
@@ -1224,8 +1231,15 @@ def main() -> None:
             _trigger_refresh()
         if not auto_enabled:
             st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
+        elif auto_holds:
+            st.caption(
+                "Автообновление временно приостановлено: "
+                + "; ".join(auto_holds)
+            )
 
-    if auto_enabled:
+    effective_auto_refresh = auto_enabled and not auto_holds
+
+    if effective_auto_refresh:
         auto_refresh(refresh_interval, key="home_auto_refresh_v2")
 
     guardian_snapshot = cached_guardian_snapshot()
