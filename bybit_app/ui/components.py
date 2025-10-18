@@ -20,7 +20,7 @@ from bybit_app.utils.envs import (
     active_dry_run,
     last_api_client_error,
 )
-from bybit_app.utils.ui import build_pill, navigation_link
+from bybit_app.utils.ui import build_pill, navigation_link, page_slug_from_path
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     place_spot_market_with_tolerance,
