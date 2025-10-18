@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
 CacheKey = Tuple[Tuple[Optional[float], Optional[float], Optional[float]], Tuple[Tuple[str, Any], ...]]
 
+from .file_io import atomic_write_text
+from .locks import FileLockTimeout, acquire_lock
 from .paths import (
     DATA_DIR,
     SETTINGS_FILE,
@@ -75,6 +77,11 @@ _CACHE: dict[str, Any] = {
     "key": None,
     "api_error": None,
 }
+
+
+def _lock_path(target: Path) -> Path:
+    suffix = target.suffix + ".lock" if target.suffix else ".lock"
+    return target.with_suffix(suffix)
 
 
 def _critical_snapshot(settings: Settings) -> Dict[str, Any]:
@@ -407,6 +414,7 @@ class Settings:
     # AI — общие
     ai_enabled: bool = True
     ai_category: str = "spot"
+    ai_strategy: str = "guardian"
     ai_symbols: str = ""
     ai_whitelist: str = ""
     ai_force_include: str = ""
@@ -716,15 +724,27 @@ def _filter_profile_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _load_file() -> Dict[str, Any]:
     try:
-        if SETTINGS_FILE.exists():
-            payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            cleaned = _scrub_sensitive(payload)
-            if cleaned != payload:
-                SETTINGS_FILE.write_text(
-                    json.dumps(cleaned, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            return cleaned
+        lock_file = _lock_path(SETTINGS_FILE)
+        try:
+            with acquire_lock(lock_file, timeout=2.0):
+                if SETTINGS_FILE.exists():
+                    payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+                    cleaned = _scrub_sensitive(payload)
+                    if cleaned != payload:
+                        atomic_write_text(
+                            SETTINGS_FILE,
+                            json.dumps(cleaned, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                    return cleaned
+        except FileLockTimeout:
+            log(
+                "envs.settings.lock_timeout",
+                path=str(SETTINGS_FILE),
+            )
+            if SETTINGS_FILE.exists():
+                payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+                return _scrub_sensitive(payload)
     except Exception:
         pass
     return {}
@@ -737,9 +757,17 @@ def _profile_settings_file(testnet: bool) -> Path:
 def _load_profile_payload(testnet: bool) -> Dict[str, Any]:
     path = _profile_settings_file(testnet)
     try:
-        if path.exists():
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return _filter_profile_fields(payload)
+        lock_file = _lock_path(path)
+        try:
+            with acquire_lock(lock_file, timeout=2.0):
+                if path.exists():
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    return _filter_profile_fields(payload)
+        except FileLockTimeout:
+            log("envs.settings.profile.lock_timeout", path=str(path), testnet=testnet)
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return _filter_profile_fields(payload)
     except Exception:
         pass
     return {}
@@ -749,13 +777,16 @@ def _persist_profile_payload(testnet: bool, payload: Mapping[str, Any]) -> None:
     cleaned = _filter_profile_fields(dict(payload))
     path = _profile_settings_file(testnet)
     try:
-        if cleaned:
-            path.write_text(
-                json.dumps(cleaned, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        elif path.exists():
-            path.unlink()
+        lock_file = _lock_path(path)
+        with acquire_lock(lock_file, timeout=5.0):
+            if cleaned:
+                atomic_write_text(
+                    path,
+                    json.dumps(cleaned, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            elif path.exists():
+                path.unlink()
     except Exception:
         log(
             "envs.settings.profile.persist_error",
@@ -1246,10 +1277,13 @@ def update_settings(**kwargs) -> Settings:
         for k, v in current.items()
         if k not in _SENSITIVE_FIELDS and k not in {"profile_testnet", "profile_mainnet"}
     }
-    SETTINGS_FILE.write_text(
-        json.dumps(persistable, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    lock_file = _lock_path(SETTINGS_FILE)
+    with acquire_lock(lock_file, timeout=5.0):
+        atomic_write_text(
+            SETTINGS_FILE,
+            json.dumps(persistable, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     _invalidate_cache()
     try:
         from .bybit_api import clear_api_cache  # local import to avoid cycle

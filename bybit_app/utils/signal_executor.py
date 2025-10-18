@@ -7,11 +7,12 @@ import math
 import re
 import time
 from collections import deque
+from functools import lru_cache
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
 from .ai_thresholds import resolve_min_ev_from_settings
 from .envs import (
@@ -64,6 +65,14 @@ from .self_learning import (
 _PERCENT_TOLERANCE_MIN = 0.05
 _PERCENT_TOLERANCE_MAX = 5.0
 
+_DECIMAL_ZERO = Decimal("0")
+_DECIMAL_ONE = Decimal("1")
+_DECIMAL_BASIS_POINT = Decimal("0.0001")
+_DECIMAL_TICK = Decimal("0.00000001")
+_DECIMAL_CENT = Decimal("0.01")
+_DECIMAL_MICRO = Decimal("0.000001")
+_SEQUENCE_SPLIT_RE = re.compile(r"[;,]")
+
 _VALIDATION_PENALTY_TTL = 240.0  # 4 minutes cooldown window
 _PRICE_LIMIT_LIQUIDITY_TTL = 150.0  # shorter cooldown after price cap hits
 _SUMMARY_PRICE_STALE_SECONDS = 180.0
@@ -71,12 +80,19 @@ _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _SUMMARY_PRICE_EXECUTION_MAX_AGE = 9.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 _PARTIAL_FILL_MAX_FOLLOWUPS = 3
-_PARTIAL_FILL_MIN_THRESHOLD = Decimal("0.00000001")
+_PARTIAL_FILL_MIN_THRESHOLD = _DECIMAL_TICK
 _DUST_FLUSH_INTERVAL = 12.0
 _DUST_RETRY_DELAY = 45.0
-_DUST_MIN_QUOTE = Decimal("0.00000001")
+_DUST_MIN_QUOTE = _DECIMAL_TICK
 _IMPULSE_SIGNAL_THRESHOLD = math.log(1.8)
 _MIN_QUOTE_RESERVE_PCT = 2.0
+
+_TIF_ALIAS_MAP = {
+    "POSTONLY": "PostOnly",
+    "IOC": "IOC",
+    "FOK": "FOK",
+    "GTC": "GTC",
+}
 
 
 def _normalise_slippage_percent(value: float) -> float:
@@ -101,7 +117,7 @@ def _safe_float(value: object) -> Optional[float]:
         return None
 
 
-@dataclass
+@dataclass(slots=True)
 class ExecutionResult:
     """Outcome of the automatic executor."""
 
@@ -112,14 +128,43 @@ class ExecutionResult:
     context: Optional[Dict[str, object]] = None
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
+class SignalExecutionContext:
+    summary: Dict[str, object]
+    settings: Settings
+    now: float
+    performance_snapshot: Optional[TradePerformanceSnapshot]
+    summary_meta: Optional[Tuple[float, float]]
+    price_meta: Optional[Tuple[float, float]]
+    api: Optional[BybitAPI]
+    wallet_totals: Tuple[float, float]
+    quote_wallet_cap: Optional[float]
+    wallet_meta: Optional[Mapping[str, object]]
+    forced_exit_meta: Optional[Dict[str, object]]
+    total_equity: float
+    available_equity: float
+    equity_for_limits: Optional[float]
+    forced_summary_applied: bool = False
+
+
+@dataclass(slots=True)
+class TradePreparation:
+    symbol: str
+    side: str
+    symbol_meta: Optional[Mapping[str, object]]
+    summary_price_snapshot: Optional[Mapping[str, object]]
+    summary_meta: Optional[Tuple[float, float]]
+    price_meta: Optional[Tuple[float, float]]
+
+
+@dataclass(frozen=True, slots=True)
 class _LadderStep:
     profit_bps: Decimal
     size_fraction: Decimal
 
     @property
     def profit_fraction(self) -> Decimal:
-        return self.profit_bps / Decimal("10000")
+        return self.profit_bps * _DECIMAL_BASIS_POINT
 
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
@@ -179,6 +224,216 @@ class SignalExecutor:
         self._live_orderbook: Optional[LiveOrderbook] = None
         self._risk_override_pct: Optional[float] = None
         self._performance_state: Optional[TradePerformanceSnapshot] = None
+
+    # ------------------------------------------------------------------
+    # pipeline helpers
+    def _prepare_context(self) -> Union[SignalExecutionContext, ExecutionResult]:
+        self._spot_inventory_snapshot = None
+        raw_summary = self._fetch_summary()
+        if isinstance(raw_summary, dict):
+            summary: Dict[str, object] = raw_summary
+        else:
+            try:
+                summary = dict(raw_summary)
+            except Exception:
+                summary = {}
+
+        settings = self._resolve_settings()
+        now = self._current_time()
+        self._maybe_refresh_market_model(settings, now)
+        performance_snapshot = self._update_performance_state(settings)
+        self._maybe_log_daily_pnl(settings, now=now)
+        summary_meta = self._resolve_summary_update_meta(summary, now)
+        price_meta = self._resolve_price_update_meta(summary, now)
+
+        guard = self._kill_switch_guard()
+        if guard is not None:
+            message, guard_context = guard
+            return self._decision("disabled", reason=message, context=guard_context)
+
+        guard = self._private_ws_guard(settings)
+        if guard is not None:
+            message, guard_context = guard
+            return self._decision("disabled", reason=message, context=guard_context)
+
+        try:
+            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
+                require_success=not active_dry_run(settings)
+            )
+        except Exception as exc:
+            reason_text = f"Не удалось получить баланс: {exc}"
+            if not creds_ok(settings) and not active_dry_run(settings):
+                reason_text = (
+                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
+                )
+            return self._decision("error", reason=reason_text)
+
+        total_equity, available_equity = wallet_totals
+        if not math.isfinite(total_equity):
+            total_equity = 0.0
+        if not math.isfinite(available_equity):
+            available_equity = 0.0
+
+        equity_for_limits: Optional[float]
+        if total_equity > 0:
+            equity_for_limits = float(total_equity)
+        else:
+            equity_for_limits = None
+
+        self._update_trailing_stops(
+            api,
+            settings,
+            summary if isinstance(summary, Mapping) else None,
+        )
+
+        forced_summary, forced_meta = self._maybe_force_exit(
+            summary,
+            settings,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+            portfolio_total_equity=equity_for_limits,
+        )
+
+        forced_applied = False
+        if forced_summary is not None:
+            if isinstance(forced_summary, dict):
+                summary = forced_summary
+            else:
+                try:
+                    summary = dict(forced_summary)
+                except Exception:
+                    summary = {}
+            summary_meta = self._resolve_summary_update_meta(summary, now)
+            price_meta = self._resolve_price_update_meta(summary, now)
+            forced_applied = True
+
+        context = SignalExecutionContext(
+            summary=summary,
+            settings=settings,
+            now=now,
+            performance_snapshot=performance_snapshot,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+            api=api,
+            wallet_totals=(total_equity, available_equity),
+            quote_wallet_cap=quote_wallet_cap,
+            wallet_meta=wallet_meta,
+            forced_exit_meta=forced_meta,
+            total_equity=total_equity,
+            available_equity=available_equity,
+            equity_for_limits=equity_for_limits,
+            forced_summary_applied=forced_applied,
+        )
+        return context
+
+    def _prepare_trade(
+        self, context: SignalExecutionContext
+    ) -> Union[TradePreparation, ExecutionResult]:
+        summary = context.summary
+        settings = context.settings
+        now = context.now
+        summary_meta = context.summary_meta
+        price_meta = context.price_meta
+
+        if not context.forced_summary_applied and not summary.get("actionable"):
+            return self._decision(
+                "skipped",
+                reason="Signal is not actionable according to current thresholds.",
+            )
+
+        self._purge_validation_penalties()
+        self._purge_price_limit_backoff()
+        self._ensure_ws_activity(settings)
+        if not getattr(settings, "ai_enabled", False):
+            return self._decision(
+                "disabled",
+                reason="Автоматизация выключена — включите AI сигналы в настройках.",
+            )
+
+        guard_result = self._apply_runtime_guards(
+            settings,
+            summary,
+            total_equity=context.equity_for_limits,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
+        if guard_result is not None:
+            return guard_result
+
+        mode = str(summary.get("mode") or "").lower()
+        if mode not in {"buy", "sell"}:
+            return self._decision(
+                "skipped",
+                reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
+            )
+
+        symbol, symbol_meta = self._select_symbol(summary, settings)
+        if symbol is None:
+            reason = "Не удалось определить инструмент для сделки."
+            if symbol_meta and isinstance(symbol_meta, Mapping):
+                meta_reason = str(symbol_meta.get("reason") or "")
+                if meta_reason == "unsupported_quote":
+                    requested = symbol_meta.get("requested") or summary.get("symbol")
+                    reason = (
+                        f"Инструмент {requested or ''} недоступен — поддерживаются только спотовые пары USDT."
+                    )
+                elif meta_reason:
+                    reason = f"Инструмент недоступен для сделки ({meta_reason})."
+            return self._decision(
+                "skipped",
+                reason=reason,
+                context={"symbol_meta": symbol_meta} if symbol_meta else None,
+            )
+
+        backoff_state = self._price_limit_backoff.get(symbol)
+        if isinstance(backoff_state, Mapping):
+            cooldown_ttl = _safe_float(backoff_state.get("quarantine_ttl"))
+            last_updated = _safe_float(backoff_state.get("last_updated"))
+            if (
+                cooldown_ttl is not None
+                and cooldown_ttl > 0
+                and last_updated is not None
+                and math.isfinite(last_updated)
+            ):
+                cooldown_expires = last_updated + cooldown_ttl
+                if math.isfinite(cooldown_expires) and now < cooldown_expires:
+                    remaining = max(cooldown_expires - now, 0.0)
+                    minutes = remaining / 60.0
+                    context_payload = {
+                        "validation_code": "price_limit_backoff",
+                        "price_limit_backoff": dict(backoff_state),
+                        "quarantine_ttl": cooldown_ttl,
+                        "quarantine_until": cooldown_expires,
+                    }
+                    reason = (
+                        "Ордер пропущен (price_limit_backoff): "
+                        "ждём восстановления ликвидности ≈{duration:.1f} мин"
+                    ).format(duration=minutes)
+                    return self._decision(
+                        "skipped", reason=reason, context=context_payload
+                    )
+
+        side = "Buy" if mode == "buy" else "Sell"
+        summary_price_snapshot = self._extract_market_price(summary, symbol)
+        summary_age = summary_meta[1] if summary_meta is not None else None
+        price_age = price_meta[1] if price_meta is not None else None
+        if summary_price_snapshot is not None:
+            if (
+                (summary_age is not None and summary_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
+                or (price_age is not None and price_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
+            ):
+                summary_price_snapshot = None
+
+        return TradePreparation(
+            symbol=symbol,
+            side=side,
+            symbol_meta=symbol_meta,
+            summary_price_snapshot=summary_price_snapshot,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
 
     def export_state(self) -> Dict[str, Any]:
         self._purge_validation_penalties()
@@ -2246,158 +2501,34 @@ class SignalExecutor:
         return forced_summary, metadata
 
     def execute_once(self) -> ExecutionResult:
-        self._spot_inventory_snapshot = None
-        summary = self._fetch_summary()
-        settings = self._resolve_settings()
-        now = self._current_time()
-        self._maybe_refresh_market_model(settings, now)
-        performance_snapshot = self._update_performance_state(settings)
-        self._maybe_log_daily_pnl(settings, now=now)
-        summary_meta = self._resolve_summary_update_meta(summary, now)
-        price_meta = self._resolve_price_update_meta(summary, now)
-        guard = self._kill_switch_guard()
-        if guard is not None:
-            message, context = guard
-            return self._decision("disabled", reason=message, context=context)
+        context_or_result = self._prepare_context()
+        if isinstance(context_or_result, ExecutionResult):
+            return context_or_result
 
-        guard = self._private_ws_guard(settings)
-        if guard is not None:
-            message, context = guard
-            return self._decision("disabled", reason=message, context=context)
+        context = context_or_result
+        trade_or_result = self._prepare_trade(context)
+        if isinstance(trade_or_result, ExecutionResult):
+            return trade_or_result
 
-        try:
-            api, wallet_totals, quote_wallet_cap, wallet_meta = self._resolve_wallet(
-                require_success=not active_dry_run(settings)
-            )
-        except Exception as exc:
-            reason_text = f"Не удалось получить баланс: {exc}"
-            if not creds_ok(settings) and not active_dry_run(settings):
-                reason_text = (
-                    "API ключи не настроены — сохраните ключ и секрет перед отправкой ордеров."
-                )
-            return self._decision(
-                "error",
-                reason=reason_text,
-            )
+        summary = context.summary
+        settings = context.settings
+        now = context.now
+        performance_snapshot = context.performance_snapshot
+        summary_meta = trade_or_result.summary_meta
+        price_meta = trade_or_result.price_meta
+        symbol = trade_or_result.symbol
+        side = trade_or_result.side
+        symbol_meta = trade_or_result.symbol_meta
+        summary_price_snapshot = trade_or_result.summary_price_snapshot
+        forced_exit_meta = context.forced_exit_meta
+        api = context.api
+        wallet_totals = context.wallet_totals
+        quote_wallet_cap = context.quote_wallet_cap
+        wallet_meta = context.wallet_meta
+        total_equity = context.total_equity
+        available_equity = context.available_equity
+        equity_for_limits = context.equity_for_limits
 
-        total_equity, available_equity = wallet_totals
-        if not math.isfinite(total_equity):
-            total_equity = 0.0
-        if not math.isfinite(available_equity):
-            available_equity = 0.0
-
-        equity_for_limits: Optional[float]
-        if total_equity > 0:
-            equity_for_limits = float(total_equity)
-        else:
-            equity_for_limits = None
-
-        self._update_trailing_stops(
-            api,
-            settings,
-            summary if isinstance(summary, Mapping) else None,
-        )
-
-        forced_summary, forced_meta = self._maybe_force_exit(
-            summary,
-            settings,
-            current_time=now,
-            summary_meta=summary_meta,
-            price_meta=price_meta,
-            portfolio_total_equity=equity_for_limits,
-        )
-        forced_exit_meta = forced_meta
-        if forced_summary is not None:
-            summary = forced_summary
-            summary_meta = self._resolve_summary_update_meta(summary, now)
-            price_meta = self._resolve_price_update_meta(summary, now)
-        elif not summary.get("actionable"):
-            return self._decision(
-                "skipped",
-                reason="Signal is not actionable according to current thresholds.",
-            )
-
-        self._purge_validation_penalties()
-        self._purge_price_limit_backoff()
-        self._ensure_ws_activity(settings)
-        if not getattr(settings, "ai_enabled", False):
-            return self._decision(
-                "disabled",
-                reason="Автоматизация выключена — включите AI сигналы в настройках.",
-            )
-
-        guard_result = self._apply_runtime_guards(
-            settings,
-            summary,
-            total_equity=equity_for_limits,
-            current_time=now,
-            summary_meta=summary_meta,
-            price_meta=price_meta,
-        )
-        if guard_result is not None:
-            return guard_result
-
-        mode = str(summary.get("mode") or "").lower()
-        if mode not in {"buy", "sell"}:
-            return self._decision(
-                "skipped",
-                reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
-            )
-
-        symbol, symbol_meta = self._select_symbol(summary, settings)
-        if symbol is None:
-            reason = "Не удалось определить инструмент для сделки."
-            if symbol_meta and isinstance(symbol_meta, Mapping):
-                meta_reason = str(symbol_meta.get("reason") or "")
-                if meta_reason == "unsupported_quote":
-                    requested = symbol_meta.get("requested") or summary.get("symbol")
-                    reason = (
-                        f"Инструмент {requested or ''} недоступен — поддерживаются только спотовые пары USDT."
-                    )
-                elif meta_reason:
-                    reason = f"Инструмент недоступен для сделки ({meta_reason})."
-            return self._decision(
-                "skipped",
-                reason=reason,
-                context={"symbol_meta": symbol_meta} if symbol_meta else None,
-            )
-
-        backoff_state = self._price_limit_backoff.get(symbol)
-        if isinstance(backoff_state, Mapping):
-            cooldown_ttl = _safe_float(backoff_state.get("quarantine_ttl"))
-            last_updated = _safe_float(backoff_state.get("last_updated"))
-            if (
-                cooldown_ttl is not None
-                and cooldown_ttl > 0
-                and last_updated is not None
-                and math.isfinite(last_updated)
-            ):
-                cooldown_expires = last_updated + cooldown_ttl
-                if math.isfinite(cooldown_expires) and now < cooldown_expires:
-                    remaining = max(cooldown_expires - now, 0.0)
-                    minutes = remaining / 60.0
-                    context = {
-                        "validation_code": "price_limit_backoff",
-                        "price_limit_backoff": dict(backoff_state),
-                        "quarantine_ttl": cooldown_ttl,
-                        "quarantine_until": cooldown_expires,
-                    }
-                    reason = (
-                        "Ордер пропущен (price_limit_backoff): "
-                        "ждём восстановления ликвидности ≈{duration:.1f} мин"
-                    ).format(duration=minutes)
-                    return self._decision("skipped", reason=reason, context=context)
-
-        side = "Buy" if mode == "buy" else "Sell"
-        summary_price_snapshot = self._extract_market_price(summary, symbol)
-        summary_age = summary_meta[1] if summary_meta is not None else None
-        price_age = price_meta[1] if price_meta is not None else None
-        if summary_price_snapshot is not None:
-            if (
-                (summary_age is not None and summary_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
-                or (price_age is not None and price_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
-            ):
-                summary_price_snapshot = None
 
         quote_wallet_cap_value = quote_wallet_cap
         if quote_wallet_cap_value is not None:
@@ -3437,8 +3568,8 @@ class SignalExecutor:
 
         requested_quote_decimal = self._decimal_from(order_context.get("notional_quote"))
         partial_meta: Optional[Dict[str, object]] = None
-        executed_base_total = Decimal("0")
-        executed_quote_total = Decimal("0")
+        executed_base_total = _DECIMAL_ZERO
+        executed_quote_total = _DECIMAL_ZERO
         if isinstance(response, Mapping):
             response, executed_base_total, executed_quote_total, partial_meta = self._chase_partial_fill(
                 api=api,
@@ -3633,7 +3764,7 @@ class SignalExecutor:
             return [], {}, []
 
         executed_base = filled_base_total
-        avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
+        avg_price = executed_quote / executed_base if executed_base > 0 else _DECIMAL_ZERO
         if avg_price <= 0:
             return [], {}, []
 
@@ -3652,21 +3783,21 @@ class SignalExecutor:
             log("guardian.auto.tp_ladder.limits.error", symbol=symbol, err=str(exc))
             limits = None
 
-        qty_step = self._decimal_from(audit.get("qty_step") if audit else None, Decimal("0.00000001"))
+        qty_step = self._decimal_from(audit.get("qty_step") if audit else None, _DECIMAL_TICK)
         if qty_step <= 0:
-            qty_step = Decimal("0.00000001")
+            qty_step = _DECIMAL_TICK
         if limits:
             limit_qty_step = self._decimal_from(limits.get("qty_step"), qty_step)
             if limit_qty_step > qty_step:
                 qty_step = limit_qty_step
 
-        min_qty = self._decimal_from(audit.get("min_order_qty") if audit else None, Decimal("0"))
+        min_qty = self._decimal_from(audit.get("min_order_qty") if audit else None, _DECIMAL_ZERO)
         if limits:
             limit_min_qty = self._decimal_from(limits.get("min_order_qty"))
             if limit_min_qty > min_qty:
                 min_qty = limit_min_qty
 
-        quote_step = self._decimal_from(audit.get("quote_step") if audit else None, Decimal("0.01"))
+        quote_step = self._decimal_from(audit.get("quote_step") if audit else None, _DECIMAL_CENT)
         if limits:
             limit_quote_step = self._decimal_from(limits.get("quote_step"), quote_step)
             if limit_quote_step > quote_step:
@@ -3678,11 +3809,11 @@ class SignalExecutor:
             if limit_price_step > price_step:
                 price_step = limit_price_step
         if price_step <= 0:
-            price_step = Decimal("0.00000001")
+            price_step = _DECIMAL_TICK
 
-        min_notional = self._decimal_from(audit.get("min_order_amt") if audit else None, Decimal("0"))
-        price_band_min = self._decimal_from(audit.get("min_price") if audit else None, Decimal("0"))
-        price_band_max = self._decimal_from(audit.get("max_price") if audit else None, Decimal("0"))
+        min_notional = self._decimal_from(audit.get("min_order_amt") if audit else None, _DECIMAL_ZERO)
+        price_band_min = self._decimal_from(audit.get("min_price") if audit else None, _DECIMAL_ZERO)
+        price_band_max = self._decimal_from(audit.get("max_price") if audit else None, _DECIMAL_ZERO)
         if limits:
             limit_min_notional = self._decimal_from(limits.get("min_order_amt"))
             if limit_min_notional > min_notional:
@@ -3704,14 +3835,14 @@ class SignalExecutor:
         open_sell_reserved = self._resolve_open_sell_reserved(symbol, rows=order_rows)
         available_base = filled_base_total - open_sell_reserved
         if available_base < 0:
-            available_base = Decimal("0")
+            available_base = _DECIMAL_ZERO
 
         if open_sell_reserved > 0 and qty_step > 0 and available_base > qty_step:
             # leave a small buffer to avoid "insufficient balance" from rounding noise
             available_base -= qty_step
 
         sell_budget_base = self._round_to_step(available_base, qty_step, rounding=ROUND_DOWN)
-        total_qty = sell_budget_base if sell_budget_base > 0 else Decimal("0")
+        total_qty = sell_budget_base if sell_budget_base > 0 else _DECIMAL_ZERO
         if total_qty <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
             execution_stats = self._build_tp_execution_stats(
@@ -3747,7 +3878,7 @@ class SignalExecutor:
             remaining -= qty
             allocations.append((step_cfg, qty))
 
-        if remaining > Decimal("0") and allocations:
+        if remaining > _DECIMAL_ZERO and allocations:
             extra = self._round_to_step(remaining, qty_step, rounding=ROUND_DOWN)
             if extra > 0:
                 step_cfg, qty = allocations[-1]
@@ -3758,14 +3889,14 @@ class SignalExecutor:
 
         if min_qty > 0 and allocations:
             adjusted: list[tuple[_LadderStep, Decimal]] = []
-            carry = Decimal("0")
+            carry = _DECIMAL_ZERO
             for step_cfg, qty in allocations:
                 if qty + carry < min_qty:
                     carry += qty
                     continue
                 if carry > 0:
                     qty += carry
-                    carry = Decimal("0")
+                    carry = _DECIMAL_ZERO
                 adjusted.append((step_cfg, qty))
             if carry > 0 and adjusted:
                 last_step, last_qty = adjusted[-1]
@@ -3776,8 +3907,7 @@ class SignalExecutor:
         time_in_force = "GTC"
         if isinstance(tif_candidate, str) and tif_candidate.strip():
             tif_upper = tif_candidate.strip().upper()
-            mapping = {"POSTONLY": "PostOnly", "IOC": "IOC", "FOK": "FOK", "GTC": "GTC"}
-            time_in_force = mapping.get(tif_upper, tif_upper)
+            time_in_force = _TIF_ALIAS_MAP.get(tif_upper, tif_upper)
 
         fee_guard_fraction = resolve_fee_guard_fraction(settings)
         aggregated: list[Dict[str, object]] = []
@@ -4060,7 +4190,7 @@ class SignalExecutor:
         try:
             qty_decimal = Decimal(qty_text)
         except (InvalidOperation, ValueError):
-            qty_decimal = Decimal("0")
+            qty_decimal = _DECIMAL_ZERO
         if qty_decimal <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
             return []
@@ -4132,11 +4262,11 @@ class SignalExecutor:
             return []
 
         base_bps = stop_loss_bps if stop_loss_bps > 0 else trailing_bps
-        base_fraction = Decimal(base_bps) / Decimal("10000")
+        base_fraction = self._decimal_from(base_bps) * _DECIMAL_BASIS_POINT
         if exit_side == "Sell":
-            stop_price = avg_price * (Decimal("1") - base_fraction)
+            stop_price = avg_price * (_DECIMAL_ONE - base_fraction)
         else:
-            stop_price = avg_price * (Decimal("1") + base_fraction)
+            stop_price = avg_price * (_DECIMAL_ONE + base_fraction)
 
         if stop_price <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
@@ -4201,7 +4331,7 @@ class SignalExecutor:
         if order_type == "Limit":
             limit_rounding = ROUND_DOWN if exit_side == "Sell" else ROUND_UP
             limit_price = stop_price
-            adjust_step = price_step if price_step > 0 else Decimal("0")
+            adjust_step = price_step if price_step > 0 else _DECIMAL_ZERO
             if adjust_step > 0:
                 if exit_side == "Sell":
                     candidate = stop_price - adjust_step
@@ -4409,8 +4539,10 @@ class SignalExecutor:
                 except (InvalidOperation, ValueError):
                     continue
 
-            fraction = Decimal(trailing_bps) / Decimal("10000")
-            activation_fraction = Decimal(activation_bps) / Decimal("10000")
+            fraction = self._decimal_from(trailing_bps) * _DECIMAL_BASIS_POINT
+            activation_fraction = (
+                self._decimal_from(activation_bps) * _DECIMAL_BASIS_POINT
+            )
             exit_side = str(state.get("side") or "").capitalize() or "Sell"
 
             if exit_side == "Sell":
@@ -4426,10 +4558,10 @@ class SignalExecutor:
                     highest_price = current_price
                 state["highest_price"] = highest_price
                 if activation_fraction > 0:
-                    activation_price = avg_price * (Decimal("1") + activation_fraction)
+                    activation_price = avg_price * (_DECIMAL_ONE + activation_fraction)
                     if highest_price < activation_price:
                         continue
-                target_price = highest_price * (Decimal("1") - fraction)
+                target_price = highest_price * (_DECIMAL_ONE - fraction)
                 rounding_mode = ROUND_DOWN
                 comparison = target_price > current_stop
             else:
@@ -4445,10 +4577,10 @@ class SignalExecutor:
                     lowest_price = current_price
                 state["lowest_price"] = lowest_price
                 if activation_fraction > 0:
-                    activation_price = avg_price * (Decimal("1") - activation_fraction)
+                    activation_price = avg_price * (_DECIMAL_ONE - activation_fraction)
                     if lowest_price > activation_price:
                         continue
-                target_price = lowest_price * (Decimal("1") + fraction)
+                target_price = lowest_price * (_DECIMAL_ONE + fraction)
                 rounding_mode = ROUND_UP
                 comparison = target_price < current_stop
 
@@ -4557,7 +4689,7 @@ class SignalExecutor:
         ws_rows: Optional[Sequence[Mapping[str, object]]] = None,
         ledger_rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
-        best_total = executed_base if executed_base > 0 else Decimal("0")
+        best_total = executed_base if executed_base > 0 else _DECIMAL_ZERO
 
         ws_total = self._filled_base_from_private_ws(
             symbol,
@@ -4670,7 +4802,7 @@ class SignalExecutor:
             return
 
         min_notional_raw = getattr(settings, "tg_trade_notifs_min_notional", 0.0) or 0.0
-        min_notional = self._decimal_from(min_notional_raw, Decimal("0"))
+        min_notional = self._decimal_from(min_notional_raw, _DECIMAL_ZERO)
         if min_notional > 0 and executed_quote < min_notional:
             log(
                 "telegram.trade.skip",
@@ -4681,7 +4813,7 @@ class SignalExecutor:
             )
             return
 
-        avg_price = executed_quote / executed_base if executed_base > 0 else Decimal("0")
+        avg_price = executed_quote / executed_base if executed_base > 0 else _DECIMAL_ZERO
         if avg_price <= 0:
             log(
                 "telegram.trade.skip",
@@ -4691,12 +4823,12 @@ class SignalExecutor:
             )
             return
 
-        qty_step = self._decimal_from(audit.get("qty_step")) if isinstance(audit, Mapping) else Decimal("0.00000001")
+        qty_step = self._decimal_from(audit.get("qty_step")) if isinstance(audit, Mapping) else _DECIMAL_TICK
         if qty_step <= 0:
-            qty_step = Decimal("0.00000001")
-        price_step = self._infer_price_step(audit) if isinstance(audit, Mapping) else Decimal("0.00000001")
+            qty_step = _DECIMAL_TICK
+        price_step = self._infer_price_step(audit) if isinstance(audit, Mapping) else _DECIMAL_TICK
         if price_step <= 0:
-            price_step = Decimal("0.00000001")
+            price_step = _DECIMAL_TICK
 
         qty_text = self._format_decimal_step(executed_base, qty_step)
         price_text = self._format_decimal_step(avg_price, price_step)
@@ -4735,7 +4867,7 @@ class SignalExecutor:
             rows_before, rows_after, symbol_upper
         )
 
-        sold_total = Decimal("0")
+        sold_total = _DECIMAL_ZERO
         has_sell = False
         for entry in new_symbol_rows:
             if str(entry.get("side") or "").lower() == "sell":
@@ -4770,14 +4902,14 @@ class SignalExecutor:
             settings=settings,
         )
 
-        sell_budget = Decimal("0")
+        sell_budget = _DECIMAL_ZERO
         if isinstance(execution_stats, Mapping):
             sell_budget = self._decimal_from(execution_stats.get("sell_budget_base"))
 
         sold_amount = sell_budget if sell_budget > 0 else sold_total
         sold_text = self._format_decimal_step(sold_amount, qty_step)
 
-        pnl_display = trade_realized_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        pnl_display = trade_realized_pnl.quantize(_DECIMAL_CENT, rounding=ROUND_HALF_UP)
         pnl_text = f"{pnl_display:+.2f} USDT"
 
         base_asset = symbol_upper[:-4] if symbol_upper.endswith("USDT") else symbol_upper
@@ -4911,20 +5043,20 @@ class SignalExecutor:
             else self._extract_new_symbol_rows(rows_before, rows_after, symbol_upper)
         )
         if not candidate_rows_source:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         candidate_rows = self._filter_symbol_ledger_rows(
             candidate_rows_source, symbol_upper
         )
         if not candidate_rows:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         has_sell_events = any(
             str(row.get("side") or "").strip().lower() == "sell"
             for row in candidate_rows
         )
         if not has_sell_events:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         inventory: dict[str, dict[str, float]] = {}
         layers: dict[str, dict[str, object]] = {}
@@ -4952,7 +5084,7 @@ class SignalExecutor:
                 if isinstance(candidate_layers, Mapping):
                     resolved_layers = candidate_layers
 
-        realized_before = Decimal("0")
+        realized_before = _DECIMAL_ZERO
         if isinstance(resolved_state, Mapping):
             realized_before = self._decimal_from(resolved_state.get("realized_pnl"))
             inventory[symbol_upper] = {
@@ -4985,7 +5117,7 @@ class SignalExecutor:
         realized_after = (
             self._decimal_from(after_state.get("realized_pnl"))
             if isinstance(after_state, Mapping)
-            else Decimal("0")
+            else _DECIMAL_ZERO
         )
 
         return realized_after - realized_before
@@ -4999,15 +5131,15 @@ class SignalExecutor:
         rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         if not order_id and not order_link_id:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         if rows is None:
             rows = ws_manager.realtime_private_rows("execution")
         if not rows:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         symbol_upper = symbol.upper()
-        total = Decimal("0")
+        total = _DECIMAL_ZERO
         seen_exec_ids: set[str] = set()
 
         for row in rows:
@@ -5050,18 +5182,18 @@ class SignalExecutor:
         rows: Optional[Sequence[Mapping[str, object]]] = None,
     ) -> Decimal:
         if not order_id and not order_link_id:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         if rows is None:
             try:
                 rows = read_ledger(2000, settings=settings)
             except Exception:
-                return Decimal("0")
+                return _DECIMAL_ZERO
         if not rows:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         symbol_upper = symbol.upper()
-        total = Decimal("0")
+        total = _DECIMAL_ZERO
         for row in rows:
             if not isinstance(row, Mapping):
                 continue
@@ -5089,11 +5221,11 @@ class SignalExecutor:
         if rows is None:
             rows = ws_manager.realtime_private_rows("order")
         if not rows:
-            return Decimal("0")
+            return _DECIMAL_ZERO
 
         symbol_upper = symbol.upper()
         reserved: Dict[str, Decimal] = {}
-        total_reserved = Decimal("0")
+        total_reserved = _DECIMAL_ZERO
 
         for row in rows:
             if not isinstance(row, Mapping):
@@ -5196,15 +5328,24 @@ class SignalExecutor:
         return clean_rows, last_id
 
     @staticmethod
-    def _decimal_from(value: object, default: Decimal = Decimal("0")) -> Decimal:
+    def _decimal_from(value: object, default: Decimal = _DECIMAL_ZERO) -> Decimal:
         if value is None:
             return default
         if isinstance(value, Decimal):
             return value
-        if isinstance(value, (int, float)):
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, int):
             try:
-                return Decimal(str(value))
+                return Decimal(value)
             except (InvalidOperation, ValueError):
+                return default
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                return default
+            try:
+                return Decimal.from_float(value)
+            except (InvalidOperation, ValueError, TypeError):
                 return default
         if isinstance(value, str):
             text = value.strip()
@@ -5232,21 +5373,37 @@ class SignalExecutor:
         return None
 
     @classmethod
+    @lru_cache(maxsize=256)
+    def _parse_decimal_sequence_from_text(cls, text: str) -> tuple[Decimal, ...]:
+        tokens = [token.strip() for token in _SEQUENCE_SPLIT_RE.split(text) if token.strip()]
+        values: list[Decimal] = []
+        decimal_from = cls._decimal_from
+        for token in tokens:
+            dec = decimal_from(token)
+            if dec > 0:
+                values.append(dec)
+        return tuple(values)
+
+    @classmethod
     def _parse_decimal_sequence(cls, raw: object) -> list[Decimal]:
         if raw is None:
             return []
         if isinstance(raw, str):
-            tokens = [token.strip() for token in re.split(r"[;,]", raw) if token.strip()]
-        elif isinstance(raw, Sequence):
+            text = raw.strip()
+            if not text:
+                return []
+            return list(cls._parse_decimal_sequence_from_text(text))
+        if isinstance(raw, Sequence):
             tokens = list(raw)
         else:
             tokens = [raw]
         values: list[Decimal] = []
+        decimal_from = cls._decimal_from
         for token in tokens:
             candidate = token
             if isinstance(candidate, str):
                 candidate = candidate.strip()
-            dec = cls._decimal_from(candidate)
+            dec = decimal_from(candidate)
             if dec > 0:
                 values.append(dec)
         return values
@@ -5254,12 +5411,22 @@ class SignalExecutor:
     def _resolve_tp_ladder(self, settings: Settings) -> list[_LadderStep]:
         levels_raw = getattr(settings, "spot_tp_ladder_bps", None)
         sizes_raw = getattr(settings, "spot_tp_ladder_split_pct", None)
+        cache_key = (levels_raw, sizes_raw)
+        cached = getattr(settings, "_tp_ladder_cache", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == cache_key
+        ):
+            cached_steps = cached[1]
+            if isinstance(cached_steps, tuple):
+                return list(cached_steps)
         levels = self._parse_decimal_sequence(levels_raw)
         if not levels:
             return []
         sizes = self._parse_decimal_sequence(sizes_raw)
         if not sizes:
-            sizes = [Decimal("1")] * len(levels)
+            sizes = [_DECIMAL_ONE] * len(levels)
         if len(sizes) == 1 and len(levels) > 1:
             sizes = [sizes[0]] * len(levels)
         if len(sizes) < len(levels):
@@ -5269,7 +5436,7 @@ class SignalExecutor:
 
         total_size = sum(sizes)
         if total_size <= 0:
-            sizes = [Decimal("1")] * len(levels)
+            sizes = [_DECIMAL_ONE] * len(levels)
             total_size = Decimal(len(levels))
 
         steps: list[_LadderStep] = []
@@ -5277,6 +5444,11 @@ class SignalExecutor:
             if level <= 0 or size <= 0:
                 continue
             steps.append(_LadderStep(profit_bps=level, size_fraction=size / total_size))
+        steps_tuple = tuple(steps)
+        try:
+            setattr(settings, "_tp_ladder_cache", (cache_key, steps_tuple))
+        except (AttributeError, TypeError):
+            pass
         return steps
 
     @staticmethod
@@ -5298,8 +5470,8 @@ class SignalExecutor:
                 continue
             exponent = value.normalize().as_tuple().exponent
             if exponent < 0:
-                return Decimal("1").scaleb(exponent)
-        return Decimal("0.00000001")
+                return _DECIMAL_ONE.scaleb(exponent)
+        return _DECIMAL_TICK
 
     @staticmethod
     def _round_to_step(value: Decimal, step: Decimal, *, rounding: str) -> Decimal:
@@ -5335,8 +5507,8 @@ class SignalExecutor:
 
     @staticmethod
     def _extract_execution_totals(response: Mapping[str, object] | None) -> tuple[Decimal, Decimal]:
-        executed_base = Decimal("0")
-        executed_quote = Decimal("0")
+        executed_base = _DECIMAL_ZERO
+        executed_quote = _DECIMAL_ZERO
 
         payloads: list[Mapping[str, object]] = []
         if isinstance(response, Mapping):
@@ -5371,8 +5543,8 @@ class SignalExecutor:
             if isinstance(local, Mapping):
                 attempts = local.get("attempts")
             if isinstance(attempts, Sequence):
-                base_total = Decimal("0")
-                quote_total = Decimal("0")
+                base_total = _DECIMAL_ZERO
+                quote_total = _DECIMAL_ZERO
                 for entry in attempts:
                     if not isinstance(entry, Mapping):
                         continue
@@ -5586,7 +5758,7 @@ class SignalExecutor:
                 response=response,
             )
 
-            remaining_quote = Decimal("0")
+            remaining_quote = _DECIMAL_ZERO
             try:
                 refreshed = prepare_spot_trade_snapshot(
                     api,
@@ -5631,7 +5803,7 @@ class SignalExecutor:
         quote_step = self._decimal_from((audit or {}).get("quote_step"), _PARTIAL_FILL_MIN_THRESHOLD)
         threshold = max(_PARTIAL_FILL_MIN_THRESHOLD, quote_step)
         if requested_quote > 0:
-            fractional = requested_quote * Decimal("0.000001")
+            fractional = requested_quote * _DECIMAL_MICRO
             if fractional > threshold:
                 threshold = fractional
         return threshold
@@ -5677,8 +5849,8 @@ class SignalExecutor:
             meta = {
                 "status": "complete",
                 "requested_quote": self._format_decimal_for_meta(requested_quote),
-                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
-                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, _DECIMAL_ZERO)),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
             }
             return response, executed_base, executed_quote, meta
 
@@ -5687,8 +5859,8 @@ class SignalExecutor:
             meta = {
                 "status": "complete_below_minimum",
                 "requested_quote": self._format_decimal_for_meta(requested_quote),
-                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
-                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, _DECIMAL_ZERO)),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
                 "min_order_amt": self._format_decimal_for_meta(min_notional),
             }
             return response, executed_base, executed_quote, meta
@@ -5698,8 +5870,8 @@ class SignalExecutor:
                 "status": "incomplete",
                 "reason": "api_unavailable",
                 "requested_quote": self._format_decimal_for_meta(requested_quote),
-                "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
-                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                "executed_quote": self._format_decimal_for_meta(max(executed_quote, _DECIMAL_ZERO)),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
             }
             return response, executed_base, executed_quote, meta
 
@@ -5732,7 +5904,7 @@ class SignalExecutor:
                         "status": "error",
                         "code": exc.code,
                         "message": str(exc),
-                        "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                        "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
                     }
                 )
                 log(
@@ -5750,7 +5922,7 @@ class SignalExecutor:
                         "status": "error",
                         "code": "runtime",
                         "message": str(exc),
-                        "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                        "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
                     }
                 )
                 log(
@@ -5768,13 +5940,13 @@ class SignalExecutor:
             executed_quote += add_quote
             remaining = requested_quote - executed_quote
             if remaining < 0:
-                remaining = Decimal("0")
+                remaining = _DECIMAL_ZERO
 
             follow_entry: dict[str, object] = {
                 "status": "filled" if add_quote > 0 else "empty",
-                "executed_base": self._format_decimal_for_meta(max(add_base, Decimal("0"))),
-                "executed_quote": self._format_decimal_for_meta(max(add_quote, Decimal("0"))),
-                "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+                "executed_base": self._format_decimal_for_meta(max(add_base, _DECIMAL_ZERO)),
+                "executed_quote": self._format_decimal_for_meta(max(add_quote, _DECIMAL_ZERO)),
+                "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
             }
             followups.append(follow_entry)
             log(
@@ -5794,8 +5966,8 @@ class SignalExecutor:
         meta: Dict[str, object] = {
             "status": "complete" if remaining <= threshold else "incomplete",
             "requested_quote": self._format_decimal_for_meta(requested_quote),
-            "executed_quote": self._format_decimal_for_meta(max(executed_quote, Decimal("0"))),
-            "remaining_quote": self._format_decimal_for_meta(max(remaining, Decimal("0"))),
+            "executed_quote": self._format_decimal_for_meta(max(executed_quote, _DECIMAL_ZERO)),
+            "remaining_quote": self._format_decimal_for_meta(max(remaining, _DECIMAL_ZERO)),
             "followups": followups,
         }
 
@@ -6777,7 +6949,7 @@ class SignalExecutor:
 
         min_order_amt = self._decimal_from(limits.get("min_order_amt"), Decimal(str(5.0)))
         if min_order_amt <= 0:
-            min_order_amt = Decimal("0")
+            min_order_amt = _DECIMAL_ZERO
 
         context["min_order_amt"] = float(min_order_amt) if min_order_amt > 0 else 0.0
 
@@ -6785,7 +6957,7 @@ class SignalExecutor:
         if expected_base_requirement is not None:
             try:
                 if math.isfinite(expected_base_requirement) and expected_base_requirement > 0:
-                    candidate = self._decimal_from(expected_base_requirement, Decimal("0"))
+                    candidate = self._decimal_from(expected_base_requirement, _DECIMAL_ZERO)
                 else:
                     candidate = None
             except (TypeError, ValueError):
@@ -6803,7 +6975,7 @@ class SignalExecutor:
             available_base = self._decimal_from(available_base)
 
         balance_account_type = "UNIFIED"
-        unified_available = available_base if available_base > 0 else Decimal("0")
+        unified_available = available_base if available_base > 0 else _DECIMAL_ZERO
         context["unified_available_base"] = (
             float(unified_available) if unified_available > 0 else 0.0
         )

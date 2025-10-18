@@ -13,7 +13,10 @@ from .ai_thresholds import (
     resolve_min_ev_from_settings,
 )
 from .envs import Settings, get_api_client, get_settings
-from .market_scanner import MIN_EV_CHANGE_PCT_FLOOR, scan_market_opportunities
+from .market_scanner import MIN_EV_CHANGE_PCT_FLOOR, scan_market_opportunities as _default_scan_market_opportunities
+from .strategies import StrategyContext, get_strategy
+
+scan_market_opportunities = _default_scan_market_opportunities
 from .paths import DATA_DIR
 
 
@@ -76,6 +79,7 @@ class LiveSignalFetcher:
         )
         self.live_only = False
         self.cache_ttl = self._base_cache_ttl
+        self._strategy_name = "guardian"
         if self._stale_grace_override is None:
             # allow a wider reuse window for previously good payloads in case the
             # scanner temporarily fails — never smaller than 15 seconds to avoid
@@ -181,6 +185,12 @@ class LiveSignalFetcher:
             self._cached_status = None
             self._cache_timestamp = 0.0
 
+        try:
+            strategy_name = str(getattr(settings, "ai_strategy", "guardian") or "guardian")
+        except Exception:
+            strategy_name = "guardian"
+        self._strategy_name = strategy_name
+
     def _scan_market(self, settings: Settings, api) -> List[Dict[str, object]]:
         try:
             min_turnover = float(getattr(settings, "ai_min_turnover_usd", 0.0) or 0.0)
@@ -255,21 +265,45 @@ class LiveSignalFetcher:
         except (TypeError, ValueError):
             min_top_quote = 0.0
 
+        max_spread_effective = max_spread if max_spread > 0 else 50.0
+        legacy_callable = globals().get("scan_market_opportunities", _default_scan_market_opportunities)
+        if legacy_callable is not _default_scan_market_opportunities:
+            try:
+                return legacy_callable(
+                    api,
+                    data_dir=self.data_dir,
+                    limit=limit_hint,
+                    min_turnover=min_turnover,
+                    min_change_pct=min_change_pct,
+                    max_spread_bps=max_spread_effective,
+                    whitelist=whitelist or (),
+                    blacklist=blacklist or (),
+                    cache_ttl=0.0 if self.live_only else max(self.cache_ttl, 0.0),
+                    settings=settings,
+                    testnet=testnet,
+                    min_top_quote=min_top_quote,
+                )
+            except Exception as exc:
+                raise LiveSignalError(str(exc)) from exc
+
+        strategy = get_strategy(self._strategy_name)
+        context_payload = StrategyContext(
+            settings=settings,
+            api=api,
+            data_dir=self.data_dir,
+            limit=limit_hint,
+            min_turnover=min_turnover,
+            min_change_pct=min_change_pct,
+            max_spread_bps=max_spread_effective,
+            whitelist=tuple(whitelist or ()),
+            blacklist=tuple(blacklist or ()),
+            cache_ttl=0.0 if self.live_only else max(self.cache_ttl, 0.0),
+            testnet=testnet,
+            min_top_quote=min_top_quote,
+        )
+
         try:
-            opportunities = scan_market_opportunities(
-                api,
-                data_dir=self.data_dir,
-                limit=limit_hint,
-                min_turnover=min_turnover,
-                min_change_pct=min_change_pct,
-                max_spread_bps=max_spread if max_spread > 0 else 50.0,
-                whitelist=whitelist or (),
-                blacklist=blacklist or (),
-                cache_ttl=0.0 if self.live_only else max(self.cache_ttl, 0.0),
-                settings=settings,
-                testnet=testnet,
-                min_top_quote=min_top_quote,
-            )
+            opportunities = strategy.scan_market(context_payload)
         except Exception as exc:
             raise LiveSignalError(str(exc)) from exc
 

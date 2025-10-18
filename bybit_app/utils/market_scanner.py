@@ -29,7 +29,9 @@ from .ai_thresholds import resolve_min_ev_from_settings
 from .bybit_api import BybitAPI
 from .ai.external import ExternalFeatureProvider
 from .ai.models import (
+    MODEL_FILENAME,
     MarketModel,
+    clear_model_cache,
     ensure_market_model,
     initialise_feature_map,
     liquidity_feature,
@@ -42,6 +44,7 @@ from .market_features import build_feature_bundle
 
 
 MIN_EV_CHANGE_PCT_FLOOR = 0.0005  # 0.05%
+from .data_refresh import ensure_hourly_ohlcv
 from .ohlcv import normalise_ohlcv_frame
 from .symbols import ensure_usdt_symbol
 from .telegram_notify import enqueue_telegram_message
@@ -479,6 +482,8 @@ def _load_hourly_indicator_bundle(
     *,
     data_dir: Path = DATA_DIR,
     now: Optional[float] = None,
+    settings: Optional["Settings"] = None,
+    api=None,
 ) -> Optional[Dict[str, object]]:
     key = (str(Path(data_dir).resolve()), symbol.upper())
     now_ts = now if isinstance(now, (int, float)) else time.time()
@@ -487,6 +492,12 @@ def _load_hourly_indicator_bundle(
         payload = cached[1]
         return copy.deepcopy(payload) if payload is not None else None
 
+    ensure_hourly_ohlcv(
+        symbol,
+        data_dir=data_dir,
+        settings=settings,
+        api=api,
+    )
     path = _ohlcv_hourly_path(data_dir, symbol)
     frame = _load_hourly_frame(path)
     if frame is None or frame.empty:
@@ -1652,9 +1663,13 @@ def scan_market_opportunities(
     else:
         training_limit = max(int(training_limit_setting), 50)
 
+    clear_model_cache()
+    model_path = Path(data_dir) / "ai" / MODEL_FILENAME
+
     try:
         model: Optional[MarketModel] = ensure_market_model(
             data_dir=data_dir,
+            model_path=model_path,
             max_age=retrain_interval,
             limit=training_limit,
         )
@@ -1862,6 +1877,8 @@ def scan_market_opportunities(
                 indicator_bundle = _load_hourly_indicator_bundle(
                     symbol,
                     data_dir=data_dir,
+                    settings=settings,
+                    api=api,
                 )
                 confirmed_trend = _resolve_trend_with_confirmation(
                     change_pct,

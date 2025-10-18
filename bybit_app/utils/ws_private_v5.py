@@ -427,11 +427,14 @@ class WSPrivateV5:
                 try:
                     cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                     sslopt = {"cert_reqs": cert_reqs}
-                    ws.run_forever(
-                        sslopt=sslopt,
-                        ping_interval=0,
-                        ping_timeout=None,
-                    )
+                    try:
+                        ws.run_forever(
+                            sslopt=sslopt,
+                            ping_interval=0,
+                            ping_timeout=None,
+                        )
+                    except TypeError:
+                        ws.run_forever(sslopt=sslopt)
                 finally:
                     with self._ws_lock:
                         self._ws = None
