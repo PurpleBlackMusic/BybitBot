@@ -181,6 +181,56 @@ def _handle_post_update_hooks(
 _TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
 _FALSE_STRINGS = {"0", "false", "no", "n", "off"}
 
+_NETWORK_ALIAS_GROUPS: dict[bool, tuple[str, ...]] = {
+    True: ("test", "testnet", "demo", "paper", "sandbox"),
+    False: ("prod", "production", "main", "mainnet", "live"),
+}
+
+_NETWORK_ALIAS_MAP: dict[str, bool] = {
+    alias: is_testnet
+    for is_testnet, aliases in _NETWORK_ALIAS_GROUPS.items()
+    for alias in aliases
+}
+_NETWORK_ENV_KEYS = ("BYBIT_ENV", "ENV")
+
+NETWORK_ALIAS_CHOICES: tuple[str, ...] = tuple(
+    alias
+    for is_testnet in (True, False)
+    for alias in _NETWORK_ALIAS_GROUPS[is_testnet]
+)
+"""Canonical list of CLI choices, preserving the human-friendly ordering."""
+
+
+def normalise_network_choice(choice: object | None, *, strict: bool = False) -> bool | None:
+    """Return ``True`` for testnet, ``False`` for mainnet or ``None`` when unknown."""
+
+    if choice is None:
+        return None
+
+    if isinstance(choice, bool):
+        return choice
+
+    if isinstance(choice, str):
+        marker = choice.strip().lower()
+    else:
+        marker = str(choice).strip().lower()
+
+    if not marker:
+        return None
+
+    alias_match = _NETWORK_ALIAS_MAP.get(marker)
+    if alias_match is not None:
+        return alias_match
+
+    if marker in _TRUE_STRINGS:
+        return True
+    if marker in _FALSE_STRINGS:
+        return False
+
+    if strict:
+        raise ValueError(f"unknown network marker: {choice!r}")
+    return None
+
 
 def _network_field(base: str, testnet: bool) -> str:
     return f"{base}_{'testnet' if testnet else 'mainnet'}"
@@ -802,7 +852,17 @@ _ENV_MAP = {
 
 
 def _read_env() -> Dict[str, Optional[str]]:
-    return {k: os.getenv(v) for k, v in _ENV_MAP.items()}
+    env = {k: os.getenv(v) for k, v in _ENV_MAP.items()}
+
+    marker: Optional[str] = None
+    for env_name in _NETWORK_ENV_KEYS:
+        value = os.getenv(env_name)
+        if value is not None:
+            marker = value
+            break
+
+    env["__network_marker__"] = marker
+    return env
 
 
 def _normalise_symbol_csv(value: object) -> Optional[str]:
@@ -889,6 +949,13 @@ def _env_overrides(raw_env: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, 
     _bulk_cast(m, _BOOL_ENV_KEYS, _cast_bool)
     _bulk_cast(m, _INT_ENV_KEYS, _cast_int)
     _bulk_cast(m, _FLOAT_ENV_KEYS, _cast_float)
+
+    marker_value = m.get("__network_marker__")
+    marker_flag = normalise_network_choice(marker_value)
+    if marker_flag is not None:
+        m["testnet"] = marker_flag
+
+    m.pop("__network_marker__", None)
 
     streak_limit = m.get("ai_kill_switch_loss_streak")
     if streak_limit is not None and streak_limit < 0:

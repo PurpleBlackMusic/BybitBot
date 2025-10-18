@@ -37,7 +37,13 @@ from .ai_thresholds import (
     min_change_from_ev_bps,
     resolve_min_ev_from_settings,
 )
-from .envs import Settings, active_dry_run, get_settings, get_api_client
+from .envs import (
+    Settings,
+    active_dry_run,
+    get_settings,
+    get_api_client,
+    normalise_network_choice,
+)
 from .settings_loader import call_get_settings
 from .paths import DATA_DIR
 from .pnl import _ledger_path_for
@@ -151,19 +157,10 @@ class GuardianBot:
 
     @staticmethod
     def _normalise_network_marker(value: object) -> Optional[str]:
-        if isinstance(value, bool):
-            return "testnet" if value else "mainnet"
-
-        if isinstance(value, str):
-            cleaned = value.strip().lower()
-            if cleaned in {"testnet", "mainnet"}:
-                return cleaned
-            if cleaned in {"true", "1", "yes", "on"}:
-                return "testnet"
-            if cleaned in {"false", "0", "no", "off"}:
-                return "mainnet"
-
-        return None
+        flag = normalise_network_choice(value)
+        if flag is None:
+            return None
+        return "testnet" if flag else "mainnet"
 
     @classmethod
     def status_filename(cls, *, network: object | None = None) -> str:

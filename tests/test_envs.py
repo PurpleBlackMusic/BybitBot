@@ -10,6 +10,35 @@ from bybit_app.utils import envs
 import bybit_app.utils.bybit_api as bybit_api_module
 
 
+def test_network_alias_choices_cover_known_markers() -> None:
+    assert "sandbox" in envs.NETWORK_ALIAS_CHOICES
+    assert "testnet" in envs.NETWORK_ALIAS_CHOICES
+    assert "mainnet" in envs.NETWORK_ALIAS_CHOICES
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("test", True),
+        ("sandbox", True),
+        ("prod", False),
+        ("MainNet", False),
+        (True, True),
+        (False, False),
+        (None, None),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_normalise_network_choice_handles_aliases(value: object, expected: bool | None) -> None:
+    assert envs.normalise_network_choice(value) is expected
+
+
+def test_normalise_network_choice_strict_mode_raises() -> None:
+    with pytest.raises(ValueError):
+        envs.normalise_network_choice("universe", strict=True)
+
+
 def _write_settings(settings_file: Path, payload: dict) -> None:
     settings_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -38,6 +67,8 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         "BYBIT_API_SECRET_TESTNET",
         "BYBIT_DRY_RUN_MAINNET",
         "BYBIT_DRY_RUN_TESTNET",
+        "BYBIT_ENV",
+        "ENV",
     )
 
     for key in tracked_env:
@@ -167,6 +198,29 @@ def test_mainnet_autoswitch_disables_only_mainnet(isolated_settings: Path) -> No
     assert os.getenv("BYBIT_API_SECRET_MAINNET") == "SECRET"
     assert os.getenv("BYBIT_API_KEY") == "MAIN"
     assert os.getenv("BYBIT_API_SECRET") == "SECRET"
+
+
+def test_bybit_env_alias_overrides_boolean_flag(
+    isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BYBIT_TESTNET", "0")
+    monkeypatch.setenv("BYBIT_ENV", "test")
+    envs._invalidate_cache()
+
+    settings = envs.get_settings(force_reload=True)
+    assert settings.testnet is True
+
+
+def test_env_alias_supports_prod(
+    isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BYBIT_ENV", raising=False)
+    monkeypatch.setenv("BYBIT_TESTNET", "1")
+    monkeypatch.setenv("ENV", "prod")
+    envs._invalidate_cache()
+
+    settings = envs.get_settings(force_reload=True)
+    assert settings.testnet is False
 
 
 def test_legacy_config_migrates_on_save(isolated_settings: Path) -> None:
