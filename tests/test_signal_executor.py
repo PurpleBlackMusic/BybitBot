@@ -4674,6 +4674,7 @@ def test_liquidity_guard_skips_on_recent_spread_violation() -> None:
         ai_risk_per_trade_pct=1.0,
         spot_cash_reserve_pct=0.0,
         ai_spread_compression_window_sec=5.0,
+        ai_max_spread_bps=40.0,
     )
     bot = StubBot(summary, settings)
 
