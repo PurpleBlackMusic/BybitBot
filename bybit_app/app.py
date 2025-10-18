@@ -1159,7 +1159,6 @@ def main() -> None:
             on_success=[_trigger_refresh],
             key_prefix="quick_trade",
             compact=True,
-            submit_label="Отправить ордер",
         )
 
         st.divider()

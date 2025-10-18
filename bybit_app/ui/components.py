@@ -561,7 +561,7 @@ def trade_ticket(
 ) -> None:
     """Render an interactive trade ticket tied to ``place_spot_market_with_tolerance``."""
 
-    heading = "⚡ Быстрый ордер" if compact else "🛒 Торговый ордер"
+    heading = "⚡ Быстрый ордер" if compact else "🛒 Ордер"
     st.subheader(heading)
     if on_success is None:
         on_success = []
@@ -579,7 +579,7 @@ def trade_ticket(
 
     help_suffix = "" if compact else "Например BTCUSDT"
     form_key = f"{key_prefix}-ticket-form" if key_prefix else "trade-ticket-form"
-    submit_text = submit_label or ("Отправить" if compact else "Разместить ордер")
+    submit_text = submit_label or ("Отправить" if compact else "Разместить маркет-ордер")
 
     with st.form(form_key):
         symbol = st.text_input("Тикер", value=defaults["symbol"], help=help_suffix or None)
