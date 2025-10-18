@@ -1249,7 +1249,7 @@ def main() -> None:
         "min_probability": _state_float("signals_min_probability", 0.0),
     }
 
-    tabs = st.tabs(["Dashboard", "Signals", "Orders", "Wallet", "Settings", "Logs"])
+    tabs = st.tabs(["Обзор", "Сигналы", "Ордера", "Кошелёк", "Настройки", "Логи"])
 
     with tabs[0]:
         status_bar(
