@@ -1124,7 +1124,23 @@ def main() -> None:
     settings = get_settings()
 
     with st.sidebar:
-        st.header("🚀 Управление")
+        st.header("🚀 Быстрый ордер")
+        trade_ticket(
+            settings=settings,
+            client_factory=cached_api_client,
+            state=state,
+            on_success=[_trigger_refresh],
+            key_prefix="quick_trade",
+            compact=True,
+            submit_label="Отправить ордер",
+        )
+
+        st.divider()
+        st.header("🛡️ Пауза и Kill-Switch")
+        st.caption(
+            "Пауза временно приостанавливает сделки, а Kill-Switch останавливает бота до ручного "
+            "возобновления."
+        )
         kill_reason = st.text_input(
             "Комментарий",
             value=state.get("kill_reason", BASE_SESSION_STATE.get("kill_reason", "Manual kill-switch")),
@@ -1156,8 +1172,7 @@ def main() -> None:
                 activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
                 _trigger_refresh()
 
-        st.divider()
-        st.header("🛑 Kill-Switch")
+        st.subheader("🛑 Kill-Switch")
         kill_duration = st.number_input(
             "Kill-switch (мин)",
             min_value=1,
@@ -1165,22 +1180,13 @@ def main() -> None:
             step=5,
             value=int(state.get("kill_custom_minutes", BASE_SESSION_STATE.get("kill_custom_minutes", 60))),
             key="kill_custom_minutes",
+            help="Полная остановка до ручного включения, независимо от таймера паузы.",
         )
         if st.button("Активировать Kill-Switch", use_container_width=True):
             activate_kill_switch(float(kill_duration), kill_reason or "Manual kill-switch")
             _trigger_refresh()
         if kill_state.paused and not kill_state.until:
             st.caption("Kill-Switch активен до ручного возобновления.")
-
-        st.divider()
-        trade_ticket(
-            settings=settings,
-            client_factory=cached_api_client,
-            state=state,
-            on_success=[_trigger_refresh],
-            key_prefix="quick_trade",
-            compact=True,
-        )
 
         st.divider()
         st.header("🌐 Фильтры сигналов")
