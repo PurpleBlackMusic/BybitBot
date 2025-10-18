@@ -1,11 +1,16 @@
 from __future__ import annotations
 import hmac, hashlib, json, time, uuid
 from dataclasses import dataclass
+import asyncio
+import inspect
+import os
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextvars import copy_context
+from functools import lru_cache, partial, wraps
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 import threading
 import requests
-from functools import lru_cache
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
@@ -1358,6 +1363,149 @@ class BybitAPI:
         )
 
 
+_SHARED_EXECUTOR_LOCK = threading.Lock()
+_SHARED_EXECUTOR: ThreadPoolExecutor | None = None
+_SHARED_EXECUTOR_WORKERS: int | None = None
+
+
+def _default_executor_workers() -> int:
+    cpu_count = os.cpu_count() or 1
+    return max(4, min(32, cpu_count + 4))
+
+
+def _make_executor(max_workers: int) -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bybit-api-async")
+
+
+def _get_shared_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
+    """Return a module-level executor reused across async clients.
+
+    The executor grows to accommodate larger ``max_workers`` requests but will not
+    churn for smaller hints, keeping thread creation predictable while still
+    allowing integrations to opt into additional concurrency when required.
+    """
+
+    global _SHARED_EXECUTOR, _SHARED_EXECUTOR_WORKERS
+
+    target = max(1, int(max_workers)) if max_workers else _default_executor_workers()
+
+    to_shutdown: ThreadPoolExecutor | None = None
+
+    with _SHARED_EXECUTOR_LOCK:
+        if _SHARED_EXECUTOR is None:
+            _SHARED_EXECUTOR = _make_executor(target)
+            _SHARED_EXECUTOR_WORKERS = target
+        else:
+            current_workers = _SHARED_EXECUTOR_WORKERS or target
+            if target > current_workers:
+                to_shutdown = _SHARED_EXECUTOR
+                _SHARED_EXECUTOR = _make_executor(target)
+                _SHARED_EXECUTOR_WORKERS = target
+    if to_shutdown is not None:
+        to_shutdown.shutdown(wait=False)
+    # mypy does not realise the executor is initialised in the lock above.
+    assert _SHARED_EXECUTOR is not None
+    return _SHARED_EXECUTOR
+
+
+def reset_async_executor() -> None:
+    """Dispose of the shared executor (primarily for tests)."""
+
+    global _SHARED_EXECUTOR, _SHARED_EXECUTOR_WORKERS
+
+    with _SHARED_EXECUTOR_LOCK:
+        executor = _SHARED_EXECUTOR
+        _SHARED_EXECUTOR = None
+        _SHARED_EXECUTOR_WORKERS = None
+
+    if executor is not None:
+        executor.shutdown(wait=False)
+
+
+class AsyncBybitAPI:
+    """Thin ``asyncio`` wrapper around :class:`BybitAPI`.
+
+    The synchronous SDK performs blocking HTTP requests via ``requests``.
+    Wrapping it with a shared :class:`ThreadPoolExecutor` keeps the
+    well-tested implementation while allowing callers to await network-bound
+    operations without stalling the event loop.  Only callables are proxied –
+    attribute access falls back to the underlying client unchanged.
+    """
+
+    def __init__(
+        self,
+        api: BybitAPI,
+        *,
+        executor: Executor | None = None,
+        max_workers: int | None = None,
+    ) -> None:
+        if not isinstance(api, BybitAPI):
+            raise TypeError(
+                "AsyncBybitAPI expects a BybitAPI instance; "
+                f"got {type(api).__name__}"
+            )
+        self._api = api
+        self._call_cache: dict[str, object] = {}
+        self._executor: Executor | None = executor
+        self._max_workers = max_workers
+
+    @property
+    def sync_api(self) -> BybitAPI:
+        """Expose the underlying synchronous client for advanced use-cases."""
+
+        return self._api
+
+    def _ensure_executor(self) -> Executor:
+        if self._executor is None:
+            self._executor = _get_shared_executor(self._max_workers)
+        return self._executor
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial representation
+        return f"AsyncBybitAPI({self._api!r})"
+
+    def __getattr__(self, name: str):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+
+        cached = self._call_cache.get(name)
+        if cached is not None:
+            return cached
+
+        attr = getattr(self._api, name)
+
+        if not callable(attr) or inspect.iscoroutinefunction(attr) or inspect.isasyncgenfunction(attr):
+            return attr
+
+        @wraps(attr)
+        async def _async_call(*args, **kwargs):
+            loop = asyncio.get_running_loop()
+            executor = self._ensure_executor()
+            ctx = copy_context()
+            bound_call = partial(attr, *args, **kwargs)
+            return await loop.run_in_executor(executor, ctx.run, bound_call)
+
+        self._call_cache[name] = _async_call
+        return _async_call
+
+    async def close(self) -> None:
+        """Close the shared HTTP session without blocking the event loop."""
+
+        session = getattr(self._api, "session", None)
+        close = getattr(session, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)
+        try:
+            self._api.session = None
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
+
+    async def __aenter__(self) -> "AsyncBybitAPI":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+
 @lru_cache(maxsize=16)
 def _build_api(key: str, secret: str, testnet: bool, recv_window: int, timeout: int, verify_ssl: bool) -> BybitAPI:
     creds = BybitCreds(key=key, secret=secret, testnet=testnet)
@@ -1384,6 +1532,26 @@ def get_api(
         int(timeout),
         bool(verify_ssl),
     )
+
+
+def get_async_api(
+    creds: BybitCreds,
+    recv_window: int = 15000,
+    timeout: int = 10000,
+    verify_ssl: bool = True,
+    *,
+    executor: Executor | None = None,
+    max_workers: int | None = None,
+) -> AsyncBybitAPI:
+    """Return an :class:`AsyncBybitAPI` wrapper around the cached client."""
+
+    sync_client = get_api(
+        creds,
+        recv_window=recv_window,
+        timeout=timeout,
+        verify_ssl=verify_ssl,
+    )
+    return AsyncBybitAPI(sync_client, executor=executor, max_workers=max_workers)
 
 
 def clear_api_cache() -> None:
@@ -1424,6 +1592,24 @@ def api_from_settings(settings: "Settings") -> BybitAPI:
         recv_window=int(getattr(settings, "recv_window_ms", 15000)),
         timeout=int(getattr(settings, "http_timeout_ms", 10000)),
         verify_ssl=settings.verify_ssl,
+    )
+
+
+def async_api_from_settings(
+    settings: "Settings",
+    *,
+    executor: Executor | None = None,
+    max_workers: int | None = None,
+) -> AsyncBybitAPI:
+    """Asynchronous variant of :func:`api_from_settings`."""
+
+    return get_async_api(
+        creds_from_settings(settings),
+        recv_window=int(getattr(settings, "recv_window_ms", 15000)),
+        timeout=int(getattr(settings, "http_timeout_ms", 10000)),
+        verify_ssl=settings.verify_ssl,
+        executor=executor,
+        max_workers=max_workers,
     )
 
 # --- metadata used by KillSwitch & API Nanny ---

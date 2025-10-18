@@ -1319,6 +1319,22 @@ def get_api_client(force_reload: bool = False):
     return client
 
 
+def get_async_api_client(
+    force_reload: bool = False,
+    *,
+    executor: "Executor" | None = None,
+    max_workers: int | None = None,
+):
+    """Return an ``AsyncBybitAPI`` wrapper for integration with asyncio code."""
+
+    from .bybit_api import AsyncBybitAPI
+
+    sync_client = get_api_client(force_reload=force_reload)
+    if sync_client is None:
+        return None
+    return AsyncBybitAPI(sync_client, executor=executor, max_workers=max_workers)
+
+
 def active_api_key(settings: Any) -> str:
     getter = getattr(settings, "get_api_key", None)
     if callable(getter):
