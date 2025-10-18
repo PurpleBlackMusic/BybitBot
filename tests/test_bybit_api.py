@@ -13,7 +13,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import bybit_app.utils.bybit_api as bybit_api_module
-from bybit_app.utils.bybit_api import BybitAPI, BybitCreds
+from bybit_app.utils.bybit_api import (
+    BybitAPI,
+    BybitCreds,
+    _RetryableRequestError,
+    _compute_retry_delay,
+)
 from bybit_app.utils.time_sync import SyncedTimestamp
 from bybit_app.utils.helpers import ensure_link_id
 
@@ -194,6 +199,14 @@ def test_batch_cancel_rejects_empty_payload() -> None:
         api.batch_cancel(category="spot", request=[])
 
     assert "non-empty" in str(excinfo.value)
+
+
+def test_retryable_error_normalises_retry_after() -> None:
+    err = _RetryableRequestError("boom", meta={"retry_after": "2.5"})
+
+    assert err.retry_after == pytest.approx(2.5)
+    assert err.meta["retry_after"] == pytest.approx(2.5)
+    assert err.meta["retry_after_seconds"] == pytest.approx(2.5)
 
 
 def test_batch_cancel_rejects_non_mapping_entries() -> None:

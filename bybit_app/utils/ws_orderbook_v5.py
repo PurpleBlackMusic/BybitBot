@@ -94,6 +94,10 @@ class WSOrderbookV5:
                         on_error=lambda w, e: log("ws.orderbook.error", err=str(e)),
                         on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m),
                     )
+                    try:
+                        ws.sslopt = sslopt  # type: ignore[attr-defined]
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                     self._ws = ws
                     ws.run_forever(sslopt=sslopt)
                 except Exception as e:
