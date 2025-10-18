@@ -94,6 +94,13 @@ class BackgroundServices:
         self._preflight_last_run: float = 0.0
         self._preflight_error: Optional[str] = None
 
+        # watchdog loop keeping critical services alive
+        self._watchdog_lock = threading.Lock()
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop_event: Optional[threading.Event] = None
+        self._watchdog_interval = 30.0
+        self._watchdog_backoff_cap = 120.0
+
     # ------------------------------------------------------------------
     # Lifecycle
     def ensure_started(self) -> None:
@@ -110,6 +117,7 @@ class BackgroundServices:
 
         self.ensure_automation_loop()
         self.ensure_guardian_worker()
+        self._ensure_watchdog()
 
     def _await_private_ready(self, timeout: float | None = None) -> bool:
         """Wait until the private websocket reports a fresh heartbeat."""
@@ -527,6 +535,86 @@ class BackgroundServices:
 
     def restart_guardian_worker(self) -> bool:
         return self.ensure_guardian_worker(force=True)
+
+    # ------------------------------------------------------------------
+    # Watchdog supervision
+    def _ensure_watchdog(self) -> None:
+        with self._watchdog_lock:
+            thread = self._watchdog_thread
+            if thread and thread.is_alive():
+                return
+
+            stop_event = threading.Event()
+            self._watchdog_stop_event = stop_event
+
+            thread = threading.Thread(
+                target=self._watchdog_loop,
+                args=(stop_event,),
+                name="background-watchdog",
+                daemon=True,
+            )
+            self._watchdog_thread = thread
+            thread.start()
+
+    def _watchdog_loop(self, stop_event: threading.Event) -> None:
+        interval = max(float(self._watchdog_interval), 0.5)
+        backoff = 0.0
+        log("background.watchdog.start", interval=interval)
+        try:
+            while not stop_event.is_set():
+                if backoff > 0.0:
+                    wait_for = min(backoff, self._watchdog_backoff_cap)
+                    if stop_event.wait(timeout=wait_for):
+                        break
+                try:
+                    self._watchdog_tick()
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    log("background.watchdog.error", err=str(exc))
+                    backoff = min(max(backoff * 2.0, 5.0), self._watchdog_backoff_cap)
+                else:
+                    backoff = 0.0
+
+                if stop_event.wait(timeout=interval):
+                    break
+        finally:
+            log("background.watchdog.stop")
+
+    def _watchdog_tick(self) -> None:
+        try:
+            ws_ok = self.ensure_ws_started()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("background.watchdog.ws_error", err=str(exc))
+        else:
+            if not ws_ok:
+                log("background.watchdog.ws_unhealthy")
+
+        try:
+            automation_ok = self.ensure_automation_loop()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("background.watchdog.automation_error", err=str(exc))
+        else:
+            if not automation_ok:
+                log("background.watchdog.automation_unhealthy")
+
+        try:
+            self.ensure_guardian_worker()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            log("background.watchdog.guardian_error", err=str(exc))
+
+    def shutdown(self, *, timeout: float | None = None) -> None:
+        with self._watchdog_lock:
+            stop_event = self._watchdog_stop_event
+            thread = self._watchdog_thread
+            self._watchdog_stop_event = None
+            self._watchdog_thread = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None:
+            try:
+                if thread is not threading.current_thread():
+                    thread.join(timeout=timeout)
+            except Exception:  # pragma: no cover - defensive guard
+                pass
 
     # ------------------------------------------------------------------
     # Automation
@@ -1035,3 +1123,7 @@ def request_guardian_refresh() -> None:
 
 def get_ws_events(*, since: int | None = None, limit: int | None = 100) -> Dict[str, Any]:
     return _state.ws_events(since=since, limit=limit)
+
+
+def shutdown_background_services(*, timeout: float | None = None) -> None:
+    _state.shutdown(timeout=timeout)
