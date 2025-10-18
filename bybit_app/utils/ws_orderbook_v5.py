@@ -1,15 +1,30 @@
 
 from __future__ import annotations
-import json, time, threading
+
+import json
+import threading
+import time
 from typing import Dict, Iterable, List, Tuple
-from .log import log
+from weakref import WeakSet
+
 from .envs import get_settings
+from .log import log
+
+_ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
     Processes snapshot + delta per official rules. Fallback to REST must be handled by caller.
     """
     def __init__(self, url: str = "wss://stream.bybit.com/v5/public/spot", levels: int = 200):
+        for existing in list(_ACTIVE_ORDERBOOKS):
+            if existing is None or existing is self:
+                continue
+            try:
+                existing.stop()
+            except Exception:
+                pass
+        _ACTIVE_ORDERBOOKS.add(self)
         self.url = url
         self.levels = levels
         self._book: Dict[str, Dict[str, List[Tuple[float,float]]]] = {}  # {sym: {'b':[(px,qty)], 'a':[]}, 'ts': ms}

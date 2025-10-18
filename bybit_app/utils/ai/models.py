@@ -19,6 +19,7 @@ from ..trade_analytics import ExecutionRecord, load_executions
 from ..log import log
 
 MODEL_FILENAME = "model.joblib"
+_MODEL_CACHE: Dict[Path, Tuple[float, "MarketModel"]] = {}
 MODEL_FEATURES: Tuple[str, ...] = (
     "directional_change_pct",
     "multiframe_change_pct",
@@ -43,6 +44,19 @@ MODEL_FEATURES: Tuple[str, ...] = (
 
 class StandardScaler:
     """Lightweight replacement for ``sklearn.preprocessing.StandardScaler``."""
+
+    __slots__ = (
+        "with_mean",
+        "with_std",
+        "epsilon",
+        "n_features_in_",
+        "n_samples_seen_",
+        "_sum_",
+        "_sum_sq_",
+        "mean_",
+        "scale_",
+        "var_",
+    )
 
     def __init__(
         self,
@@ -157,6 +171,8 @@ class StandardScaler:
 
 class Pipeline:
     """Minimal pipeline implementation supporting fit/predict workflows."""
+
+    __slots__ = ("steps", "named_steps")
 
     def __init__(self, steps: Sequence[Tuple[str, object]]):
         if not steps:
@@ -325,7 +341,7 @@ def feature_vector_from_map(features: Mapping[str, float]) -> List[float]:
     return [float(features.get(name, 0.0)) for name in MODEL_FEATURES]
 
 
-@dataclass
+@dataclass(slots=True)
 class MarketModel:
     """Persisted pipeline wrapper used for inference in the market scanner."""
 
@@ -1574,6 +1590,19 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
     if not model_path.exists():
         return None
     try:
+        stat_result = model_path.stat()
+        mtime = getattr(stat_result, "st_mtime_ns", None)
+        if mtime is None:
+            mtime = stat_result.st_mtime
+    except OSError:
+        return None
+
+    resolved_path = model_path.resolve()
+    cached = _MODEL_CACHE.get(resolved_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    try:
         payload = joblib.load(model_path)
     except Exception:
         return None
@@ -1591,7 +1620,7 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
     if not isinstance(pipeline, Pipeline):
         return None
 
-    return MarketModel(
+    model = MarketModel(
         feature_names=feature_names,
         pipeline=pipeline,
         trained_at=trained_at,
@@ -1599,6 +1628,9 @@ def load_model(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Opt
         training_metrics=training_metrics,
         feature_stats=feature_stats,
     )
+
+    _MODEL_CACHE[resolved_path] = (mtime, model)
+    return model
 
 
 def save_model(model: MarketModel, path: Optional[Path] = None, *, data_dir: Path = DATA_DIR) -> Path:
@@ -1615,7 +1647,28 @@ def save_model(model: MarketModel, path: Optional[Path] = None, *, data_dir: Pat
         "feature_stats": dict(model.feature_stats),
     }
     joblib.dump(payload, resolved)
+    try:
+        stat_result = resolved.stat()
+        mtime = getattr(stat_result, "st_mtime_ns", None)
+        if mtime is None:
+            mtime = stat_result.st_mtime
+        _MODEL_CACHE[resolved.resolve()] = (mtime, model)
+    except OSError:
+        _MODEL_CACHE.pop(resolved.resolve(), None)
     return resolved
+
+
+def clear_model_cache(path: Optional[Path] = None) -> None:
+    """Invalidate cached models used for quick reloads."""
+
+    if path is None:
+        _MODEL_CACHE.clear()
+        return
+    try:
+        resolved = Path(path).resolve()
+    except Exception:
+        return
+    _MODEL_CACHE.pop(resolved, None)
 
 
 def model_is_stale(path: Optional[Path] = None, *, data_dir: Path = DATA_DIR, max_age: float = 3600.0) -> bool:
