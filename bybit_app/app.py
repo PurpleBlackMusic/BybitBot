@@ -49,6 +49,7 @@ from bybit_app.ui.state import (
     cached_preflight_snapshot,
     cached_ws_snapshot,
     clear_data_caches,
+    get_auto_refresh_holds,
     ensure_keys,
 )
 from bybit_app.ui.components import (
@@ -199,10 +200,16 @@ def render_status(settings) -> None:
             f"API key: {'✅' if api_key_value else '❌'} · Secret: {'✅' if api_secret_value else '❌'} · Настройки обновлены: {last_update}"
         )
 
-        if not ok:
-            st.warning(
-                "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
-            )
+    if not ok:
+        st.warning(
+            "Без API ключей бот не сможет размещать ордера. Перейдите в раздел «Подключение» и добавьте их."
+        )
+        navigation_link(
+            "pages/00_✅_Подключение_и_Состояние.py",
+            label="Настроить подключение",
+            icon="🔌",
+            key="dashboard_setup_link",
+        )
 
 
 def _format_seconds_ago(value: object | None) -> str:
@@ -843,11 +850,24 @@ def render_onboarding() -> None:
 
 def render_shortcuts() -> None:
     st.subheader("Основные разделы")
+    st.caption(
+        "Не знаете, где искать нужный инструмент? Эти кнопки откроют ключевые рабочие страницы."
+    )
     shortcuts = [
         (
             "🔌 Подключение",
             "pages/00_✅_Подключение_и_Состояние.py",
             "API ключи, проверка связи и режим DRY-RUN.",
+        ),
+        (
+            "⚙️ Настройки",
+            "pages/02_⚙️_Настройки.py",
+            "Порог сигналов, торговые режимы и лимиты риска.",
+        ),
+        (
+            "🛡 Риск-менеджмент",
+            "pages/05_🧮_Portfolio_Risk_Spot.py",
+            "Контроль экспозиции и баланс портфеля.",
         ),
         (
             "🧭 Простой режим",
@@ -1103,6 +1123,7 @@ def main() -> None:
 
     auto_enabled = bool(state.get("auto_refresh_enabled", BASE_SESSION_STATE["auto_refresh_enabled"]))
     refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE["refresh_interval"]))
+    auto_holds = get_auto_refresh_holds(state)
 
     def _trigger_refresh(*, delay: float = 0.0) -> None:
         clear_data_caches()
@@ -1113,7 +1134,23 @@ def main() -> None:
     settings = get_settings()
 
     with st.sidebar:
-        st.header("🚀 Управление")
+        st.header("🚀 Быстрый ордер")
+        trade_ticket(
+            settings=settings,
+            client_factory=cached_api_client,
+            state=state,
+            on_success=[_trigger_refresh],
+            key_prefix="quick_trade",
+            compact=True,
+            submit_label="Отправить ордер",
+        )
+
+        st.divider()
+        st.header("🛡️ Пауза и Kill-Switch")
+        st.caption(
+            "Пауза временно приостанавливает сделки, а Kill-Switch останавливает бота до ручного "
+            "возобновления."
+        )
         kill_reason = st.text_input(
             "Комментарий",
             value=state.get("kill_reason", BASE_SESSION_STATE.get("kill_reason", "Manual kill-switch")),
@@ -1146,8 +1183,7 @@ def main() -> None:
                 activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
                 _trigger_refresh()
 
-        st.divider()
-        st.header("🛑 Kill-Switch")
+        st.subheader("🛑 Kill-Switch")
         kill_duration = st.number_input(
             "Kill-switch: длительность паузы (мин)",
             min_value=1,
@@ -1233,8 +1269,15 @@ def main() -> None:
             _trigger_refresh()
         if not auto_enabled:
             st.caption("Автообновление отключено — используйте ручное обновление при необходимости.")
+        elif auto_holds:
+            st.caption(
+                "Автообновление временно приостановлено: "
+                + "; ".join(auto_holds)
+            )
 
-    if auto_enabled:
+    effective_auto_refresh = auto_enabled and not auto_holds
+
+    if effective_auto_refresh:
         auto_refresh(refresh_interval, key="home_auto_refresh_v2")
 
     guardian_snapshot = cached_guardian_snapshot()
@@ -1284,7 +1327,7 @@ def main() -> None:
         "min_probability": _state_float("signals_min_probability", 0.0),
     }
 
-    tabs = st.tabs(["Dashboard", "Signals", "Orders", "Wallet", "Settings", "Logs"])
+    tabs = st.tabs(["Обзор", "Сигналы", "Ордера", "Кошелёк", "Настройки", "Логи"])
 
     with tabs[0]:
         status_bar(
@@ -1299,6 +1342,7 @@ def main() -> None:
             st.info(
                 "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
             )
+        render_shortcuts()
         st.markdown("### Быстрые действия")
         if actions:
             for action in actions:
