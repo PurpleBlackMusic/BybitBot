@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from bybit_app.utils import envs
+import bybit_app.utils.bybit_api as bybit_api_module
 
 
 def _write_settings(settings_file: Path, payload: dict) -> None:
@@ -213,3 +214,26 @@ def test_validate_runtime_credentials_allows_dry_run(isolated_settings: Path) ->
 
     # Should not raise when both networks are in dry-run mode.
     envs.validate_runtime_credentials(settings)
+
+
+def test_get_async_api_client_wraps_sync_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    sync_client = bybit_api_module.BybitAPI(
+        bybit_api_module.BybitCreds(key="key", secret="sec", testnet=True)
+    )
+
+    def fake_get_api_client(*, force_reload: bool = False):
+        assert force_reload is False
+        return sync_client
+
+    monkeypatch.setattr(envs, "get_api_client", fake_get_api_client)
+
+    async_client = envs.get_async_api_client()
+
+    assert isinstance(async_client, bybit_api_module.AsyncBybitAPI)
+    assert async_client.sync_api is sync_client
+
+
+def test_get_async_api_client_returns_none_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(envs, "get_api_client", lambda force_reload=False: None)
+
+    assert envs.get_async_api_client() is None

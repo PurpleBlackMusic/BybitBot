@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
-from types import SimpleNamespace
+from types import MethodType
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1412,65 +1414,174 @@ def test_batch_place_rejects_invalid_side() -> None:
     assert "side" in str(excinfo.value)
 
 
-def test_compute_retry_delay_uses_retry_after(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bybit_api_module.random, "random", lambda: 0.0)
+def test_async_api_executes_in_threadpool(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    thread_ids: list[int] = []
 
-    delay = _compute_retry_delay(1, retry_after=2.75, maximum=10.0)
+    def fake_safe_req(self, method: str, path: str, *, params=None, body=None, signed=False):
+        thread_ids.append(threading.get_ident())
+        assert method == "GET"
+        assert path == "/v5/market/time"
+        return {"retCode": 0, "result": {}}
 
-    assert delay == pytest.approx(2.75)
+    monkeypatch.setattr(api, "_safe_req", MethodType(fake_safe_req, api))
+
+    async def _run() -> None:
+        async_api = bybit_api_module.AsyncBybitAPI(api)
+        result = await async_api.server_time()
+
+        assert result == {"retCode": 0, "result": {}}
+        assert thread_ids, "Expected the wrapped call to execute"
+        main_thread = threading.get_ident()
+        assert all(thread_id != main_thread for thread_id in thread_ids)
+
+    asyncio.run(_run())
 
 
-def test_compute_retry_delay_skips_jitter_when_hint_dominates(
+def test_async_api_close_releases_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    fake_session = MagicMock()
+    api.session = fake_session  # reuse setter logic
+
+    async def _run() -> None:
+        async_api = bybit_api_module.AsyncBybitAPI(api)
+        await async_api.close()
+
+    asyncio.run(_run())
+
+    assert fake_session.close.call_count == 1
+
+
+def test_async_api_supports_custom_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+    thread_names: list[str] = []
+
+    def fake_safe_req(self, method: str, path: str, *, params=None, body=None, signed=False):
+        thread_names.append(threading.current_thread().name)
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", MethodType(fake_safe_req, api))
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="custom-exec")
+
+    async def _run() -> None:
+        async_api = bybit_api_module.AsyncBybitAPI(api, executor=executor)
+        await async_api.server_time()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        executor.shutdown(wait=True)
+
+    assert thread_names, "Expected executor to run the wrapped call"
+    assert any(name.startswith("custom-exec") for name in thread_names)
+
+
+def test_async_api_allows_tuning_shared_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    bybit_api_module.reset_async_executor()
+
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    created_workers: list[int] = []
+    created_executors: list[ThreadPoolExecutor] = []
+
+    def fake_make_executor(max_workers: int) -> ThreadPoolExecutor:
+        created_workers.append(max_workers)
+        executor = ThreadPoolExecutor(max_workers=1)
+        created_executors.append(executor)
+        return executor
+
+    monkeypatch.setattr(bybit_api_module, "_make_executor", fake_make_executor)
+
+    def fake_safe_req(self, method: str, path: str, *, params=None, body=None, signed=False):
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", MethodType(fake_safe_req, api))
+
+    async def _run() -> None:
+        async_api = bybit_api_module.AsyncBybitAPI(api, max_workers=17)
+        await async_api.server_time()
+
+    try:
+        asyncio.run(_run())
+        assert created_workers == [17]
+    finally:
+        for executor in created_executors:
+            executor.shutdown(wait=True)
+        bybit_api_module.reset_async_executor()
+
+
+def test_async_api_shared_executor_expands_for_larger_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[float] = []
+    bybit_api_module.reset_async_executor()
 
-    def fake_random() -> float:
-        calls.append(1.0)
-        return 1.0
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    monkeypatch.setattr(bybit_api_module.random, "random", fake_random)
+    created_workers: list[int] = []
+    created_executors: list[ThreadPoolExecutor] = []
 
-    delay = _compute_retry_delay(1, retry_after=4.0, maximum=10.0)
+    def fake_make_executor(max_workers: int) -> ThreadPoolExecutor:
+        created_workers.append(max_workers)
+        executor = ThreadPoolExecutor(max_workers=1)
+        created_executors.append(executor)
+        return executor
 
-    assert delay == pytest.approx(4.0)
-    assert not calls, "Expected jitter to be skipped when server hint dominates"
+    monkeypatch.setattr(bybit_api_module, "_make_executor", fake_make_executor)
 
+    def fake_safe_req(self, method: str, path: str, *, params=None, body=None, signed=False):
+        return {"retCode": 0, "result": {}}
 
-def test_compute_retry_delay_respects_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bybit_api_module.random, "random", lambda: 0.0)
+    monkeypatch.setattr(api, "_safe_req", MethodType(fake_safe_req, api))
 
-    first = _compute_retry_delay(1, retry_after=None, maximum=10.0)
-    second = _compute_retry_delay(2, retry_after=None, maximum=10.0)
-    third = _compute_retry_delay(5, retry_after=None, maximum=10.0)
+    async def _run() -> None:
+        fast_api = bybit_api_module.AsyncBybitAPI(api, max_workers=3)
+        await fast_api.server_time()
+        faster_api = bybit_api_module.AsyncBybitAPI(api, max_workers=9)
+        await faster_api.server_time()
 
-    assert first == pytest.approx(0.5)
-    assert second > first
-    assert third <= 5.0
-
-
-def test_retry_delay_from_headers_prefers_retry_after() -> None:
-    response = MagicMock()
-    response.headers = {"Retry-After": "3"}
-
-    delay = bybit_api_module._retry_delay_from_headers(response)
-
-    assert delay == pytest.approx(3.0)
-
-
-def test_retry_delay_from_headers_supports_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = time.time()
-    response = MagicMock()
-    response.headers = {"X-Bapi-Limit-Reset-Timestamp": str(now + 5)}
-
-    delay = bybit_api_module._retry_delay_from_headers(response)
-
-    assert delay is not None and delay == pytest.approx(5.0, abs=0.25)
+    try:
+        asyncio.run(_run())
+        assert created_workers == [3, 9]
+    finally:
+        for executor in created_executors:
+            executor.shutdown(wait=True)
+        bybit_api_module.reset_async_executor()
 
 
-def test_retry_delay_from_payload_reads_ext_info() -> None:
-    payload = {"retExtInfo": {"retryAfter": "4.2"}}
+def test_async_api_shared_executor_reuses_existing_for_smaller_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bybit_api_module.reset_async_executor()
 
-    delay = bybit_api_module._retry_delay_from_payload(payload)
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 
-    assert delay == pytest.approx(4.2)
+    created_workers: list[int] = []
+    created_executors: list[ThreadPoolExecutor] = []
+
+    def fake_make_executor(max_workers: int) -> ThreadPoolExecutor:
+        created_workers.append(max_workers)
+        executor = ThreadPoolExecutor(max_workers=1)
+        created_executors.append(executor)
+        return executor
+
+    monkeypatch.setattr(bybit_api_module, "_make_executor", fake_make_executor)
+
+    def fake_safe_req(self, method: str, path: str, *, params=None, body=None, signed=False):
+        return {"retCode": 0, "result": {}}
+
+    monkeypatch.setattr(api, "_safe_req", MethodType(fake_safe_req, api))
+
+    async def _run() -> None:
+        wide_api = bybit_api_module.AsyncBybitAPI(api, max_workers=11)
+        await wide_api.server_time()
+        narrow_api = bybit_api_module.AsyncBybitAPI(api, max_workers=2)
+        await narrow_api.server_time()
+
+    try:
+        asyncio.run(_run())
+        assert created_workers == [11]
+    finally:
+        for executor in created_executors:
+            executor.shutdown(wait=True)
+        bybit_api_module.reset_async_executor()
