@@ -115,6 +115,37 @@ class ExecutionResult:
     order: Optional[Dict[str, object]] = None
     response: Optional[Dict[str, object]] = None
     context: Optional[Dict[str, object]] = None
+
+
+@dataclass(slots=True)
+class SignalExecutionContext:
+    summary: Dict[str, object]
+    settings: Settings
+    now: float
+    performance_snapshot: Optional[TradePerformanceSnapshot]
+    summary_meta: Optional[Tuple[float, float]]
+    price_meta: Optional[Tuple[float, float]]
+    api: Optional[BybitAPI]
+    wallet_totals: Tuple[float, float]
+    quote_wallet_cap: Optional[float]
+    wallet_meta: Optional[Mapping[str, object]]
+    forced_exit_meta: Optional[Dict[str, object]]
+    total_equity: float
+    available_equity: float
+    equity_for_limits: Optional[float]
+    forced_summary_applied: bool = False
+
+
+@dataclass(slots=True)
+class TradePreparation:
+    symbol: str
+    side: str
+    symbol_meta: Optional[Mapping[str, object]]
+    summary_price_snapshot: Optional[Mapping[str, object]]
+    summary_meta: Optional[Tuple[float, float]]
+    price_meta: Optional[Tuple[float, float]]
+
+
 class SignalExecutor:
     """Translate Guardian summaries into real trading actions."""
 
@@ -1898,8 +1929,8 @@ class SignalExecutor:
 
         return forced_summary, metadata
 
-    def execute_once(self) -> ExecutionResult:
-        """Process the most recent summary and submit orders when actionable."""
+    def _prepare_context(self) -> SignalExecutionContext | ExecutionResult:
+        """Collect summary, wallet, and guard state before trading."""
 
         self._spot_inventory_snapshot = None
         summary = self._fetch_summary()
@@ -1910,6 +1941,7 @@ class SignalExecutor:
         self._maybe_log_daily_pnl(settings, now=now)
         summary_meta = self._resolve_summary_update_meta(summary, now)
         price_meta = self._resolve_price_update_meta(summary, now)
+
         guard = self._kill_switch_guard()
         if guard is not None:
             message, context = guard
@@ -1961,9 +1993,10 @@ class SignalExecutor:
             price_meta=price_meta,
             portfolio_total_equity=equity_for_limits,
         )
-        forced_exit_meta = forced_meta
+        forced_summary_applied = False
         if forced_summary is not None:
             summary = forced_summary
+            forced_summary_applied = True
             summary_meta = self._resolve_summary_update_meta(summary, now)
             price_meta = self._resolve_price_update_meta(summary, now)
         elif not summary.get("actionable"):
@@ -1991,6 +2024,32 @@ class SignalExecutor:
         )
         if guard_result is not None:
             return guard_result
+
+        return SignalExecutionContext(
+            summary=summary,
+            settings=settings,
+            now=now,
+            performance_snapshot=performance_snapshot,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+            api=api,
+            wallet_totals=wallet_totals,
+            quote_wallet_cap=quote_wallet_cap,
+            wallet_meta=wallet_meta,
+            forced_exit_meta=forced_meta,
+            total_equity=total_equity,
+            available_equity=available_equity,
+            equity_for_limits=equity_for_limits,
+            forced_summary_applied=forced_summary_applied,
+        )
+
+    def _prepare_trade(
+        self, context: SignalExecutionContext
+    ) -> TradePreparation | ExecutionResult:
+        """Resolve symbol selection and market snapshots for execution."""
+
+        summary = context.summary
+        settings = context.settings
 
         mode = str(summary.get("mode") or "").lower()
         if mode not in {"buy", "sell"}:
@@ -2028,10 +2087,10 @@ class SignalExecutor:
                 and math.isfinite(last_updated)
             ):
                 cooldown_expires = last_updated + cooldown_ttl
-                if math.isfinite(cooldown_expires) and now < cooldown_expires:
-                    remaining = max(cooldown_expires - now, 0.0)
+                if math.isfinite(cooldown_expires) and context.now < cooldown_expires:
+                    remaining = max(cooldown_expires - context.now, 0.0)
                     minutes = remaining / 60.0
-                    context = {
+                    cooldown_context = {
                         "validation_code": "price_limit_backoff",
                         "price_limit_backoff": dict(backoff_state),
                         "quarantine_ttl": cooldown_ttl,
@@ -2041,12 +2100,14 @@ class SignalExecutor:
                         "Ордер пропущен (price_limit_backoff): "
                         "ждём восстановления ликвидности ≈{duration:.1f} мин"
                     ).format(duration=minutes)
-                    return self._decision("skipped", reason=reason, context=context)
+                    return self._decision(
+                        "skipped", reason=reason, context=cooldown_context
+                    )
 
         side = "Buy" if mode == "buy" else "Sell"
         summary_price_snapshot = self._extract_market_price(summary, symbol)
-        summary_age = summary_meta[1] if summary_meta is not None else None
-        price_age = price_meta[1] if price_meta is not None else None
+        summary_age = context.summary_meta[1] if context.summary_meta is not None else None
+        price_age = context.price_meta[1] if context.price_meta is not None else None
         if summary_price_snapshot is not None:
             if (
                 (summary_age is not None and summary_age > _SUMMARY_PRICE_EXECUTION_MAX_AGE)
@@ -2054,15 +2115,59 @@ class SignalExecutor:
             ):
                 summary_price_snapshot = None
 
-        quote_wallet_cap_value = quote_wallet_cap
+        quote_wallet_cap_value = context.quote_wallet_cap
         if quote_wallet_cap_value is not None:
             if not math.isfinite(quote_wallet_cap_value):
                 quote_wallet_cap_value = None
             elif quote_wallet_cap_value < 0.0:
                 quote_wallet_cap_value = 0.0
+        context.quote_wallet_cap = quote_wallet_cap_value
 
-        self._maybe_flush_dust(api, settings, now=now)
+        self._maybe_flush_dust(context.api, settings, now=context.now)
 
+        return TradePreparation(
+            symbol=symbol,
+            side=side,
+            symbol_meta=symbol_meta,
+            summary_price_snapshot=summary_price_snapshot,
+            summary_meta=context.summary_meta,
+            price_meta=context.price_meta,
+        )
+
+    def execute_once(self) -> ExecutionResult:
+        """Process the most recent summary and submit orders when actionable."""
+
+        context_or_result = self._prepare_context()
+        if isinstance(context_or_result, ExecutionResult):
+            return context_or_result
+
+        context = context_or_result
+        trade_or_result = self._prepare_trade(context)
+        if isinstance(trade_or_result, ExecutionResult):
+            return trade_or_result
+
+        trade = trade_or_result
+
+        summary = context.summary
+        settings = context.settings
+        now = context.now
+        performance_snapshot = context.performance_snapshot
+        summary_meta = trade.summary_meta
+        price_meta = trade.price_meta
+        symbol = trade.symbol
+        side = trade.side
+        symbol_meta = trade.symbol_meta
+        summary_price_snapshot = trade.summary_price_snapshot
+        forced_exit_meta = context.forced_exit_meta
+        api = context.api
+        wallet_totals = context.wallet_totals
+        quote_wallet_cap = context.quote_wallet_cap
+        wallet_meta = context.wallet_meta
+        total_equity = context.total_equity
+        available_equity = context.available_equity
+        equity_for_limits = context.equity_for_limits
+
+        quote_wallet_cap_value = quote_wallet_cap
         min_notional = 5.0
         instrument_limits: Optional[Mapping[str, object]] = None
         if api is not None:
