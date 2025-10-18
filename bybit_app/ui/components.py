@@ -16,7 +16,7 @@ from bybit_app.utils.envs import (
     active_dry_run,
     last_api_client_error,
 )
-from bybit_app.utils.ui import build_pill
+from bybit_app.utils.ui import build_pill, navigation_link
 from bybit_app.utils.spot_market import (
     OrderValidationError,
     place_spot_market_with_tolerance,
@@ -314,7 +314,7 @@ class _StatusBarContext:
                 caption=self.guardian_caption,
             ).build(),
             lambda: StatusBadge(
-                "WS",
+                "WebSocket",
                 ws_value,
                 tone=_age_tone(
                     self.ws_worst_age,
@@ -371,11 +371,21 @@ def status_bar(
     has_keys = bool(active_api_key(settings) and active_api_secret(settings))
     if not has_keys:
         show_error_banner(
-            "Добавьте API ключ и секрет, чтобы бот мог размещать ордера.",
+            "Добавьте API ключ и секрет, чтобы бот мог размещать ордера. Нажмите кнопку ниже, чтобы открыть настройки.",
             title="API ключи отсутствуют",
         )
-    if api_error:
-        show_error_banner(api_error, title="API клиент недоступен")
+        navigation_link(
+            "pages/00_✅_Подключение_и_Состояние.py",
+            label="Добавить API ключи",
+            icon="🔑",
+            key="status_api_keys_link",
+        )
+    elif api_error:
+        show_error_banner(
+            "Нет связи с биржей Bybit. Проверьте интернет или повторите попытку позже.",
+            title="API клиент недоступен",
+            details=api_error,
+        )
 
 
 def metrics_strip(report: Mapping[str, Any]) -> None:
@@ -577,30 +587,35 @@ def trade_ticket(
         "tolerance": int(state.get(_state_key("tolerance_bps"), 50) or 0),
     }
 
-    help_suffix = "" if compact else "Например BTCUSDT"
     form_key = f"{key_prefix}-ticket-form" if key_prefix else "trade-ticket-form"
     submit_text = submit_label or ("Отправить" if compact else "Place market order")
 
     with st.form(form_key):
-        symbol = st.text_input("Symbol", value=defaults["symbol"], help=help_suffix or None)
+        symbol = st.text_input(
+            "Торговая пара",
+            value=defaults["symbol"],
+            help="Введите символ, например BTCUSDT.",
+        )
         side = st.radio(
-            "Side",
+            "Направление",
             ("Buy", "Sell"),
             horizontal=True,
             index=0 if str(defaults["side"]).lower() != "sell" else 1,
+            help="Выберите действие: Buy для покупки, Sell для продажи.",
         )
         notional = st.number_input(
-            "Notional (USDT)",
+            "Сумма ордера (USDT)",
             min_value=0.0,
             value=defaults["notional"],
             step=1.0,
+            help="Размер сделки в котируемой валюте (USDT).",
         )
         tolerance = st.slider(
-            "Slippage guard (bps)",
+            "Допустимый слиппедж (б.п.)",
             min_value=0,
             max_value=500,
             value=defaults["tolerance"],
-            help="Максимально допустимый слиппедж в базисных пунктах",
+            help="Максимальный слиппедж в базисных пунктах (1 б.п. = 0.01%).",
         )
         submitted = st.form_submit_button(submit_text)
 
@@ -628,7 +643,26 @@ def trade_ticket(
 
     client = client_factory()
     if client is None:
-        show_error_banner("API клиент не готов. Проверьте подключение и ключи.")
+        has_key = bool(active_api_key(settings))
+        has_secret = bool(active_api_secret(settings))
+        api_error = last_api_client_error()
+        if not (has_key and has_secret):
+            show_error_banner(
+                "Не указан API-ключ или секрет — торговля недоступна, пока вы не добавите их.",
+                title="Нужно подключить API",
+            )
+            navigation_link(
+                "pages/00_✅_Подключение_и_Состояние.py",
+                label="Открыть настройки API",
+                icon="🔑",
+                key=f"{key_prefix or 'trade'}_api_setup_link",
+            )
+        else:
+            show_error_banner(
+                "Нет связи с биржей Bybit. Проверьте интернет и попробуйте снова.",
+                title="API клиент недоступен",
+                details=api_error,
+            )
         return
 
     try:
