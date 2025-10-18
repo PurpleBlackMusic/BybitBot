@@ -33,7 +33,12 @@ from bybit_app.utils.formatting import (
     format_quantity,
     format_datetime,
 )
-from bybit_app.ui.state import note_user_interaction, track_value_change
+from bybit_app.ui.state import (
+    clear_auto_refresh_hold,
+    note_user_interaction,
+    set_auto_refresh_hold,
+    track_value_change,
+)
 _STATUS_BADGE_CSS = """
 <style>
 .status-badge{padding:0.5rem;border-radius:0.75rem;background-color:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.2);margin-bottom:0.5rem;}
