@@ -33,6 +33,7 @@ from .ws_events import fetch_events as _fetch_ws_events
 from .ws_events import event_queue_stats as _ws_event_stats
 from .ws_events import publish_event as _publish_ws_event
 from .bybit_errors import parse_bybit_error_message
+from .ws_limits import reserve_ws_connection_slot
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
@@ -464,6 +465,41 @@ class WSManager:
                 self.start_private()
             except Exception as exc:  # pragma: no cover - defensive guard
                 log("ws.private.restart.fail", err=str(exc))
+
+    def ensure_realtime_streams(
+        self, symbols: Iterable[str], *, depth: int = 50
+    ) -> tuple[str, ...]:
+        """Ensure public subscriptions cover the provided symbols in real-time."""
+
+        try:
+            depth_hint = int(depth)
+        except (TypeError, ValueError):
+            depth_hint = 50
+        if depth_hint <= 0:
+            depth_hint = 50
+
+        desired: set[str] = set(self._pub_subs)
+        for raw in symbols:
+            symbol = str(raw or "").strip().upper()
+            if not symbol:
+                continue
+            desired.add(f"tickers.{symbol}")
+            desired.add(f"orderbook.{depth_hint}.{symbol}")
+            desired.add(f"publicTrade.{symbol}")
+
+        if not desired:
+            return self._pub_subs
+
+        updated = tuple(sorted(desired))
+        if updated != self._pub_subs:
+            log(
+                "ws.public.ensure_streams",
+                count=len(updated),
+                depth=depth_hint,
+            )
+            self.start_public(subs=updated)
+        return updated
+
     def start_public(self, subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
         subs = tuple(subs)
         self._pub_subs = subs
@@ -546,6 +582,7 @@ class WSManager:
                 verify_ssl = bool(getattr(self.s, "verify_ssl", True))
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
+                reserve_ws_connection_slot()
                 ws = websocket.WebSocketApp(
                     current_url,
                     on_open=on_open,

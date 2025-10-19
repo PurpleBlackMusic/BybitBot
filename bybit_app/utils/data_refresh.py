@@ -16,6 +16,10 @@ from .paths import DATA_DIR
 __all__ = ["ensure_hourly_ohlcv"]
 
 
+_HOURLY_MS = 60 * 60 * 1000
+_MAX_CACHE_HOURS = 24 * 120  # keep roughly four months of cached candles
+
+
 def _normalise_row(row: Iterable[object]) -> Optional[dict[str, object]]:
     items = list(row)
     if len(items) < 7:
@@ -56,6 +60,59 @@ def _parse_kline_payload(payload: Mapping[str, object]) -> list[dict[str, object
     return normalised
 
 
+def _read_cached_rows(path: Path) -> dict[int, dict[str, float]]:
+    if not path.exists():
+        return {}
+
+    rows: dict[int, dict[str, float]] = {}
+    try:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for raw in reader:
+                try:
+                    start = int(float(raw.get("start", 0)))
+                except (TypeError, ValueError):
+                    continue
+                if start <= 0:
+                    continue
+                try:
+                    rows[start] = {
+                        "start": float(start),
+                        "open": float(raw.get("open", 0.0)),
+                        "high": float(raw.get("high", 0.0)),
+                        "low": float(raw.get("low", 0.0)),
+                        "close": float(raw.get("close", 0.0)),
+                        "volume": float(raw.get("volume", 0.0)),
+                        "turnover": float(raw.get("turnover", 0.0)),
+                    }
+                except (TypeError, ValueError):
+                    continue
+    except Exception:  # pragma: no cover - defensive fallback
+        return {}
+    return rows
+
+
+def _serialise_rows(rows: Mapping[int, Mapping[str, float]]) -> str:
+    ordered_keys = sorted(rows)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["start", "open", "high", "low", "close", "volume", "turnover"])
+    for key in ordered_keys:
+        row = rows[key]
+        writer.writerow(
+            [
+                int(round(float(row.get("start", key)))),
+                f"{float(row.get('open', 0.0)):.10f}",
+                f"{float(row.get('high', 0.0)):.10f}",
+                f"{float(row.get('low', 0.0)):.10f}",
+                f"{float(row.get('close', 0.0)):.10f}",
+                f"{float(row.get('volume', 0.0)):.10f}",
+                f"{float(row.get('turnover', 0.0)):.10f}",
+            ]
+        )
+    return buffer.getvalue()
+
+
 def ensure_hourly_ohlcv(
     symbol: str,
     *,
@@ -70,6 +127,10 @@ def ensure_hourly_ohlcv(
     ensure_directory(target_dir)
     path = target_dir / f"{symbol.upper()}_1h.csv"
 
+    existing_rows = _read_cached_rows(path)
+    last_cached_start = max(existing_rows) if existing_rows else None
+
+    now_ms = int(time.time() * 1000)
     max_age_seconds = max(float(max_age_minutes), 1.0) * 60.0
     needs_refresh = True
     if path.exists():
@@ -82,6 +143,14 @@ def ensure_hourly_ohlcv(
             needs_refresh = False
 
     if not needs_refresh:
+        if existing_rows and _MAX_CACHE_HOURS:
+            prune_before = now_ms - int(_MAX_CACHE_HOURS * _HOURLY_MS)
+            if prune_before > 0:
+                filtered = {k: v for k, v in existing_rows.items() if k >= prune_before}
+            else:
+                filtered = dict(existing_rows)
+            if filtered and len(filtered) != len(existing_rows):
+                atomic_write_text(path, _serialise_rows(filtered))
         return path
 
     if api is None:
@@ -99,15 +168,24 @@ def ensure_hourly_ohlcv(
             return path
     else:
         client = api
-    end = int(time.time() * 1000)
-    start = end - int(200 * 60 * 60 * 1000)
+
+    end = now_ms
+    default_window = 200 * _HOURLY_MS
+    start = max(end - default_window, 0)
+    if last_cached_start is not None:
+        candidate = last_cached_start + _HOURLY_MS
+        if candidate < end:
+            start = max(candidate, end - default_window)
+        else:
+            start = candidate
 
     try:
+        bars = int((end - start) / _HOURLY_MS) + 2
         payload = client.kline(
             category="spot",
             symbol=symbol.upper(),
             interval=60,
-            limit=200,
+            limit=min(200, max(bars, 1)),
             start=start,
             end=end,
         )
@@ -120,11 +198,15 @@ def ensure_hourly_ohlcv(
         log("data_refresh.ohlcv.empty", symbol=symbol)
         return path
 
-    deduplicated: dict[int, dict[str, object]] = {}
-    for row in rows:
+    merged: dict[int, dict[str, float]] = dict(existing_rows)
+    newly_added = False
+    last_seen = last_cached_start
+    for row in sorted(rows, key=lambda item: int(item["start"])):
         start_value = int(row["start"])
-        deduplicated[start_value] = {
-            "start": start_value,
+        if last_seen is not None and start_value <= last_seen:
+            continue
+        merged[start_value] = {
+            "start": float(start_value),
             "open": float(row["open"]),
             "high": float(row["high"]),
             "low": float(row["low"]),
@@ -132,29 +214,21 @@ def ensure_hourly_ohlcv(
             "volume": float(row["volume"]),
             "turnover": float(row.get("turnover", 0.0)),
         }
+        newly_added = True
+        last_seen = start_value if last_seen is None else max(last_seen, start_value)
 
-    ordered_rows = [
-        deduplicated[key] for key in sorted(deduplicated.keys())
-    ]
-    if not ordered_rows:
+    if not newly_added and not merged:
         return path
 
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(["start", "open", "high", "low", "close", "volume", "turnover"])
-    for row in ordered_rows:
-        writer.writerow(
-            [
-                row["start"],
-                f"{row['open']:.10f}",
-                f"{row['high']:.10f}",
-                f"{row['low']:.10f}",
-                f"{row['close']:.10f}",
-                f"{row['volume']:.10f}",
-                f"{row['turnover']:.10f}",
-            ]
-        )
+    filtered_rows = merged
+    if _MAX_CACHE_HOURS and merged:
+        prune_before = end - int(_MAX_CACHE_HOURS * _HOURLY_MS)
+        if prune_before > 0:
+            filtered_rows = {k: v for k, v in merged.items() if k >= prune_before}
 
-    atomic_write_text(path, buffer.getvalue())
+    if newly_added or len(filtered_rows) != len(existing_rows):
+        payload_text = _serialise_rows(filtered_rows)
+        atomic_write_text(path, payload_text)
+
     return path
 

@@ -337,10 +337,7 @@ def _prune_log_file(
     )
 
     cleaned = [raw for raw, _ in _iter_json_lines(tail, drop_invalid=True)]
-    if cleaned:
-        text = "\n".join(cleaned) + "\n"
-    else:
-        text = ""
+    text = "\n".join(cleaned) + "\n" if cleaned else ""
 
     atomic_write_text(path, text, encoding="utf-8", preserve_permissions=True)
     _ensure_secure_log(path)
@@ -483,7 +480,7 @@ def log(
     record: dict[str, Any] = {
         "ts": int(time.time() * 1000),
         "event": event,
-        "severity": _derive_severity(event, severity),
+        "severity": severity_value,
         "thread": threading.current_thread().name,
         "context": context,
         "payload": remaining_payload,
@@ -504,8 +501,15 @@ def log(
             LOG_FILE,
             max_bytes=MAX_LOG_BYTES,
             retain_lines=RETAIN_LOG_LINES,
-            size_hint=size_hint,
         )
+        severity_path = SEVERITY_LOG_PATHS.get(severity_value)
+        if severity_path is not None:
+            _write_log_line(
+                severity_path,
+                text,
+                max_bytes=MAX_SEVERITY_LOG_BYTES,
+                retain_lines=SEVERITY_RETAIN_LOG_LINES,
+            )
 
         if record["severity"] in _ERROR_SEVERITIES:
             _maybe_rotate_by_time(ERROR_LOG_FILE, now=now)

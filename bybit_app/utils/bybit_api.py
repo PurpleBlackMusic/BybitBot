@@ -1,28 +1,31 @@
 from __future__ import annotations
-import hmac, hashlib, json, time, uuid
-from dataclasses import dataclass
+
 import asyncio
+import hashlib
+import hmac
 import inspect
+import json
 import os
-from concurrent.futures import Executor, ThreadPoolExecutor
-from contextvars import copy_context
-from functools import lru_cache, partial, wraps
-from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode
+import random
+import re
 import threading
-import requests
+import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from functools import lru_cache
+from email.utils import parsedate_to_datetime
+from functools import lru_cache, partial, wraps
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
-from email.utils import parsedate_to_datetime
-
 import requests
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
+from tenacity.wait import wait_base
 
 if TYPE_CHECKING:
     from .envs import Settings
@@ -99,6 +102,40 @@ def _coerce_positive_seconds(value: object | None) -> float | None:
         return None
 
     return float(candidate)
+
+
+def _parse_limit_status(value: object | None) -> tuple[int | None, int | None]:
+    """Return ``(remaining, limit)`` parsed from Bybit's limit status header."""
+
+    if value is None:
+        return None, None
+
+    text = str(value).strip()
+    if not text:
+        return None, None
+
+    if "/" not in text:
+        try:
+            limit = int(float(text))
+        except (TypeError, ValueError):
+            return None, None
+        return None, limit
+
+    left, _, right = text.partition("/")
+    remaining: int | None
+    limit: int | None
+
+    try:
+        remaining = int(float(left.strip())) if left.strip() else None
+    except (TypeError, ValueError):
+        remaining = None
+
+    try:
+        limit = int(float(right.strip())) if right.strip() else None
+    except (TypeError, ValueError):
+        limit = None
+
+    return remaining, limit
 
 
 def _retry_delay_from_headers(response: requests.Response | None) -> float | None:
@@ -201,6 +238,143 @@ def _compute_retry_delay(
     return max(delay, 0.0)
 
 
+class _AdaptiveWait(wait_base):
+    """Tenacity wait strategy that respects retry hints and HTTP status codes."""
+
+    def __call__(self, retry_state):  # type: ignore[override]
+        attempt = getattr(retry_state, "attempt_number", 1) or 1
+        outcome = getattr(retry_state, "outcome", None)
+        exception = outcome.exception() if outcome is not None and outcome.failed else None
+
+        retry_after: float | None = None
+        status: int | None = None
+        if isinstance(exception, _RetryableRequestError):
+            retry_after = exception.retry_after
+            try:
+                status = int(exception.meta.get("status")) if "status" in exception.meta else None
+            except (TypeError, ValueError):
+                status = None
+
+        minimum = 0.2 if status == 429 else 0.05
+        maximum = 12.0 if status == 429 else 6.0
+        base = 0.6 if status == 429 else 0.3
+        backoff_cap = 8.0 if status == 429 else 3.0
+
+        delay = _compute_retry_delay(
+            attempt,
+            retry_after=retry_after,
+            minimum=minimum,
+            maximum=maximum,
+            base=base,
+            backoff_cap=backoff_cap,
+            jitter=0.6,
+        )
+        return max(delay, minimum)
+
+
+_LIMIT_STATUS_SPLIT_RE = re.compile(r"[;,]")
+_LIMIT_STATUS_RATIO_RE = re.compile(r"(?P<used>\d+(?:\.\d+)?)\s*/\s*(?P<limit>\d+(?:\.\d+)?)")
+_LIMIT_STATUS_PERCENT_RE = re.compile(r"(?P<pct>\d+(?:\.\d+)?)\s*%")
+
+
+@dataclass(frozen=True)
+class _LimitStatusHint:
+    entries: tuple[tuple[str, float, float | None], ...]
+    utilisation: float | None
+    slowdown: float
+
+
+@lru_cache(maxsize=256)
+def _normalised_limit_status(text: str) -> _LimitStatusHint:
+    entries: list[tuple[str, float, float | None]] = []
+    for chunk in _LIMIT_STATUS_SPLIT_RE.split(text):
+        piece = chunk.strip()
+        if not piece:
+            continue
+        label = ""
+        if ":" in piece:
+            label, _, remainder = piece.partition(":")
+            piece = remainder.strip()
+            label = label.strip()
+        ratio_match = _LIMIT_STATUS_RATIO_RE.search(piece)
+        if ratio_match:
+            try:
+                used = float(ratio_match.group("used"))
+                limit = float(ratio_match.group("limit"))
+            except (TypeError, ValueError):
+                continue
+            entries.append((label or "default", used, limit))
+            continue
+        percent_match = _LIMIT_STATUS_PERCENT_RE.search(piece)
+        if percent_match:
+            try:
+                pct = float(percent_match.group("pct"))
+            except (TypeError, ValueError):
+                continue
+            entries.append((label or "default", pct, 100.0))
+            continue
+        try:
+            value_float = float(piece)
+        except ValueError:
+            continue
+        entries.append((label or "default", value_float, None))
+    entries_tuple = tuple(entries)
+    utilisation = _limit_status_utilisation(entries_tuple)
+    slowdown = _limit_status_delay(utilisation)
+    return _LimitStatusHint(entries_tuple, utilisation, slowdown)
+
+
+def _limit_status_hint(value: object | None) -> _LimitStatusHint | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return _normalised_limit_status(text)
+
+
+def _parse_limit_status(value: object | None) -> list[tuple[str, float, float | None]]:
+    hint = _limit_status_hint(value)
+    if hint is None:
+        return []
+    return list(hint.entries)
+
+
+def _limit_status_utilisation(entries: Iterable[tuple[str, float, float | None]]) -> float | None:
+    utilisation: float | None = None
+    for _label, used, limit in entries:
+        if limit is None or limit <= 0:
+            continue
+        try:
+            ratio = float(used) / float(limit)
+        except ZeroDivisionError:
+            continue
+        if ratio < 0:
+            continue
+        utilisation = ratio if utilisation is None else max(utilisation, ratio)
+    return utilisation
+
+
+def _limit_status_delay(utilisation: float | None) -> float:
+    if utilisation is None:
+        return 0.0
+    if utilisation >= 0.98:
+        return 1.2
+    if utilisation >= 0.95:
+        return 0.8
+    if utilisation >= 0.9:
+        return 0.6
+    if utilisation >= 0.85:
+        return 0.35
+    if utilisation >= 0.8:
+        return 0.18
+    if utilisation >= 0.75:
+        return 0.08
+    return 0.0
+
+
 class _TTLCache:
     """Thread-safe TTL cache for JSON serialisable API responses."""
 
@@ -244,13 +418,16 @@ class _APINanny:
         self._limits: dict[str, tuple[int, float]] = {}
         self._records: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._cooldowns: dict[str, float] = {}
 
     def set_limit(self, key: str, *, burst: int, window: float) -> None:
         burst = max(int(burst), 1)
         window = max(float(window), 0.01)
-        with self._lock:
+        with self._condition:
             self._limits[key] = (burst, window)
             self._records.setdefault(key, deque())
+            self._condition.notify_all()
 
     def _resolve_limit(self, key: str, fallback: str | None) -> tuple[int, float]:
         if key in self._limits:
@@ -262,23 +439,91 @@ class _APINanny:
     def guard(self, key: str, *, fallback: str | None = None) -> None:
         burst, window = self._resolve_limit(key, fallback)
 
-        while True:
-            with self._lock:
+        fallback_key = fallback if fallback and fallback != key else None
+        cooldown_keys = (key,) if fallback_key is None else (key, fallback_key)
+
+        with self._condition:
+            queue = self._records.setdefault(key, deque())
+            while True:
                 now = time.monotonic()
-                queue = self._records.setdefault(key, deque())
                 while queue and now - queue[0] >= window:
                     queue.popleft()
 
-                if len(queue) < burst:
+                cooldown_wait = 0.0
+                for candidate in cooldown_keys:
+                    deadline = self._cooldowns.get(candidate, 0.0)
+                    if deadline <= now and candidate in self._cooldowns:
+                        self._cooldowns.pop(candidate, None)
+                        continue
+                    cooldown_wait = max(cooldown_wait, max(deadline - now, 0.0))
+
+                wait_time = 0.0
+                if len(queue) >= burst:
+                    wait_time = max(wait_time, window - (now - queue[0]))
+                if cooldown_wait > 0:
+                    wait_time = max(wait_time, cooldown_wait)
+
+                if wait_time <= 0:
                     queue.append(now)
+                    self._condition.notify_all()
                     return
 
-                wait_time = window - (now - queue[0]) if queue else window
+                self._condition.wait(timeout=wait_time)
 
-            if wait_time > 0:
-                time.sleep(min(wait_time, window))
-            else:
-                time.sleep(0)
+    def slowdown(self, key: str, delay: float, *, fallback: str | None = None) -> None:
+        seconds = max(float(delay or 0.0), 0.0)
+        if seconds <= 0:
+            return
+
+        deadline = time.monotonic() + seconds
+        fallback_key = fallback if fallback and fallback != key else None
+        candidates = (key,) if fallback_key is None else (key, fallback_key)
+        with self._condition:
+            for candidate in candidates:
+                current = self._cooldowns.get(candidate)
+                if current is None or deadline > current:
+                    self._cooldowns[candidate] = deadline
+            self._condition.notify_all()
+
+    def observe_quota(
+        self,
+        key: str,
+        *,
+        remaining: int | None,
+        limit: int | None,
+        window: float | None,
+        fallback: str | None = None,
+    ) -> None:
+        """Update dynamic limits from exchange-provided rate limit headers."""
+
+        if limit is None or limit <= 0:
+            return
+
+        window_seconds = max(float(window) if window else self._default_window, 0.01)
+        burst = max(int(limit), 1)
+
+        self.set_limit(key, burst=burst, window=window_seconds)
+        if fallback and fallback != key:
+            self.set_limit(fallback, burst=burst, window=window_seconds)
+
+        if remaining is None:
+            return
+
+        with self._lock:
+            queue = self._records.setdefault(key, deque())
+            now = time.monotonic()
+            while queue and now - queue[0] >= window_seconds:
+                queue.popleft()
+
+            deficit = max(burst - max(int(remaining), 0), 0)
+            if deficit <= 0:
+                return
+
+            # Pre-fill the queue with timestamps slightly in the past to align
+            # our local rate limiter with the server-observed usage.
+            backdated = now - window_seconds + 0.001
+            for _ in range(min(deficit, burst)):
+                queue.append(backdated)
 
 @dataclass
 class BybitCreds:
@@ -417,6 +662,8 @@ class BybitAPI:
 
     def _req(self, method: str, path: str, params: dict | None = None, body: dict | None = None, signed: bool = False):
         url = self.base + path
+        bucket = "signed" if signed else "public"
+
         if not signed:
             if method.upper() == "GET":
                 r = self.session.get(
@@ -436,6 +683,7 @@ class BybitAPI:
                     headers={"Content-Type": "application/json"},
                 )
             r.raise_for_status()
+            self._record_quota_headers(r, bucket=bucket, path=path)
             return r.json()
 
         # signed
@@ -459,11 +707,12 @@ class BybitAPI:
             r = self.session.request(method.upper(), url, params=None, data=q, headers=headers,
                                      timeout=self.timeout, verify=self.verify_ssl)
         r.raise_for_status()
-        self._record_quota_headers(r)
+        self._record_quota_headers(r, bucket=bucket, path=path)
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
         max_attempts = 5 if signed else 3
+        bucket = "signed" if signed else "public"
 
         def _perform_once():
             self._guard_quota(path, signed=signed)
@@ -471,6 +720,7 @@ class BybitAPI:
                 resp = self._req(method, path, params=params, body=body, signed=signed)
             except requests.exceptions.HTTPError as exc:
                 response = exc.response
+                self._record_quota_headers(response, bucket=bucket, path=path)
                 status_code = response.status_code if response is not None else None
                 detail = ""
                 if response is not None:
@@ -549,37 +799,42 @@ class BybitAPI:
 
             raise RuntimeError(message)
 
-        attempt = 1
-        while True:
-            try:
-                return _perform_once()
-            except _RetryableRequestError as exc:
-                meta = dict(exc.meta)
-                retry_hint = exc.retry_after
+        def _log_retry(retry_state) -> None:
+            outcome = getattr(retry_state, "outcome", None)
+            exception = outcome.exception() if outcome is not None and outcome.failed else None
+            meta: dict[str, object] = {}
+            if isinstance(exception, _RetryableRequestError):
+                meta.update(exception.meta)
+                retry_hint = exception.retry_after
                 if retry_hint is None:
                     retry_hint = _coerce_positive_seconds(meta.get("retry_after"))
                 if retry_hint is not None:
-                    meta["retry_after"] = retry_hint
-                    meta["retry_after_seconds"] = retry_hint
-                    meta["retryAfterSeconds"] = round(retry_hint, 3)
-                meta.update(
-                    {
-                        "attempt": attempt,
-                        "maxAttempts": max_attempts,
-                        "method": method,
-                        "path": path,
-                    }
-                )
-                log("bybit.request.retry", **meta)
+                    meta.setdefault("retry_after", retry_hint)
+                    meta.setdefault("retry_after_seconds", retry_hint)
+                    meta.setdefault("retryAfterSeconds", round(retry_hint, 3))
+            meta.update(
+                {
+                    "attempt": getattr(retry_state, "attempt_number", 0),
+                    "maxAttempts": max_attempts,
+                    "method": method,
+                    "path": path,
+                }
+            )
+            next_action = getattr(retry_state, "next_action", None)
+            sleep_for = getattr(next_action, "sleep", None) if next_action is not None else None
+            if sleep_for is not None:
+                meta["sleep"] = round(float(sleep_for), 4)
+            log("bybit.request.retry", **meta)
 
-                if attempt >= max_attempts:
-                    raise
+        retryer = Retrying(
+            stop=stop_after_attempt(max_attempts),
+            wait=_AdaptiveWait(),
+            retry=retry_if_exception_type(_RetryableRequestError),
+            reraise=True,
+            before_sleep=_log_retry,
+        )
 
-                delay = _compute_retry_delay(attempt, retry_after=retry_hint)
-                if delay > 0:
-                    time.sleep(delay)
-
-                attempt += 1
+        return retryer(_perform_once)
 
     def _guard_quota(self, path: str, *, signed: bool) -> None:
         nanny = getattr(self, "_api_nanny", None)
@@ -589,16 +844,27 @@ class BybitAPI:
         key = f"{bucket}:{path}" if path else bucket
         nanny.guard(key, fallback=bucket)
 
-    def _record_quota_headers(self, response: requests.Response | None) -> None:
+    def _record_quota_headers(
+        self,
+        response: requests.Response | None,
+        *,
+        bucket: str,
+        path: str | None = None,
+    ) -> None:
         if response is None:
             return
+
         headers = getattr(response, "headers", None)
         if not headers:
             return
 
         quota_fields: dict[str, object] = {}
+        limit_status_raw: object | None = None
+
         for key, value in headers.items():
             lower_key = key.lower()
+            if lower_key == "x-bapi-limit-status":
+                limit_status_raw = value
             if "quota" not in lower_key and "ratelimit" not in lower_key:
                 continue
             if value is None:
@@ -618,12 +884,57 @@ class BybitAPI:
                     parsed = stripped
             quota_fields[key] = parsed
 
-        if not quota_fields:
+        utilisation = None
+        delay = 0.0
+        hint = _limit_status_hint(limit_status_raw)
+        if hint is not None and hint.entries:
+            quota_fields["X-Bapi-Limit-Status"] = str(limit_status_raw)
+            utilisation = hint.utilisation
+            if utilisation is not None:
+                quota_fields["X-Bapi-Limit-Utilisation"] = utilisation
+                quota_fields["X-Bapi-Limit-Bucket"] = bucket
+            delay = hint.slowdown
+
+        if not quota_fields and utilisation is None:
             return
+
+        bucket = "signed" if signed else "public"
+        nanny = getattr(self, "_api_nanny", None)
+        remaining, limit = _parse_limit_status(lower_headers.get("x-bapi-limit-status"))
+        reset_hint = (
+            lower_headers.get("x-bapi-limit-reset-after")
+            or lower_headers.get("x-ratelimit-reset-after")
+            or lower_headers.get("x-bapi-limit-reset")
+            or lower_headers.get("x-ratelimit-reset")
+            or lower_headers.get("x-bapi-limit-interval")
+        )
+        window = _coerce_positive_seconds(reset_hint)
+        if nanny is not None and limit is not None:
+            key = f"{bucket}:{path}" if path else bucket
+            nanny.observe_quota(
+                key,
+                remaining=remaining,
+                limit=limit,
+                window=window,
+                fallback=bucket,
+            )
 
         quota_fields["updated_at"] = time.time()
         with self._quota_lock:
             self._last_quota = quota_fields
+
+        if delay > 0:
+            log(
+                "bybit.rate_limit.slowdown",
+                bucket=bucket,
+                utilisation=round(float(utilisation), 4) if utilisation is not None else None,
+                sleep=round(delay, 4),
+                raw=str(limit_status_raw) if limit_status_raw is not None else None,
+            )
+            key = f"{bucket}:{path}" if path else bucket
+            nanny = getattr(self, "_api_nanny", None)
+            if nanny is not None:
+                nanny.slowdown(key, delay, fallback=bucket)
 
     @property
     def quota_snapshot(self) -> dict[str, object]:
@@ -733,6 +1044,8 @@ class BybitAPI:
         *,
         limit: int | None = None,
         cursor: str | None = None,
+        status: str | None = None,
+        baseCoin: str | None = None,
     ):
         params = {"category": category}
         if symbol:
@@ -745,6 +1058,10 @@ class BybitAPI:
         cursor_token = self._normalise_cursor(cursor)
         if cursor_token:
             params["cursor"] = cursor_token
+        if status:
+            params["status"] = status
+        if baseCoin:
+            params["baseCoin"] = baseCoin
         return self._safe_req("GET", "/v5/market/instruments-info", params=params)
 
     def tickers(self, category: str = "spot", symbol: str | None = None):

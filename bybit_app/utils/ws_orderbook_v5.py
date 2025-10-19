@@ -9,8 +9,27 @@ from weakref import WeakSet
 
 from .envs import get_settings
 from .log import log
+from .ws_limits import reserve_ws_connection_slot
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
+
+
+def _should_verify_ssl(settings: object | None) -> bool:
+    if settings is None:
+        return True
+
+    raw_value = getattr(settings, "verify_ssl", True)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in {"false", "0", "no", "off"}:
+            return False
+        if text in {"true", "1", "yes", "on"}:
+            return True
+    return bool(raw_value)
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
@@ -105,6 +124,7 @@ class WSOrderbookV5:
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False
                 try:
+                    reserve_ws_connection_slot()
                     ws = websocket.WebSocketApp(
                         self.url,
                         on_open=lambda w: self._on_open(w),

@@ -10,6 +10,7 @@ from typing import Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Tup
 
 from .bybit_api import BybitAPI
 from .log import log
+from .ws_limits import reserve_ws_connection_slot
 
 
 class LiveOrderbook:
@@ -94,6 +95,7 @@ class LiveOrderbook:
             url = self._resolve_ws_url()
 
             try:
+                reserve_ws_connection_slot()
                 ws_app = websocket.WebSocketApp(
                     url,
                     on_open=self._handle_ws_open,
