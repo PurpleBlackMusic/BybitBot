@@ -5,28 +5,33 @@ import json
 import threading
 import time
 import traceback
-from pathlib import Path
+from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, Iterable, Iterator, Mapping
 
+from pathlib import Path
+
 from .file_io import atomic_write_text, tail_lines
 from .paths import LOG_DIR
+from .security import ensure_restricted_permissions, permissions_too_permissive
 
 LOG_FILE = LOG_DIR / "app.log"
-SEVERITY_LOG_PATHS: dict[str, Path] = {
-    level: LOG_DIR / f"{level}.log"
-    for level in ("warning", "error", "critical")
-}
+ERROR_LOG_FILE = LOG_DIR / "error.log"
+
+# Time-based rotation keeps separate daily files in addition to size-based pruning.
+LOG_ROTATION_INTERVAL = 24 * 60 * 60
 
 # Default retention parameters keep the log at a manageable size while still
 # preserving enough history for troubleshooting. The values are deliberately
 # conservative and can be adjusted in tests through monkeypatching.
 MAX_LOG_BYTES = 5_000_000
 RETAIN_LOG_LINES = 5_000
-MAX_SEVERITY_LOG_BYTES = 2_000_000
-SEVERITY_RETAIN_LOG_LINES = 2_000
+MAX_ERROR_LOG_BYTES = 2_000_000
+ERROR_RETAIN_LOG_LINES = 2_000
 
 _LOCK = threading.RLock()
+
+_SECURED_PATHS: dict[str, float] = {}
 
 _RESET_DONE = False
 
@@ -49,18 +54,26 @@ _STRUCTURED_ALIASES: dict[str, tuple[str, ...]] = {
     "qty": ("qty", "quantity"),
 }
 
-_SENSITIVE_KEYWORDS = {
+_STRUCTURED_ALIAS_MAP: dict[str, str] = {
+    alias: canonical
+    for canonical, aliases in _STRUCTURED_ALIASES.items()
+    for alias in aliases
+}
+
+_SENSITIVE_EXACT_KEYS = {
     "api_key",
     "api_secret",
-    "secret",
-    "token",
-    "passphrase",
-    "password",
-    "private_key",
-    "access_token",
-    "refresh_token",
+    "api_key_mainnet",
+    "api_secret_mainnet",
+    "api_key_testnet",
+    "api_secret_testnet",
+    "telegram_token",
+    "telegram_chat_id",
 }
-_REDACTED_VALUE = "[redacted]"
+
+_SENSITIVE_KEYWORDS = ("secret", "token", "apikey", "api-key", "password", "chat_id", "key")
+
+_ERROR_SEVERITIES = {"error", "critical"}
 
 
 def _normalise_limit(value: int | str | None, fallback: int) -> int:
@@ -96,12 +109,208 @@ def _iter_json_lines(
         yield raw, parsed
 
 
+def _is_sensitive_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    lowered = key.strip().lower()
+    if lowered in _SENSITIVE_EXACT_KEYS:
+        return True
+    return any(token in lowered for token in _SENSITIVE_KEYWORDS)
+
+
+def _sanitize_list(values: list[Any]) -> list[Any]:
+    sanitized: list[Any] | None = None
+
+    for index, item in enumerate(values):
+        if isinstance(item, Mapping):
+            cleaned = _sanitize_mapping(item)
+        elif isinstance(item, list):
+            cleaned = _sanitize_list(item)
+        elif isinstance(item, tuple):
+            cleaned = _sanitize_tuple(item)
+        elif isinstance(item, set):
+            cleaned = _sanitize_set(item)
+        else:
+            cleaned = item
+
+        if sanitized is None:
+            if cleaned is not item:
+                sanitized = values[:index]
+                sanitized.append(cleaned)
+        else:
+            sanitized.append(cleaned)
+
+    if sanitized is None:
+        return values
+
+    return sanitized
+
+
+def _sanitize_tuple(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    sanitized_prefix: list[Any] | None = None
+
+    for index, item in enumerate(values):
+        if isinstance(item, Mapping):
+            cleaned = _sanitize_mapping(item)
+        elif isinstance(item, list):
+            cleaned = _sanitize_list(item)
+        elif isinstance(item, tuple):
+            cleaned = _sanitize_tuple(item)
+        elif isinstance(item, set):
+            cleaned = _sanitize_set(item)
+        else:
+            cleaned = item
+
+        if sanitized_prefix is None:
+            if cleaned is not item:
+                sanitized_prefix = list(values[:index])
+                sanitized_prefix.append(cleaned)
+        else:
+            sanitized_prefix.append(cleaned)
+
+    if sanitized_prefix is None:
+        return values
+
+    return tuple(sanitized_prefix)
+
+
+def _sanitize_set(values: set[Any]) -> set[Any]:
+    sanitized_items: list[Any] = []
+    changed = False
+
+    for item in values:
+        if isinstance(item, Mapping):
+            cleaned = _sanitize_mapping(item)
+        elif isinstance(item, list):
+            cleaned = _sanitize_list(item)
+        elif isinstance(item, tuple):
+            cleaned = _sanitize_tuple(item)
+        elif isinstance(item, set):
+            cleaned = _sanitize_set(item)
+        else:
+            cleaned = item
+
+        if cleaned is not item:
+            changed = True
+        sanitized_items.append(cleaned)
+
+    sanitized_set = set(sanitized_items)
+    if not changed and len(sanitized_set) == len(values):
+        return values
+    return sanitized_set
+
+
+def _sanitize_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _sanitize_mapping(value)
+    if isinstance(value, list):
+        return _sanitize_list(value)
+    if isinstance(value, tuple):
+        return _sanitize_tuple(value)
+    if isinstance(value, set):
+        return _sanitize_set(value)
+    return value
+
+
+def _sanitize_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    if not mapping:
+        return {}
+
+    items: list[tuple[str, Any]] = []
+    changed = False
+
+    for key, value in mapping.items():
+        is_str_key = isinstance(key, str)
+        key_text = key if is_str_key else str(key)
+
+        if _is_sensitive_key(key_text):
+            items.append((key_text, "***"))
+            changed = True
+            continue
+
+        sanitized_value = value
+        if isinstance(value, Mapping):
+            sanitized_value = _sanitize_mapping(value)
+        elif isinstance(value, list):
+            sanitized_value = _sanitize_list(value)
+        elif isinstance(value, tuple):
+            sanitized_value = _sanitize_tuple(value)
+        elif isinstance(value, set):
+            sanitized_value = _sanitize_set(value)
+
+        if sanitized_value is not value:
+            changed = True
+
+        if not is_str_key:
+            changed = True
+
+        items.append((key_text, sanitized_value))
+
+    if not changed and isinstance(mapping, dict):
+        return mapping
+
+    return {key: value for key, value in items}
+
+
+def _secure_cache_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _ensure_secure_log(path: Path) -> None:
+    cache_key = _secure_cache_key(path)
+
+    try:
+        stat_result = path.stat()
+    except FileNotFoundError:
+        _SECURED_PATHS.pop(cache_key, None)
+        return
+    except OSError:
+        return
+
+    cached_ctime = _SECURED_PATHS.get(cache_key)
+    if cached_ctime is not None and cached_ctime == stat_result.st_ctime:
+        return
+
+    if permissions_too_permissive(path):
+        ensure_restricted_permissions(path)
+        try:
+            stat_result = path.stat()
+        except OSError:
+            _SECURED_PATHS.pop(cache_key, None)
+            return
+
+    _SECURED_PATHS[cache_key] = stat_result.st_ctime
+
+
+def _maybe_rotate_by_time(path: Path, *, now: datetime) -> None:
+    if LOG_ROTATION_INTERVAL <= 0:
+        return
+    if not path.exists():
+        return
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return
+
+    if now.timestamp() - mtime < LOG_ROTATION_INTERVAL:
+        return
+
+    rotated_suffix = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d")
+    rotated = path.with_name(f"{path.stem}-{rotated_suffix}{path.suffix}")
+    try:
+        if rotated.exists():
+            rotated.unlink()
+        path.rename(rotated)
+    except OSError:
+        return
+    _ensure_secure_log(rotated)
+
+
 def _prune_log_file(
-    path: Path,
-    *,
-    max_bytes: int,
-    retain_lines: int,
-    size_hint: int | None = None,
+    path: Path, *, max_bytes: int, retain_lines: int, size_hint: int | None = None
 ) -> None:
     """Truncate ``path`` when it exceeds ``max_bytes``."""
 
@@ -131,6 +340,7 @@ def _prune_log_file(
     text = "\n".join(cleaned) + "\n" if cleaned else ""
 
     atomic_write_text(path, text, encoding="utf-8", preserve_permissions=True)
+    _ensure_secure_log(path)
 
 
 def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None) -> None:
@@ -141,49 +351,11 @@ def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None)
 
     with _LOCK:
         _prune_log_file(LOG_FILE, max_bytes=maximum, retain_lines=keep)
-        for severity, path in SEVERITY_LOG_PATHS.items():
-            limit = MAX_SEVERITY_LOG_BYTES
-            retain = SEVERITY_RETAIN_LOG_LINES
-            _prune_log_file(path, max_bytes=limit, retain_lines=retain)
-
-
-def _should_redact(key: str) -> bool:
-    lower = key.lower()
-    return any(fragment in lower for fragment in _SENSITIVE_KEYWORDS)
-
-
-def _scrub_sensitive_data(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        cleaned: dict[Any, Any] = {}
-        for key, item in value.items():
-            if isinstance(key, str) and _should_redact(key):
-                cleaned[key] = _REDACTED_VALUE
-            else:
-                cleaned[key] = _scrub_sensitive_data(item)
-        return cleaned
-    if isinstance(value, list):
-        return [_scrub_sensitive_data(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_scrub_sensitive_data(item) for item in value)
-    return value
-
-
-def _write_log_line(
-    path: Path,
-    text: str,
-    *,
-    max_bytes: int,
-    retain_lines: int,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(text + "\n")
-        handle.flush()
-        try:
-            size_hint = handle.buffer.tell()
-        except AttributeError:
-            size_hint = None
-    _prune_log_file(path, max_bytes=max_bytes, retain_lines=retain_lines, size_hint=size_hint)
+        _prune_log_file(
+            ERROR_LOG_FILE,
+            max_bytes=min(maximum, MAX_ERROR_LOG_BYTES),
+            retain_lines=max(keep // 2, 1),
+        )
 
 
 def reset_logs_on_start(*, force: bool = False) -> None:
@@ -194,25 +366,25 @@ def reset_logs_on_start(*, force: bool = False) -> None:
     if _RESET_DONE and not force:
         return
 
+    targets = (LOG_FILE, ERROR_LOG_FILE)
+
     with _LOCK:
         if _RESET_DONE and not force:
             return
 
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
 
-        targets = [LOG_FILE, *SEVERITY_LOG_PATHS.values()]
-        for path in targets:
+        for target in targets:
             try:
-                path.unlink()
+                target.unlink()
             except FileNotFoundError:
-                continue
+                pass
             except OSError:
-                atomic_write_text(
-                    path,
-                    "",
-                    encoding="utf-8",
-                    preserve_permissions=True,
-                )
+                atomic_write_text(target, "", encoding="utf-8", preserve_permissions=True)
+            finally:
+                _SECURED_PATHS.pop(_secure_cache_key(target), None)
+                _ensure_secure_log(target)
 
         _RESET_DONE = True
 
@@ -259,29 +431,37 @@ def _normalise_exception(
 
 
 def _split_structured_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return ``(context, remaining)`` with canonical trading metadata keys.
+    """Return ``(context, remaining)`` with canonical trading metadata keys."""
 
-    The context includes the standard identifiers (``linkId``, ``symbol``,
-    ``meta``, ``notional``, ``price`` and ``qty``) whenever they are supplied via
-    any of their supported aliases. Entries that are not part of this
-    structured metadata remain inside ``payload`` so the existing log consumers
-    behave exactly as before.
-    """
+    if not payload:
+        return {}, {}
 
     context: dict[str, Any] = {}
     remaining: dict[str, Any] = {}
 
     for key, value in payload.items():
-        matched = False
-        for canonical, aliases in _STRUCTURED_ALIASES.items():
-            if key in aliases:
-                context[canonical] = value
-                matched = True
-                break
-        if not matched:
+        key_text = str(key)
+        canonical = _STRUCTURED_ALIAS_MAP.get(key_text)
+        if canonical is not None:
+            context[canonical] = value
+        else:
             remaining[key] = value
 
     return context, remaining
+
+
+
+def _append_record(path: Path, text: str) -> int | None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+        handle.flush()
+        buffer = getattr(handle, "buffer", None)
+        try:
+            size_hint = buffer.tell() if buffer is not None else None
+        except AttributeError:
+            size_hint = None
+    _ensure_secure_log(path)
+    return size_hint
 
 
 def log(
@@ -293,11 +473,9 @@ def log(
 ) -> None:
     """Append a JSON record with ``event`` and ``payload`` to the log file."""
 
-    context_raw, payload_raw = _split_structured_payload(payload)
-    context = _scrub_sensitive_data(context_raw)
-    remaining_payload = _scrub_sensitive_data(payload_raw)
-
-    severity_value = _derive_severity(event, severity)
+    context, remaining_payload = _split_structured_payload(payload)
+    context = _sanitize_mapping(context)
+    remaining_payload = _sanitize_mapping(remaining_payload)
 
     record: dict[str, Any] = {
         "ts": int(time.time() * 1000),
@@ -313,11 +491,14 @@ def log(
         record["exception"] = exception_payload
 
     text = json.dumps(record, ensure_ascii=False)
+    now = datetime.now(timezone.utc)
 
     with _LOCK:
-        _write_log_line(
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _maybe_rotate_by_time(LOG_FILE, now=now)
+        size_hint = _append_record(LOG_FILE, text)
+        _prune_log_file(
             LOG_FILE,
-            text,
             max_bytes=MAX_LOG_BYTES,
             retain_lines=RETAIN_LOG_LINES,
         )
@@ -328,6 +509,16 @@ def log(
                 text,
                 max_bytes=MAX_SEVERITY_LOG_BYTES,
                 retain_lines=SEVERITY_RETAIN_LOG_LINES,
+            )
+
+        if record["severity"] in _ERROR_SEVERITIES:
+            _maybe_rotate_by_time(ERROR_LOG_FILE, now=now)
+            error_size = _append_record(ERROR_LOG_FILE, text)
+            _prune_log_file(
+                ERROR_LOG_FILE,
+                max_bytes=MAX_ERROR_LOG_BYTES,
+                retain_lines=ERROR_RETAIN_LOG_LINES,
+                size_hint=error_size,
             )
 
 

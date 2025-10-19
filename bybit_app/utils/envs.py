@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, json, re
-from dataclasses import dataclass, asdict, fields, field
+from dataclasses import asdict, fields, field
+from pydantic.dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
@@ -15,6 +16,7 @@ from .paths import (
     SETTINGS_TESTNET_FILE,
 )
 from .log import log
+from .security import ensure_restricted_permissions, permissions_too_permissive
 
 
 _SENSITIVE_FIELDS = {
@@ -35,6 +37,18 @@ _PLACEHOLDER_VALUES = {
     "your_secret_here",
     "changeme",
 }
+
+
+
+def _secure_path(path: Path) -> None:
+    if permissions_too_permissive(path):
+        ensure_restricted_permissions(path)
+
+
+def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    atomic_write_text(path, text, encoding="utf-8", preserve_permissions=False)
+    _secure_path(path)
 
 
 class CredentialValidationError(RuntimeError):
@@ -433,7 +447,7 @@ class Settings:
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
     ai_kill_switch_loss_streak: int = 0
-    ai_min_ev_bps: float = 12.0
+    ai_min_ev_bps: float | str = 12.0
     ai_signal_hysteresis: float = 0.015
     ai_retrain_minutes: int = 10080
     ai_training_trade_limit: int = 400
@@ -487,7 +501,7 @@ class Settings:
     telegram_token: str = ""
     telegram_chat_id: str = ""
     telegram_notify: bool = False
-    heartbeat_enabled: bool = False
+    heartbeat_enabled: bool = True
     heartbeat_minutes: int = 5
     heartbeat_interval_min: int = 30
 
@@ -502,10 +516,12 @@ class Settings:
             coerced = _coerce_bool(current)
             setattr(self, field.name, coerced)
 
+        self._validate_numeric_fields()
         self._sync_credentials()
         self.profile_testnet = dict(self.profile_testnet or {})
         self.profile_mainnet = dict(self.profile_mainnet or {})
         self._apply_profile_overrides()
+        self._sync_credentials()
 
     # --- helpers -----------------------------------------------------
     def _profile_payload(self, suffix: str) -> Dict[str, Any]:
@@ -533,6 +549,36 @@ class Settings:
         base_value = getattr(self, "testnet", True)
         target = base_value if testnet is None else testnet
         return "testnet" if _coerce_bool(target) else "mainnet"
+
+    def _validate_numeric_fields(self) -> None:
+        non_negative_fields = set(_INT_ENV_KEYS) | set(_FLOAT_ENV_KEYS) | {
+            "recv_window_ms",
+            "http_timeout_ms",
+            "reprice_unfilled_after_sec",
+            "max_amendments",
+            "heartbeat_minutes",
+            "heartbeat_interval_min",
+            "ws_watchdog_max_age_sec",
+            "execution_watchdog_max_age_sec",
+        }
+        allow_text_fields = {"ai_min_ev_bps"}
+        allow_negative = {"ai_min_exit_bps"}
+        for field_name in non_negative_fields:
+            if field_name in allow_text_fields:
+                continue
+            if not hasattr(self, field_name):
+                continue
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise TypeError(f"{field_name} must be numeric") from None
+            if numeric < 0 and field_name not in allow_negative:
+                raise ValueError(f"{field_name} must be non-negative")
 
     def _sync_credentials(self) -> None:
         suffix = self._active_suffix()
@@ -563,6 +609,7 @@ class Settings:
         return getattr(self, f"api_secret_{suffix}")
 
     def get_dry_run(self, *, testnet: Optional[bool] = None) -> bool:
+        self._sync_credentials()
         suffix = self._active_suffix(testnet)
         return bool(getattr(self, f"dry_run_{suffix}"))
 
@@ -728,14 +775,11 @@ def _load_file() -> Dict[str, Any]:
         try:
             with acquire_lock(lock_file, timeout=2.0):
                 if SETTINGS_FILE.exists():
+                    _secure_path(SETTINGS_FILE)
                     payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
                     cleaned = _scrub_sensitive(payload)
                     if cleaned != payload:
-                        atomic_write_text(
-                            SETTINGS_FILE,
-                            json.dumps(cleaned, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
+                        _write_secure_json(SETTINGS_FILE, cleaned)
                     return cleaned
         except FileLockTimeout:
             log(
@@ -743,6 +787,7 @@ def _load_file() -> Dict[str, Any]:
                 path=str(SETTINGS_FILE),
             )
             if SETTINGS_FILE.exists():
+                _secure_path(SETTINGS_FILE)
                 payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
                 return _scrub_sensitive(payload)
     except Exception:
@@ -766,6 +811,7 @@ def _load_profile_payload(testnet: bool) -> Dict[str, Any]:
         except FileLockTimeout:
             log("envs.settings.profile.lock_timeout", path=str(path), testnet=testnet)
             if path.exists():
+                _secure_path(path)
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 return _filter_profile_fields(payload)
     except Exception:
@@ -780,11 +826,7 @@ def _persist_profile_payload(testnet: bool, payload: Mapping[str, Any]) -> None:
         lock_file = _lock_path(path)
         with acquire_lock(lock_file, timeout=5.0):
             if cleaned:
-                atomic_write_text(
-                    path,
-                    json.dumps(cleaned, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                _write_secure_json(path, cleaned)
             elif path.exists():
                 path.unlink()
     except Exception:
@@ -1279,11 +1321,7 @@ def update_settings(**kwargs) -> Settings:
     }
     lock_file = _lock_path(SETTINGS_FILE)
     with acquire_lock(lock_file, timeout=5.0):
-        atomic_write_text(
-            SETTINGS_FILE,
-            json.dumps(persistable, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _write_secure_json(SETTINGS_FILE, persistable)
     _invalidate_cache()
     try:
         from .bybit_api import clear_api_cache  # local import to avoid cycle

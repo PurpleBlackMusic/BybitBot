@@ -14,7 +14,10 @@ from typing import Any, Callable, Iterator, Mapping, MutableMapping, Sequence, T
 
 from .. import envs
 from ..guardian_bot import GuardianBot
+from ..integrity import IntegrityError, assert_integrity, load_manifest, should_skip_integrity
 from ..log import log
+from ..monitoring import MonitoringReporter
+from ..security import ensure_restricted_permissions, permissions_too_permissive
 
 DEFAULT_POLL_INTERVAL = 15.0
 
@@ -89,14 +92,20 @@ class BotCLI:
         if default_env_file is None:
             default_env_file = Path(__file__).resolve().parents[3] / ".env"
         self._default_env_file = default_env_file
+        self._monitoring: MonitoringReporter | None = None
 
     # ------------------------------------------------------------------
     # dependency injection helpers
+    def _update_dependency_field(self, field: str, value: _DependencyT) -> None:
+        setattr(self, field, value)
+        if field == "_logger":
+            self._monitoring = None
+
     def _swap_dependency(
         self, field: str, value: _DependencyT
     ) -> _DependencyT:  # pragma: no cover - exercised via public helpers
         previous: _DependencyT = getattr(self, field)
-        setattr(self, field, value)
+        self._update_dependency_field(field, value)
         return previous
 
     @contextmanager
@@ -107,7 +116,15 @@ class BotCLI:
         try:
             yield previous
         finally:
-            setattr(self, field, previous)
+            self._update_dependency_field(field, previous)
+
+    def _resolve_alert_callback(self) -> Callable[[str], None] | None:
+        try:
+            from .. import telegram_notify  # type: ignore[import-not-found]
+        except Exception:  # pragma: no cover - optional dependency
+            return None
+        callback = getattr(getattr(telegram_notify, "dispatcher", None), "enqueue_message", None)
+        return callback if callable(callback) else None
 
     @property
     def logger(self) -> Callable[..., None]:
@@ -122,6 +139,16 @@ class BotCLI:
         """
 
         return self._swap_dependency("_logger", logger)
+
+    def _get_monitoring(self) -> MonitoringReporter:
+        reporter = self._monitoring
+        if reporter is None:
+            reporter = MonitoringReporter(
+                self._logger,
+                alert_callback=self._resolve_alert_callback(),
+            )
+            self._monitoring = reporter
+        return reporter
 
     def set_settings_loader(
         self, loader: Callable[[bool], envs.Settings]
@@ -159,6 +186,13 @@ class BotCLI:
             dotenv_path = self._default_env_file
         else:
             dotenv_path = Path(path).expanduser().resolve()
+
+        if dotenv_path.exists():
+            if permissions_too_permissive(dotenv_path):
+                ensure_restricted_permissions(dotenv_path)
+                self._logger("bot.env.permissions_hardened", path=str(dotenv_path))
+        else:
+            self._logger("bot.env.missing", path=str(dotenv_path))
 
         load_dotenv(dotenv_path, override=False)
         self._harden_env_permissions(dotenv_path)
@@ -200,6 +234,24 @@ class BotCLI:
                 new_mode=oct(new_mode),
             )
 
+    def should_load_env_file(self, requested_path: str | os.PathLike[str] | None) -> bool:
+        disable_marker = os.getenv("BYBITBOT_DISABLE_ENV_FILE", "").strip().lower()
+        if disable_marker in {"1", "true", "yes", "on"}:
+            return False
+        if requested_path:
+            return True
+        testnet_flag = os.getenv("BYBIT_TESTNET")
+        if isinstance(testnet_flag, str) and testnet_flag.strip().lower() in {"0", "false", "no", "off"}:
+            return False
+        env_marker = os.getenv("BYBIT_ENV") or os.getenv("ENV")
+        try:
+            marker_choice = envs.normalise_network_choice(env_marker)
+        except ValueError:
+            marker_choice = None
+        if marker_choice is False:
+            return False
+        return True
+
     def apply_cli_overrides(self, *, testnet: bool | None, dry_run: bool | None) -> None:
         """Update environment variables according to CLI overrides."""
 
@@ -216,6 +268,9 @@ class BotCLI:
         """Return CLI defaults loaded from a JSON file."""
 
         resolved = Path(path).expanduser().resolve()
+        if resolved.exists() and permissions_too_permissive(resolved):
+            ensure_restricted_permissions(resolved)
+            self._logger("bot.config.permissions_hardened", path=str(resolved))
         payload = json.loads(resolved.read_text(encoding="utf-8"))
         try:
             return BotConfig.from_mapping(payload)
@@ -393,6 +448,7 @@ class BotCLI:
             once=once,
             summary=self.render_automation_summary(snapshot),
         )
+        self._get_monitoring().process(snapshot)
 
         if once:
             return 0
@@ -405,6 +461,7 @@ class BotCLI:
                 time.sleep(poll)
                 snapshot = get_automation_status()
                 self.print_snapshot(snapshot, prefix="tick")
+                self._get_monitoring().process(snapshot)
         except KeyboardInterrupt:
             print("\nStopping automation...")
             self._logger("bot.stop", reason="keyboard_interrupt")
@@ -416,12 +473,26 @@ class BotCLI:
         parser = self.build_arg_parser()
         namespace = parser.parse_args(argv)
 
+        manifest = load_manifest()
+        if manifest and not should_skip_integrity():
+            try:
+                assert_integrity()
+            except IntegrityError as exc:
+                self._logger("bot.integrity.failed", severity="error", err=str(exc))
+                print(f"Integrity check failed: {exc}")
+                return 2
+            else:
+                self._logger("bot.integrity.ok", files=len(manifest))
+
         if namespace.config:
             config = self.load_config_file(namespace.config)
             self.apply_config_defaults(vars(namespace), config=config)
 
         if not namespace.no_env_file:
-            self.load_env_file(namespace.env_file)
+            if self.should_load_env_file(namespace.env_file):
+                self.load_env_file(namespace.env_file)
+            else:
+                self._logger("bot.env.skip", reason="disabled_or_production")
 
         testnet_override = envs.normalise_network_choice(namespace.env)
         self.apply_cli_overrides(testnet=testnet_override, dry_run=namespace.dry_run)

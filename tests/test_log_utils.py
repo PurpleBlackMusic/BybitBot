@@ -194,3 +194,26 @@ def test_reset_logs_on_start_truncates_existing_file(tmp_path, monkeypatch):
 
     log_module.reset_logs_on_start()
     assert log_file.read_text(encoding="utf-8") == contents
+
+
+def test_log_masks_sensitive_fields_and_writes_error(tmp_path, monkeypatch):
+    log_file = _use_temp_log(tmp_path, monkeypatch)
+    error_file = tmp_path / "error.log"
+    monkeypatch.setattr(log_module, "ERROR_LOG_FILE", error_file)
+
+    log_module.log(
+        "runtime.error",
+        severity="error",
+        api_key="SUPERSECRET",
+        payload_token="abc",
+        context_token="value",
+    )
+
+    record = json.loads(log_file.read_text(encoding="utf-8"))
+    assert record["payload"]["api_key"] == "***"
+    assert record["payload"]["payload_token"] == "***"
+    assert record["payload"]["context_token"] == "***"
+    assert error_file.exists()
+    error_record = json.loads(error_file.read_text(encoding="utf-8"))
+    assert error_record == record
+
