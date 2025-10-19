@@ -501,7 +501,7 @@ class Settings:
     telegram_token: str = ""
     telegram_chat_id: str = ""
     telegram_notify: bool = False
-    heartbeat_enabled: bool = True
+    heartbeat_enabled: bool = False
     heartbeat_minutes: int = 5
     heartbeat_interval_min: int = 30
 
