@@ -28,11 +28,7 @@ from bybit_app.utils.ui import (
     auto_refresh,
 )
 from bybit_app.utils.formatting import tabular_numeric_css
-from bybit_app.utils.ai.kill_switch import (
-    clear_pause,
-    get_state as get_kill_switch_state,
-    set_pause as activate_kill_switch,
-)
+from bybit_app.utils.ai.kill_switch import get_state as get_kill_switch_state
 from bybit_app.utils.background import (
     ensure_background_services,
     restart_automation,
@@ -71,6 +67,10 @@ from bybit_app.ui.components import (
     status_bar,
     trade_ticket,
     wallet_overview,
+)
+from bybit_app.ui.backend_client import (
+    pause_kill_switch as backend_pause_kill_switch,
+    resume_kill_switch as backend_resume_kill_switch,
 )
 
 
@@ -1270,12 +1270,16 @@ def main() -> None:
             if kill_state.reason:
                 st.caption(f"Причина: {kill_state.reason}")
             if st.button("▶️ Возобновить работу", use_container_width=True):
-                clear_pause()
+                resume_ok = backend_resume_kill_switch()
+                if not resume_ok:
+                    st.info("Backend недоступен, Kill-Switch возобновлен локально.")
                 _trigger_refresh()
         else:
             if mode == "pause":
                 if st.button("⏸ Поставить на паузу", use_container_width=True):
-                    activate_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
+                    pause_ok = backend_pause_kill_switch(pause_minutes, kill_reason or "Paused via dashboard")
+                    if not pause_ok:
+                        st.info("Backend недоступен, пауза применена локально.")
                     _trigger_refresh()
             else:
                 confirm_pending = bool(state.get("kill_switch_confirm_pending", False))
@@ -1290,7 +1294,9 @@ def main() -> None:
                         use_container_width=True,
                         key="kill_switch_confirm_yes",
                     ):
-                        activate_kill_switch(None, kill_reason or "Manual kill-switch")
+                        pause_ok = backend_pause_kill_switch(None, kill_reason or "Manual kill-switch")
+                        if not pause_ok:
+                            st.info("Backend недоступен, Kill-Switch активирован локально.")
                         state["kill_switch_confirm_pending"] = False
                         _trigger_refresh()
                     if cancel_col.button(
