@@ -18,6 +18,19 @@ from .security import ensure_restricted_permissions, permissions_too_permissive
 LOG_FILE = LOG_DIR / "app.log"
 ERROR_LOG_FILE = LOG_DIR / "error.log"
 
+# Optional per-severity log files allow operators to focus on a specific
+# category without tailing the full application log. The mapping is mutable so
+# tests can inject temporary files.
+SEVERITY_LOG_PATHS: dict[str, Path] = {
+    "critical": LOG_DIR / "critical.log",
+    "warning": LOG_DIR / "warning.log",
+}
+
+# Retention controls for the per-severity log files. They intentionally mirror
+# the defaults for the main logs but can be overridden in tests if needed.
+MAX_SEVERITY_LOG_BYTES = 2_000_000
+SEVERITY_RETAIN_LOG_LINES = 2_000
+
 # Time-based rotation keeps separate daily files in addition to size-based pruning.
 LOG_ROTATION_INTERVAL = 24 * 60 * 60
 
@@ -366,7 +379,8 @@ def reset_logs_on_start(*, force: bool = False) -> None:
     if _RESET_DONE and not force:
         return
 
-    targets = (LOG_FILE, ERROR_LOG_FILE)
+    severity_targets = tuple(dict.fromkeys(SEVERITY_LOG_PATHS.values()))
+    targets = (LOG_FILE, ERROR_LOG_FILE, *severity_targets)
 
     with _LOCK:
         if _RESET_DONE and not force:
@@ -464,6 +478,24 @@ def _append_record(path: Path, text: str) -> int | None:
     return size_hint
 
 
+def _write_log_line(
+    path: Path,
+    text: str,
+    *,
+    max_bytes: int,
+    retain_lines: int,
+) -> None:
+    """Append ``text`` to ``path`` and prune the file if it grows too large."""
+
+    size_hint = _append_record(path, text)
+    _prune_log_file(
+        path,
+        max_bytes=max_bytes,
+        retain_lines=retain_lines,
+        size_hint=size_hint,
+    )
+
+
 def log(
     event: str,
     *,
@@ -476,6 +508,8 @@ def log(
     context, remaining_payload = _split_structured_payload(payload)
     context = _sanitize_mapping(context)
     remaining_payload = _sanitize_mapping(remaining_payload)
+
+    severity_value = _derive_severity(event, severity)
 
     record: dict[str, Any] = {
         "ts": int(time.time() * 1000),
