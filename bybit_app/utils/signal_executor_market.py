@@ -497,35 +497,131 @@ class SignalExecutorMarketMixin:
     ) -> Tuple[bool, Optional[Dict[str, object]]]:
         context: Dict[str, object] = {}
 
-        entry = summary
-        strength_hint = _safe_float(entry.get("impulse_strength"))
-        if strength_hint is not None:
-            context["impulse_strength_hint"] = strength_hint
-        volume_impulse = entry.get("volume_impulse")
-        if isinstance(volume_impulse, Mapping):
-            context["volume_impulse"] = dict(volume_impulse)
-        if bool(entry.get("impulse_signal")):
-            context.setdefault("trigger", "flagged")
-            return True, context
+        symbol_entries: List[Tuple[str, Mapping[str, object]]] = []
+        if symbol is not None:
+            symbol_entries = self._summary_entries_for_symbol(summary, symbol)
 
-        best_impulse: Optional[float] = None
-        if isinstance(volume_impulse, Mapping):
-            for value in volume_impulse.values():
-                numeric = _safe_float(value)
-                if numeric is None:
-                    continue
-                if best_impulse is None or float(numeric) > best_impulse:
-                    best_impulse = float(numeric)
+        entries: List[Tuple[str, Mapping[str, object]]] = []
+        entries.extend(symbol_entries)
+        entries.append(("summary", dict(summary)))
 
+        best_strength_hint: Optional[float] = None
+        best_strength_source: Optional[str] = None
+        best_volume_value: Optional[float] = None
+        best_volume_source: Optional[str] = None
+        best_volume_payload: Optional[Mapping[str, object]] = None
+
+        cleaned_symbol = _safe_symbol(symbol)
+
+        for source, entry in entries:
+            strength_hint = _safe_float(entry.get("impulse_strength"))
+            if strength_hint is not None and (
+                best_strength_hint is None or strength_hint > best_strength_hint
+            ):
+                best_strength_hint = strength_hint
+                best_strength_source = source
+
+            volume_impulse = entry.get("volume_impulse")
+            if isinstance(volume_impulse, Mapping):
+                for value in volume_impulse.values():
+                    numeric = _safe_float(value)
+                    if numeric is None:
+                        continue
+                    if best_volume_value is None or numeric > best_volume_value:
+                        best_volume_value = numeric
+                        best_volume_source = source
+                        best_volume_payload = volume_impulse
+
+            if bool(entry.get("impulse_signal")):
+                if cleaned_symbol:
+                    context.setdefault("symbol", cleaned_symbol)
+                context.setdefault("trigger", "flagged")
+                context.setdefault("source", source)
+                if best_strength_hint is not None:
+                    context.setdefault("impulse_strength_hint", best_strength_hint)
+                    if best_strength_source:
+                        context.setdefault("hint_source", best_strength_source)
+                if isinstance(best_volume_payload, Mapping):
+                    context.setdefault("volume_impulse", dict(best_volume_payload))
+                    if best_volume_source:
+                        context.setdefault("volume_source", best_volume_source)
+                return True, context
+
+        if best_strength_hint is not None:
+            context["impulse_strength_hint"] = best_strength_hint
+            if best_strength_source:
+                context["hint_source"] = best_strength_source
+
+        if isinstance(best_volume_payload, Mapping):
+            context["volume_impulse"] = dict(best_volume_payload)
+            if best_volume_source:
+                context["volume_source"] = best_volume_source
+
+        best_impulse = best_volume_value
         if best_impulse is None:
-            best_impulse = strength_hint
+            best_impulse = best_strength_hint
 
         if best_impulse is not None and best_impulse >= _IMPULSE_SIGNAL_THRESHOLD:
+            if cleaned_symbol:
+                context.setdefault("symbol", cleaned_symbol)
             context.setdefault("trigger", "volume_impulse")
             context["impulse_strength"] = best_impulse
+            if best_volume_source and best_impulse == best_volume_value:
+                context.setdefault("source", best_volume_source)
+            elif best_strength_source and best_impulse == best_strength_hint:
+                context.setdefault("source", best_strength_source)
             return True, context
 
         return False, context or None
+
+    def _summary_entries_for_symbol(
+        self, summary: Mapping[str, object], symbol: str
+    ) -> List[Tuple[str, Mapping[str, object]]]:
+        symbol_key = _safe_symbol(symbol)
+        if not symbol_key:
+            return []
+
+        entries: List[Tuple[str, Mapping[str, object]]] = []
+
+        def _append(source: str, candidate: object) -> None:
+            if isinstance(candidate, Mapping):
+                entries.append((source, dict(candidate)))
+
+        trade_candidates = summary.get("trade_candidates")
+        if isinstance(trade_candidates, Sequence):
+            for candidate in trade_candidates:
+                if not isinstance(candidate, Mapping):
+                    continue
+                if _safe_symbol(candidate.get("symbol")) == symbol_key:
+                    _append("trade_candidates", candidate)
+
+        watchlist = summary.get("watchlist")
+        if isinstance(watchlist, Mapping):
+            for watch_symbol, payload in watchlist.items():
+                if _safe_symbol(watch_symbol) == symbol_key:
+                    _append("watchlist", payload)
+        elif isinstance(watchlist, Sequence):
+            for payload in watchlist:
+                if isinstance(payload, Mapping) and _safe_symbol(payload.get("symbol")) == symbol_key:
+                    _append("watchlist", payload)
+
+        holdings = summary.get("holdings")
+        if isinstance(holdings, Mapping):
+            holding_payload = holdings.get(symbol_key)
+            _append("holdings", holding_payload)
+
+        symbol_plan = summary.get("symbol_plan")
+        if isinstance(symbol_plan, Mapping):
+            for key in ("priority_table", "priorityTable", "positions", "combined"):
+                value = symbol_plan.get(key)
+                if isinstance(value, Mapping):
+                    _append(f"symbol_plan.{key}", value.get(symbol_key))
+                elif isinstance(value, Sequence):
+                    for payload in value:
+                        if isinstance(payload, Mapping) and _safe_symbol(payload.get("symbol")) == symbol_key:
+                            _append(f"symbol_plan.{key}", payload)
+
+        return entries
 
     @staticmethod
     def _impulse_stop_loss_bps(settings: Settings) -> float:
