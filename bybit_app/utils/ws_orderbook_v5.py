@@ -12,6 +12,24 @@ from .log import log
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
 
+
+def _should_verify_ssl(settings: object | None) -> bool:
+    if settings is None:
+        return True
+
+    raw_value = getattr(settings, "verify_ssl", True)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in {"false", "0", "no", "off"}:
+            return False
+        if text in {"true", "1", "yes", "on"}:
+            return True
+    return bool(raw_value)
+
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
     Processes snapshot + delta per official rules. Fallback to REST must be handled by caller.
@@ -96,9 +114,7 @@ class WSOrderbookV5:
                     settings = get_settings()
                 except Exception:
                     settings = None
-                verify_ssl = True
-                if settings is not None:
-                    verify_ssl = bool(getattr(settings, "verify_ssl", True))
+                verify_ssl = _should_verify_ssl(settings)
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False

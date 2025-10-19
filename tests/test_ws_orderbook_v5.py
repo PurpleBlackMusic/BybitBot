@@ -10,6 +10,7 @@ import threading
 import time
 
 
+from bybit_app.utils import ws_orderbook_v5 as ws_orderbook_v5_module
 from bybit_app.utils.ws_orderbook_v5 import WSOrderbookV5
 
 
@@ -26,6 +27,25 @@ class _DummyWebSocketApp:
 
     def close(self):  # pragma: no cover - defensive
         pass
+
+
+@pytest.mark.parametrize(
+    "raw_value, expected",
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("true", True),
+        ("False", False),
+        ("no", False),
+        ("yes", True),
+        (None, True),
+    ],
+)
+def test_should_verify_ssl_normalises_inputs(raw_value, expected):
+    settings = SimpleNamespace(verify_ssl=raw_value) if raw_value is not None else None
+    assert ws_orderbook_v5_module._should_verify_ssl(settings) is expected
 
 
 @pytest.mark.parametrize("verify_flag, expected_cert", [(True, ssl.CERT_REQUIRED), (False, ssl.CERT_NONE)])
