@@ -1642,6 +1642,66 @@ def test_start_public_resubscribes_only_when_socket_connected() -> None:
     ]
 
 
+def test_ensure_realtime_streams_expands_subscriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager._pub_subs = ("tickers.BTCUSDT",)
+
+    recorded: list[tuple[str, ...]] = []
+
+    def fake_start_public(subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
+        snapshot = tuple(subs)
+        recorded.append(snapshot)
+        manager._pub_subs = snapshot
+        return True
+
+    monkeypatch.setattr(manager, "start_public", fake_start_public)
+
+    result = manager.ensure_realtime_streams(["ethusdt", "XRPUSDT", ""], depth=25)
+
+    expected = tuple(
+        sorted(
+            {
+                "tickers.BTCUSDT",
+                "tickers.ETHUSDT",
+                "tickers.XRPUSDT",
+                "orderbook.25.ETHUSDT",
+                "orderbook.25.XRPUSDT",
+                "publicTrade.ETHUSDT",
+                "publicTrade.XRPUSDT",
+            }
+        )
+    )
+
+    assert result == expected
+    assert recorded == [expected]
+
+    follow_up = manager.ensure_realtime_streams(["ETHUSDT"], depth=25)
+    assert follow_up == expected
+    assert recorded == [expected]
+
+
+def test_ensure_realtime_streams_ignores_empty_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+    manager._pub_subs = ("tickers.BTCUSDT",)
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_start_public(subs: Iterable[str] = ("tickers.BTCUSDT",)) -> bool:
+        calls.append(tuple(subs))
+        return True
+
+    monkeypatch.setattr(manager, "start_public", fake_start_public)
+
+    result = manager.ensure_realtime_streams([], depth=10)
+
+    assert result == ("tickers.BTCUSDT",)
+    assert calls == []
+
+
 def test_ws_private_v5_resubscribe_requires_connected_socket() -> None:
     ws_client = WSPrivateV5(reconnect=False)
     ws_client._thread = SimpleNamespace(is_alive=lambda: True)

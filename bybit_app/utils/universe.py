@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import heapq
 import json
 import math
 import os
@@ -10,7 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple, TypeVar, Generic, cast
 
-from .bybit_api import BybitAPI
+from .bybit_api import AsyncBybitAPI, BybitAPI
 from .envs import get_settings, update_settings
 from .instruments import filter_listed_spot_symbols
 from .paths import DATA_DIR
@@ -181,6 +183,51 @@ def _cache_instrument_metadata(records: Mapping[str, Mapping[str, object]]) -> N
             _INSTRUMENT_META_CACHE[symbol] = (now, meta)
 
 
+async def _fetch_instrument_metadata_async(
+    api: BybitAPI,
+    symbols: Iterable[str],
+    *,
+    concurrency: int = 8,
+) -> dict[str, Mapping[str, object]]:
+    """Fetch instrument metadata concurrently via :class:`AsyncBybitAPI`."""
+
+    target = {_normalize_symbol(sym) for sym in symbols if _normalize_symbol(sym)}
+    if not target:
+        return {}
+
+    async_api = AsyncBybitAPI(api, max_workers=max(int(concurrency), 1))
+    semaphore = asyncio.Semaphore(max(int(concurrency), 1))
+
+    async def _load(symbol: str) -> tuple[str, Mapping[str, object] | None]:
+        async with semaphore:
+            try:
+                payload = await async_api.instruments_info(
+                    category="spot", symbol=symbol, limit=1
+                )
+            except Exception:
+                return symbol, None
+
+        result = payload.get("result") if isinstance(payload, Mapping) else None
+        rows = result.get("list") if isinstance(result, Mapping) else []
+        if isinstance(rows, list) and rows:
+            candidate = rows[0]
+            if isinstance(candidate, Mapping):
+                return symbol, candidate
+        return symbol, None
+
+    tasks = [_load(symbol) for symbol in sorted(target)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    collected: dict[str, Mapping[str, object]] = {}
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        symbol, meta = result
+        if isinstance(meta, Mapping):
+            collected[symbol] = meta
+    return collected
+
+
 def _fetch_instrument_metadata(
     api: BybitAPI, symbols: Iterable[str]
 ) -> dict[str, Mapping[str, object]]:
@@ -196,7 +243,7 @@ def _fetch_instrument_metadata(
 
     def _refresh() -> dict[str, Mapping[str, object]]:
         fresh: dict[str, Mapping[str, object]] = {}
-        payload: Mapping[str, object]
+        cursor: str | None = None
 
         if hasattr(api, "instruments_info"):
             cursor_token: str | None = None
@@ -610,19 +657,28 @@ def build_universe_scored(
         if not sym or sym in seen:
             continue
         seen.add(sym)
-
-        if not _has_allowed_quote(sym, quotes):
-            continue
         if sym in blacklist_set:
+            continue
+        if not _has_allowed_quote(sym, quotes):
             continue
         if is_symbol_blacklisted(sym):
             continue
 
         candidates.append((sym, item))
 
-    instrument_meta = _fetch_instrument_metadata(api, (sym for sym, _ in candidates))
+    non_whitelist_symbols = {sym for sym, _ in candidates if sym not in whitelist_set}
+    instrument_meta = (
+        _fetch_instrument_metadata(api, non_whitelist_symbols)
+        if non_whitelist_symbols
+        else {}
+    )
 
-    snapshots: list[LiquiditySnapshot] = []
+    if whitelist_set:
+        cached_meta, _ = _resolve_cache_entries(whitelist_set)
+        if cached_meta:
+            instrument_meta.update(cached_meta)
+
+    scored: list[tuple[str, float]] = []
     for sym, item in candidates:
         turnover = _safe_float(item.get("turnover24h"))
         bid = _safe_float(item.get("bestBidPrice"))
@@ -631,15 +687,14 @@ def build_universe_scored(
             continue
 
         spread_bps = max(((ask - bid) / ask) * 10_000.0, 0.0)
-
         meta = instrument_meta.get(sym)
-        age_days = _resolve_age_days(meta)
-        mean_spread = _resolve_mean_spread(spread_bps, meta)
-        volatility_rank = _resolve_volatility_rank(item, meta)
-
         is_whitelisted = sym in whitelist_set
 
         if not is_whitelisted:
+            age_days = _resolve_age_days(meta)
+            mean_spread = _resolve_mean_spread(spread_bps, meta)
+            volatility_rank = _resolve_volatility_rank(item, meta)
+
             if age_days is None or age_days <= _MIN_LISTING_AGE_DAYS:
                 continue
             if mean_spread is None or mean_spread >= _MEAN_SPREAD_BPS_THRESHOLD:
@@ -648,28 +703,21 @@ def build_universe_scored(
                 continue
 
         if turnover >= float(min_turnover) and spread_bps <= float(max_spread_bps):
-            snapshots.append(
-                LiquiditySnapshot(
-                    sym,
-                    turnover,
-                    spread_bps,
-                    age_days=age_days,
-                    mean_spread_bps=mean_spread,
-                    volatility_rank=volatility_rank,
-                )
-            )
-
-    scored = [
-        (snapshot.symbol, float(score_fn(snapshot.turnover, snapshot.spread_bps)))
-        for snapshot in snapshots
-    ]
+            scored.append((sym, float(score_fn(turnover, spread_bps))))
 
     existing_symbols = {symbol for symbol, _ in scored}
     for symbol in whitelist_set - existing_symbols:
         scored.append((symbol, float("inf")))
 
-    scored.sort(key=lambda item: item[1], reverse=True)
-    return scored[: int(size)] if size else scored
+    if size:
+        limit = max(int(size), 0)
+        if limit and len(scored) > limit:
+            top = heapq.nlargest(limit, scored, key=lambda item: item[1])
+        else:
+            top = sorted(scored, key=lambda item: item[1], reverse=True)
+        return top[:limit]
+
+    return sorted(scored, key=lambda item: item[1], reverse=True)
 
 def auto_rotate_universe(
     api: BybitAPI,
