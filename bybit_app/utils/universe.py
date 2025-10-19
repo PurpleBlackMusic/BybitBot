@@ -198,44 +198,93 @@ def _fetch_instrument_metadata(
         fresh: dict[str, Mapping[str, object]] = {}
         payload: Mapping[str, object]
 
-        try:
-            payload = api._safe_req(
-                "GET",
-                "/v5/market/instruments-info",
-                params={"category": "spot"},
-            )
-        except Exception:
-            rows: list[Mapping[str, object]] = []
+        if hasattr(api, "instruments_info"):
+            cursor_token: str | None = None
+            while pending:
+                try:
+                    payload = api.instruments_info(
+                        category="spot",
+                        status="Trading",
+                        limit=200,
+                        cursor=cursor_token,
+                    )
+                except Exception:
+                    break
+
+                result = payload.get("result") if isinstance(payload, Mapping) else None
+                rows = result.get("list") if isinstance(result, Mapping) else []
+                if not isinstance(rows, list):
+                    rows = []
+
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        continue
+                    symbol = _normalize_symbol(row.get("symbol"))
+                    if symbol and symbol in pending:
+                        fresh[symbol] = row
+                        pending.discard(symbol)
+
+                next_cursor_raw = None
+                if isinstance(result, Mapping):
+                    next_cursor_raw = result.get("nextPageCursor") or result.get("nextPageToken")
+                if next_cursor_raw is None and isinstance(payload, Mapping):
+                    next_cursor_raw = payload.get("nextPageCursor") or payload.get("nextPageToken")
+                next_cursor = str(next_cursor_raw).strip() if next_cursor_raw else ""
+                if not pending or not next_cursor or next_cursor == cursor_token:
+                    break
+                cursor_token = next_cursor
+
+            for symbol in list(pending):
+                try:
+                    detail = api.instruments_info(category="spot", symbol=symbol)
+                except Exception:
+                    continue
+                result = detail.get("result") if isinstance(detail, Mapping) else None
+                rows = result.get("list") if isinstance(result, Mapping) else []
+                if isinstance(rows, list) and rows:
+                    row = rows[0]
+                    if isinstance(row, Mapping):
+                        fresh[symbol] = row
+                        pending.discard(symbol)
         else:
-            result = payload.get("result") if isinstance(payload, Mapping) else None
-            rows = result.get("list") if isinstance(result, Mapping) else []
-            if not isinstance(rows, list):
-                rows = []
-
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            symbol = _normalize_symbol(row.get("symbol"))
-            if symbol and symbol in pending:
-                fresh[symbol] = row
-
-        remaining = pending - set(fresh.keys())
-
-        for symbol in list(remaining):
             try:
-                detail = api._safe_req(
+                payload = api._safe_req(
                     "GET",
                     "/v5/market/instruments-info",
-                    params={"category": "spot", "symbol": symbol},
+                    params={"category": "spot"},
                 )
             except Exception:
-                continue
-            result = detail.get("result") if isinstance(detail, Mapping) else None
-            rows = result.get("list") if isinstance(result, Mapping) else []
-            if isinstance(rows, list) and rows:
-                row = rows[0]
-                if isinstance(row, Mapping):
+                rows: list[Mapping[str, object]] = []
+            else:
+                result = payload.get("result") if isinstance(payload, Mapping) else None
+                rows = result.get("list") if isinstance(result, Mapping) else []
+                if not isinstance(rows, list):
+                    rows = []
+
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                symbol = _normalize_symbol(row.get("symbol"))
+                if symbol and symbol in pending:
                     fresh[symbol] = row
+
+            remaining = pending - set(fresh.keys())
+
+            for symbol in list(remaining):
+                try:
+                    detail = api._safe_req(
+                        "GET",
+                        "/v5/market/instruments-info",
+                        params={"category": "spot", "symbol": symbol},
+                    )
+                except Exception:
+                    continue
+                result = detail.get("result") if isinstance(detail, Mapping) else None
+                rows = result.get("list") if isinstance(result, Mapping) else []
+                if isinstance(rows, list) and rows:
+                    row = rows[0]
+                    if isinstance(row, Mapping):
+                        fresh[symbol] = row
 
         if fresh:
             _cache_instrument_metadata(fresh)

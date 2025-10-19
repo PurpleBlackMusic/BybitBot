@@ -9,6 +9,7 @@ from weakref import WeakSet
 
 from .envs import get_settings
 from .log import log
+from .ws_limits import reserve_ws_connection_slot
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
 
@@ -103,6 +104,7 @@ class WSOrderbookV5:
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False
                 try:
+                    reserve_ws_connection_slot()
                     ws = websocket.WebSocketApp(
                         self.url,
                         on_open=lambda w: self._on_open(w),

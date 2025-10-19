@@ -14,6 +14,7 @@ from .envs import get_settings
 from .settings_loader import call_get_settings
 from .log import log
 from .time_sync import invalidate_synced_clock, synced_timestamp_ms
+from .ws_limits import reserve_ws_connection_slot
 
 
 DEFAULT_TOPICS: tuple[str, ...] = (
@@ -414,6 +415,7 @@ class WSPrivateV5:
                 stop_ping_loop()
 
             while not self._stop:
+                reserve_ws_connection_slot()
                 ws = websocket.WebSocketApp(
                     self.url,
                     on_open=handle_open,

@@ -13,6 +13,7 @@ from bybit_app.utils.background import (
     get_ws_snapshot,
 )
 from bybit_app.utils.envs import get_api_client
+from bybit_app.ui.backend_client import call_backend
 
 BASE_SESSION_STATE: dict[str, Any] = {
     "auto_refresh_enabled": True,
@@ -101,21 +102,21 @@ def _ensure_mapping(payload: object) -> dict[str, Any]:
 def cached_guardian_snapshot() -> dict[str, Any]:
     """Fetch the latest guardian snapshot with lightweight caching."""
 
-    return _ensure_mapping(get_guardian_state())
+    return _ensure_mapping(call_backend("/state/guardian", get_guardian_state))
 
 
 @st.cache_data(ttl=10.0, show_spinner=False)
 def cached_ws_snapshot() -> dict[str, Any]:
     """Fetch the latest websocket snapshot with lightweight caching."""
 
-    return _ensure_mapping(get_ws_snapshot())
+    return _ensure_mapping(call_backend("/state/ws", get_ws_snapshot))
 
 
 @st.cache_data(ttl=30.0, show_spinner=False)
 def cached_preflight_snapshot() -> dict[str, Any]:
     """Return the latest automation/preflight snapshot."""
 
-    return _ensure_mapping(get_preflight_snapshot())
+    return _ensure_mapping(call_backend("/state/preflight", get_preflight_snapshot))
 
 
 def clear_data_caches() -> None:

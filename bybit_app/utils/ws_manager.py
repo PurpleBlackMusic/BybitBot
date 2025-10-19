@@ -33,6 +33,7 @@ from .ws_events import fetch_events as _fetch_ws_events
 from .ws_events import event_queue_stats as _ws_event_stats
 from .ws_events import publish_event as _publish_ws_event
 from .bybit_errors import parse_bybit_error_message
+from .ws_limits import reserve_ws_connection_slot
 _TP_LADDER_SKIP_CODES = {"170194", "170131"}
 
 
@@ -546,6 +547,7 @@ class WSManager:
                 verify_ssl = bool(getattr(self.s, "verify_ssl", True))
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
+                reserve_ws_connection_slot()
                 ws = websocket.WebSocketApp(
                     current_url,
                     on_open=on_open,
