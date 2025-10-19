@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 from weakref import WeakSet
 
 from .envs import get_settings
@@ -92,13 +92,15 @@ class WSOrderbookV5:
             max_backoff = 60.0
             while not self._stop:
                 attempt += 1
+                had_error = False
                 try:
                     settings = get_settings()
                 except Exception:
                     settings = None
                 verify_ssl = True
                 if settings is not None:
-                    verify_ssl = bool(getattr(settings, "verify_ssl", True))
+                    verify_value = getattr(settings, "verify_ssl", True)
+                    verify_ssl = _coerce_verify_flag(verify_value)
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False
@@ -120,10 +122,13 @@ class WSOrderbookV5:
                     self._ws = ws
                     ws.run_forever(sslopt=sslopt)
                 except Exception as e:
+                    had_error = True
                     log("ws.orderbook.run_err", err=str(e))
                 finally:
                     self._ws = None
-                if self._stop or is_test_ws:
+                if self._stop:
+                    break
+                if is_test_ws and not had_error:
                     break
                 sleep_for = min(backoff, max_backoff)
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
@@ -300,3 +305,19 @@ class WSOrderbookV5:
     def get(self, symbol: str):
         with self._lock:
             return self._book.get(symbol)
+def _coerce_verify_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        marker = value.strip().lower()
+        if not marker:
+            return True
+        if marker in {"0", "false", "no", "off"}:
+            return False
+        if marker in {"1", "true", "yes", "on"}:
+            return True
+    return bool(value)

@@ -88,9 +88,10 @@ def test_cli_status_prints_testnet_configuration(
     assert "Dry-run flags: testnet=ON" in out
     assert os.getenv("BYBIT_TESTNET") == "1"
     assert os.getenv("BYBIT_ENV") == "test"
-    assert events and events[0][0] == "bot.start"
-    assert events[0][1]["network"] == "testnet"
-    assert events[0][1]["dry_run"] is True
+    start_event = next((payload for event, payload in events if event == "bot.start"), None)
+    assert start_event is not None
+    assert start_event["network"] == "testnet"
+    assert start_event["dry_run"] is True
 
 
 def test_cli_status_mainnet_live(
@@ -125,7 +126,9 @@ def test_cli_status_mainnet_live(
     assert os.getenv("BYBIT_TESTNET") == "0"
     assert os.getenv("BYBIT_ENV") == "prod"
     assert os.getenv("BYBIT_DRY_RUN") == "0"
-    assert events and events[0][1]["dry_run"] is False
+    start_event = next((payload for event, payload in events if event == "bot.start"), None)
+    assert start_event is not None
+    assert start_event["dry_run"] is False
 
 
 def test_cli_invokes_background_loop_with_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
