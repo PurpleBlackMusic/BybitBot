@@ -19,9 +19,11 @@ try:
     tk = api.tickers(category="spot")
     rows = (tk.get("result") or {}).get("list") or []
     # простая фильтрация и сортировка по turnover24h
-    def as_float(x, default=0.0):
-        try: return float(x)
-        except: return default
+    def as_float(value, default=0.0):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
     rows = [r for r in rows if q.upper() in str(r.get("symbol","")).upper()]
     rows.sort(key=lambda r: as_float(r.get("turnover24h",0)), reverse=True)
     if rows:

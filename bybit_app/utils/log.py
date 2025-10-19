@@ -5,19 +5,26 @@ import json
 import threading
 import time
 import traceback
+from pathlib import Path
 from types import TracebackType
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 from .file_io import atomic_write_text, tail_lines
 from .paths import LOG_DIR
 
 LOG_FILE = LOG_DIR / "app.log"
+SEVERITY_LOG_PATHS: dict[str, Path] = {
+    level: LOG_DIR / f"{level}.log"
+    for level in ("warning", "error", "critical")
+}
 
 # Default retention parameters keep the log at a manageable size while still
 # preserving enough history for troubleshooting. The values are deliberately
 # conservative and can be adjusted in tests through monkeypatching.
 MAX_LOG_BYTES = 5_000_000
 RETAIN_LOG_LINES = 5_000
+MAX_SEVERITY_LOG_BYTES = 2_000_000
+SEVERITY_RETAIN_LOG_LINES = 2_000
 
 _LOCK = threading.RLock()
 
@@ -41,6 +48,19 @@ _STRUCTURED_ALIASES: dict[str, tuple[str, ...]] = {
     "price": ("price",),
     "qty": ("qty", "quantity"),
 }
+
+_SENSITIVE_KEYWORDS = {
+    "api_key",
+    "api_secret",
+    "secret",
+    "token",
+    "passphrase",
+    "password",
+    "private_key",
+    "access_token",
+    "refresh_token",
+}
+_REDACTED_VALUE = "[redacted]"
 
 
 def _normalise_limit(value: int | str | None, fallback: int) -> int:
@@ -77,17 +97,21 @@ def _iter_json_lines(
 
 
 def _prune_log_file(
-    *, max_bytes: int, retain_lines: int, size_hint: int | None = None
+    path: Path,
+    *,
+    max_bytes: int,
+    retain_lines: int,
+    size_hint: int | None = None,
 ) -> None:
-    """Truncate ``LOG_FILE`` when it exceeds ``max_bytes``."""
+    """Truncate ``path`` when it exceeds ``max_bytes``."""
 
     if max_bytes <= 0 or retain_lines <= 0:
         return
-    if not LOG_FILE.exists():
+    if not path.exists():
         return
 
     try:
-        size = size_hint if size_hint is not None else LOG_FILE.stat().st_size
+        size = size_hint if size_hint is not None else path.stat().st_size
     except OSError:
         return
 
@@ -95,7 +119,7 @@ def _prune_log_file(
         return
 
     tail = tail_lines(
-        LOG_FILE,
+        path,
         retain_lines,
         encoding="utf-8",
         errors="replace",
@@ -104,12 +128,9 @@ def _prune_log_file(
     )
 
     cleaned = [raw for raw, _ in _iter_json_lines(tail, drop_invalid=True)]
-    if cleaned:
-        text = "\n".join(cleaned) + "\n"
-    else:
-        text = ""
+    text = "\n".join(cleaned) + "\n" if cleaned else ""
 
-    atomic_write_text(LOG_FILE, text, encoding="utf-8", preserve_permissions=True)
+    atomic_write_text(path, text, encoding="utf-8", preserve_permissions=True)
 
 
 def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None) -> None:
@@ -119,7 +140,50 @@ def clean_logs(*, max_bytes: int | None = None, retain_lines: int | None = None)
     keep = retain_lines if retain_lines is not None else RETAIN_LOG_LINES
 
     with _LOCK:
-        _prune_log_file(max_bytes=maximum, retain_lines=keep)
+        _prune_log_file(LOG_FILE, max_bytes=maximum, retain_lines=keep)
+        for severity, path in SEVERITY_LOG_PATHS.items():
+            limit = MAX_SEVERITY_LOG_BYTES
+            retain = SEVERITY_RETAIN_LOG_LINES
+            _prune_log_file(path, max_bytes=limit, retain_lines=retain)
+
+
+def _should_redact(key: str) -> bool:
+    lower = key.lower()
+    return any(fragment in lower for fragment in _SENSITIVE_KEYWORDS)
+
+
+def _scrub_sensitive_data(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        cleaned: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and _should_redact(key):
+                cleaned[key] = _REDACTED_VALUE
+            else:
+                cleaned[key] = _scrub_sensitive_data(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_scrub_sensitive_data(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scrub_sensitive_data(item) for item in value)
+    return value
+
+
+def _write_log_line(
+    path: Path,
+    text: str,
+    *,
+    max_bytes: int,
+    retain_lines: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+        handle.flush()
+        try:
+            size_hint = handle.buffer.tell()
+        except AttributeError:
+            size_hint = None
+    _prune_log_file(path, max_bytes=max_bytes, retain_lines=retain_lines, size_hint=size_hint)
 
 
 def reset_logs_on_start(*, force: bool = False) -> None:
@@ -136,16 +200,19 @@ def reset_logs_on_start(*, force: bool = False) -> None:
 
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            LOG_FILE.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            # Fall back to truncating in-place when unlinking fails, e.g. on
-            # locked filesystems during tests or restricted environments.
-            atomic_write_text(
-                LOG_FILE, "", encoding="utf-8", preserve_permissions=True
-            )
+        targets = [LOG_FILE, *SEVERITY_LOG_PATHS.values()]
+        for path in targets:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                atomic_write_text(
+                    path,
+                    "",
+                    encoding="utf-8",
+                    preserve_permissions=True,
+                )
 
         _RESET_DONE = True
 
@@ -226,12 +293,16 @@ def log(
 ) -> None:
     """Append a JSON record with ``event`` and ``payload`` to the log file."""
 
-    context, remaining_payload = _split_structured_payload(payload)
+    context_raw, payload_raw = _split_structured_payload(payload)
+    context = _scrub_sensitive_data(context_raw)
+    remaining_payload = _scrub_sensitive_data(payload_raw)
+
+    severity_value = _derive_severity(event, severity)
 
     record: dict[str, Any] = {
         "ts": int(time.time() * 1000),
         "event": event,
-        "severity": _derive_severity(event, severity),
+        "severity": severity_value,
         "thread": threading.current_thread().name,
         "context": context,
         "payload": remaining_payload,
@@ -244,19 +315,20 @@ def log(
     text = json.dumps(record, ensure_ascii=False)
 
     with _LOCK:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(text + "\n")
-            handle.flush()
-            try:
-                size_hint = handle.buffer.tell()
-            except AttributeError:
-                size_hint = None
-        _prune_log_file(
+        _write_log_line(
+            LOG_FILE,
+            text,
             max_bytes=MAX_LOG_BYTES,
             retain_lines=RETAIN_LOG_LINES,
-            size_hint=size_hint,
         )
+        severity_path = SEVERITY_LOG_PATHS.get(severity_value)
+        if severity_path is not None:
+            _write_log_line(
+                severity_path,
+                text,
+                max_bytes=MAX_SEVERITY_LOG_BYTES,
+                retain_lines=SEVERITY_RETAIN_LOG_LINES,
+            )
 
 
 def read_tail(
