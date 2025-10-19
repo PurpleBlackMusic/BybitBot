@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -160,6 +161,44 @@ class BotCLI:
             dotenv_path = Path(path).expanduser().resolve()
 
         load_dotenv(dotenv_path, override=False)
+        self._harden_env_permissions(dotenv_path)
+
+    def _harden_env_permissions(self, dotenv_path: Path) -> None:
+        if not dotenv_path.exists():
+            return
+
+        try:
+            mode = stat.S_IMODE(dotenv_path.stat().st_mode)
+        except OSError:
+            return
+
+        insecure_mask = stat.S_IRWXG | stat.S_IRWXO
+        if not (mode & insecure_mask):
+            return
+
+        secure_mode = mode & ~insecure_mask
+        if secure_mode == 0:
+            secure_mode = stat.S_IRUSR | stat.S_IWUSR
+
+        try:
+            os.chmod(dotenv_path, secure_mode)
+        except OSError:
+            self._logger(
+                "bot.env.permissions_warning",
+                path=str(dotenv_path),
+                previous_mode=oct(mode),
+            )
+        else:
+            try:
+                new_mode = stat.S_IMODE(dotenv_path.stat().st_mode)
+            except OSError:
+                new_mode = secure_mode
+            self._logger(
+                "bot.env.permissions_hardened",
+                path=str(dotenv_path),
+                previous_mode=oct(mode),
+                new_mode=oct(new_mode),
+            )
 
     def apply_cli_overrides(self, *, testnet: bool | None, dry_run: bool | None) -> None:
         """Update environment variables according to CLI overrides."""

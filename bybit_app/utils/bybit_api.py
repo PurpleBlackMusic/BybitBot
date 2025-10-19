@@ -1,26 +1,26 @@
 from __future__ import annotations
-import hmac, hashlib, json, time, uuid
-from dataclasses import dataclass
+
 import asyncio
+import hmac
+import hashlib
 import inspect
+import json
 import os
-from concurrent.futures import Executor, ThreadPoolExecutor
-from contextvars import copy_context
-from functools import lru_cache, partial, wraps
-from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode
+import random
 import threading
-import requests
+import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Executor, ThreadPoolExecutor
+from contextvars import copy_context
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from functools import lru_cache
+from email.utils import parsedate_to_datetime
+from functools import lru_cache, partial, wraps
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
-
-from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -99,6 +99,40 @@ def _coerce_positive_seconds(value: object | None) -> float | None:
         return None
 
     return float(candidate)
+
+
+def _parse_limit_status(value: object | None) -> tuple[int | None, int | None]:
+    """Return ``(remaining, limit)`` parsed from Bybit's limit status header."""
+
+    if value is None:
+        return None, None
+
+    text = str(value).strip()
+    if not text:
+        return None, None
+
+    if "/" not in text:
+        try:
+            limit = int(float(text))
+        except (TypeError, ValueError):
+            return None, None
+        return None, limit
+
+    left, _, right = text.partition("/")
+    remaining: int | None
+    limit: int | None
+
+    try:
+        remaining = int(float(left.strip())) if left.strip() else None
+    except (TypeError, ValueError):
+        remaining = None
+
+    try:
+        limit = int(float(right.strip())) if right.strip() else None
+    except (TypeError, ValueError):
+        limit = None
+
+    return remaining, limit
 
 
 def _retry_delay_from_headers(response: requests.Response | None) -> float | None:
@@ -280,6 +314,46 @@ class _APINanny:
             else:
                 time.sleep(0)
 
+    def observe_quota(
+        self,
+        key: str,
+        *,
+        remaining: int | None,
+        limit: int | None,
+        window: float | None,
+        fallback: str | None = None,
+    ) -> None:
+        """Update dynamic limits from exchange-provided rate limit headers."""
+
+        if limit is None or limit <= 0:
+            return
+
+        window_seconds = max(float(window) if window else self._default_window, 0.01)
+        burst = max(int(limit), 1)
+
+        self.set_limit(key, burst=burst, window=window_seconds)
+        if fallback and fallback != key:
+            self.set_limit(fallback, burst=burst, window=window_seconds)
+
+        if remaining is None:
+            return
+
+        with self._lock:
+            queue = self._records.setdefault(key, deque())
+            now = time.monotonic()
+            while queue and now - queue[0] >= window_seconds:
+                queue.popleft()
+
+            deficit = max(burst - max(int(remaining), 0), 0)
+            if deficit <= 0:
+                return
+
+            # Pre-fill the queue with timestamps slightly in the past to align
+            # our local rate limiter with the server-observed usage.
+            backdated = now - window_seconds + 0.001
+            for _ in range(min(deficit, burst)):
+                queue.append(backdated)
+
 @dataclass
 class BybitCreds:
     key: str
@@ -436,6 +510,7 @@ class BybitAPI:
                     headers={"Content-Type": "application/json"},
                 )
             r.raise_for_status()
+            self._record_quota_headers(r, path=path, signed=False)
             return r.json()
 
         # signed
@@ -459,7 +534,7 @@ class BybitAPI:
             r = self.session.request(method.upper(), url, params=None, data=q, headers=headers,
                                      timeout=self.timeout, verify=self.verify_ssl)
         r.raise_for_status()
-        self._record_quota_headers(r)
+        self._record_quota_headers(r, path=path, signed=True)
         return r.json()
 
     def _safe_req(self, method: str, path: str, params=None, body=None, signed=False):
@@ -589,7 +664,13 @@ class BybitAPI:
         key = f"{bucket}:{path}" if path else bucket
         nanny.guard(key, fallback=bucket)
 
-    def _record_quota_headers(self, response: requests.Response | None) -> None:
+    def _record_quota_headers(
+        self,
+        response: requests.Response | None,
+        *,
+        path: str,
+        signed: bool,
+    ) -> None:
         if response is None:
             return
         headers = getattr(response, "headers", None)
@@ -597,6 +678,7 @@ class BybitAPI:
             return
 
         quota_fields: dict[str, object] = {}
+        lower_headers = {str(key).lower(): value for key, value in headers.items() if key}
         for key, value in headers.items():
             lower_key = key.lower()
             if "quota" not in lower_key and "ratelimit" not in lower_key:
@@ -620,6 +702,27 @@ class BybitAPI:
 
         if not quota_fields:
             return
+
+        bucket = "signed" if signed else "public"
+        nanny = getattr(self, "_api_nanny", None)
+        remaining, limit = _parse_limit_status(lower_headers.get("x-bapi-limit-status"))
+        reset_hint = (
+            lower_headers.get("x-bapi-limit-reset-after")
+            or lower_headers.get("x-ratelimit-reset-after")
+            or lower_headers.get("x-bapi-limit-reset")
+            or lower_headers.get("x-ratelimit-reset")
+            or lower_headers.get("x-bapi-limit-interval")
+        )
+        window = _coerce_positive_seconds(reset_hint)
+        if nanny is not None and limit is not None:
+            key = f"{bucket}:{path}" if path else bucket
+            nanny.observe_quota(
+                key,
+                remaining=remaining,
+                limit=limit,
+                window=window,
+                fallback=bucket,
+            )
 
         quota_fields["updated_at"] = time.time()
         with self._quota_lock:
