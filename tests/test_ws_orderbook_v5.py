@@ -48,7 +48,16 @@ def test_should_verify_ssl_normalises_inputs(raw_value, expected):
     assert ws_orderbook_v5_module._should_verify_ssl(settings) is expected
 
 
-@pytest.mark.parametrize("verify_flag, expected_cert", [(True, ssl.CERT_REQUIRED), (False, ssl.CERT_NONE)])
+@pytest.mark.parametrize(
+    "verify_flag, expected_cert",
+    [
+        (True, ssl.CERT_REQUIRED),
+        (False, ssl.CERT_NONE),
+        ("false", ssl.CERT_NONE),
+        ("yes", ssl.CERT_REQUIRED),
+        (0, ssl.CERT_NONE),
+    ],
+)
 def test_ws_orderbook_v5_respects_verify_ssl(monkeypatch, verify_flag, expected_cert):
     dummy_module = SimpleNamespace(WebSocketApp=_DummyWebSocketApp)
     monkeypatch.setitem(sys.modules, "websocket", dummy_module)

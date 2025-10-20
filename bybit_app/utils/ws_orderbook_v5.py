@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 from weakref import WeakSet
 
 from .envs import get_settings
@@ -12,6 +12,8 @@ from .log import log
 from .ws_limits import reserve_ws_connection_slot
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
+_FALSE_VERIFY_STRINGS = {"false", "0", "no", "off"}
+_TRUE_VERIFY_STRINGS = {"true", "1", "yes", "on"}
 
 
 def _should_verify_ssl(settings: object | None) -> bool:
@@ -25,9 +27,9 @@ def _should_verify_ssl(settings: object | None) -> bool:
         return bool(raw_value)
     if isinstance(raw_value, str):
         text = raw_value.strip().lower()
-        if text in {"false", "0", "no", "off"}:
+        if text in _FALSE_VERIFY_STRINGS:
             return False
-        if text in {"true", "1", "yes", "on"}:
+        if text in _TRUE_VERIFY_STRINGS:
             return True
     return bool(raw_value)
 
@@ -116,10 +118,7 @@ class WSOrderbookV5:
                     settings = get_settings()
                 except Exception:
                     settings = None
-                verify_ssl = True
-                if settings is not None:
-                    verify_value = getattr(settings, "verify_ssl", True)
-                    verify_ssl = _coerce_verify_flag(verify_value)
+                verify_ssl = _should_verify_ssl(settings)
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False
@@ -325,19 +324,3 @@ class WSOrderbookV5:
     def get(self, symbol: str):
         with self._lock:
             return self._book.get(symbol)
-def _coerce_verify_flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return True
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        marker = value.strip().lower()
-        if not marker:
-            return True
-        if marker in {"0", "false", "no", "off"}:
-            return False
-        if marker in {"1", "true", "yes", "on"}:
-            return True
-    return bool(value)
