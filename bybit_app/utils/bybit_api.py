@@ -858,11 +858,16 @@ class BybitAPI:
         if not headers:
             return
 
+        lower_headers: dict[str, object] = {}
         quota_fields: dict[str, object] = {}
         limit_status_raw: object | None = None
 
         for key, value in headers.items():
-            lower_key = key.lower()
+            if key is None:
+                continue
+
+            lower_key = str(key).lower()
+            lower_headers[lower_key] = value
             if lower_key == "x-bapi-limit-status":
                 limit_status_raw = value
             if "quota" not in lower_key and "ratelimit" not in lower_key:
@@ -898,7 +903,6 @@ class BybitAPI:
         if not quota_fields and utilisation is None:
             return
 
-        bucket = "signed" if signed else "public"
         nanny = getattr(self, "_api_nanny", None)
         remaining, limit = _parse_limit_status(lower_headers.get("x-bapi-limit-status"))
         reset_hint = (
@@ -909,10 +913,11 @@ class BybitAPI:
             or lower_headers.get("x-bapi-limit-interval")
         )
         window = _coerce_positive_seconds(reset_hint)
+        quota_key = f"{bucket}:{path}" if path else bucket
+
         if nanny is not None and limit is not None:
-            key = f"{bucket}:{path}" if path else bucket
             nanny.observe_quota(
-                key,
+                quota_key,
                 remaining=remaining,
                 limit=limit,
                 window=window,
@@ -931,10 +936,8 @@ class BybitAPI:
                 sleep=round(delay, 4),
                 raw=str(limit_status_raw) if limit_status_raw is not None else None,
             )
-            key = f"{bucket}:{path}" if path else bucket
-            nanny = getattr(self, "_api_nanny", None)
             if nanny is not None:
-                nanny.slowdown(key, delay, fallback=bucket)
+                nanny.slowdown(quota_key, delay, fallback=bucket)
 
     @property
     def quota_snapshot(self) -> dict[str, object]:
