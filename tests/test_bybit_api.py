@@ -100,6 +100,50 @@ def test_signed_get_params_are_sorted_and_signed(monkeypatch: pytest.MonkeyPatch
     assert api.clock_latency_ms == pytest.approx(12.0)
 
 
+def test_record_quota_headers_signed_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = BybitAPI(BybitCreds(key="key123", secret="secret456", testnet=True))
+
+    observed_calls: list[dict[str, Any]] = []
+    slowdown_calls: list[dict[str, Any]] = []
+
+    def fake_observe_quota(key: str, *, remaining, limit, window, fallback):
+        observed_calls.append(
+            {
+                "key": key,
+                "remaining": remaining,
+                "limit": limit,
+                "window": window,
+                "fallback": fallback,
+            }
+        )
+
+    def fake_slowdown(key: str, delay: float, *, fallback: str):
+        slowdown_calls.append({"key": key, "delay": delay, "fallback": fallback})
+
+    api._api_nanny.observe_quota = fake_observe_quota  # type: ignore[assignment]
+    api._api_nanny.slowdown = fake_slowdown  # type: ignore[assignment]
+
+    monkeypatch.setattr(bybit_api_module, "_parse_limit_status", lambda value: (3, 10))
+
+    response = MagicMock()
+    response.headers = {
+        "X-Bapi-Limit-Status": "99/100",
+        "X-Bapi-Limit-Reset-After": "1.5",
+        "X-RateLimit-Remaining": "3",
+    }
+
+    api._record_quota_headers(response, bucket="signed", path="/v5/order/create")
+
+    assert observed_calls, "Expected quota observation to be recorded"
+    assert observed_calls[0]["key"] == "signed:/v5/order/create"
+    assert observed_calls[0]["fallback"] == "signed"
+    assert observed_calls[0]["remaining"] == 3
+    assert observed_calls[0]["limit"] == 10
+    assert slowdown_calls, "Expected slowdown notification"
+    assert slowdown_calls[0]["key"] == "signed:/v5/order/create"
+    assert slowdown_calls[0]["fallback"] == "signed"
+
+
 def test_fee_rate_responses_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     session = _RecordingSession()
     api = BybitAPI(BybitCreds(key="k", secret="s", testnet=True))

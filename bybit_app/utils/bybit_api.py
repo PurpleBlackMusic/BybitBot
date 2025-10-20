@@ -914,10 +914,11 @@ class BybitAPI:
             or lower_headers.get("x-bapi-limit-interval")
         )
         window = _coerce_positive_seconds(reset_hint)
+        quota_key = f"{bucket}:{path}" if path else bucket
+
         if nanny is not None and limit is not None:
-            key = f"{bucket}:{path}" if path else bucket
             nanny.observe_quota(
-                key,
+                quota_key,
                 remaining=remaining,
                 limit=limit,
                 window=window,
@@ -936,10 +937,8 @@ class BybitAPI:
                 sleep=round(delay, 4),
                 raw=str(limit_status_raw) if limit_status_raw is not None else None,
             )
-            key = f"{bucket}:{path}" if path else bucket
-            nanny = getattr(self, "_api_nanny", None)
             if nanny is not None:
-                nanny.slowdown(key, delay, fallback=bucket)
+                nanny.slowdown(quota_key, delay, fallback=bucket)
 
     @property
     def quota_snapshot(self) -> dict[str, object]:
