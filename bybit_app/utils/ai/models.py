@@ -39,6 +39,9 @@ MODEL_FEATURES: Tuple[str, ...] = (
     "sentiment_score",
     "news_heat",
     "macro_regime_score",
+    "deepseek_score",
+    "deepseek_stop_loss",
+    "deepseek_take_profit",
 )
 
 

@@ -265,6 +265,7 @@ _SETTINGS_BOOL_FIELDS = {
     "ai_enabled",
     "ai_live_only",
     "ai_market_scan_enabled",
+    "ai_deepseek_enabled",
     "twap_enabled",
     "spot_cash_only",
     "allow_partial_fills",
@@ -294,6 +295,7 @@ _BOOL_ENV_KEYS: Tuple[str, ...] = (
     "ai_enabled",
     "ai_live_only",
     "ai_market_scan_enabled",
+    "ai_deepseek_enabled",
     "twap_enabled",
     "heartbeat_enabled",
     "ws_autostart",
@@ -324,7 +326,9 @@ _FLOAT_ENV_KEYS: Tuple[str, ...] = (
     "ai_buy_threshold",
     "ai_sell_threshold",
     "ai_risk_per_trade_pct",
+    "ai_max_leverage_multiple",
     "ai_daily_loss_limit_pct",
+    "ai_max_drawdown_limit_pct",
     "ai_max_trade_loss_pct",
     "ai_portfolio_loss_limit_pct",
     "ai_kill_switch_cooldown_min",
@@ -443,6 +447,7 @@ class Settings:
     ai_buy_threshold: float = 0.52
     ai_sell_threshold: float = 0.42
     ai_daily_loss_limit_pct: float = 3.0
+    ai_max_drawdown_limit_pct: float = 0.0
     ai_max_trade_loss_pct: float = 0.0
     ai_portfolio_loss_limit_pct: float = 0.0
     ai_kill_switch_cooldown_min: float = 60.0
@@ -453,7 +458,9 @@ class Settings:
     ai_training_trade_limit: int = 400
     ai_max_concurrent: int = 3
     ai_risk_per_trade_pct: float = 0.25
+    ai_max_leverage_multiple: float = 2.0
     ai_market_scan_enabled: bool = True
+    ai_deepseek_enabled: bool = True
     ai_max_hold_minutes: float = 480.0  # минут до жёсткого выхода (8 ч по умолчанию)
     ai_min_exit_bps: Optional[float] = None  # None → авто-порог из статистики
     ai_max_daily_surge_pct: float = 12.0
@@ -865,7 +872,9 @@ _ENV_MAP = {
     "ai_buy_threshold": "AI_BUY_THRESHOLD",
     "ai_sell_threshold": "AI_SELL_THRESHOLD",
     "ai_risk_per_trade_pct": "AI_RISK_PER_TRADE_PCT",
+    "ai_max_leverage_multiple": "AI_MAX_LEVERAGE_MULTIPLE",
     "ai_daily_loss_limit_pct": "AI_DAILY_LOSS_LIMIT_PCT",
+    "ai_max_drawdown_limit_pct": "AI_MAX_DRAWDOWN_LIMIT_PCT",
     "ai_max_trade_loss_pct": "AI_MAX_TRADE_LOSS_PCT",
     "ai_portfolio_loss_limit_pct": "AI_PORTFOLIO_LOSS_LIMIT_PCT",
     "ai_kill_switch_cooldown_min": "AI_KILL_SWITCH_COOLDOWN_MIN",
@@ -876,6 +885,7 @@ _ENV_MAP = {
     "ai_retrain_minutes": "AI_RETRAIN_MINUTES",
     "ai_training_trade_limit": "AI_TRAINING_TRADE_LIMIT",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
+    "ai_deepseek_enabled": "AI_DEEPSEEK_ENABLED",
     "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
     "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
     "ai_max_daily_surge_pct": "AI_MAX_DAILY_SURGE_PCT",

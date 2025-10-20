@@ -17,3 +17,4 @@ bybit_app/_data/profiles/
 
 bybit_app/_data/logs/
 bybit_app/_data/pnl/
+.runtime-test/

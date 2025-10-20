@@ -6,10 +6,11 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from ..log import log
 from ..paths import DATA_DIR
+from .deepseek_adapter import DeepSeekAdapter
 
 
 @dataclass
@@ -26,11 +27,24 @@ class ExternalFeatureSnapshot:
 class ExternalFeatureProvider:
     """Load optional external data sources (sentiment, macro regime, etc.)."""
 
-    def __init__(self, data_dir: Path = DATA_DIR) -> None:
+    def __init__(
+        self,
+        data_dir: Path = DATA_DIR,
+        *,
+        deepseek_adapter: DeepSeekAdapter | None = None,
+        enable_deepseek: bool = True,
+    ) -> None:
         self.data_dir = Path(data_dir)
         self._cache: Optional[ExternalFeatureSnapshot] = None
         self._cache_path: Optional[Path] = None
         self._cache_mtime: Optional[float] = None
+        self._enable_deepseek = bool(enable_deepseek)
+        if deepseek_adapter is not None:
+            self._deepseek: DeepSeekAdapter | None = deepseek_adapter
+        elif self._enable_deepseek:
+            self._deepseek = DeepSeekAdapter()
+        else:
+            self._deepseek = None
 
     def _snapshot_path(self) -> Path:
         return self.data_dir / "external" / "sentiment.json"
@@ -116,16 +130,41 @@ class ExternalFeatureProvider:
         snapshot = self._load_snapshot()
         return float(snapshot.macro_regime)
 
-    def batch_features(self, symbols: Mapping[str, str] | Mapping[str, object]) -> Dict[str, Dict[str, float]]:
+    def batch_features(
+        self,
+        symbols: Mapping[str, str] | Mapping[str, object],
+    ) -> Dict[str, Dict[str, Any]]:
         snapshot = self._load_snapshot()
-        features: Dict[str, Dict[str, float]] = {}
+        features: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
             key = str(symbol).upper()
             features[key] = {
                 "sentiment_score": float(snapshot.sentiment.get(key, 0.0)),
                 "news_heat": float(snapshot.news_heat.get(key, 0.0)),
                 "social_score": float(snapshot.social_score.get(key, 0.0)),
+                "deepseek_score": 0.0,
             }
+            deepseek_payload: Mapping[str, Any] = {}
+            if self._enable_deepseek and self._deepseek is not None:
+                try:
+                    deepseek_payload = self._deepseek.get_signal(key)
+                except Exception as exc:  # pragma: no cover - defensive network failure
+                    log("external_features.deepseek.error", symbol=key, error=str(exc))
+                    deepseek_payload = {}
+            if isinstance(deepseek_payload, Mapping):
+                score_value = deepseek_payload.get("deepseek_confidence")
+            else:
+                score_value = None
+            try:
+                score_numeric = float(score_value)
+            except (TypeError, ValueError):
+                score_numeric = 0.0
+            features[key]["deepseek_score"] = score_numeric
+            if isinstance(deepseek_payload, Mapping):
+                for extra_key, extra_value in deepseek_payload.items():
+                    if extra_key == "deepseek_confidence":
+                        continue
+                    features[key][extra_key] = extra_value
         return features
 
     def log_health(self) -> None:

@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from .envs import get_api_client, get_settings, creds_ok
 from .guardian_bot import GuardianBot
+from .ai.deepseek_ops import DeepSeekRuntimeSupervisor
 from .hygiene import cancel_stale_orders, cancel_twap_leftovers
 from .log import log
 from .signal_executor import AutomationLoop, ExecutionResult, SignalExecutor
@@ -31,6 +32,7 @@ class BackgroundServices:
         bot_factory: Optional[BotFactory] = None,
         executor_factory: Optional[ExecutorFactory] = None,
         loop_factory: Optional[LoopFactory] = None,
+        runtime_supervisor: Optional[DeepSeekRuntimeSupervisor] = None,
         public_stale_after: float = 60.0,
         private_stale_after: float = 90.0,
         automation_stale_after: float = 300.0,
@@ -61,6 +63,7 @@ class BackgroundServices:
             lambda bot: SignalExecutor(bot)
         )
         self._loop_factory = loop_factory
+        self._runtime_supervisor = runtime_supervisor or DeepSeekRuntimeSupervisor()
         self._automation_poll_interval = 15.0
         self._automation_success_cooldown = 120.0
         self._automation_error_backoff = 5.0
@@ -698,6 +701,13 @@ class BackgroundServices:
                 reason=result.reason,
                 signature=signature,
             )
+
+            supervisor = self._runtime_supervisor
+            if supervisor is not None:
+                try:
+                    supervisor.process_cycle(result, signature, marker)
+                except Exception as exc:
+                    log("background.automation.supervisor_error", err=str(exc))
 
         def sweep_orders() -> bool:
             return self._maybe_sweep_orders()
