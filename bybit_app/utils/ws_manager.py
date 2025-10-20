@@ -777,10 +777,16 @@ class WSManager:
                 return bool(info.get("running"))
             return False
 
+        def _connected(info: object) -> bool:
+            if isinstance(info, dict):
+                return bool(info.get("connected"))
+            return False
+
         public_info = status_snapshot.get("public") if isinstance(status_snapshot, dict) else None
         private_info = status_snapshot.get("private") if isinstance(status_snapshot, dict) else None
         public_running = _running(public_info)
         private_running = _running(private_info)
+        private_connected = _connected(private_info)
 
         started_public = False
         if not public_running:
@@ -798,7 +804,7 @@ class WSManager:
 
         started_private = False
         if include_private and creds_ok(settings):
-            if not private_running:
+            if not private_running or not private_connected:
                 try:
                     started_private = bool(self.start_private())
                 except Exception as exc:  # pragma: no cover - defensive network guard
@@ -815,14 +821,16 @@ class WSManager:
         pub_age = max(0.0, now - pub_last) if pub_last else None
         priv_age = max(0.0, now - priv_last) if priv_last else None
 
-        private_ws = getattr(self._priv, "_ws", None)
+        def _socket_connected(ws_obj: object) -> bool:
+            if ws_obj is None:
+                return False
+            sock = getattr(ws_obj, "sock", None)
+            if sock is None:
+                return False
+            return bool(getattr(sock, "connected", False))
 
         public_ws = self._pub_ws
-        public_socket_connected = False
-        if public_ws is not None:
-            sock = getattr(public_ws, "sock", None)
-            if sock is not None:
-                public_socket_connected = bool(getattr(sock, "connected", False))
+        public_socket_connected = _socket_connected(public_ws)
 
         public_thread_alive = bool(
             self._pub_thread and getattr(self._pub_thread, "is_alive", lambda: False)()
@@ -839,26 +847,45 @@ class WSManager:
             public_running = True
 
         priv = self._priv
-        private_running = False
-        if priv is not None:
-            is_running = getattr(priv, "is_running", None)
+
+        def _private_runtime_state(private_client: object | None) -> tuple[bool, bool]:
+            if private_client is None:
+                return False, False
+
+            running = False
+            is_running = getattr(private_client, "is_running", None)
             if callable(is_running):
                 try:
-                    private_running = bool(is_running())
+                    running = bool(is_running())
                 except Exception:  # pragma: no cover - defensive
-                    private_running = False
-            if not private_running:
-                priv_thread = getattr(priv, "_thread", None)
+                    running = False
+
+            if not running:
+                priv_thread = getattr(private_client, "_thread", None)
                 if priv_thread is not None:
                     is_alive = getattr(priv_thread, "is_alive", None)
                     if callable(is_alive):
                         try:
-                            private_running = bool(is_alive())
+                            running = bool(is_alive())
                         except Exception:  # pragma: no cover - defensive
-                            private_running = False
-                if not private_running and private_ws is not None:
-                    private_running = True
-        if not private_running and priv_age is not None and priv_age < 90.0:
+                            running = False
+
+            ws_obj = getattr(private_client, "_ws", None)
+            socket_connected = _socket_connected(ws_obj)
+
+            if not running and socket_connected:
+                running = True
+
+            return running, socket_connected
+
+        private_running, private_socket_connected = _private_runtime_state(priv)
+
+        if (
+            not private_running
+            and priv_age is not None
+            and priv_age < 90.0
+            and private_socket_connected
+        ):
             private_running = True
 
         return {
@@ -873,7 +900,7 @@ class WSManager:
             },
             "private": {
                 "running": private_running,
-                "connected": bool(private_ws),
+                "connected": private_socket_connected,
                 "last_beat": self.last_private_beat or None,
                 "age_seconds": priv_age,
                 "latency_ms": round(self._priv_last_latency * 1000, 3)

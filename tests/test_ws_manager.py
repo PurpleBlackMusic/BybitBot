@@ -79,7 +79,7 @@ def test_ws_manager_status_falls_back_to_private_ws_state() -> None:
 
     class DummyPrivate:
         _thread = SimpleNamespace(is_alive=lambda: False)
-        _ws = object()
+        _ws = SimpleNamespace(sock=SimpleNamespace(connected=True))
 
         def is_running(self) -> bool:
             return False
@@ -99,7 +99,7 @@ def test_ws_manager_status_uses_recent_beats(monkeypatch: pytest.MonkeyPatch) ->
 
     status = manager.status()
     assert status["public"]["running"] is True
-    assert status["private"]["running"] is True
+    assert status["private"]["running"] is False
 
 
 def test_public_on_error_403_triggers_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -752,6 +752,52 @@ def test_ws_manager_autostart_respects_settings(monkeypatch: pytest.MonkeyPatch)
     assert started_private is True
     assert calls["public"] == ("tickers.BTCUSDT",)
     assert calls["private"] is True
+
+
+def test_ws_manager_autostart_restarts_disconnected_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WSManager()
+
+    settings = SimpleNamespace(
+        ws_autostart=True,
+        ws_watchdog_max_age_sec=90,
+        testnet=True,
+        api_key="key",
+        api_secret="secret",
+    )
+
+    monkeypatch.setattr(ws_manager_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(ws_manager_module, "creds_ok", lambda s: True)
+    manager.s = settings
+
+    monkeypatch.setattr(
+        manager,
+        "status",
+        lambda: {
+            "public": {"running": True},
+            "private": {
+                "running": True,
+                "connected": False,
+                "age_seconds": 5.0,
+            },
+        },
+    )
+
+    calls: dict[str, int] = {}
+
+    def fake_start_private() -> bool:
+        calls["private"] = calls.get("private", 0) + 1
+        return True
+
+    monkeypatch.setattr(manager, "start_private", fake_start_private)
+    monkeypatch.setattr(manager, "start_public", lambda *_, **__: False)
+
+    started_public, started_private = manager.autostart(include_private=True)
+
+    assert started_public is False
+    assert started_private is True
+    assert calls["private"] == 1
 
 
 def test_ws_manager_autostart_returns_false_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
