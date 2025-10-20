@@ -335,7 +335,7 @@ def _limit_status_hint(value: object | None) -> _LimitStatusHint | None:
     return _normalised_limit_status(text)
 
 
-def _parse_limit_status(value: object | None) -> list[tuple[str, float, float | None]]:
+def _limit_status_entries(value: object | None) -> list[tuple[str, float, float | None]]:
     hint = _limit_status_hint(value)
     if hint is None:
         return []
@@ -858,13 +858,18 @@ class BybitAPI:
         if not headers:
             return
 
-        quota_fields: dict[str, object] = {}
-        limit_status_raw: object | None = None
-
+        lower_headers: dict[str, object] = {}
+        original_header_names: dict[str, str] = {}
         for key, value in headers.items():
-            lower_key = key.lower()
-            if lower_key == "x-bapi-limit-status":
-                limit_status_raw = value
+            if not key:
+                continue
+            lower_key = str(key).lower()
+            lower_headers[lower_key] = value
+            original_header_names.setdefault(lower_key, key)
+        quota_fields: dict[str, object] = {}
+        limit_status_raw = lower_headers.get("x-bapi-limit-status")
+
+        for lower_key, value in lower_headers.items():
             if "quota" not in lower_key and "ratelimit" not in lower_key:
                 continue
             if value is None:
@@ -882,7 +887,8 @@ class BybitAPI:
                         parsed = stripped
                 else:
                     parsed = stripped
-            quota_fields[key] = parsed
+            original_key = original_header_names.get(lower_key, lower_key)
+            quota_fields[original_key] = parsed
 
         utilisation = None
         delay = 0.0
@@ -898,9 +904,8 @@ class BybitAPI:
         if not quota_fields and utilisation is None:
             return
 
-        bucket = "signed" if signed else "public"
         nanny = getattr(self, "_api_nanny", None)
-        remaining, limit = _parse_limit_status(lower_headers.get("x-bapi-limit-status"))
+        remaining, limit = _parse_limit_status(limit_status_raw)
         reset_hint = (
             lower_headers.get("x-bapi-limit-reset-after")
             or lower_headers.get("x-ratelimit-reset-after")
