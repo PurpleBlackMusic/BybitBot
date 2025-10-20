@@ -58,3 +58,16 @@ section[data-testid="stSidebar"] {
     border-radius: 999px;
     font-weight: 600;
 }
+
+.pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.75rem 0 1rem;
+}
+
+.pill-row .bybit-pill {
+    background-color: rgba(148, 163, 184, 0.25);
+    color: #e2e8f0;
+}
