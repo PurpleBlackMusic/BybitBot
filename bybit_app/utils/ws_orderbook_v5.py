@@ -13,23 +13,15 @@ from .ws_limits import reserve_ws_connection_slot
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
 
+_DEFAULT_INITIAL_BACKOFF = 0.1
+_MAX_INITIAL_BACKOFF = 1.0
+
 
 def _should_verify_ssl(settings: object | None) -> bool:
-    if settings is None:
-        return True
-
-    raw_value = getattr(settings, "verify_ssl", True)
-    if isinstance(raw_value, bool):
-        return raw_value
-    if isinstance(raw_value, (int, float)):
-        return bool(raw_value)
-    if isinstance(raw_value, str):
-        text = raw_value.strip().lower()
-        if text in {"false", "0", "no", "off"}:
-            return False
-        if text in {"true", "1", "yes", "on"}:
-            return True
-    return bool(raw_value)
+    raw_value: Any = True
+    if settings is not None:
+        raw_value = getattr(settings, "verify_ssl", True)
+    return _coerce_verify_flag(raw_value)
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
@@ -107,8 +99,9 @@ class WSOrderbookV5:
         def run():
             import websocket, ssl
             attempt = 0
-            backoff = 1.0
             max_backoff = 60.0
+            backoff: float | None = None
+            initial_backoff: float | None = None
             while not self._stop:
                 attempt += 1
                 had_error = False
@@ -116,10 +109,10 @@ class WSOrderbookV5:
                     settings = get_settings()
                 except Exception:
                     settings = None
-                verify_ssl = True
-                if settings is not None:
-                    verify_value = getattr(settings, "verify_ssl", True)
-                    verify_ssl = _coerce_verify_flag(verify_value)
+                if backoff is None:
+                    initial_backoff = _initial_retry_delay(settings)
+                    backoff = initial_backoff
+                verify_ssl = _should_verify_ssl(settings)
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
                 is_test_ws = False
@@ -150,10 +143,12 @@ class WSOrderbookV5:
                     break
                 if is_test_ws and not had_error:
                     break
-                sleep_for = min(backoff, max_backoff)
+                sleep_for = max(0.0, min(backoff, max_backoff))
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2, max_backoff)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                base_initial = initial_backoff or 0.0
+                backoff = min(_next_retry_delay(backoff, base_initial), max_backoff)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         return True
@@ -341,3 +336,35 @@ def _coerce_verify_flag(value: Any) -> bool:
         if marker in {"1", "true", "yes", "on"}:
             return True
     return bool(value)
+
+
+def _initial_retry_delay(settings: object | None) -> float:
+    raw_value = None
+    if settings is not None:
+        raw_value = getattr(settings, "ws_initial_retry_delay", None)
+    coerced = _coerce_float(raw_value)
+    if coerced is None:
+        return _DEFAULT_INITIAL_BACKOFF
+    if coerced <= 0:
+        return 0.0
+    return min(coerced, _MAX_INITIAL_BACKOFF)
+
+
+def _next_retry_delay(previous: float, initial: float) -> float:
+    if previous <= 0:
+        baseline = initial if initial > 0 else 0.0
+        return max(baseline, _DEFAULT_INITIAL_BACKOFF)
+    return previous * 2
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            return float(value)
+    except (TypeError, ValueError):
+        return None
+    return None
