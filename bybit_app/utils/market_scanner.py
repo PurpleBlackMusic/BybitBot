@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from statistics import fmean, pstdev
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -1225,6 +1226,9 @@ def _model_feature_vector(
     news_heat: Optional[float],
     macro_regime_score: Optional[float],
     event_timestamp: Optional[float],
+    deepseek_score: Optional[float],
+    deepseek_stop_loss: Optional[float],
+    deepseek_take_profit: Optional[float],
 ) -> Dict[str, float]:
     direction = 0
     if trend == "buy":
@@ -1301,6 +1305,22 @@ def _model_feature_vector(
     sentiment_value = float(sentiment_score) if isinstance(sentiment_score, (int, float)) else 0.0
     news_value = float(news_heat) if isinstance(news_heat, (int, float)) else 0.0
     macro_value = float(macro_regime_score) if isinstance(macro_regime_score, (int, float)) else 0.0
+    deepseek_score_value = (
+        float(deepseek_score)
+        if isinstance(deepseek_score, (int, float)) and math.isfinite(float(deepseek_score))
+        else 0.0
+    )
+    deepseek_stop_value = (
+        float(deepseek_stop_loss)
+        if isinstance(deepseek_stop_loss, (int, float)) and math.isfinite(float(deepseek_stop_loss))
+        else 0.0
+    )
+    deepseek_take_profit_value = (
+        float(deepseek_take_profit)
+        if isinstance(deepseek_take_profit, (int, float))
+        and math.isfinite(float(deepseek_take_profit))
+        else 0.0
+    )
 
     features = initialise_feature_map()
     features["directional_change_pct"] = signed_change
@@ -1320,6 +1340,9 @@ def _model_feature_vector(
     features["sentiment_score"] = sentiment_value
     features["news_heat"] = news_value
     features["macro_regime_score"] = macro_value
+    features["deepseek_score"] = deepseek_score_value
+    features["deepseek_stop_loss"] = deepseek_stop_value
+    features["deepseek_take_profit"] = deepseek_take_profit_value
     return features
 
 
@@ -1677,12 +1700,41 @@ def scan_market_opportunities(
         log("market_scanner.model.error", err=str(exc))
         model = None
 
-    external_provider = ExternalFeatureProvider(data_dir=data_dir)
+    deepseek_enabled = True
+    if settings is not None:
+        deepseek_enabled = bool(getattr(settings, "ai_deepseek_enabled", True))
+
+    external_provider = ExternalFeatureProvider(
+        data_dir=data_dir,
+        enable_deepseek=deepseek_enabled,
+    )
     try:  # pragma: no cover - best effort logging
         external_provider.log_health()
     except Exception:
         pass
     macro_regime_hint = external_provider.macro_regime_score()
+
+    external_feature_batch: Dict[str, Dict[str, Any]] = {}
+    symbol_lookup: Dict[str, str] = {}
+    if isinstance(rows, list):
+        for raw in rows:
+            if not isinstance(raw, Mapping):
+                continue
+            raw_symbol = raw.get("symbol")
+            symbol, _ = ensure_usdt_symbol(raw_symbol)
+            if not symbol:
+                continue
+            symbol_lookup[symbol.upper()] = symbol.upper()
+    if symbol_lookup:
+        try:
+            external_feature_batch = external_provider.batch_features(symbol_lookup)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log(
+                "market_scanner.external_features.error",
+                error=str(exc),
+                symbols=len(symbol_lookup),
+            )
+            external_feature_batch = {}
 
     prediction_path_override: Optional[str] = None
     if settings is not None:
@@ -1940,11 +1992,27 @@ def scan_market_opportunities(
         if event_ts is None:
             event_ts = snapshot_ts
 
-        sentiment_value = external_provider.sentiment_for(symbol)
-        social_value = external_provider.social_score_for(symbol)
-        if math.isfinite(social_value):
+        external_row: Mapping[str, Any] = external_feature_batch.get(symbol.upper(), {})
+        sentiment_value = _safe_float(external_row.get("sentiment_score")) or 0.0
+        social_value = _safe_float(external_row.get("social_score"))
+        if social_value is not None and math.isfinite(social_value):
             sentiment_value = sentiment_value * 0.7 + social_value * 0.3
-        news_heat_value = external_provider.news_heat_for(symbol)
+        news_heat_value = _safe_float(external_row.get("news_heat")) or 0.0
+        deepseek_score_value = _safe_float(external_row.get("deepseek_score"))
+        deepseek_stop_loss_value = _safe_float(external_row.get("deepseek_stop_loss"))
+        deepseek_take_profit_value = _safe_float(external_row.get("deepseek_take_profit"))
+        deepseek_direction_value = external_row.get("deepseek_direction")
+        if isinstance(deepseek_direction_value, str):
+            cleaned_direction = deepseek_direction_value.strip().lower()
+            deepseek_direction_value = cleaned_direction or None
+        else:
+            deepseek_direction_value = None
+        deepseek_summary_value = external_row.get("deepseek_summary")
+        if isinstance(deepseek_summary_value, str):
+            cleaned_summary = deepseek_summary_value.strip()
+            deepseek_summary_value = cleaned_summary or None
+        else:
+            deepseek_summary_value = None
 
         feature_vector = _model_feature_vector(
             trend=trend,
@@ -1964,6 +2032,9 @@ def scan_market_opportunities(
             news_heat=news_heat_value,
             macro_regime_score=macro_regime_hint,
             event_timestamp=event_ts,
+            deepseek_score=deepseek_score_value,
+            deepseek_stop_loss=deepseek_stop_loss_value,
+            deepseek_take_profit=deepseek_take_profit_value,
         )
 
         overbought_flags: List[str] = []
@@ -2023,6 +2094,19 @@ def scan_market_opportunities(
                     "fallback": fallback_details,
                 }
             )
+
+        if deepseek_score_value is not None:
+            model_metrics["deepseek_score"] = float(deepseek_score_value)
+        else:
+            model_metrics.setdefault("deepseek_score", 0.0)
+        if deepseek_stop_loss_value is not None:
+            model_metrics["deepseek_stop_loss"] = float(deepseek_stop_loss_value)
+        if deepseek_take_profit_value is not None:
+            model_metrics["deepseek_take_profit"] = float(deepseek_take_profit_value)
+        if deepseek_direction_value:
+            model_metrics["deepseek_direction"] = deepseek_direction_value
+        if deepseek_summary_value:
+            model_metrics["deepseek_summary"] = deepseek_summary_value
 
         logistic_probability: Optional[float]
         logistic_score: Optional[float]
@@ -2312,6 +2396,28 @@ def scan_market_opportunities(
         if overbought_flags:
             note_parts.append("⚠️ перекупленность")
 
+        deepseek_details: Optional[Dict[str, object]] = None
+        if (
+            deepseek_score_value is not None
+            or deepseek_direction_value
+            or deepseek_summary_value
+            or deepseek_stop_loss_value is not None
+            or deepseek_take_profit_value is not None
+        ):
+            deepseek_details = {
+                "score": float(deepseek_score_value)
+                if deepseek_score_value is not None
+                else 0.0,
+                "direction": deepseek_direction_value,
+                "stop_loss": float(deepseek_stop_loss_value)
+                if deepseek_stop_loss_value is not None
+                else None,
+                "take_profit": float(deepseek_take_profit_value)
+                if deepseek_take_profit_value is not None
+                else None,
+                "summary": deepseek_summary_value,
+            }
+
         entry = {
             "symbol": symbol,
             "trend": trend,
@@ -2362,6 +2468,7 @@ def scan_market_opportunities(
             "impulse_signal": impulse_signal,
             "impulse_strength": best_impulse_value,
             "model_metrics": model_metrics,
+            "deepseek": deepseek_details,
             "source": "market_scanner",
             "actionable": actionable,
             "liquidity_ok": liquidity_ok,

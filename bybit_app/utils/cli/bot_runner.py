@@ -398,6 +398,11 @@ class BotCLI:
             help="Показать конфигурацию и завершиться без запуска фоновых потоков.",
         )
         parser.add_argument(
+            "--paper",
+            action="store_true",
+            help="Быстрый запуск на тестнете в режиме paper trading (dry-run).",
+        )
+        parser.add_argument(
             "--once",
             action="store_true",
             help="Запустить фоновые сервисы, снять снимок и завершиться.",
@@ -487,6 +492,10 @@ class BotCLI:
         if namespace.config:
             config = self.load_config_file(namespace.config)
             self.apply_config_defaults(vars(namespace), config=config)
+
+        if namespace.paper:
+            namespace.env = "test"
+            namespace.dry_run = True
 
         if not namespace.no_env_file:
             if self.should_load_env_file(namespace.env_file):

@@ -9,6 +9,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .envs import Settings
 from .log import log
+from .ai.deepseek_utils import resolve_deepseek_drawdown_limit
 from .signal_executor_models import _safe_float
 
 
@@ -43,6 +44,13 @@ class SignalExecutorGuardsMixin:
             return self._decision("disabled", reason=message, context=context)
 
         guard = self._daily_loss_guard(settings, total_equity=total_equity)
+        if guard is not None:
+            message, context = guard
+            return self._decision(
+                "disabled", reason=message, context=context
+            )
+
+        guard = self._drawdown_guard(settings, total_equity=total_equity)
         if guard is not None:
             message, context = guard
             return self._decision("disabled", reason=message, context=context)
@@ -225,6 +233,148 @@ class SignalExecutorGuardsMixin:
             context["kill_switch_until"] = kill_until
         context["message"] = message
         return message, context
+
+    def _drawdown_guard(
+        self,
+        settings: Settings,
+        *,
+        total_equity: Optional[float],
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        try:
+            limit_pct = float(getattr(settings, "ai_max_drawdown_limit_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            limit_pct = 0.0
+
+        if limit_pct <= 0.0:
+            fallback_limit = resolve_deepseek_drawdown_limit()
+            if fallback_limit is not None:
+                limit_pct = float(fallback_limit)
+
+        if limit_pct <= 0.0:
+            return None
+
+        force_refresh = self._daily_pnl_force_refresh
+        try:
+            aggregated = self._daily_pnl(force_refresh=force_refresh)
+        except TypeError:
+            aggregated = self._daily_pnl()
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
+        except Exception:
+            if force_refresh:
+                self._daily_pnl_force_refresh = True
+            return None
+        else:
+            if force_refresh:
+                self._daily_pnl_force_refresh = False
+
+        if not isinstance(aggregated, Mapping):
+            return None
+
+        history: list[Tuple[str, float]] = []
+        cumulative = 0.0
+        peak = 0.0
+        last_drawdown = 0.0
+        max_drawdown = 0.0
+
+        for day in sorted(aggregated.keys()):
+            net_result = self._extract_spot_daily_net(aggregated, day)
+            if net_result is None:
+                continue
+            history.append((day, float(net_result)))
+            cumulative += float(net_result)
+            if cumulative > peak:
+                peak = cumulative
+            else:
+                drop = peak - cumulative
+                if drop > max_drawdown:
+                    max_drawdown = drop
+            last_drawdown = peak - cumulative
+
+        if not history:
+            return None
+        if last_drawdown <= 0.0:
+            return None
+
+        equity_value: Optional[float] = None
+        if isinstance(total_equity, (int, float)) and math.isfinite(total_equity) and total_equity > 0:
+            equity_value = float(total_equity)
+        if equity_value is None:
+            try:
+                _, wallet_totals, _, _ = self._resolve_wallet(require_success=False)
+            except Exception:
+                wallet_totals = None
+            if isinstance(wallet_totals, Sequence) and wallet_totals:
+                candidate = _safe_float(wallet_totals[0])
+                if candidate is not None and candidate > 0.0:
+                    equity_value = candidate
+        if equity_value is None or equity_value <= 0.0:
+            return None
+
+        peak_equity = equity_value + last_drawdown
+        if peak_equity <= 0.0:
+            return None
+
+        drawdown_pct = (last_drawdown / peak_equity) * 100.0
+        if drawdown_pct <= limit_pct:
+            return None
+
+        try:
+            cooldown_minutes = float(getattr(settings, "ai_kill_switch_cooldown_min", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cooldown_minutes = 0.0
+
+        kill_until = None
+        if cooldown_minutes > 0.0:
+            reason = (
+                "Просадка портфеля превысила лимит {limit:.2f}% ({loss:.2f}%)."
+            ).format(limit=limit_pct, loss=drawdown_pct)
+            kill_until = self._activate_kill_switch(cooldown_minutes, reason)
+
+        log(
+            "guardian.auto.guard.drawdown",
+            drawdown=round(last_drawdown, 2),
+            percent=round(drawdown_pct, 4),
+            limit=limit_pct,
+            equity=round(equity_value, 2),
+            peak=round(peak_equity, 2),
+            max_drawdown=round(max_drawdown, 2),
+        )
+
+        message = (
+            "Просадка портфеля {loss:.2f} USDT ({percent:.2f}%) превысила лимит {limit:.2f}% —"
+            " автоматика приостановлена"
+        ).format(loss=last_drawdown, percent=drawdown_pct, limit=limit_pct)
+
+        if kill_until:
+            try:
+                resume_at = datetime.fromtimestamp(kill_until, tz=timezone.utc).strftime(
+                    "%H:%M:%S UTC"
+                )
+            except (OSError, ValueError):
+                resume_at = None
+            else:
+                message += f". Kill-switch активирован до {resume_at}."
+
+        context: Dict[str, object] = {
+            "guard": "max_drawdown_limit",
+            "drawdown_value": last_drawdown,
+            "drawdown_percent": drawdown_pct,
+            "limit_percent": limit_pct,
+            "total_equity": equity_value,
+            "peak_equity": peak_equity,
+            "max_historical_drawdown": max_drawdown,
+            "daily_history": [
+                {"day": day, "net": net}
+                for day, net in history[-10:]
+            ],
+        }
+        if kill_until:
+            context["kill_switch_until"] = kill_until
+
+        context["message"] = message
+        return message, context
+
 
     def _extract_spot_daily_net(
         self, aggregated: Mapping[str, object], day_key: str

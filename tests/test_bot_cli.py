@@ -94,6 +94,41 @@ def test_cli_status_prints_testnet_configuration(
     assert start_event["dry_run"] is True
 
 
+def test_cli_paper_flag_forces_testnet_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(envs, "DATA_DIR", tmp_path)
+    events: list[tuple[str, dict]] = []
+
+    def _log(event: str, **payload: dict) -> None:
+        events.append((event, payload))
+
+    def _loader(force_reload: bool = True) -> DummySettings:
+        testnet_flag = os.getenv("BYBIT_TESTNET") == "1"
+        dry_testnet = os.getenv("BYBIT_DRY_RUN_TESTNET", "0") == "1"
+        dry_mainnet = os.getenv("BYBIT_DRY_RUN_MAINNET", "0") == "1"
+        keys = {True: "TEST" if testnet_flag else "", False: "MAIN"}
+        dry_flags = {True: dry_testnet, False: dry_mainnet}
+        return DummySettings(testnet=testnet_flag, dry_flags=dry_flags, keys=keys)
+
+    with bot.temporary_logger(_log), bot.temporary_settings_loader(_loader):
+        exit_code = bot.main([
+            "--paper",
+            "--status-only",
+            "--no-env-file",
+        ])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Starting bot in TESTNET mode" in out
+    assert os.getenv("BYBIT_TESTNET") == "1"
+    assert os.getenv("BYBIT_DRY_RUN") == "1"
+    start_event = next((payload for event, payload in events if event == "bot.start"), None)
+    assert start_event is not None
+    assert start_event["network"] == "testnet"
+    assert start_event["dry_run"] is True
+
+
 def test_cli_status_mainnet_live(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

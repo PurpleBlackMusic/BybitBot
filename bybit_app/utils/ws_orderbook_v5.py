@@ -1,10 +1,12 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 import threading
 import time
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 from weakref import WeakSet
 
 from .envs import get_settings
@@ -50,6 +52,16 @@ def _next_retry_delay(current: float | None, initial: float) -> float:
     next_delay = float(current) * 2.0
     return max(next_delay, initial_value)
 
+
+def _resolve_websocket_module() -> Any | None:
+    module = sys.modules.get("websocket")
+    if module is not None:
+        return module
+    try:
+        return importlib.import_module("websocket")
+    except Exception:
+        return None
+
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
     Processes snapshot + delta per official rules. Fallback to REST must be handled by caller.
@@ -76,13 +88,15 @@ class WSOrderbookV5:
         self._ws = None
         self._thread = None
         self._topics: set[str] = set()
+        self._ws_factory: Any | None = None
 
     def start(self, symbols: list[str]):
-        try:
-            import websocket
-        except Exception as e:
-            log("ws.orderbook.disabled", reason="no websocket-client", err=str(e))
+        module = _resolve_websocket_module()
+        factory = getattr(module, "WebSocketApp", None) if module else None
+        if not factory:
+            log("ws.orderbook.disabled", reason="no websocket-client")
             return False
+        self._ws_factory = factory
         new_topics = {f"orderbook.{self.levels}.{s}" for s in symbols}
         topic_symbols = {topic: self._extract_symbol(topic) for topic in new_topics}
         with self._topic_lock:
@@ -124,7 +138,7 @@ class WSOrderbookV5:
         self._stop = False
 
         def run():
-            import websocket, ssl
+            import ssl
             attempt = 0
             max_backoff = 60.0
             initial_backoff: float = _DEFAULT_INITIAL_BACKOFF
@@ -132,8 +146,10 @@ class WSOrderbookV5:
             while not self._stop:
                 attempt += 1
                 had_error = False
+                module_ref = sys.modules.get(__name__)
+                settings_getter = getattr(module_ref, "get_settings", get_settings)
                 try:
-                    settings = get_settings()
+                    settings = settings_getter()
                 except Exception:
                     settings = None
                 verify_ssl = _should_verify_ssl(settings)
@@ -142,7 +158,10 @@ class WSOrderbookV5:
                 is_test_ws = False
                 try:
                     reserve_ws_connection_slot()
-                    ws = websocket.WebSocketApp(
+                    ws_factory = self._ws_factory or getattr(_resolve_websocket_module(), "WebSocketApp", None)
+                    if ws_factory is None:
+                        raise RuntimeError("websocket factory unavailable")
+                    ws = ws_factory(
                         self.url,
                         on_open=lambda w: self._on_open(w),
                         on_message=self._on_msg,

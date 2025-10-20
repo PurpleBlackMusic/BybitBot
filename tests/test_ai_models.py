@@ -60,6 +60,9 @@ def test_model_features_layout() -> None:
         "sentiment_score",
         "news_heat",
         "macro_regime_score",
+        "deepseek_score",
+        "deepseek_stop_loss",
+        "deepseek_take_profit",
     )
 
 
@@ -108,6 +111,9 @@ def test_sell_vector_contains_expected_metrics() -> None:
     assert features["order_flow_ratio"] == 0.0
     assert features["sentiment_score"] == 0.0
     assert features["news_heat"] == 0.0
+    assert features["deepseek_score"] == 0.0
+    assert features["deepseek_stop_loss"] == 0.0
+    assert features["deepseek_take_profit"] == 0.0
 
     # Ensure remaining buys are preserved for the open portion of the position.
     assert state.position_qty == pytest.approx(0.5)

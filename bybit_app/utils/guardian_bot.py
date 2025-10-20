@@ -37,6 +37,7 @@ from .ai_thresholds import (
     min_change_from_ev_bps,
     resolve_min_ev_from_settings,
 )
+from .ai.deepseek_utils import extract_deepseek_snapshot, evaluate_deepseek_guidance
 from .envs import (
     Settings,
     active_dry_run,
@@ -3789,6 +3790,19 @@ class GuardianBot:
             "probability": probability_value,
             "ev_bps": ev_value,
         }
+        if isinstance(payload, Mapping):
+            deepseek_snapshot = extract_deepseek_snapshot(payload)
+        else:
+            deepseek_snapshot = {}
+        if deepseek_snapshot:
+            deepseek_data = dict(deepseek_snapshot)
+            mode_hint = entry.get("trend")
+            if not isinstance(mode_hint, str):
+                mode_hint = str(mode_hint or "")
+            guidance = evaluate_deepseek_guidance(deepseek_snapshot, mode_hint)
+            if guidance:
+                deepseek_data["guidance"] = guidance
+            entry["deepseek"] = deepseek_data
         if isinstance(source_value, str) and source_value.strip():
             entry["source"] = source_value.strip()
         return entry

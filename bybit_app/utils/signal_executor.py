@@ -33,6 +33,7 @@ from .envs import (
     creds_ok,
 )
 from .ai.kill_switch import get_state as kill_switch_state, set_pause as activate_kill_switch
+from .ai.deepseek_utils import extract_deepseek_snapshot, evaluate_deepseek_guidance
 from .settings_loader import call_get_settings
 from .helpers import ensure_link_id
 from .precision import format_to_step
@@ -150,6 +151,8 @@ class SignalExecutor(
         self._live_orderbook: Optional["LiveOrderbook"] = None
         self._risk_override_pct: Optional[float] = None
         self._performance_state: Optional[TradePerformanceSnapshot] = None
+        self._deepseek_stop_context: Optional[Dict[str, object]] = None
+        self._last_leverage_guard: Optional[Dict[str, object]] = None
 
     def _read_ledger(self, *args, **kwargs):
         return read_ledger(*args, **kwargs)
@@ -300,6 +303,9 @@ class SignalExecutor(
             available_equity=available_equity,
             equity_for_limits=equity_for_limits,
             forced_summary_applied=forced_applied,
+            deepseek_payload=None,
+            deepseek_guidance=None,
+            deepseek_multiplier=1.0,
         )
         return context
 
@@ -364,6 +370,40 @@ class SignalExecutor(
                 reason=reason,
                 context={"symbol_meta": symbol_meta} if symbol_meta else None,
             )
+
+        deepseek_payload = extract_deepseek_snapshot(summary)
+        if deepseek_payload:
+            context.deepseek_payload = dict(deepseek_payload)
+            guidance = evaluate_deepseek_guidance(deepseek_payload, mode)
+            context.deepseek_guidance = dict(guidance)
+            multiplier_value = guidance.get("multiplier")
+            try:
+                multiplier_float = float(multiplier_value)
+            except (TypeError, ValueError):
+                multiplier_float = 1.0
+            if not math.isfinite(multiplier_float) or multiplier_float <= 0:
+                multiplier_float = 1.0
+            context.deepseek_multiplier = multiplier_float
+            if not guidance.get("allow", True):
+                reason_bits = [
+                    "Сделка пропущена: DeepSeek рекомендует избегать входа",
+                ]
+                direction_hint = guidance.get("direction")
+                score_hint = guidance.get("score")
+                extra_details: list[str] = []
+                if isinstance(direction_hint, str) and direction_hint:
+                    extra_details.append(direction_hint.lower())
+                if isinstance(score_hint, (int, float)) and math.isfinite(score_hint):
+                    extra_details.append(f"уверенность {score_hint * 100:.0f}%")
+                if extra_details:
+                    reason_bits.append(f"({', '.join(extra_details)})")
+                reason_text = " ".join(reason_bits)
+                guidance_context = {"deepseek": copy.deepcopy(guidance), "symbol": symbol}
+                return self._decision("skipped", reason=reason_text, context=guidance_context)
+        else:
+            context.deepseek_payload = None
+            context.deepseek_guidance = None
+            context.deepseek_multiplier = 1.0
 
         backoff_state = self._price_limit_backoff.get(symbol)
         if isinstance(backoff_state, Mapping):
@@ -1656,6 +1696,12 @@ class SignalExecutor(
         total_equity = context.total_equity
         available_equity = context.available_equity
         equity_for_limits = context.equity_for_limits
+        deepseek_payload = (
+            dict(context.deepseek_payload)
+            if isinstance(getattr(context, "deepseek_payload", None), Mapping)
+            else None
+        )
+        deepseek_stop_price = _safe_float(deepseek_payload.get("stop_loss")) if deepseek_payload else None
 
 
         quote_wallet_cap_value = quote_wallet_cap
@@ -1702,6 +1748,18 @@ class SignalExecutor(
         if vol_meta is not None:
             risk_context["volatility"] = vol_meta
         sizing_factor = max(0.0, min(sizing_factor * vol_scale, 1.0))
+        deepseek_multiplier = getattr(context, "deepseek_multiplier", 1.0) or 1.0
+        if not isinstance(deepseek_multiplier, (int, float)):
+            deepseek_multiplier = 1.0
+        if not math.isfinite(deepseek_multiplier) or deepseek_multiplier <= 0:
+            deepseek_multiplier = 1.0
+        if not math.isclose(deepseek_multiplier, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+            sizing_factor = max(0.0, min(sizing_factor * deepseek_multiplier, 1.0))
+        deepseek_guidance = getattr(context, "deepseek_guidance", None)
+        if isinstance(deepseek_guidance, Mapping):
+            deepseek_context = dict(deepseek_guidance)
+            deepseek_context["multiplier"] = deepseek_multiplier
+            risk_context["deepseek"] = deepseek_context
         volatility_pct = None
         if isinstance(vol_meta, Mapping):
             volatility_candidate = _safe_float(vol_meta.get("volatility_pct"))
@@ -1830,6 +1888,18 @@ class SignalExecutor(
             )
         finally:
             self._risk_override_pct = previous_risk_override
+
+        leverage_meta = self._last_leverage_guard
+        if leverage_meta:
+            risk_context["leverage_guard"] = dict(leverage_meta)
+            cap_notional = leverage_meta.get("cap_notional")
+            if (
+                isinstance(cap_notional, (int, float))
+                and math.isfinite(cap_notional)
+                and cap_notional > 0
+                and notional > cap_notional
+            ):
+                notional = float(cap_notional)
 
         is_minimum_buy_request = False
         if (
@@ -2072,6 +2142,13 @@ class SignalExecutor(
             "usable_after_reserve": usable_after_reserve,
             "total_equity": total_equity,
         }
+        if deepseek_payload:
+            order_context["deepseek_signal"] = copy.deepcopy(deepseek_payload)
+        if isinstance(context.deepseek_guidance, Mapping):
+            order_context["deepseek_guidance"] = copy.deepcopy(context.deepseek_guidance)
+        leverage_meta = self._last_leverage_guard
+        if leverage_meta:
+            order_context["leverage_guard"] = dict(leverage_meta)
         if impulse_signal:
             order_context["impulse_signal"] = True
             if impulse_context:
@@ -2762,6 +2839,7 @@ class SignalExecutor(
             fallback_stop_loss_bps=impulse_stop_bps,
             volatility_pct=volatility_pct,
             performance=performance_snapshot,
+            deepseek_stop_price=deepseek_stop_price,
         )
         if execution_stats:
             order_context["execution"] = execution_stats
@@ -2851,6 +2929,7 @@ class SignalExecutor(
         fallback_stop_loss_bps: Optional[float] = None,
         volatility_pct: Optional[float] = None,
         performance: Optional[TradePerformanceSnapshot] = None,
+        deepseek_stop_price: Optional[float] = None,
     ) -> tuple[list[Dict[str, object]], Dict[str, str], list[Dict[str, object]]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
@@ -3267,7 +3346,12 @@ class SignalExecutor(
             fallback_stop_loss_bps=fallback_stop_loss_bps,
             volatility_pct=volatility_pct,
             performance=performance,
+            deepseek_stop_price=deepseek_stop_price,
         )
+        deepseek_stop_meta = self._deepseek_stop_context
+        if deepseek_stop_meta:
+            order_context["deepseek_stop"] = copy.deepcopy(deepseek_stop_meta)
+        self._deepseek_stop_context = None
 
         execution_payload = execution_stats if execution_stats else {}
         return placed, execution_payload, stop_orders
@@ -3290,8 +3374,12 @@ class SignalExecutor(
         fallback_stop_loss_bps: Optional[float] = None,
         volatility_pct: Optional[float] = None,
         performance: Optional[TradePerformanceSnapshot] = None,
+        deepseek_stop_price: Optional[float] = None,
     ) -> list[Dict[str, object]]:
         symbol_upper = symbol.upper()
+        self._deepseek_stop_context = None
+        deepseek_meta: Dict[str, object] = {}
+        deepseek_bps: Optional[float] = None
         if sell_budget <= 0 or qty_step <= 0 or avg_price <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
             return []
@@ -3323,6 +3411,35 @@ class SignalExecutor(
             self._cancel_existing_stop_orders(symbol, api, settings)
             return []
 
+        if deepseek_stop_price is not None:
+            try:
+                deepseek_price = float(deepseek_stop_price)
+            except (TypeError, ValueError):
+                deepseek_price = None
+            if deepseek_price is not None and math.isfinite(deepseek_price) and deepseek_price > 0:
+                avg_float = float(avg_price)
+                if avg_float > 0:
+                    if exit_side == "Sell" and deepseek_price < avg_float:
+                        deepseek_bps = (avg_float - deepseek_price) / avg_float * 10000.0
+                    elif exit_side == "Buy" and deepseek_price > avg_float:
+                        deepseek_bps = (deepseek_price - avg_float) / avg_float * 10000.0
+                    else:
+                        deepseek_meta = {
+                            "requested_price": deepseek_price,
+                            "ignored": "direction_mismatch",
+                            "exit_side": exit_side,
+                        }
+                else:
+                    deepseek_meta = {
+                        "requested_price": deepseek_price,
+                        "ignored": "invalid_reference_price",
+                    }
+            else:
+                deepseek_meta = {
+                    "requested_price": deepseek_stop_price,
+                    "ignored": "invalid_price",
+                }
+
         stop_loss_bps = _safe_float(getattr(settings, "spot_stop_loss_bps", None)) or 0.0
         trailing_bps = _safe_float(
             getattr(settings, "spot_trailing_stop_distance_bps", None)
@@ -3352,6 +3469,42 @@ class SignalExecutor(
                 stop_loss_bps = float(fallback)
                 trailing_bps = 0.0
                 enforced = True
+
+        if deepseek_bps is not None and deepseek_bps > 0:
+            reference_values: list[float] = []
+            base_setting = _safe_float(getattr(settings, "spot_stop_loss_bps", None))
+            if base_setting is not None and base_setting > 0:
+                reference_values.append(base_setting)
+            impulse_setting = _safe_float(getattr(settings, "spot_impulse_stop_loss_bps", None))
+            if impulse_setting is not None and impulse_setting > 0:
+                reference_values.append(impulse_setting)
+            if fallback_stop_loss_bps is not None and fallback_stop_loss_bps > 0:
+                reference_values.append(float(fallback_stop_loss_bps))
+            if not reference_values:
+                reference_values.append(80.0)
+            min_reference = min(reference_values)
+            max_reference = max(reference_values)
+            min_limit = max(25.0, min_reference * 0.6)
+            max_limit = min(600.0, max(max_reference * 1.5, min_limit + 20.0))
+            applied_bps = max(min_limit, min(deepseek_bps, max_limit))
+            deepseek_meta = {
+                "source": "deepseek",
+                "requested_price": float(deepseek_stop_price)
+                if deepseek_stop_price is not None
+                else None,
+                "requested_bps": float(deepseek_bps),
+                "applied_bps": float(applied_bps),
+                "min_limit_bps": float(min_limit),
+                "max_limit_bps": float(max_limit),
+                "exit_side": exit_side,
+            }
+            if stop_loss_bps > 0:
+                deepseek_meta["prior_stop_bps"] = float(stop_loss_bps)
+            if trailing_bps > 0:
+                deepseek_meta["prior_trailing_bps"] = float(trailing_bps)
+            if deepseek_meta.get("requested_price") is None:
+                deepseek_meta.pop("requested_price", None)
+            stop_loss_bps = applied_bps
 
         adaptive_meta: Dict[str, object] = {}
         if volatility_pct is not None and volatility_pct > 0:
@@ -3387,6 +3540,7 @@ class SignalExecutor(
 
         if stop_loss_bps <= 0 and trailing_bps <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
+            self._deepseek_stop_context = deepseek_meta or None
             return []
 
         base_bps = stop_loss_bps if stop_loss_bps > 0 else trailing_bps
@@ -3398,6 +3552,7 @@ class SignalExecutor(
 
         if stop_price <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
+            self._deepseek_stop_context = deepseek_meta or None
             return []
 
         if price_band_min > 0 and stop_price < price_band_min:
@@ -3409,7 +3564,11 @@ class SignalExecutor(
         stop_price = self._round_to_step(stop_price, price_step, rounding=rounding_mode)
         if stop_price <= 0:
             self._cancel_existing_stop_orders(symbol, api, settings)
+            self._deepseek_stop_context = deepseek_meta or None
             return []
+
+        if deepseek_meta and deepseek_meta.get("applied_bps") is not None:
+            deepseek_meta["final_trigger_price"] = float(stop_price)
 
         stop_price_text = format_to_step(stop_price, price_step, rounding=rounding_mode)
 
@@ -3439,6 +3598,8 @@ class SignalExecutor(
             trailing_state["adaptive_stop"] = adaptive_meta
         else:
             trailing_state["lowest_price"] = avg_price
+        if deepseek_meta:
+            trailing_state["deepseek_stop"] = dict(deepseek_meta)
 
         place_supported = not active_dry_run(settings) and api is not None and hasattr(api, "place_order")
 
@@ -3542,6 +3703,10 @@ class SignalExecutor(
                 order_entry["activationBps"] = activation_bps
         if client_managed:
             order_entry["clientManaged"] = True
+        if deepseek_meta:
+            order_entry["deepseek"] = copy.deepcopy(deepseek_meta)
+
+        self._deepseek_stop_context = deepseek_meta or None
 
         return [order_entry]
 
@@ -4184,6 +4349,7 @@ class SignalExecutor(
         min_notional: float | None = None,
         quote_balance_cap: float | None = None,
     ) -> Tuple[float, float, bool, bool]:
+        self._last_leverage_guard = None
         try:
             reserve_pct = float(getattr(settings, "spot_cash_reserve_pct", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -4282,6 +4448,22 @@ class SignalExecutor(
         if cap_pct > 0:
             caps.append(total_equity * cap_pct / 100.0)
 
+        leverage_multiple = 0.0
+        leverage_cap: Optional[float] = None
+        try:
+            leverage_multiple = float(getattr(settings, "ai_max_leverage_multiple", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            leverage_multiple = 0.0
+        if (
+            leverage_multiple > 0
+            and math.isfinite(total_equity)
+            and total_equity > 0
+        ):
+            leverage_cap_candidate = float(total_equity) * leverage_multiple
+            if math.isfinite(leverage_cap_candidate) and leverage_cap_candidate > 0:
+                leverage_cap = leverage_cap_candidate
+                caps.append(leverage_cap)
+
         base_notional = min(caps) if caps else 0.0
         sizing = max(0.0, min(float(sizing_factor), 1.0))
         notional = round(base_notional * sizing, 2) if base_notional > 0 else 0.0
@@ -4295,6 +4477,17 @@ class SignalExecutor(
                     reserve_relaxed = True
             elif meets_min_post_reserve and (notional == 0.0 or notional < min_threshold):
                 notional = min_threshold
+
+        leverage_meta: Optional[Dict[str, object]] = None
+        if leverage_cap is not None:
+            leverage_meta = {
+                "max_multiple": float(leverage_multiple),
+                "cap_notional": float(leverage_cap),
+                "binding": bool(base_notional <= leverage_cap + 1e-6),
+            }
+            if math.isfinite(total_equity):
+                leverage_meta["total_equity"] = float(total_equity)
+        self._last_leverage_guard = leverage_meta
 
         return notional, usable_after_reserve, reserve_relaxed, quote_cap_substituted
 

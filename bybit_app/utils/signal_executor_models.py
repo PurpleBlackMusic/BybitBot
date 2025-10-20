@@ -86,6 +86,9 @@ class SignalExecutionContext:
     available_equity: float
     equity_for_limits: Optional[float]
     forced_summary_applied: bool = False
+    deepseek_payload: Optional[Dict[str, object]] = None
+    deepseek_guidance: Optional[Dict[str, object]] = None
+    deepseek_multiplier: float = 1.0
 
 
 @dataclass(slots=True)

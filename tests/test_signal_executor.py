@@ -11,6 +11,7 @@ import pytest
 
 import bybit_app.utils.pnl as pnl_module
 import bybit_app.utils.signal_executor as signal_executor_module
+import bybit_app.utils.signal_executor_guards as signal_executor_guards_module
 import bybit_app.utils.ws_manager as ws_manager_module
 import bybit_app.utils.spot_pnl as spot_pnl_module
 import bybit_app.utils.spot_fifo as spot_fifo_module
@@ -1158,8 +1159,31 @@ def test_compute_notional_allows_zero_reserve() -> None:
     )
 
     assert usable_after_reserve == pytest.approx(100.0)
+
+
+def test_compute_notional_respects_leverage_limit() -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        spot_cash_reserve_pct=0.0,
+        ai_risk_per_trade_pct=100.0,
+        spot_max_cap_per_trade_pct=0.0,
+        ai_max_leverage_multiple=0.5,
+    )
+    bot = StubBot(summary, settings)
+    executor = SignalExecutor(bot)
+
+    notional, usable_after_reserve, reserve_relaxed, _ = executor._compute_notional(
+        settings,
+        total_equity=200.0,
+        available_equity=200.0,
+    )
+
+    assert notional == pytest.approx(100.0)
+    guard = executor._last_leverage_guard
+    assert guard is not None
+    assert guard.get("binding") is True
     assert reserve_relaxed is False
-    assert notional == pytest.approx(5.0)
 
 
 def test_signal_executor_skips_min_buy_when_quote_cap_cannot_cover_tolerance(
@@ -5928,6 +5952,79 @@ def test_signal_executor_daily_loss_ignores_derivatives(monkeypatch: pytest.Monk
     assert result.status != "disabled"
     assert (result.context or {}).get("guard") != "daily_loss_limit"
     assert stub_api.orders == []
+
+
+def test_drawdown_guard_triggers_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    day_keys = [
+        time.strftime("%Y-%m-%d", time.gmtime(time.time() - 172800)),
+        time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400)),
+        time.strftime("%Y-%m-%d", time.gmtime()),
+    ]
+    summary = {"actionable": True, "mode": "buy", "symbol": "BTCUSDT"}
+    settings = Settings(
+        ai_enabled=True,
+        ai_max_drawdown_limit_pct=10.0,
+        ai_kill_switch_cooldown_min=45.0,
+    )
+    bot = StubBot(summary, settings)
+
+    def fake_daily_pnl(**_: object) -> dict[str, dict[str, dict[str, float]]]:
+        return {
+            day_keys[0]: {"BTCUSDT": {"spot_net": 120.0}},
+            day_keys[1]: {"BTCUSDT": {"spot_net": 150.0}},
+            day_keys[2]: {"BTCUSDT": {"spot_net": -260.0}},
+        }
+
+    monkeypatch.setattr(signal_executor_module, "daily_pnl", fake_daily_pnl)
+
+    stub_api = StubAPI(total=1200.0, available=950.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
+
+    captured: Dict[str, object] = {}
+
+    def fake_set_pause(minutes: float | None, reason: str) -> float | None:
+        captured["minutes"] = minutes
+        captured["reason"] = reason
+        return 1700001000.0
+
+    monkeypatch.setattr(signal_executor_module, "activate_kill_switch", fake_set_pause)
+
+    executor = SignalExecutor(bot)
+    guard = executor._drawdown_guard(settings, total_equity=1000.0)
+    assert guard is not None
+    message, context = guard
+    assert "Просадка портфеля" in message
+    assert context.get("guard") == "max_drawdown_limit"
+    assert context.get("drawdown_percent") == pytest.approx(20.6349, rel=1e-3)
+    assert captured.get("minutes") == pytest.approx(45.0)
+    assert context.get("kill_switch_until") == pytest.approx(1700001000.0)
+
+
+def test_drawdown_guard_uses_deepseek_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    day_key = time.strftime("%Y-%m-%d", time.gmtime())
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, ai_max_drawdown_limit_pct=0.0)
+    bot = StubBot(summary, settings)
+
+    def fake_daily_pnl(**_: object) -> dict[str, dict[str, dict[str, float]]]:
+        return {day_key: {"ETHUSDT": {"spot_net": -80.0}}}
+
+    monkeypatch.setattr(signal_executor_module, "daily_pnl", fake_daily_pnl)
+    monkeypatch.setattr(
+        signal_executor_guards_module,
+        "resolve_deepseek_drawdown_limit",
+        lambda: 5.0,
+    )
+
+    stub_api = StubAPI(total=500.0, available=420.0)
+    monkeypatch.setattr(signal_executor_module, "get_api_client", lambda: stub_api)
+
+    executor = SignalExecutor(bot)
+    guard = executor._drawdown_guard(settings, total_equity=500.0)
+    assert guard is not None
+    message, context = guard
+    assert context.get("limit_percent") == pytest.approx(5.0)
+    assert "Просадка портфеля" in message
 
 
 def test_portfolio_loss_guard_triggers_kill_switch(
