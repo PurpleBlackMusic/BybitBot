@@ -19,6 +19,7 @@ _DEFAULT_INITIAL_BACKOFF = 0.1
 _MAX_INITIAL_BACKOFF = 1.0
 
 
+def _should_verify_ssl(settings: object | None) -> bool:
     raw_value = getattr(settings, "verify_ssl", True)
     if isinstance(raw_value, bool):
         return raw_value
