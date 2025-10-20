@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 from weakref import WeakSet
 
 from .envs import get_settings
@@ -12,16 +12,25 @@ from .log import log
 from .ws_limits import reserve_ws_connection_slot
 
 _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
+_FALSE_VERIFY_STRINGS = {"false", "0", "no", "off"}
+_TRUE_VERIFY_STRINGS = {"true", "1", "yes", "on"}
 
 _DEFAULT_INITIAL_BACKOFF = 0.1
 _MAX_INITIAL_BACKOFF = 1.0
 
 
-def _should_verify_ssl(settings: object | None) -> bool:
-    raw_value: Any = True
-    if settings is not None:
-        raw_value = getattr(settings, "verify_ssl", True)
-    return _coerce_verify_flag(raw_value)
+    raw_value = getattr(settings, "verify_ssl", True)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return bool(raw_value)
+    if isinstance(raw_value, str):
+        text = raw_value.strip().lower()
+        if text in _FALSE_VERIFY_STRINGS:
+            return False
+        if text in _TRUE_VERIFY_STRINGS:
+            return True
+    return bool(raw_value)
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
@@ -109,9 +118,6 @@ class WSOrderbookV5:
                     settings = get_settings()
                 except Exception:
                     settings = None
-                if backoff is None:
-                    initial_backoff = _initial_retry_delay(settings)
-                    backoff = initial_backoff
                 verify_ssl = _should_verify_ssl(settings)
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
@@ -320,51 +326,3 @@ class WSOrderbookV5:
     def get(self, symbol: str):
         with self._lock:
             return self._book.get(symbol)
-def _coerce_verify_flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return True
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        marker = value.strip().lower()
-        if not marker:
-            return True
-        if marker in {"0", "false", "no", "off"}:
-            return False
-        if marker in {"1", "true", "yes", "on"}:
-            return True
-    return bool(value)
-
-
-def _initial_retry_delay(settings: object | None) -> float:
-    raw_value = None
-    if settings is not None:
-        raw_value = getattr(settings, "ws_initial_retry_delay", None)
-    coerced = _coerce_float(raw_value)
-    if coerced is None:
-        return _DEFAULT_INITIAL_BACKOFF
-    if coerced <= 0:
-        return 0.0
-    return min(coerced, _MAX_INITIAL_BACKOFF)
-
-
-def _next_retry_delay(previous: float, initial: float) -> float:
-    if previous <= 0:
-        baseline = initial if initial > 0 else 0.0
-        return max(baseline, _DEFAULT_INITIAL_BACKOFF)
-    return previous * 2
-
-
-def _coerce_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str) and value.strip():
-            return float(value)
-    except (TypeError, ValueError):
-        return None
-    return None
