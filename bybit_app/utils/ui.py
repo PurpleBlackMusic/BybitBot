@@ -395,6 +395,18 @@ def inject_css(css: str | None = None, *, include_default: bool = True):
         font-size: 0.875rem;
     }
 
+    .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem;
+        margin: 0.75rem 0 1rem;
+    }
+
+    .pill-row .bybit-pill {
+        background: rgba(148, 163, 184, 0.22);
+    }
+
     .bybit-pill {
         display: inline-flex;
         align-items: center;
