@@ -245,6 +245,47 @@ def test_batch_cancel_rejects_empty_payload() -> None:
     assert "non-empty" in str(excinfo.value)
 
 
+def test_record_quota_headers_handles_limit_headers() -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    observed: list[tuple[str, int | None, int | None, float | None, str]] = []
+
+    def fake_observe_quota(
+        self,
+        key: str,
+        *,
+        remaining: int | None,
+        limit: int | None,
+        window: float | None,
+        fallback: str,
+    ) -> None:
+        observed.append((key, remaining, limit, window, fallback))
+
+    api._api_nanny.observe_quota = MethodType(fake_observe_quota, api._api_nanny)  # type: ignore[assignment]
+
+    response = MagicMock()
+    response.headers = {
+        "X-BAPI-LIMIT-STATUS": "5/10",
+        "X-BAPI-USED-QUOTA": "3",
+        "X-BAPI-LIMIT-RESET-AFTER": "2",
+    }
+
+    api._record_quota_headers(response, bucket="signed", path="/v5/test")
+
+    assert len(observed) == 1
+    key, remaining, limit, window, fallback = observed[0]
+    assert key == "signed:/v5/test"
+    assert remaining == 5
+    assert limit == 10
+    assert window == pytest.approx(2.0)
+    assert fallback == "signed"
+
+    snapshot = api.quota_snapshot
+    assert snapshot["X-Bapi-Limit-Status"] == "5/10"
+    assert snapshot["X-BAPI-USED-QUOTA"] == 3
+    assert "updated_at" in snapshot
+
+
 def test_retryable_error_normalises_retry_after() -> None:
     err = _RetryableRequestError("boom", meta={"retry_after": "2.5"})
 
