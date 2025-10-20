@@ -15,10 +15,9 @@ _ACTIVE_ORDERBOOKS: "WeakSet[WSOrderbookV5]" = WeakSet()
 _FALSE_VERIFY_STRINGS = {"false", "0", "no", "off"}
 _TRUE_VERIFY_STRINGS = {"true", "1", "yes", "on"}
 
+_DEFAULT_INITIAL_BACKOFF = 0.1
+_MAX_INITIAL_BACKOFF = 1.0
 
-def _should_verify_ssl(settings: object | None) -> bool:
-    if settings is None:
-        return True
 
     raw_value = getattr(settings, "verify_ssl", True)
     if isinstance(raw_value, bool):
@@ -109,8 +108,9 @@ class WSOrderbookV5:
         def run():
             import websocket, ssl
             attempt = 0
-            backoff = 1.0
             max_backoff = 60.0
+            backoff: float | None = None
+            initial_backoff: float | None = None
             while not self._stop:
                 attempt += 1
                 had_error = False
@@ -149,10 +149,12 @@ class WSOrderbookV5:
                     break
                 if is_test_ws and not had_error:
                     break
-                sleep_for = min(backoff, max_backoff)
+                sleep_for = max(0.0, min(backoff, max_backoff))
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
-                time.sleep(sleep_for)
-                backoff = min(backoff * 2, max_backoff)
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                base_initial = initial_backoff or 0.0
+                backoff = min(_next_retry_delay(backoff, base_initial), max_backoff)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         return True

@@ -141,6 +141,7 @@ def test_ws_orderbook_v5_reconnects_until_stopped(monkeypatch):
     assert ob._ws is None
     assert stop_event.is_set()
     assert sleep_calls, "backoff sleep was not invoked"
+    assert sleep_calls[0] < 1.0
 
 
 def test_ws_orderbook_v5_updates_topics_without_restarting(monkeypatch):
