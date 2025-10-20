@@ -8,8 +8,8 @@ from bybit_app.utils.ui import page_slug_from_path
 
 
 def test_page_slug_from_path_removes_prefix_and_normalises_underscores():
-    assert page_slug_from_path("pages/03_🛡_Спот_Бот.py") == "🛡 Спот Бот"
-    assert page_slug_from_path("pages/02_⚙️_Настройки.py") == "⚙️ Настройки"
+    assert page_slug_from_path("pages/05_portfolio_risk_spot.py") == "portfolio risk spot"
+    assert page_slug_from_path("pages/02_settings.py") == "settings"
 
 
 def test_page_slug_from_path_handles_nested_paths_and_no_prefix():
@@ -25,7 +25,7 @@ def streamlit_ctx(monkeypatch):
 
 
 def test_resolve_page_location_strips_absolute_and_prefixed_paths(streamlit_ctx):
-    target = "pages/02_⚙️_Настройки.py"
+    target = "pages/02_settings.py"
     absolute = str((Path("bybit_app") / target).resolve())
     prefixed = f"bybit_app/{target}"
     windows_like = prefixed.replace("/", "\\")
@@ -59,7 +59,7 @@ def test_navigation_link_falls_back_when_page_is_missing(monkeypatch, streamlit_
     session_state: dict[str, bool] = {}
     monkeypatch.setattr(ui.st, "session_state", session_state, raising=False)
 
-    ui.navigation_link("pages/02_⚙️_Настройки.py", label="Настройки")
+    ui.navigation_link("pages/02_settings.py", label="Настройки")
 
     assert calls["button"] == 1
     assert calls["caption"] == 1
@@ -86,7 +86,7 @@ def test_navigation_link_uses_custom_key_in_button_fallback(monkeypatch, streaml
     monkeypatch.setattr(ui.st, "session_state", session_state, raising=False)
 
     ui.navigation_link(
-        "pages/02_⚙️_Настройки.py",
+        "pages/02_settings.py",
         label="Настройки",
         key="custom_nav_key",
     )
