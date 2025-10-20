@@ -19,6 +19,7 @@ _DEFAULT_INITIAL_BACKOFF = 0.1
 _MAX_INITIAL_BACKOFF = 1.0
 
 
+def _should_verify_ssl(settings) -> bool:
     raw_value = getattr(settings, "verify_ssl", True)
     if isinstance(raw_value, bool):
         return raw_value
@@ -31,6 +32,23 @@ _MAX_INITIAL_BACKOFF = 1.0
         if text in _TRUE_VERIFY_STRINGS:
             return True
     return bool(raw_value)
+
+
+def _next_retry_delay(current: float | None, initial: float) -> float:
+    try:
+        initial_value = float(initial)
+    except (TypeError, ValueError):
+        initial_value = 0.0
+
+    if initial_value <= 0:
+        initial_value = _DEFAULT_INITIAL_BACKOFF
+    initial_value = min(max(initial_value, _DEFAULT_INITIAL_BACKOFF), _MAX_INITIAL_BACKOFF)
+
+    if current is None or current <= 0:
+        return initial_value
+
+    next_delay = float(current) * 2.0
+    return max(next_delay, initial_value)
 
 class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
@@ -109,8 +127,8 @@ class WSOrderbookV5:
             import websocket, ssl
             attempt = 0
             max_backoff = 60.0
-            backoff: float | None = None
-            initial_backoff: float | None = None
+            initial_backoff: float = _DEFAULT_INITIAL_BACKOFF
+            backoff: float | None = initial_backoff
             while not self._stop:
                 attempt += 1
                 had_error = False
@@ -149,11 +167,11 @@ class WSOrderbookV5:
                     break
                 if is_test_ws and not had_error:
                     break
-                sleep_for = max(0.0, min(backoff, max_backoff))
+                sleep_for = max(0.0, min(backoff if backoff is not None else initial_backoff, max_backoff))
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
                 if sleep_for > 0:
                     time.sleep(sleep_for)
-                base_initial = initial_backoff or 0.0
+                base_initial = initial_backoff
                 backoff = min(_next_retry_delay(backoff, base_initial), max_backoff)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
