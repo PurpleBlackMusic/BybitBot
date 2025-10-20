@@ -306,7 +306,7 @@ def test_heartbeat_alerts_on_silence(monkeypatch: pytest.MonkeyPatch) -> None:
     telegram_notify._record_activity(ts=fake_now["value"])
 
     # Advance past threshold to trigger alert.
-    fake_now["value"] += 61.0
+    fake_now["value"] += 91.0
     heartbeat.run_cycle()
 
     def events() -> list[str]:
@@ -323,6 +323,58 @@ def test_heartbeat_alerts_on_silence(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Fresh activity resets the alert guard.
     telegram_notify._record_activity(ts=fake_now["value"])
-    fake_now["value"] += 61.0
+    fake_now["value"] += 91.0
     heartbeat.run_cycle()
     assert events().count("telegram.heartbeat.alert") == 2
+
+
+def test_heartbeat_large_interval_does_not_trigger_false_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_settings(monkeypatch)
+
+    fake_now = {"value": 0.0}
+
+    def fake_time() -> float:
+        return fake_now["value"]
+
+    sent: list[str] = []
+    recorded_logs: list[tuple[str, dict[str, object]]] = []
+
+    def fake_send(text: str) -> None:
+        sent.append(text)
+        telegram_notify._record_activity(ts=fake_now["value"])
+
+    def fake_log(event: str, **payload: object) -> None:
+        recorded_logs.append((event, payload))
+
+    def fake_settings() -> SimpleNamespace:
+        return SimpleNamespace(
+            heartbeat_enabled=True,
+            heartbeat_interval_min=10,
+            telegram_token="token",
+            telegram_chat_id="chat",
+        )
+
+    heartbeat = telegram_notify.TelegramHeartbeat(
+        send=fake_send,
+        get_settings_func=fake_settings,
+        log_func=fake_log,
+        time_func=fake_time,
+        silence_threshold=60.0,
+        min_poll_interval=5.0,
+    )
+
+    telegram_notify._record_activity(ts=fake_now["value"])
+
+    sleep_one = heartbeat.run_cycle()
+    assert sleep_one == pytest.approx(150.0)
+
+    fake_now["value"] += 500.0
+    sleep_two = heartbeat.run_cycle()
+    assert sleep_two == pytest.approx(150.0)
+
+    events = [event for event, _ in recorded_logs]
+    assert "telegram.heartbeat.silence" not in events
+    assert "telegram.heartbeat.alert" not in events
+    assert len(sent) == 1

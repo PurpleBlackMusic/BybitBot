@@ -316,15 +316,19 @@ class TelegramHeartbeat:
             return self._min_poll_interval
 
         interval_seconds = self._resolve_interval_seconds(settings)
+        threshold = self._effective_silence_threshold(interval_seconds)
         now = self._time()
 
         if self._should_emit_heartbeat(settings, now, interval_seconds):
             message = self._format_message(now)
             self._safe_send(message, interval_seconds, event="telegram.heartbeat.sent")
 
-        self._check_silence(now)
+        self._check_silence(now, threshold)
 
-        return self._next_sleep(interval_seconds)
+        return self._next_sleep(interval_seconds, threshold)
+
+    def _effective_silence_threshold(self, interval_seconds: float) -> float:
+        return max(self._silence_threshold, interval_seconds * 1.5)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -388,7 +392,7 @@ class TelegramHeartbeat:
 
         self._log(event, interval=interval_seconds, text=text)
 
-    def _check_silence(self, now: float) -> None:
+    def _check_silence(self, now: float, threshold: float) -> None:
         last = _last_activity()
         if last < 0:
             return
@@ -398,32 +402,38 @@ class TelegramHeartbeat:
         self._last_activity_seen = last
 
         silence = now - last
-        if silence > self._silence_threshold:
+
+        if silence > threshold:
             if not self._alerted:
                 self._alerted = True
-                self._handle_silence(silence)
+                self._handle_silence(silence, threshold)
         else:
             if self._alerted:
                 self._log(
                     "telegram.heartbeat.recovered",
                     silence=silence,
-                    threshold=self._silence_threshold,
+                    threshold=threshold,
                 )
             self._alerted = False
 
-    def _handle_silence(self, silence: float) -> None:
-        payload = {"silence": round(silence, 3), "threshold": self._silence_threshold}
+    def _handle_silence(self, silence: float, threshold: float) -> None:
+        payload = {"silence": round(silence, 3), "threshold": round(threshold, 3)}
         self._log("telegram.heartbeat.silence", **payload)
         alert_text = (
             "⚠️ Telegram heartbeat silence "
-            f"> {self._silence_threshold:.0f}s (actual {silence:.0f}s)."
+            f"> {threshold:.0f}s (actual {silence:.0f}s)."
         )
-        self._safe_send(alert_text, self._silence_threshold, event="telegram.heartbeat.alert", mark_last=False)
+        self._safe_send(
+            alert_text,
+            threshold,
+            event="telegram.heartbeat.alert",
+            mark_last=False,
+        )
 
-    def _next_sleep(self, interval_seconds: float) -> float:
+    def _next_sleep(self, interval_seconds: float, threshold: float) -> float:
         candidate = interval_seconds / 4.0
         candidate = max(candidate, self._min_poll_interval)
-        candidate = min(candidate, max(self._silence_threshold / 2.0, self._min_poll_interval))
+        candidate = min(candidate, max(threshold / 2.0, self._min_poll_interval))
         return candidate
 
 def send_telegram(text: str):
