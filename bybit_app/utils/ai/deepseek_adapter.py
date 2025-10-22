@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional
+from typing import Any, Dict, Mapping, MutableMapping, Optional, TYPE_CHECKING
 
 import requests
 
@@ -15,6 +15,9 @@ from ..file_io import atomic_write_text
 from ..http_client import create_http_session
 from ..log import log
 from ..paths import CACHE_DIR
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .deepseek_local import DeepSeekLocalAdapter
 
 
 _DEEPSEEK_DEFAULT_ENDPOINT = "https://api.deepseek.com/chat/completions"
@@ -62,6 +65,7 @@ class DeepSeekAdapter:
         session: requests.Session | None = None,
         temperature: float = 0.1,
         max_tokens: int = 600,
+        local_model_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.api_key = api_key or os.environ.get(_DEEPSEEK_ENV_KEY)
         self.endpoint = endpoint
@@ -72,6 +76,15 @@ class DeepSeekAdapter:
         self.cache_ttl = float(cache_ttl)
         self.session = session or create_http_session()
         self._cache: MutableMapping[str, Mapping[str, Any]] | None = None
+        candidate: Path | None = (
+            Path(local_model_path).expanduser() if local_model_path else None
+        )
+        self._local_model_candidate: Path | None = candidate
+        self.local_model_path: Path | None = candidate
+        self._local_model_enabled: bool = candidate is not None
+        self._local_model_missing_logged: bool = False
+        self._local_adapter: DeepSeekLocalAdapter | None = None
+        self._local_dependency_error: type[Exception] | None = None
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -146,7 +159,64 @@ class DeepSeekAdapter:
             ],
         }
 
-    def _perform_request(self, payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    def _perform_request(self, symbol: str, payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        model_candidate = self._local_model_candidate if self._local_model_enabled else None
+        if model_candidate is not None:
+            if model_candidate.is_file():
+                self.local_model_path = model_candidate
+                self._local_model_missing_logged = False
+                if self._local_adapter is None:
+                    try:
+                        from .deepseek_local import (
+                            DeepSeekLocalAdapter,
+                            DeepSeekLocalDependencyError,
+                        )
+                    except Exception as exc:  # pragma: no cover - optional dependency failure
+                        log(
+                            "deepseek.local.import_error",
+                            error=str(exc),
+                            path=str(model_candidate),
+                        )
+                        self._local_model_enabled = False
+                        self._local_adapter = None
+                    else:
+                        self._local_dependency_error = DeepSeekLocalDependencyError
+                        self._local_adapter = DeepSeekLocalAdapter(
+                            str(model_candidate),
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                        )
+                if self._local_adapter is not None:
+                    try:
+                        signal_payload = self._local_adapter.get_signal(symbol)
+                    except Exception as exc:  # pragma: no cover - runtime failure
+                        dependency_error = self._local_dependency_error
+                        if dependency_error is not None and isinstance(exc, dependency_error):
+                            self._local_model_enabled = False
+                        log(
+                            "deepseek.local.inference_error",
+                            error=str(exc),
+                            path=str(model_candidate),
+                        )
+                        self._local_adapter = None
+                    else:
+                        return {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": json.dumps(
+                                            signal_payload, ensure_ascii=False
+                                        )
+                                    }
+                                }
+                            ]
+                        }
+            else:
+                self._local_adapter = None
+                self.local_model_path = model_candidate
+                if not self._local_model_missing_logged:
+                    log("deepseek.local.model_missing", path=str(model_candidate))
+                    self._local_model_missing_logged = True
         if not self.api_key:
             log("deepseek.api.missing_key")
             return None
@@ -240,7 +310,7 @@ class DeepSeekAdapter:
             return cached.to_features()
 
         payload = self._request_payload(key)
-        raw_response = self._perform_request(payload)
+        raw_response = self._perform_request(key, payload)
         if not raw_response:
             return DeepSeekSignal(symbol=key, direction="neutral", confidence=0.0).to_features()
         message = self._extract_message(raw_response)

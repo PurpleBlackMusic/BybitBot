@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import platform
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -14,6 +17,28 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from ..log import log
 from ..paths import DATA_DIR
 from .deepseek_adapter import DeepSeekAdapter
+
+
+def _is_low_memory_apple_host() -> bool:
+    override = os.environ.get("DEEPSEEK_FORCE_LOW_MEM")
+    if override is not None:
+        return override.strip().lower() not in {"0", "false", "no"}
+    if platform.system() != "Darwin":
+        return False
+    try:
+        completed = subprocess.run(  # noqa: S603, S607
+            ["sysctl", "-n", "hw.memsize"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):  # pragma: no cover - platform specific
+        return False
+    try:
+        total_memory = int(completed.stdout.strip())
+    except ValueError:
+        return False
+    return total_memory <= 9 * 1024**3
 
 
 @dataclass
@@ -48,21 +73,63 @@ class ExternalFeatureProvider:
         self._deepseek_batch_timestamp: float = 0.0
         self._deepseek_cache_ttl = max(float(deepseek_cache_ttl), 0.0)
         self._executor: ThreadPoolExecutor | None = None
+        self._local_weight: Path | None = None
         if deepseek_adapter is not None:
             self._deepseek: DeepSeekAdapter | None = deepseek_adapter
         elif self._enable_deepseek:
-            self._deepseek = DeepSeekAdapter()
+            local_model_path = os.environ.get("DEEPSEEK_GGUF_PATH")
+            if not local_model_path:
+                candidate = DATA_DIR / "ai" / "weights" / "DeepSeek-R1-Distill-Qwen-7B-Q5_K_M.gguf"
+                if candidate.is_file():
+                    local_model_path = str(candidate)
+            self._deepseek = DeepSeekAdapter(local_model_path=local_model_path)
         else:
             self._deepseek = None
+        if self._deepseek is not None:
+            local_weight = self._refresh_local_weight()
+            if local_weight is not None and self._deepseek_cache_ttl == 30.0:
+                self._deepseek_cache_ttl = 3600.0
 
     def _snapshot_path(self) -> Path:
         return self.data_dir / "external" / "sentiment.json"
 
+    def _refresh_local_weight(self) -> Path | None:
+        if self._deepseek is None:
+            self._local_weight = None
+            return None
+        model_path = getattr(self._deepseek, "local_model_path", None)
+        if not model_path:
+            self._local_weight = None
+            return None
+        try:
+            candidate = Path(model_path)
+        except TypeError:
+            self._local_weight = None
+            return None
+        if not candidate.is_file():
+            self._local_weight = None
+            return None
+        self._local_weight = candidate
+        return candidate
+
     def _ensure_executor(self) -> ThreadPoolExecutor:
         if self._executor is None or self._executor._shutdown:  # type: ignore[attr-defined]
-            # allow up to 8 workers but avoid spinning too many threads for
-            # smaller batches.
-            self._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="deepseek")
+            max_workers = 8
+            local_weight = self._refresh_local_weight()
+            if self._deepseek is not None and local_weight is not None:
+                # When running entirely on-device (e.g. MacBook Air M1 with 8 GB of
+                # RAM) we keep concurrency low to avoid swapping pressure.
+                cpu_count = os.cpu_count() or 2
+                if _is_low_memory_apple_host():
+                    max_workers = 1
+                else:
+                    max_workers = max(1, min(2, cpu_count))
+            cpu_limit = os.cpu_count() or 1
+            max_workers = max(1, min(max_workers, cpu_limit))
+            self._executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="deepseek",
+            )
         return self._executor
 
     def _deepseek_cache_valid(self, symbols: Iterable[str]) -> bool:

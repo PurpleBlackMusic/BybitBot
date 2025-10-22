@@ -89,6 +89,7 @@ class WSOrderbookV5:
         self._thread = None
         self._topics: set[str] = set()
         self._ws_factory: Any | None = None
+        self._get_settings = get_settings
 
     def start(self, symbols: list[str]):
         module = _resolve_websocket_module()
@@ -97,6 +98,8 @@ class WSOrderbookV5:
             log("ws.orderbook.disabled", reason="no websocket-client")
             return False
         self._ws_factory = factory
+        module_ref = sys.modules.get(__name__)
+        self._get_settings = getattr(module_ref, "get_settings", get_settings)
         new_topics = {f"orderbook.{self.levels}.{s}" for s in symbols}
         topic_symbols = {topic: self._extract_symbol(topic) for topic in new_topics}
         with self._topic_lock:
@@ -146,8 +149,7 @@ class WSOrderbookV5:
             while not self._stop:
                 attempt += 1
                 had_error = False
-                module_ref = sys.modules.get(__name__)
-                settings_getter = getattr(module_ref, "get_settings", get_settings)
+                settings_getter = getattr(self, "_get_settings", get_settings)
                 try:
                     settings = settings_getter()
                 except Exception:
