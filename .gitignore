@@ -14,6 +14,9 @@ bybit_app/_data/cache/
 bybit_app/_data/profiles/
 .runtime/
 
+# Large local model weights
+bybit_app/_data/ai/weights/
+
 
 bybit_app/_data/logs/
 bybit_app/_data/pnl/

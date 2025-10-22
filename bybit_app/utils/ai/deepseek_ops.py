@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -44,6 +45,18 @@ class RuntimeJournalEntry:
         return payload
 
 
+def _detect_local_weight() -> Path | None:
+    env_path = os.environ.get("DEEPSEEK_GGUF_PATH")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.is_file():
+            return candidate
+    candidate = DATA_DIR / "ai" / "weights" / "DeepSeek-R1-Distill-Qwen-7B-Q5_K_M.gguf"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 class DeepSeekRuntimeSupervisor:
     """Coordinate DeepSeek runtime hygiene: caching, journaling and alerts."""
 
@@ -64,7 +77,15 @@ class DeepSeekRuntimeSupervisor:
     ) -> None:
         self._adapter_factory = adapter_factory or DeepSeekAdapter
         self._adapter: DeepSeekAdapter | None = None
-        self._refresh_interval = max(float(refresh_interval), 0.0)
+        self._local_weight_path = _detect_local_weight()
+        refresh_value = float(refresh_interval)
+        if (
+            enable_refresh
+            and refresh_interval == 30.0 * 60.0
+            and self._local_weight_path is not None
+        ):
+            refresh_value = max(refresh_value, 3600.0)
+        self._refresh_interval = max(refresh_value, 0.0)
         self._enable_refresh = bool(enable_refresh)
         self._watchlist_override = tuple(str(s).strip().upper() for s in watchlist) if watchlist else None
         self._trades_path = Path(trades_path) if trades_path else DATA_DIR / "trades" / "deepseek_runtime.jsonl"
@@ -214,9 +235,29 @@ class DeepSeekRuntimeSupervisor:
         if now - self._last_refresh < self._refresh_interval:
             return
         adapter = self._get_adapter()
-        if adapter is None or not getattr(adapter, "api_key", None):
+        if adapter is None:
+            return
+        api_key = getattr(adapter, "api_key", None)
+        local_model_path = getattr(adapter, "local_model_path", None)
+        local_candidate: Path | None = None
+        if local_model_path:
+            try:
+                candidate = Path(local_model_path)
+            except TypeError:
+                candidate = None
+            else:
+                if candidate.is_file():
+                    local_candidate = candidate
+        if not api_key and local_candidate is None:
             return
         symbols = self._resolve_watchlist()
+        if local_candidate is not None:
+            # Local inference is comparatively expensive; refresh only the
+            # first symbol to keep cache warm without overwhelming the host.
+            if symbols:
+                symbols = symbols[:1]
+            else:
+                return
         if not symbols:
             return
         refreshed: list[str] = []
