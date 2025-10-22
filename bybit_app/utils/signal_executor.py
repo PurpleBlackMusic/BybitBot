@@ -113,6 +113,7 @@ _SUMMARY_PRICE_ENTRY_GRACE = 2.0
 _SUMMARY_PRICE_EXECUTION_MAX_AGE = 9.0
 _PRICE_LIMIT_MAX_IMMEDIATE_RETRIES = 2  # initial attempt plus one adaptive retry
 _MIN_QUOTE_RESERVE_PCT = 2.0
+_SIZING_FACTOR_CAP = 1.5
 
 _TIF_ALIAS_MAP = {
     "POSTONLY": "PostOnly",
@@ -152,6 +153,7 @@ class SignalExecutor(
         self._risk_override_pct: Optional[float] = None
         self._performance_state: Optional[TradePerformanceSnapshot] = None
         self._deepseek_stop_context: Optional[Dict[str, object]] = None
+        self._deepseek_tp_context: Optional[Dict[str, object]] = None
         self._last_leverage_guard: Optional[Dict[str, object]] = None
 
     def _read_ledger(self, *args, **kwargs):
@@ -320,58 +322,18 @@ class SignalExecutor(
         summary_meta = context.summary_meta
         price_meta = context.price_meta
 
-        if not context.forced_summary_applied and not summary.get("actionable"):
-            return self._decision(
-                "skipped",
-                reason="Signal is not actionable according to current thresholds.",
-            )
-
-        self._purge_validation_penalties()
-        self._purge_price_limit_backoff()
-        self._ensure_ws_activity(settings)
-        if not getattr(settings, "ai_enabled", False):
-            return self._decision(
-                "disabled",
-                reason="Автоматизация выключена — включите AI сигналы в настройках.",
-            )
-
-        guard_result = self._apply_runtime_guards(
-            settings,
-            summary,
-            total_equity=context.equity_for_limits,
-            current_time=now,
-            summary_meta=summary_meta,
-            price_meta=price_meta,
-        )
-        if guard_result is not None:
-            return guard_result
-
+        ai_enabled = bool(getattr(settings, "ai_enabled", False))
         mode = str(summary.get("mode") or "").lower()
-        if mode not in {"buy", "sell"}:
-            return self._decision(
-                "skipped",
-                reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
-            )
 
-        symbol, symbol_meta = self._select_symbol(summary, settings)
-        if symbol is None:
-            reason = "Не удалось определить инструмент для сделки."
-            if symbol_meta and isinstance(symbol_meta, Mapping):
-                meta_reason = str(symbol_meta.get("reason") or "")
-                if meta_reason == "unsupported_quote":
-                    requested = symbol_meta.get("requested") or summary.get("symbol")
-                    reason = (
-                        f"Инструмент {requested or ''} недоступен — поддерживаются только спотовые пары USDT."
-                    )
-                elif meta_reason:
-                    reason = f"Инструмент недоступен для сделки ({meta_reason})."
-            return self._decision(
-                "skipped",
-                reason=reason,
-                context={"symbol_meta": symbol_meta} if symbol_meta else None,
-            )
-
+        deepseek_required = bool(getattr(settings, "ai_require_deepseek", False))
+        if not deepseek_required and getattr(settings, "ai_use_deepseek_only", False):
+            deepseek_required = True
+        enforce_deepseek = deepseek_required and ai_enabled
         deepseek_payload = extract_deepseek_snapshot(summary)
+        context.deepseek_payload = None
+        context.deepseek_guidance = None
+        context.deepseek_multiplier = 1.0
+
         if deepseek_payload:
             context.deepseek_payload = dict(deepseek_payload)
             guidance = evaluate_deepseek_guidance(deepseek_payload, mode)
@@ -398,10 +360,79 @@ class SignalExecutor(
                 if extra_details:
                     reason_bits.append(f"({', '.join(extra_details)})")
                 reason_text = " ".join(reason_bits)
-                guidance_context = {"deepseek": copy.deepcopy(guidance), "symbol": symbol}
+                guidance_context = {"deepseek": copy.deepcopy(guidance), "symbol": summary.get("symbol")}
                 return self._decision("skipped", reason=reason_text, context=guidance_context)
+
+            canonical_direction = str(guidance.get("canonical_direction") or "").lower()
+            if enforce_deepseek and mode in {"buy", "sell"}:
+                if not canonical_direction:
+                    reason = "Сделка пропущена: DeepSeek не предоставил направление для подтверждения сигнала."
+                    guidance_context = {"deepseek": copy.deepcopy(guidance), "symbol": summary.get("symbol")}
+                    return self._decision("skipped", reason=reason, context=guidance_context)
+                if canonical_direction != mode:
+                    reason = (
+                        "Сделка пропущена: DeepSeek указал направление "
+                        f"{canonical_direction} при сигнальном запросе {mode}."
+                    )
+                    guidance_context = {"deepseek": copy.deepcopy(guidance), "symbol": summary.get("symbol")}
+                    return self._decision("skipped", reason=reason, context=guidance_context)
         else:
-            context.deepseek_payload = None
+            if enforce_deepseek:
+                reason = "Сделка пропущена: DeepSeek не предоставил сигнал для подтверждения входа."
+                guidance_context = {"deepseek": None, "symbol": summary.get("symbol")}
+                return self._decision("skipped", reason=reason, context=guidance_context)
+
+        if not context.forced_summary_applied and not summary.get("actionable"):
+            return self._decision(
+                "skipped",
+                reason="Signal is not actionable according to current thresholds.",
+            )
+
+        self._purge_validation_penalties()
+        self._purge_price_limit_backoff()
+        self._ensure_ws_activity(settings)
+        if not ai_enabled:
+            return self._decision(
+                "disabled",
+                reason="Автоматизация выключена — включите AI сигналы в настройках.",
+            )
+
+        guard_result = self._apply_runtime_guards(
+            settings,
+            summary,
+            total_equity=context.equity_for_limits,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
+        if guard_result is not None:
+            return guard_result
+
+        if mode not in {"buy", "sell"}:
+            return self._decision(
+                "skipped",
+                reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
+            )
+
+        symbol, symbol_meta = self._select_symbol(summary, settings)
+        if symbol is None:
+            reason = "Не удалось определить инструмент для сделки."
+            if symbol_meta and isinstance(symbol_meta, Mapping):
+                meta_reason = str(symbol_meta.get("reason") or "")
+                if meta_reason == "unsupported_quote":
+                    requested = symbol_meta.get("requested") or summary.get("symbol")
+                    reason = (
+                        f"Инструмент {requested or ''} недоступен — поддерживаются только спотовые пары USDT."
+                    )
+                elif meta_reason:
+                    reason = f"Инструмент недоступен для сделки ({meta_reason})."
+            return self._decision(
+                "skipped",
+                reason=reason,
+                context={"symbol_meta": symbol_meta} if symbol_meta else None,
+            )
+
+        if context.deepseek_payload is None:
             context.deepseek_guidance = None
             context.deepseek_multiplier = 1.0
 
@@ -1702,6 +1733,9 @@ class SignalExecutor(
             else None
         )
         deepseek_stop_price = _safe_float(deepseek_payload.get("stop_loss")) if deepseek_payload else None
+        deepseek_take_profit = (
+            _safe_float(deepseek_payload.get("take_profit")) if deepseek_payload else None
+        )
 
 
         quote_wallet_cap_value = quote_wallet_cap
@@ -1747,14 +1781,16 @@ class SignalExecutor(
         vol_scale, vol_meta = self._volatility_scaling_factor(summary, settings)
         if vol_meta is not None:
             risk_context["volatility"] = vol_meta
-        sizing_factor = max(0.0, min(sizing_factor * vol_scale, 1.0))
+        sizing_factor = max(0.0, min(sizing_factor * vol_scale, _SIZING_FACTOR_CAP))
         deepseek_multiplier = getattr(context, "deepseek_multiplier", 1.0) or 1.0
         if not isinstance(deepseek_multiplier, (int, float)):
             deepseek_multiplier = 1.0
         if not math.isfinite(deepseek_multiplier) or deepseek_multiplier <= 0:
             deepseek_multiplier = 1.0
         if not math.isclose(deepseek_multiplier, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            sizing_factor = max(0.0, min(sizing_factor * deepseek_multiplier, 1.0))
+            sizing_factor = max(
+                0.0, min(sizing_factor * deepseek_multiplier, _SIZING_FACTOR_CAP)
+            )
         deepseek_guidance = getattr(context, "deepseek_guidance", None)
         if isinstance(deepseek_guidance, Mapping):
             deepseek_context = dict(deepseek_guidance)
@@ -2840,7 +2876,19 @@ class SignalExecutor(
             volatility_pct=volatility_pct,
             performance=performance_snapshot,
             deepseek_stop_price=deepseek_stop_price,
+            deepseek_take_profit=deepseek_take_profit,
         )
+        tp_meta = self._deepseek_tp_context
+        if tp_meta:
+            order_context["deepseek_take_profit"] = copy.deepcopy(tp_meta)
+            order["deepseek_take_profit"] = copy.deepcopy(tp_meta)
+        self._deepseek_tp_context = None
+
+        stop_meta = self._deepseek_stop_context
+        if stop_meta:
+            order_context["deepseek_stop"] = copy.deepcopy(stop_meta)
+            order["deepseek_stop"] = copy.deepcopy(stop_meta)
+        self._deepseek_stop_context = None
         if execution_stats:
             order_context["execution"] = execution_stats
             order["execution"] = copy.deepcopy(execution_stats)
@@ -2930,6 +2978,7 @@ class SignalExecutor(
         volatility_pct: Optional[float] = None,
         performance: Optional[TradePerformanceSnapshot] = None,
         deepseek_stop_price: Optional[float] = None,
+        deepseek_take_profit: Optional[float] = None,
     ) -> tuple[list[Dict[str, object]], Dict[str, str], list[Dict[str, object]]]:
         """Place post-entry take-profit limit orders as a ladder."""
 
@@ -2937,6 +2986,8 @@ class SignalExecutor(
             return [], {}, []
         if api is None or not hasattr(api, "place_order"):
             return [], {}, []
+
+        self._deepseek_tp_context = None
 
         steps = self._resolve_tp_ladder(settings)
         if not steps:
@@ -2974,6 +3025,12 @@ class SignalExecutor(
         avg_price = executed_quote / executed_base if executed_base > 0 else _DECIMAL_ZERO
         if avg_price <= 0:
             return [], {}, []
+
+        deepseek_tp_price: Optional[Decimal] = None
+        if deepseek_take_profit is not None:
+            tp_candidate = self._decimal_from(deepseek_take_profit, _DECIMAL_ZERO)
+            if tp_candidate > 0:
+                deepseek_tp_price = tp_candidate
 
         audit: Mapping[str, object] | None = None
         if isinstance(response, Mapping):
@@ -3135,6 +3192,35 @@ class SignalExecutor(
                 else:
                     aggregated.append({"price": price, "qty": qty, "steps": [step_cfg]})
 
+        deepseek_tp_meta: Dict[str, object] = {}
+        tp_price_cap: Optional[Decimal] = None
+        if deepseek_tp_price is not None and deepseek_tp_price > 0:
+            tp_price_cap = deepseek_tp_price
+            if price_band_max > 0 and tp_price_cap > price_band_max:
+                tp_price_cap = price_band_max
+            deepseek_tp_meta = {
+                "source": "deepseek",
+                "requested_price": float(deepseek_tp_price),
+            }
+            if tp_price_cap is not None and tp_price_cap != deepseek_tp_price:
+                deepseek_tp_meta["clamped_price"] = float(tp_price_cap)
+
+        if tp_price_cap is not None and tp_price_cap > 0 and aggregated:
+            adjusted_buckets: list[Dict[str, object]] = []
+            for bucket in aggregated:
+                bucket_price = bucket["price"]
+                bucket_qty = bucket["qty"]
+                bucket_steps = list(bucket["steps"])
+                if bucket_price > tp_price_cap:
+                    bucket_price = tp_price_cap
+                entry = {"price": bucket_price, "qty": bucket_qty, "steps": bucket_steps}
+                if adjusted_buckets and adjusted_buckets[-1]["price"] == entry["price"]:
+                    adjusted_buckets[-1]["qty"] += entry["qty"]
+                    adjusted_buckets[-1]["steps"].extend(entry["steps"])
+                else:
+                    adjusted_buckets.append(entry)
+            aggregated = adjusted_buckets
+
         base_timestamp = int(time.time() * 1000)
         plan_entries: list[Dict[str, object]] = []
 
@@ -3191,6 +3277,24 @@ class SignalExecutor(
                     qty=fallback_entry.get("qty_text"),
                     price=fallback_entry.get("price_text"),
                 )
+
+        if deepseek_tp_meta:
+            applied_prices: list[Decimal] = []
+            for entry in plan_entries:
+                price_value = self._decimal_from(entry.get("price"))
+                if price_value > 0:
+                    applied_prices.append(price_value)
+            if applied_prices:
+                max_price = max(applied_prices)
+                deepseek_tp_meta["applied_price"] = float(max_price)
+                if avg_price > 0:
+                    scale = Decimal("10000")
+                    requested_reference = deepseek_tp_price if deepseek_tp_price is not None else max_price
+                    requested_diff = (requested_reference - avg_price) / avg_price * scale
+                    deepseek_tp_meta["requested_bps"] = float(requested_diff)
+                    applied_diff = (max_price - avg_price) / avg_price * scale
+                    deepseek_tp_meta["applied_bps"] = float(applied_diff)
+            self._deepseek_tp_context = deepseek_tp_meta or None
 
         if not plan_entries:
             self._cancel_existing_stop_orders(symbol, api, settings)
@@ -3348,11 +3452,6 @@ class SignalExecutor(
             performance=performance,
             deepseek_stop_price=deepseek_stop_price,
         )
-        deepseek_stop_meta = self._deepseek_stop_context
-        if deepseek_stop_meta:
-            order_context["deepseek_stop"] = copy.deepcopy(deepseek_stop_meta)
-        self._deepseek_stop_context = None
-
         execution_payload = execution_stats if execution_stats else {}
         return placed, execution_payload, stop_orders
 
@@ -4465,7 +4564,7 @@ class SignalExecutor(
                 caps.append(leverage_cap)
 
         base_notional = min(caps) if caps else 0.0
-        sizing = max(0.0, min(float(sizing_factor), 1.0))
+        sizing = max(0.0, min(float(sizing_factor), _SIZING_FACTOR_CAP))
         notional = round(base_notional * sizing, 2) if base_notional > 0 else 0.0
         notional = max(notional, 0.0)
 

@@ -58,6 +58,8 @@ def test_live_signal_fetcher_reuses_cache_within_ttl(
     assert calls["count"] == 1
     assert second == first
     assert second["status_source"] == "live"
+    assert second["status_age_seconds"] == pytest.approx(0.0)
+    assert second["status_stale"] is False
 
 
 def test_live_signal_fetcher_refreshes_snapshot_after_ttl(
@@ -130,6 +132,7 @@ def test_live_signal_fetcher_refreshes_snapshot_after_ttl(
 
     assert fetch_calls["count"] == 1
     assert result["symbol"] == "AAAUSDT"
+    assert result["status_stale"] is False
 
 
 def test_live_signal_fetcher_threads_network_flag(
@@ -207,6 +210,8 @@ def test_live_signal_fetcher_returns_cached_when_scan_empty_within_grace(
 
     assert fallback["symbol"] == "ETHUSDT"
     assert fallback["status_source"] == "live_cached"
+    assert fallback["status_stale"] is True
+    assert "DeepSeek" in fallback.get("status_warning", "")
     assert call_order == ["first", "fail"]
     assert fetcher._cached_status == initial
 
@@ -291,6 +296,7 @@ def test_live_signal_fetcher_live_only_disables_cache(
 
     assert calls["count"] == 2
     assert first["symbol"] == "SOLUSDT"
+    assert first["status_stale"] is False
     assert second["symbol"] == "DOGEUSDT"
 
 
@@ -324,6 +330,33 @@ def test_live_signal_fetcher_runtime_live_only_forces_rescan(
 
     assert calls["count"] == 2
     assert first["symbol"] == "ADAUSDT"
+    assert first["status_stale"] is False
     assert second["symbol"] == "XRPUSDT"
     assert fetcher.cache_ttl == 0.0
     assert fetcher.stale_grace == 0.0
+
+
+def test_live_signal_fetcher_deepseek_cache_floor(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    fetcher = LiveSignalFetcher(
+        settings=Settings(ai_live_only=False, ai_use_deepseek_only=True),
+        data_dir=tmp_path,
+        cache_ttl=10.0,
+    )
+
+    assert fetcher.cache_ttl == pytest.approx(60.0)
+    assert fetcher.stale_grace >= 120.0
+
+
+def test_live_signal_fetcher_require_deepseek_cache_floor(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(live_signal_module, "get_api_client", lambda: SimpleNamespace())
+
+    fetcher = LiveSignalFetcher(
+        settings=Settings(ai_live_only=False, ai_require_deepseek=True),
+        data_dir=tmp_path,
+        cache_ttl=5.0,
+    )
+
+    assert fetcher.cache_ttl == pytest.approx(30.0)
+    assert fetcher.stale_grace >= 60.0

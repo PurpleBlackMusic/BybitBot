@@ -420,6 +420,55 @@ def _normalise_percent(value: object) -> Optional[float]:
     return pct
 
 
+def _map_deepseek_trend(direction: Optional[str]) -> Optional[str]:
+    if not direction:
+        return None
+    text = str(direction).strip().lower()
+    if text in {"buy", "long", "bullish"}:
+        return "buy"
+    if text in {"sell", "short", "bearish"}:
+        return "sell"
+    if text in {"neutral", "flat", "wait"}:
+        return "wait"
+    return None
+
+
+def _compute_deepseek_ev_bps(
+    *,
+    direction: Optional[str],
+    reference_price: Optional[float],
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    total_cost_bps: Optional[float] = None,
+) -> Optional[float]:
+    if reference_price is None or reference_price <= 0:
+        return None
+
+    trend = _map_deepseek_trend(direction)
+    if trend not in {"buy", "sell"}:
+        return None
+
+    reward_pct = 0.0
+    risk_pct = 0.0
+
+    if trend == "buy":
+        if take_profit is not None and take_profit > reference_price:
+            reward_pct = (take_profit - reference_price) / reference_price * 100.0
+        if stop_loss is not None and stop_loss < reference_price:
+            risk_pct = (reference_price - stop_loss) / reference_price * 100.0
+    else:
+        if take_profit is not None and take_profit < reference_price:
+            reward_pct = (reference_price - take_profit) / reference_price * 100.0
+        if stop_loss is not None and stop_loss > reference_price:
+            risk_pct = (stop_loss - reference_price) / reference_price * 100.0
+
+    ev_pct = reward_pct - risk_pct
+    if total_cost_bps is not None:
+        ev_pct -= max(float(total_cost_bps), 0.0) / 100.0
+
+    return ev_pct * 100.0
+
+
 def _ohlcv_hourly_path(data_dir: Path, symbol: str) -> Path:
     base = Path(data_dir) / "ohlcv" / "spot" / symbol.upper()
     return base / f"{symbol.upper()}_1h.csv"
@@ -1481,6 +1530,8 @@ def scan_market_opportunities(
     settings: Optional["Settings"] = None,
     testnet: Optional[bool] = None,
     min_top_quote: Optional[float] = None,
+    use_deepseek_only: Optional[bool] = None,
+    min_deepseek_score: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """Rank spot symbols by liquidity and momentum to surface opportunities.
 
@@ -1511,6 +1562,14 @@ def scan_market_opportunities(
         min_turnover = 50_000.0
 
     min_ev_bps_threshold = resolve_min_ev_from_settings(settings, default_bps=12.0)
+
+    if use_deepseek_only is None and settings is not None:
+        use_deepseek_only = bool(getattr(settings, "ai_use_deepseek_only", False))
+    use_deepseek_only = bool(use_deepseek_only)
+
+    if min_deepseek_score is None:
+        min_deepseek_score = _safe_setting_float(settings, "ai_min_deepseek_score", 0.0)
+    min_deepseek_score = 0.0 if min_deepseek_score is None else max(float(min_deepseek_score), 0.0)
 
     max_daily_surge_pct = max(
         _safe_setting_float(settings, "ai_max_daily_surge_pct", _DEFAULT_DAILY_SURGE_LIMIT),
@@ -1812,6 +1871,9 @@ def scan_market_opportunities(
         bid = _safe_float(raw.get("bestBidPrice"))
         ask = _safe_float(raw.get("bestAskPrice"))
         spread_bps = _spread_bps(bid, ask)
+        last_price_value = _safe_float(
+            raw.get("lastPrice") or raw.get("close") or raw.get("closePrice")
+        )
         if turnover is None or turnover <= 0:
             _log_data_warning(
                 symbol,
@@ -1979,9 +2041,10 @@ def scan_market_opportunities(
             actionable = turnover_ok and spread_ok and change_ok and liquidity_ok
 
         if not actionable and not force_include:
-            strength = _strength_from_change(change_pct)
-            if strength < 0.1:
-                continue
+            if not use_deepseek_only:
+                strength = _strength_from_change(change_pct)
+                if strength < 0.1:
+                    continue
 
         event_ts = _safe_float(
             raw.get("updateTime")
@@ -2001,12 +2064,40 @@ def scan_market_opportunities(
         deepseek_score_value = _safe_float(external_row.get("deepseek_score"))
         deepseek_stop_loss_value = _safe_float(external_row.get("deepseek_stop_loss"))
         deepseek_take_profit_value = _safe_float(external_row.get("deepseek_take_profit"))
+        deepseek_entry_value = _safe_float(external_row.get("deepseek_entry"))
+        deepseek_ev_bps_value = _safe_float(external_row.get("deepseek_ev_bps"))
         deepseek_direction_value = external_row.get("deepseek_direction")
         if isinstance(deepseek_direction_value, str):
             cleaned_direction = deepseek_direction_value.strip().lower()
             deepseek_direction_value = cleaned_direction or None
         else:
             deepseek_direction_value = None
+
+        if use_deepseek_only and deepseek_score_value is None:
+            continue
+        if (
+            min_deepseek_score > 0.0
+            and deepseek_score_value is not None
+            and deepseek_score_value < min_deepseek_score
+        ):
+            continue
+
+        deepseek_trend = _map_deepseek_trend(deepseek_direction_value)
+        if use_deepseek_only:
+            if deepseek_trend is not None:
+                trend = deepseek_trend
+            else:
+                trend = "wait"
+            if deepseek_trend in {"buy", "sell"}:
+                actionable = turnover_ok and spread_ok and liquidity_ok
+            else:
+                actionable = False
+                if not force_include:
+                    continue
+
+        deepseek_probability = None
+        if deepseek_score_value is not None and math.isfinite(deepseek_score_value):
+            deepseek_probability = max(min(float(deepseek_score_value), 1.0), 0.0)
         deepseek_summary_value = external_row.get("deepseek_summary")
         if isinstance(deepseek_summary_value, str):
             cleaned_summary = deepseek_summary_value.strip()
@@ -2124,7 +2215,16 @@ def scan_market_opportunities(
             logistic_probability = probability
             logistic_score = score
 
-        freqai_prediction = _freqai_lookup(symbol, raw_symbol=raw_symbol)
+        if use_deepseek_only and deepseek_probability is not None:
+            probability = deepseek_probability
+            score = deepseek_probability * 100.0
+            logistic_probability = deepseek_probability
+            logistic_score = score
+            model_metrics["probability_source"] = "deepseek"
+
+        freqai_prediction = None
+        if not use_deepseek_only:
+            freqai_prediction = _freqai_lookup(symbol, raw_symbol=raw_symbol)
         freqai_payload: Optional[Dict[str, object]] = None
 
         direction = 0
@@ -2188,6 +2288,25 @@ def scan_market_opportunities(
             total_cost_bps = total_cost_bps if total_cost_bps > 0 else 0.0
 
         logistic_ev_bps = ev_bps
+        deepseek_ev_bps_override: Optional[float] = None
+        if deepseek_ev_bps_value is not None:
+            deepseek_ev_bps_override = float(deepseek_ev_bps_value)
+        elif use_deepseek_only:
+            reference_price = deepseek_entry_value or last_price_value
+            deepseek_ev_bps_override = _compute_deepseek_ev_bps(
+                direction=deepseek_direction_value or deepseek_trend,
+                reference_price=reference_price,
+                stop_loss=deepseek_stop_loss_value,
+                take_profit=deepseek_take_profit_value,
+                total_cost_bps=total_cost_bps,
+            )
+        if deepseek_ev_bps_override is not None:
+            ev_bps = float(deepseek_ev_bps_override)
+            logistic_ev_bps = ev_bps
+            model_metrics["ev_source"] = "deepseek"
+            model_metrics["deepseek_ev_bps"] = float(ev_bps)
+            if gross_bps is None and total_cost_bps is not None:
+                gross_bps = ev_bps + max(float(total_cost_bps), 0.0)
         if isinstance(freqai_prediction, Mapping):
             freqai_payload = {
                 "symbol": freqai_prediction.get("symbol") or symbol,
@@ -2403,11 +2522,17 @@ def scan_market_opportunities(
             or deepseek_summary_value
             or deepseek_stop_loss_value is not None
             or deepseek_take_profit_value is not None
+            or deepseek_entry_value is not None
+            or deepseek_ev_bps_override is not None
+            or deepseek_ev_bps_value is not None
         ):
             deepseek_details = {
                 "score": float(deepseek_score_value)
                 if deepseek_score_value is not None
                 else 0.0,
+                "score_pct": float(deepseek_probability * 100.0)
+                if deepseek_probability is not None
+                else None,
                 "direction": deepseek_direction_value,
                 "stop_loss": float(deepseek_stop_loss_value)
                 if deepseek_stop_loss_value is not None
@@ -2415,6 +2540,18 @@ def scan_market_opportunities(
                 "take_profit": float(deepseek_take_profit_value)
                 if deepseek_take_profit_value is not None
                 else None,
+                "entry": float(deepseek_entry_value)
+                if deepseek_entry_value is not None
+                else None,
+                "ev_bps": (
+                    float(deepseek_ev_bps_override)
+                    if deepseek_ev_bps_override is not None
+                    else (
+                        float(deepseek_ev_bps_value)
+                        if deepseek_ev_bps_value is not None
+                        else None
+                    )
+                ),
                 "summary": deepseek_summary_value,
             }
 
@@ -2484,6 +2621,9 @@ def scan_market_opportunities(
             entry["freqai"] = freqai_payload
             entry["probability_source"] = freqai_payload.get("source") or "freqai"
             entry["ev_source"] = freqai_payload.get("source") or "freqai"
+        elif use_deepseek_only and deepseek_probability is not None:
+            entry["probability_source"] = "deepseek"
+            entry["ev_source"] = "deepseek"
         elif logistic_probability is not None:
             entry["probability_source"] = "logistic_regression"
             entry["ev_source"] = "market_scanner"

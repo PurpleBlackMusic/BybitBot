@@ -461,6 +461,9 @@ class Settings:
     ai_max_leverage_multiple: float = 2.0
     ai_market_scan_enabled: bool = True
     ai_deepseek_enabled: bool = True
+    ai_use_deepseek_only: bool = False
+    ai_min_deepseek_score: float = 0.0
+    ai_require_deepseek: bool = False
     ai_max_hold_minutes: float = 480.0  # минут до жёсткого выхода (8 ч по умолчанию)
     ai_min_exit_bps: Optional[float] = None  # None → авто-порог из статистики
     ai_max_daily_surge_pct: float = 12.0
@@ -886,6 +889,7 @@ _ENV_MAP = {
     "ai_training_trade_limit": "AI_TRAINING_TRADE_LIMIT",
     "ai_market_scan_enabled": "AI_MARKET_SCAN_ENABLED",
     "ai_deepseek_enabled": "AI_DEEPSEEK_ENABLED",
+    "ai_require_deepseek": "AI_REQUIRE_DEEPSEEK",
     "ai_max_hold_minutes": "AI_MAX_HOLD_MINUTES",
     "ai_min_exit_bps": "AI_MIN_EXIT_BPS",
     "ai_max_daily_surge_pct": "AI_MAX_DAILY_SURGE_PCT",

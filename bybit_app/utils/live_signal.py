@@ -108,8 +108,13 @@ class LiveSignalFetcher:
         now = time.time()
 
         if self._cached_status is not None and self.cache_ttl > 0:
-            if now - self._cache_timestamp <= self.cache_ttl:
-                return copy.deepcopy(self._cached_status)
+            age = now - self._cache_timestamp
+            if age <= self.cache_ttl:
+                cached = copy.deepcopy(self._cached_status)
+                cached.setdefault("status_source", "live")
+                cached["status_age_seconds"] = max(age, 0.0)
+                cached["status_stale"] = False
+                return cached
 
         try:
             api = get_api_client()
@@ -127,6 +132,12 @@ class LiveSignalFetcher:
             if now - self._cache_timestamp <= max_age:
                 cached = copy.deepcopy(self._cached_status)
                 cached["status_source"] = "live_cached"
+                cached["status_age_seconds"] = max(now - self._cache_timestamp, 0.0)
+                cached["status_stale"] = True
+                cached.setdefault(
+                    "status_warning",
+                    "Данные DeepSeek устарели: показана последняя сохраненная сводка.",
+                )
                 return cached
 
             return None
@@ -155,6 +166,10 @@ class LiveSignalFetcher:
         status = self._build_status_from_opportunities(opportunities, settings)
         if status:
             status.setdefault("status_source", "live")
+            status["status_age_seconds"] = 0.0
+            status["status_stale"] = False
+            if "status_warning" in status:
+                status.pop("status_warning", None)
             self._cached_status = copy.deepcopy(status)
             self._cache_timestamp = now
         return status
@@ -165,6 +180,8 @@ class LiveSignalFetcher:
         """Re-evaluate cache controls against the latest settings."""
 
         live_only = bool(getattr(settings, "ai_live_only", False))
+        require_deepseek = bool(getattr(settings, "ai_require_deepseek", False))
+        use_deepseek_only = bool(getattr(settings, "ai_use_deepseek_only", False))
         previous_cache_ttl = self.cache_ttl
 
         if live_only:
@@ -172,6 +189,13 @@ class LiveSignalFetcher:
             stale_grace = 0.0
         else:
             cache_ttl = self._base_cache_ttl
+            cache_floor = 0.0
+            if use_deepseek_only:
+                cache_floor = 60.0
+            elif require_deepseek:
+                cache_floor = 30.0
+            if cache_floor > 0.0:
+                cache_ttl = max(cache_ttl, cache_floor)
             if self._stale_grace_override is None:
                 stale_grace = max(cache_ttl * 2.0, 15.0)
             else:
