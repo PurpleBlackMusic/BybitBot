@@ -65,6 +65,16 @@ _DEFAULT_TAKER_FEE_BPS = 5.0
 _MIN_VOLUME_FALLBACK = 1e-6
 _DEFAULT_SNAPSHOT_RETRIES = 2
 _DEFAULT_SNAPSHOT_RETRY_DELAY = 0.25
+_FALLBACK_TICKER_FIELDS: tuple[str, ...] = (
+    "volume24h",
+    "turnover24h",
+    "price24hPcnt",
+    "bestBidPrice",
+    "bestAskPrice",
+)
+_ORDERBOOK_BID_KEYS: tuple[object, ...] = ("b", "bids", "buy", "buyList")
+_ORDERBOOK_ASK_KEYS: tuple[object, ...] = ("a", "asks", "sell", "sellList")
+_ORDERBOOK_PRICE_KEYS: tuple[object, ...] = ("price", "0", 0, "p")
 
 _OUTLIER_PERCENT_FIELDS: Tuple[str, ...] = (
     "price5mPcnt",
@@ -1472,6 +1482,124 @@ def _repair_rows(rows: Sequence[Dict[str, object]]) -> Dict[str, int]:
     return {"volume_repaired": repairs}
 
 
+def _extract_orderbook_top(payload: Mapping[str, object]) -> tuple[Optional[float], Optional[float]]:
+    source = payload.get("result") if isinstance(payload, Mapping) else None
+    if not isinstance(source, Mapping):
+        source = payload if isinstance(payload, Mapping) else {}
+
+    def _first_entry(keys: Sequence[object]) -> Optional[object]:
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+                for entry in value:
+                    if entry is None:
+                        continue
+                    return entry
+        return None
+
+    def _price_from_entry(entry: object) -> Optional[float]:
+        if isinstance(entry, Mapping):
+            for key in _ORDERBOOK_PRICE_KEYS:
+                if key in entry:
+                    price = _safe_float(entry.get(key))
+                    if price is not None:
+                        return price
+        elif isinstance(entry, (list, tuple)) and entry:
+            return _safe_float(entry[0])
+        else:
+            return _safe_float(entry)
+        return None
+
+    best_ask_entry = _first_entry(_ORDERBOOK_ASK_KEYS)
+    best_bid_entry = _first_entry(_ORDERBOOK_BID_KEYS)
+
+    return _price_from_entry(best_bid_entry), _price_from_entry(best_ask_entry)
+
+
+def _augment_with_fallback_sources(
+    api: BybitAPI,
+    category: str,
+    rows: Sequence[Dict[str, object]],
+    *,
+    delay: float = 0.1,
+    max_symbols: int = 12,
+) -> Dict[str, int]:
+    if max_symbols <= 0:
+        return {}
+
+    fallback_stats = {"ticker_refreshes": 0, "orderbook_refreshes": 0, "skipped": 0}
+    seen: set[str] = set()
+    delay = max(float(delay), 0.0)
+    max_symbols = max(int(max_symbols), 1)
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        symbol_value = row.get("symbol")
+        if not isinstance(symbol_value, str):
+            continue
+        symbol = symbol_value.strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        volume_issue, orderbook_issue = _assess_row_quality(row)
+        if not volume_issue and not orderbook_issue:
+            continue
+        if len(seen) > max_symbols:
+            fallback_stats["skipped"] += 1
+            continue
+
+        if delay and (fallback_stats["ticker_refreshes"] or fallback_stats["orderbook_refreshes"]):
+            time.sleep(delay)
+
+        if volume_issue:
+            try:
+                single = api.tickers(category=category, symbol=symbol)
+            except (TypeError, AttributeError):
+                single = None
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "market_scanner.data_quality.fallback_error",
+                    category=category,
+                    symbol=symbol,
+                    source="ticker",
+                    err=str(exc),
+                )
+                single = None
+            if isinstance(single, Mapping):
+                refreshed = _extract_ticker_rows(single)
+                if refreshed:
+                    refreshed_row = refreshed[0]
+                    for field in _FALLBACK_TICKER_FIELDS:
+                        value = refreshed_row.get(field)
+                        if value is not None:
+                            row[field] = value
+                    fallback_stats["ticker_refreshes"] += 1
+                    volume_issue, orderbook_issue = _assess_row_quality(row)
+
+        if orderbook_issue and hasattr(api, "orderbook"):
+            try:
+                ob_payload = api.orderbook(category=category, symbol=symbol, limit=1)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log(
+                    "market_scanner.data_quality.fallback_error",
+                    category=category,
+                    symbol=symbol,
+                    source="orderbook",
+                    err=str(exc),
+                )
+                ob_payload = None
+            if isinstance(ob_payload, Mapping):
+                best_bid, best_ask = _extract_orderbook_top(ob_payload)
+                if best_bid is not None:
+                    row["bestBidPrice"] = best_bid
+                if best_ask is not None:
+                    row["bestAskPrice"] = best_ask
+                fallback_stats["orderbook_refreshes"] += 1
+
+    return {key: value for key, value in fallback_stats.items() if value}
+
+
 def fetch_market_snapshot(
     api: BybitAPI,
     category: str = "spot",
@@ -1479,39 +1607,58 @@ def fetch_market_snapshot(
     max_retries: int = _DEFAULT_SNAPSHOT_RETRIES,
     retry_delay: float = _DEFAULT_SNAPSHOT_RETRY_DELAY,
 ) -> Dict[str, object]:
-    attempts = 0
-    max_retries = max(int(max_retries), 0)
-    retry_delay = max(float(retry_delay), 0.0)
     last_rows: List[Dict[str, object]] = []
     quality: Dict[str, int] = {"volume_missing": 0, "orderbook_missing": 0}
+    fallback_stats: Dict[str, int] = {}
 
-    while True:
+    max_attempts = max(int(max_retries) + 1, 1)
+    retry_delay = max(float(retry_delay), 0.0)
+
+    for attempt in range(1, max_attempts + 1):
         response = api.tickers(category=category)
         extracted_rows = _extract_ticker_rows(response if isinstance(response, Mapping) else {})
         quality = _analyse_rows(extracted_rows)
         last_rows = extracted_rows
-        if (quality["volume_missing"] == 0 and quality["orderbook_missing"] == 0) or attempts >= max_retries:
+        if quality["volume_missing"] == 0 and quality["orderbook_missing"] == 0:
             break
-        attempts += 1
+        if attempt >= max_attempts:
+            break
         if retry_delay > 0:
-            time.sleep(retry_delay)
+            sleep_for = retry_delay * (2 ** (attempt - 1))
+            time.sleep(min(sleep_for, retry_delay * 4))
+
+    if (quality["volume_missing"] or quality["orderbook_missing"]) and last_rows:
+        fallback_stats = _augment_with_fallback_sources(
+            api,
+            category,
+            last_rows,
+            delay=max(retry_delay, 0.1),
+        )
+        if fallback_stats:
+            quality = _analyse_rows(last_rows)
 
     repairs = _repair_rows(last_rows)
-    if quality["volume_missing"] or quality["orderbook_missing"]:
+    attempt_used = attempt if "attempt" in locals() else 1
+    quality_payload: Dict[str, object] = {
+        **quality,
+        **repairs,
+        **fallback_stats,
+        "attempts": max(1, attempt_used),
+    }
+
+    if quality["volume_missing"] or quality["orderbook_missing"] or fallback_stats:
         log(
             "market_scanner.data_quality.snapshot",
             severity="warning",
             category=category,
-            attempts=attempts + 1,
-            **quality,
-            **repairs,
+            **quality_payload,
         )
 
     snapshot = {
         "ts": time.time(),
         "category": category,
         "rows": last_rows,
-        "quality": {**quality, **repairs, "attempts": attempts + 1},
+        "quality": quality_payload,
     }
     return snapshot
 

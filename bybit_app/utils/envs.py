@@ -120,40 +120,78 @@ def _critical_snapshot(settings: Settings) -> Dict[str, Any]:
     }
 
 
+def _normalise_restart_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    return text.strip()
+
+
+def _normalise_restart_snapshot(snapshot: Mapping[str, Any]) -> tuple[bool, str, str, bool, bool]:
+    return (
+        _coerce_bool(snapshot.get("testnet")),
+        _normalise_restart_text(snapshot.get("active_api_key")),
+        _normalise_restart_text(snapshot.get("active_api_secret")),
+        _coerce_bool(snapshot.get("ai_enabled")),
+        _coerce_bool(snapshot.get("freqai_enabled")),
+    )
+
+
 def _handle_post_update_hooks(
     previous: Mapping[str, Any], current: Mapping[str, Any]
 ) -> None:
-    if not previous or not current or previous == current:
+    if not previous or not current:
         return
 
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
 
+    previous_normalised = _normalise_restart_snapshot(previous)
+    current_normalised = _normalise_restart_snapshot(current)
+
+    if previous_normalised == current_normalised:
+        return
+
+    (
+        previous_network,
+        previous_key,
+        previous_secret,
+        previous_ai,
+        previous_freqai,
+    ) = previous_normalised
+    (
+        current_network,
+        current_key,
+        current_secret,
+        current_ai,
+        current_freqai,
+    ) = current_normalised
+
     reasons_ws: set[str] = set()
     reasons_guardian: set[str] = set()
     reasons_automation: set[str] = set()
 
-    if previous.get("testnet") != current.get("testnet"):
+    if previous_network != current_network:
         reason = "network"
         reasons_ws.add(reason)
         reasons_guardian.add(reason)
         reasons_automation.add(reason)
 
-    if (
-        previous.get("active_api_key") != current.get("active_api_key")
-        or previous.get("active_api_secret") != current.get("active_api_secret")
-    ):
+    if previous_key != current_key or previous_secret != current_secret:
         reason = "credentials"
         reasons_ws.add(reason)
         reasons_guardian.add(reason)
         reasons_automation.add(reason)
 
-    if previous.get("ai_enabled") != current.get("ai_enabled"):
+    if previous_ai != current_ai:
         reason = "ai_toggle"
         reasons_guardian.add(reason)
         reasons_automation.add(reason)
 
-    if previous.get("freqai_enabled") != current.get("freqai_enabled"):
+    if previous_freqai != current_freqai:
         reason = "freqai_toggle"
         reasons_guardian.add(reason)
 
@@ -624,6 +662,19 @@ class Settings:
         return bool(getattr(self, f"dry_run_{suffix}"))
 
     def __setattr__(self, name: str, value: Any) -> None:
+        sentinel = object()
+        try:
+            current = object.__getattribute__(self, name)
+        except AttributeError:
+            current = sentinel
+
+        if current is not sentinel:
+            try:
+                if current == value:
+                    return
+            except Exception:
+                pass
+
         object.__setattr__(self, name, value)
         if name in {
             "api_key",

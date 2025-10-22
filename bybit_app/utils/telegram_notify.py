@@ -8,15 +8,186 @@ from collections import deque
 from typing import Callable, Optional
 
 import requests
-from tenacity import (
-    RetryError,
-    Retrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-    wait_none,
-    wait_random,
-)
+
+try:
+    from tenacity import (
+        RetryError,
+        Retrying,
+        retry_if_exception_type,
+        stop_after_attempt,
+        wait_exponential,
+        wait_none,
+        wait_random,
+    )
+except ModuleNotFoundError:  # pragma: no cover - fallback path
+    import random
+
+    class _FallbackAttempt:
+        """Lightweight attempt state compatible with :class:`RetryError`."""
+
+        def __init__(self, attempt_number: int, exc: Exception | None) -> None:
+            self.attempt_number = attempt_number
+            self._exception = exc
+
+        def failed(self) -> bool:
+            return self._exception is not None
+
+        def exception(self) -> Exception | None:
+            return self._exception
+
+    class RetryError(RuntimeError):
+        """Fallback ``RetryError`` mirroring the subset used by the app."""
+
+        def __init__(self, last_attempt: _FallbackAttempt) -> None:
+            self.last_attempt = last_attempt
+            message = f"Retry failed after {last_attempt.attempt_number} attempts"
+            if last_attempt.exception() is not None:
+                message = f"{message}: {last_attempt.exception()}"
+            super().__init__(message)
+
+    class _WaitStrategy:
+        def __call__(self, attempt: int) -> float:  # pragma: no cover - simple fallback
+            return 0.0
+
+        def __add__(self, other: "_WaitStrategy") -> "_WaitStrategy":
+            return _CompositeWait((self, other))
+
+    class _CompositeWait(_WaitStrategy):
+        def __init__(self, strategies: tuple[_WaitStrategy, ...]) -> None:
+            self._strategies = strategies
+
+        def __call__(self, attempt: int) -> float:
+            total = 0.0
+            for strategy in self._strategies:
+                try:
+                    total += float(strategy(attempt))
+                except Exception:
+                    continue
+            return max(0.0, total)
+
+        def __add__(self, other: "_WaitStrategy") -> "_WaitStrategy":
+            return _CompositeWait(self._strategies + (other,))
+
+    class _WaitNone(_WaitStrategy):
+        def __call__(self, attempt: int) -> float:
+            return 0.0
+
+    class _WaitRandom(_WaitStrategy):
+        def __init__(self, lower: float, upper: float) -> None:
+            self._lower = float(lower)
+            self._upper = float(max(upper, lower))
+
+        def __call__(self, attempt: int) -> float:
+            return random.uniform(self._lower, self._upper)
+
+    class _WaitExponential(_WaitStrategy):
+        def __init__(self, multiplier: float, minimum: float, maximum: float | None) -> None:
+            self._multiplier = float(multiplier)
+            self._minimum = float(minimum)
+            self._maximum = float(maximum) if maximum is not None else None
+
+        def __call__(self, attempt: int) -> float:
+            delay = self._multiplier * (2 ** max(attempt - 1, 0))
+            delay = max(self._minimum, delay)
+            if self._maximum is not None:
+                delay = min(delay, self._maximum)
+            return max(0.0, delay)
+
+    class Retrying:
+        """Minimal retry helper used when ``tenacity`` is unavailable."""
+
+        def __init__(
+            self,
+            *,
+            stop,
+            wait,
+            retry,
+            sleep: Callable[[float], None] | None = None,
+            reraise: bool = True,
+            before_sleep=None,
+        ) -> None:
+            self._stop = stop
+            self._wait = wait
+            self._retry = retry
+            self._sleep = sleep or time.sleep
+            self._reraise = bool(reraise)
+            self._before_sleep = before_sleep
+
+        def __call__(self, fn: Callable[..., object], *args, **kwargs):
+            attempt = 0
+            while True:
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:  # pragma: no cover - exercised indirectly
+                    attempt += 1
+                    should_retry = True
+                    if self._retry is not None:
+                        try:
+                            should_retry = bool(self._retry(exc))
+                        except Exception:
+                            should_retry = False
+                    if not should_retry:
+                        if self._reraise:
+                            raise
+                        raise RetryError(_FallbackAttempt(attempt, exc)) from exc
+
+                    stop_now = False
+                    if self._stop is not None:
+                        try:
+                            stop_now = bool(self._stop(attempt))
+                        except Exception:
+                            stop_now = True
+                    if stop_now:
+                        if self._reraise:
+                            raise
+                        raise RetryError(_FallbackAttempt(attempt, exc)) from exc
+
+                    delay = 0.0
+                    if self._wait is not None:
+                        try:
+                            delay = float(self._wait(attempt))
+                        except Exception:
+                            delay = 0.0
+                    if self._before_sleep is not None:
+                        try:
+                            self._before_sleep(_FallbackAttempt(attempt, exc))
+                        except Exception:
+                            pass
+                    if delay > 0:
+                        self._sleep(delay)
+
+    def retry_if_exception_type(exc_type):
+        if not isinstance(exc_type, tuple):
+            exc_tuple = (exc_type,)
+        else:
+            exc_tuple = exc_type
+
+        def _predicate(exc: Exception) -> bool:
+            return isinstance(exc, exc_tuple)
+
+        return _predicate
+
+    def stop_after_attempt(limit: int):
+        limit_value = max(int(limit), 1)
+
+        def _stopper(attempt: int) -> bool:
+            return attempt >= limit_value
+
+        return _stopper
+
+    def wait_none() -> _WaitStrategy:
+        return _WaitNone()
+
+    def wait_random(lower: float = 0.0, upper: float = 1.0) -> _WaitStrategy:
+        return _WaitRandom(lower, upper)
+
+    def wait_exponential(
+        *,
+        multiplier: float = 1.0,
+        min: float = 0.0,
+        max: float | None = None,
+    ) -> _WaitStrategy:
+        return _WaitExponential(multiplier, min, max)
 
 from .envs import get_settings
 from .log import log
@@ -99,18 +270,20 @@ class TelegramDispatcher:
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._sleep = sleep or time.sleep
+        self._wait_strategy = self._build_wait_strategy()
 
-    def _retry_wait(self):
+    def _build_wait_strategy(self):
         if self._initial_backoff <= 0:
             return wait_none()
 
         max_backoff: float | None = self._max_backoff if self._max_backoff > 0 else None
-        wait = wait_exponential(
+        base = wait_exponential(
             multiplier=self._initial_backoff,
             min=self._initial_backoff,
             max=max_backoff,
         )
-        return wait + wait_random(0, min(0.25, self._initial_backoff))
+        jitter_upper = min(0.25, self._initial_backoff)
+        return base + wait_random(0, jitter_upper)
 
     def enqueue_message(self, text: str) -> None:
         """Schedule message for asynchronous delivery without blocking."""
@@ -195,7 +368,7 @@ class TelegramDispatcher:
 
         retrying = Retrying(
             stop=stop_after_attempt(self._max_attempts),
-            wait=self._retry_wait(),
+            wait=self._wait_strategy,
             retry=retry_if_exception_type(_RetryableTelegramError),
             sleep=self._sleep,
             reraise=False,

@@ -50,6 +50,46 @@ class _TickerAPIStub:
         return self._responses[index]
 
 
+class _FallbackAPIStub:
+    def __init__(self):
+        self.general_calls = 0
+        self.symbol_calls: list[str] = []
+        self.orderbook_calls = 0
+
+    def tickers(self, category: str = "spot", symbol: str | None = None) -> dict[str, object]:
+        if symbol:
+            self.symbol_calls.append(symbol)
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": symbol,
+                            "volume24h": 250.0,
+                            "bestBidPrice": 0,
+                            "bestAskPrice": 0,
+                        }
+                    ]
+                }
+            }
+        self.general_calls += 1
+        return {
+            "result": {
+                "list": [
+                    {
+                        "symbol": "AAAUSDT",
+                        "volume24h": 0,
+                        "bestBidPrice": 0,
+                        "bestAskPrice": 0,
+                    }
+                ]
+            }
+        }
+
+    def orderbook(self, *, category: str, symbol: str, limit: int = 1) -> dict[str, object]:
+        self.orderbook_calls += 1
+        return {"result": {"a": [["1.25", "10"]], "b": [["1.23", "9"]]}}
+
+
 def test_fetch_market_snapshot_retries_until_quality_ok() -> None:
     api = _TickerAPIStub(
         [
@@ -81,6 +121,28 @@ def test_fetch_market_snapshot_repairs_zero_volume() -> None:
     assert snapshot["quality"]["volume_missing"] == 1
     assert snapshot["quality"]["volume_repaired"] == 1
     assert snapshot["rows"][0]["volume24h"] == market_scanner_module._MIN_VOLUME_FALLBACK
+
+
+def test_fetch_market_snapshot_uses_fallback_sources() -> None:
+    api = _FallbackAPIStub()
+
+    snapshot = fetch_market_snapshot(api, max_retries=0, retry_delay=0.0)
+
+    assert api.general_calls == 1
+    assert api.symbol_calls == ["AAAUSDT"]
+    assert api.orderbook_calls == 1
+
+    row = snapshot["rows"][0]
+    assert row["volume24h"] == 250.0
+    assert row["bestBidPrice"] == "1.23" or pytest.approx(float(row["bestBidPrice"])) == pytest.approx(1.23)
+    assert row["bestAskPrice"] == "1.25" or pytest.approx(float(row["bestAskPrice"])) == pytest.approx(1.25)
+
+    quality = snapshot["quality"]
+    assert quality["attempts"] == 1
+    assert quality.get("ticker_refreshes") == 1
+    assert quality.get("orderbook_refreshes") == 1
+    assert quality["volume_missing"] == 0
+    assert quality["orderbook_missing"] == 0
 
 
 def _write_snapshot(

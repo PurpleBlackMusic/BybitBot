@@ -56,11 +56,11 @@ class WSManager:
     """Минимальный, но стабильный менеджер WS с авто‑пингом и переподключением."""
 
     _LEDGER_RECOVERY_LIMIT = 800
-    _PUBLIC_FALLBACK_RETRY_DELAY = 60.0
-    _PUBLIC_LATENCY_THRESHOLD = 5.0
-    _PRIVATE_LATENCY_THRESHOLD = 5.0
-    _PING_TIMEOUT = 12.0
-    _LATENCY_RESTART_COOLDOWN = 30.0
+    _PUBLIC_FALLBACK_RETRY_DELAY = 20.0
+    _PUBLIC_LATENCY_THRESHOLD = 3.0
+    _PRIVATE_LATENCY_THRESHOLD = 3.0
+    _PING_TIMEOUT = 8.0
+    _LATENCY_RESTART_COOLDOWN = 15.0
 
     def __init__(self):
         self.s = get_settings()
@@ -163,7 +163,7 @@ class WSManager:
         self,
         reason: str,
         *,
-        min_interval: float = 10.0,
+        min_interval: float = 5.0,
         **context: object,
     ) -> bool:
         """Request switching the public channel to the mainnet fallback."""
@@ -217,10 +217,10 @@ class WSManager:
         return False
 
     def _public_latency_timeout(self) -> float:
-        return getattr(self, "_PING_TIMEOUT", 12.0)
+        return getattr(self, "_PING_TIMEOUT", 8.0)
 
     def _private_latency_timeout(self) -> float:
-        return getattr(self, "_PING_TIMEOUT", 12.0)
+        return getattr(self, "_PING_TIMEOUT", 8.0)
 
     def _reset_public_ping_state(self) -> None:
         with self._pub_ping_lock:
@@ -332,7 +332,7 @@ class WSManager:
     ) -> None:
         now = time.monotonic()
         if now - self._pub_last_latency_restart < getattr(
-            self, "_LATENCY_RESTART_COOLDOWN", 30.0
+            self, "_LATENCY_RESTART_COOLDOWN", 15.0
         ):
             return
 
@@ -345,6 +345,14 @@ class WSManager:
             latency_ms=round(latency * 1000, 3) if isinstance(latency, (int, float)) else None,
             threshold_ms=round(threshold * 1000, 3),
         )
+        if getattr(self.s, "testnet", False):
+            latency_ms = round(latency * 1000, 3) if isinstance(latency, (int, float)) else None
+            self.force_public_fallback(
+                "latency_spike",
+                min_interval=5.0,
+                latencyMs=latency_ms,
+                reason=reason,
+            )
         self._reset_public_ping_state()
         try:
             self.stop_public()
@@ -442,7 +450,7 @@ class WSManager:
     ) -> None:
         now = time.monotonic()
         if now - self._priv_last_latency_restart < getattr(
-            self, "_LATENCY_RESTART_COOLDOWN", 30.0
+            self, "_LATENCY_RESTART_COOLDOWN", 15.0
         ):
             return
 
