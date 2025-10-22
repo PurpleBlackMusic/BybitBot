@@ -328,6 +328,11 @@ def test_cancel_batch_uses_signed_endpoint(monkeypatch) -> None:
                 "signed": signed,
             }
         )
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderId": payload["orderId"], "symbol": payload["symbol"]}]},
+            }
         return {"retCode": 0, "result": {}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
@@ -490,6 +495,11 @@ def test_amend_order_uses_signed_endpoint(monkeypatch) -> None:
                 "signed": signed,
             }
         )
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderId": payload["orderId"], "symbol": payload["symbol"]}]},
+            }
         return {"retCode": 0, "result": {}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
@@ -719,7 +729,12 @@ def test_place_order_sanitises_order_link_id(monkeypatch) -> None:
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
         calls.append({"method": method, "path": path, "body": body, "params": params})
-        return {"retCode": 0}
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderLinkId": ensure_link_id(long_link)}]},
+            }
+        return {"retCode": 0, "result": {}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
     monkeypatch.setattr(api, "open_orders", lambda **_: {"result": {"list": []}})
@@ -863,6 +878,11 @@ def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
                 "signed": signed,
             }
         )
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderId": payload["orderId"], "symbol": payload["symbol"]}]},
+            }
         return {"retCode": 0, "result": {}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
@@ -875,19 +895,27 @@ def test_cancel_order_uses_signed_endpoint(monkeypatch) -> None:
 
     resp = api.cancel_order(**payload)
 
-    assert resp == {"retCode": 0, "result": {}}
+    assert resp["retCode"] == 0
     assert calls
-    first = calls[0]
-    assert first == {
+
+    precheck = calls[0]
+    assert precheck["method"] == "GET"
+    assert precheck["path"] == "/v5/order/realtime"
+    assert precheck["params"]["openOnly"] == 1
+    assert precheck["params"]["orderId"] == payload["orderId"]
+
+    cancel_call = next(call for call in calls if call["path"] == "/v5/order/cancel")
+    assert cancel_call == {
         "method": "POST",
         "path": "/v5/order/cancel",
         "params": None,
         "body": payload,
         "signed": True,
     }
-    if len(calls) > 1:
-        follow_up = calls[1]
-        assert follow_up["path"] == "/v5/order/realtime"
+
+    follow_up_calls = [call for call in calls if call["path"] == "/v5/order/realtime" and call is not precheck]
+    assert follow_up_calls
+    for follow_up in follow_up_calls:
         assert follow_up["params"]["openOnly"] == 1
 
 
@@ -915,7 +943,12 @@ def test_cancel_order_sanitises_order_link_id(monkeypatch) -> None:
 
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
         calls.append({"method": method, "path": path, "body": body, "params": params})
-        return {"retCode": 0}
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderLinkId": ensure_link_id(long_link)}]},
+            }
+        return {"retCode": 0, "result": {}}
 
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
@@ -925,10 +958,10 @@ def test_cancel_order_sanitises_order_link_id(monkeypatch) -> None:
     api.cancel_order(category="spot", orderLinkId=long_link)
 
     assert calls
-    first = calls[0]
-    assert first["method"] == "POST"
-    assert first["path"] == "/v5/order/cancel"
-    assert first["body"]["orderLinkId"] == ensure_link_id(long_link)
+    cancel_calls = [call for call in calls if call["path"] == "/v5/order/cancel"]
+    assert cancel_calls
+    for cancel_call in cancel_calls:
+        assert cancel_call["body"]["orderLinkId"] == ensure_link_id(long_link)
 
 
 def test_place_order_self_check_logs_presence(monkeypatch) -> None:
@@ -983,14 +1016,18 @@ def test_cancel_order_self_check_logs_absence(monkeypatch) -> None:
     link = "AI-TEST-CANCEL"
     events: list[tuple[str, dict[str, Any]]] = []
 
+    state = {"precheck": True}
+
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        if path == "/v5/order/cancel":
-            return {"retCode": 0, "result": {"orderStatus": "Cancelled"}}
-        assert path == "/v5/order/realtime"
-        assert params["category"] == "spot"
-        assert params.get("openOnly") == 1
-        assert params.get("orderLinkId") == ensure_link_id(link)
-        return {"retCode": 0, "result": {"list": []}}
+        if path == "/v5/order/realtime":
+            assert params["category"] == "spot"
+            assert params.get("openOnly") == 1
+            assert params.get("orderLinkId") == ensure_link_id(link)
+            if state.pop("precheck", False):
+                return {"retCode": 0, "result": {"list": [{"orderLinkId": ensure_link_id(link)}]}}
+            return {"retCode": 0, "result": {"list": []}}
+        assert path == "/v5/order/cancel"
+        return {"retCode": 0, "result": {"orderStatus": "Cancelled"}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
     monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
@@ -1012,15 +1049,19 @@ def test_cancel_order_self_check_handles_order_id(monkeypatch) -> None:
 
     emitted: list[tuple[str, dict[str, Any]]] = []
 
+    state = {"precheck": True}
+
     def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
-        if path == "/v5/order/cancel":
-            assert body["orderId"] == "123"
-            return {"retCode": 0, "result": {"orderId": "123"}}
-        assert path == "/v5/order/realtime"
-        assert params["category"] == "spot"
-        assert params.get("openOnly") == 1
-        assert params.get("orderId") == "123"
-        return {"retCode": 0, "result": {"list": [{"orderId": "123"}]}}
+        if path == "/v5/order/realtime":
+            assert params["category"] == "spot"
+            assert params.get("openOnly") == 1
+            assert params.get("orderId") == "123"
+            if state.pop("precheck", False):
+                return {"retCode": 0, "result": {"list": [{"orderId": "123"}]}}
+            return {"retCode": 0, "result": {"list": [{"orderId": "123"}]}}
+        assert path == "/v5/order/cancel"
+        assert body["orderId"] == "123"
+        return {"retCode": 0, "result": {"orderId": "123"}}
 
     monkeypatch.setattr(api, "_safe_req", fake_safe_req)
     monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: emitted.append((event, payload)))
@@ -1037,6 +1078,74 @@ def test_cancel_order_self_check_handles_order_id(monkeypatch) -> None:
     assert payload["status"] is None
 
 
+def test_cancel_order_precheck_skips_when_missing(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    calls: list[dict[str, Any]] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_safe_req(method: str, path: str, *, params=None, body=None, signed=False):
+        calls.append({"method": method, "path": path, "params": params, "body": body})
+        assert path == "/v5/order/realtime"
+        return {"retCode": 0, "result": {"list": []}}
+
+    monkeypatch.setattr(api, "_safe_req", fake_safe_req)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
+
+    resp = api.cancel_order(category="spot", orderId="999", symbol="ETHUSDT")
+
+    assert resp["retCode"] == 0
+    assert resp["result"]["orderStatus"] == "Cancelled"
+    assert resp["result"]["orderId"] == "999"
+    assert resp["result"]["symbol"] == "ETHUSDT"
+    assert resp.get("retExtInfo", {}).get("cancelReason") == "order_not_found_precheck"
+
+    assert calls == [
+        {
+            "method": "GET",
+            "path": "/v5/order/realtime",
+            "params": {"category": "spot", "openOnly": 1, "orderId": "999", "symbol": "ETHUSDT"},
+            "body": None,
+        }
+    ]
+
+    assert any(event == "order.cancel.precheck.absent" for event, _ in events)
+
+
+def test_cancel_order_handles_170213_code(monkeypatch) -> None:
+    api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
+
+    events: list[tuple[str, dict[str, Any]]] = []
+    calls: list[dict[str, Any]] = []
+
+    def fake_req(method: str, path: str, *, params=None, body=None, signed=False):
+        calls.append({"method": method, "path": path, "params": params, "body": body})
+        if path == "/v5/order/realtime":
+            return {
+                "retCode": 0,
+                "result": {"list": [{"orderId": body if isinstance(body, str) else "123"}]},
+            }
+        assert path == "/v5/order/cancel"
+        return {
+            "retCode": 170213,
+            "retMsg": "Order already finished",
+            "result": {"orderId": "123"},
+        }
+
+    monkeypatch.setattr(api, "_req", fake_req)
+    monkeypatch.setattr(bybit_api_module, "log", lambda event, **payload: events.append((event, payload)))
+
+    resp = api.cancel_order(category="spot", orderId="123", symbol="BTCUSDT")
+
+    assert resp["retCode"] == 0
+    assert resp["result"]["orderStatus"] == "Cancelled"
+    assert resp["result"]["orderId"] == "123"
+    assert resp.get("retExtInfo", {}).get("cancelReason") == "order_already_closed"
+
+    assert any(event == "bybit.cancel.already_closed" for event, _ in events)
+
+    cancel_calls = [call for call in calls if call["path"] == "/v5/order/cancel"]
+    assert cancel_calls and cancel_calls[0]["method"] == "POST"
 def test_place_order_self_check_handles_order_id(monkeypatch) -> None:
     api = BybitAPI(BybitCreds(key="key", secret="sec", testnet=True))
 

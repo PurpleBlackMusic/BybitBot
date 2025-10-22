@@ -33,6 +33,13 @@ if TYPE_CHECKING:
 API_MAIN = "https://api.bybit.com"
 API_TEST = "https://api-testnet.bybit.com"
 
+_RETRY_AFTER_HEADER_CANDIDATES: tuple[str, ...] = (
+    "Retry-After",
+    "X-Bapi-Retry-After",
+    "X-Ratelimit-Reset-After",
+)
+_LIMIT_RESET_TIMESTAMP_HEADER = "X-Bapi-Limit-Reset-Timestamp"
+
 from .helpers import ensure_link_id
 from .http_client import create_http_session
 from .bybit_errors import (
@@ -148,15 +155,15 @@ def _retry_delay_from_headers(response: requests.Response | None) -> float | Non
     if not headers:
         return None
 
-    lower = {str(key).lower(): value for key, value in headers.items() if key}
+    def _header(name: str):
+        return headers.get(name) or headers.get(name.lower())
 
-    for header in ("retry-after", "x-bapi-retry-after", "x-ratelimit-reset-after"):
-        if header in lower:
-            delay = _coerce_positive_seconds(lower[header])
-            if delay is not None:
-                return delay
+    for header in _RETRY_AFTER_HEADER_CANDIDATES:
+        delay = _coerce_positive_seconds(_header(header))
+        if delay is not None:
+            return delay
 
-    reset_timestamp = lower.get("x-bapi-limit-reset-timestamp")
+    reset_timestamp = _header(_LIMIT_RESET_TIMESTAMP_HEADER)
     delay = _coerce_positive_seconds(reset_timestamp)
     if delay is not None:
         # Header contains absolute timestamp in seconds; convert to delta.
@@ -164,7 +171,7 @@ def _retry_delay_from_headers(response: requests.Response | None) -> float | Non
         if delta > 0:
             return delta
 
-    window = lower.get("x-bapi-limit-reset") or lower.get("x-ratelimit-reset")
+    window = _header("X-Bapi-Limit-Reset") or _header("X-Ratelimit-Reset")
     delay = _coerce_positive_seconds(window)
     if delay is not None:
         return delay
@@ -772,6 +779,24 @@ class BybitAPI:
             if numeric_code == 0 or ret_code_text == "0":
                 return resp
 
+            if numeric_code == 170213 and path == "/v5/order/cancel":
+                payload_mapping = body if isinstance(body, Mapping) else {}
+                log(
+                    "bybit.cancel.already_closed",
+                    method=method,
+                    path=path,
+                    retCode=ret_code_value,
+                    message=extract_ret_message(resp),
+                    orderId=payload_mapping.get("orderId"),
+                    orderLinkId=payload_mapping.get("orderLinkId"),
+                    category=payload_mapping.get("category"),
+                )
+                return self._build_cancel_success_response(
+                    payload_mapping,
+                    response=resp,
+                    reason="order_already_closed",
+                )
+
             ret_msg = extract_ret_message(resp)
             error_meta = {"retCode": ret_code_value, "retMsg": ret_msg or None, "path": path}
             log("bybit.exchange_error", method=method, **error_meta)
@@ -1327,6 +1352,56 @@ class BybitAPI:
 
         self._sanitise_order_link_id(payload)
 
+        category_value = payload.get("category")
+        category = str(category_value).strip() if isinstance(category_value, str) else category_value
+        symbol_value = payload.get("symbol")
+        symbol = None
+        if isinstance(symbol_value, str):
+            symbol = symbol_value.strip().upper() or None
+        order_link_id = payload.get("orderLinkId") if isinstance(payload.get("orderLinkId"), str) else None
+        order_id = payload.get("orderId") if isinstance(payload.get("orderId"), (str, int)) else None
+        if isinstance(order_id, int):
+            order_id = str(order_id)
+        if isinstance(order_id, str):
+            order_id = order_id.strip() or None
+
+        if isinstance(order_link_id, str):
+            order_link_id = ensure_link_id(order_link_id)
+            if order_link_id:
+                payload["orderLinkId"] = order_link_id
+        else:
+            order_link_id = None
+
+        if isinstance(category, str) and (order_link_id or order_id):
+            found, aborted = self._order_present_in_open_orders(
+                category=category,
+                symbol=symbol,
+                order_link_id=order_link_id,
+                order_id=order_id,
+                log_prefix="order.cancel.precheck",
+                max_pages=2,
+            )
+            if not found and not aborted:
+                log(
+                    "order.cancel.precheck.absent",
+                    category=category,
+                    symbol=symbol,
+                    orderLinkId=order_link_id,
+                    orderId=order_id,
+                )
+                return self._build_cancel_success_response(
+                    payload,
+                    reason="order_not_found_precheck",
+                )
+            if aborted:
+                log(
+                    "order.cancel.precheck.aborted",
+                    category=category,
+                    symbol=symbol,
+                    orderLinkId=order_link_id,
+                    orderId=order_id,
+                )
+
         response = self._safe_req("POST", "/v5/order/cancel", body=payload, signed=True)
 
         self._self_check_order_action(
@@ -1336,6 +1411,149 @@ class BybitAPI:
         )
 
         return response
+
+    def _build_cancel_success_response(
+        self,
+        payload: Mapping[str, object] | None,
+        *,
+        response: Mapping[str, object] | None = None,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+
+        sources: tuple[Mapping[str, object] | None, ...] = ()
+        if isinstance(response, Mapping):
+            resp_result = response.get("result")
+            sources += (resp_result if isinstance(resp_result, Mapping) else None,)
+        sources += (payload if isinstance(payload, Mapping) else None,)
+
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            symbol_value = source.get("symbol")
+            if isinstance(symbol_value, str) and symbol_value.strip():
+                result.setdefault("symbol", symbol_value.strip().upper())
+            category_value = source.get("category")
+            if isinstance(category_value, str) and category_value.strip():
+                result.setdefault("category", category_value.strip())
+            order_id_value = source.get("orderId")
+            if isinstance(order_id_value, (str, int)):
+                candidate = str(order_id_value).strip()
+                if candidate:
+                    result.setdefault("orderId", candidate)
+            order_link_value = source.get("orderLinkId")
+            if isinstance(order_link_value, str):
+                sanitised = ensure_link_id(order_link_value)
+                if sanitised:
+                    result.setdefault("orderLinkId", sanitised)
+            status_value = source.get("orderStatus")
+            if isinstance(status_value, str) and status_value.strip():
+                result.setdefault("orderStatus", status_value.strip())
+
+        result.setdefault("orderStatus", "Cancelled")
+
+        ret_msg = "OK"
+        if isinstance(response, Mapping):
+            ret_msg_candidate = response.get("retMsg")
+            if isinstance(ret_msg_candidate, str) and ret_msg_candidate.strip():
+                ret_msg = ret_msg_candidate.strip()
+
+        synthetic_response: dict[str, object] = {"retCode": 0, "retMsg": ret_msg, "result": result}
+
+        ext_info: dict[str, object] = {}
+        if isinstance(response, Mapping):
+            raw_ext = response.get("retExtInfo")
+            if isinstance(raw_ext, Mapping):
+                ext_info.update(raw_ext)
+        if reason:
+            ext_info.setdefault("cancelReason", reason)
+        if ext_info:
+            ext_info["synthetic"] = True
+            synthetic_response["retExtInfo"] = ext_info
+
+        return synthetic_response
+
+    def _order_present_in_open_orders(
+        self,
+        *,
+        category: str,
+        symbol: str | None,
+        order_link_id: str | None,
+        order_id: str | None,
+        log_prefix: str,
+        max_pages: int = 5,
+    ) -> tuple[bool, bool]:
+        params: dict[str, object] = {"category": category, "openOnly": 1}
+        if symbol:
+            params["symbol"] = symbol
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        if order_id:
+            params["orderId"] = order_id
+
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(max(1, int(max_pages))):
+            if cursor:
+                params["cursor"] = cursor
+            elif "cursor" in params:
+                params.pop("cursor", None)
+
+            try:
+                orders_payload = self._safe_req(
+                    "GET",
+                    "/v5/order/realtime",
+                    params=params,
+                    signed=True,
+                )
+            except Exception as exc:  # pragma: no cover - propagated in tests
+                log(
+                    f"{log_prefix}.error",
+                    category=category,
+                    symbol=symbol,
+                    orderLinkId=order_link_id,
+                    orderId=order_id,
+                    err=str(exc),
+                )
+                return False, True
+
+            orders_source = orders_payload.get("result") if isinstance(orders_payload, Mapping) else None
+            orders = orders_source.get("list") if isinstance(orders_source, Mapping) else []
+
+            if isinstance(orders, Iterable):
+                for row in orders:
+                    if not isinstance(row, Mapping):
+                        continue
+
+                    if order_link_id:
+                        candidate_link = row.get("orderLinkId")
+                        if (
+                            isinstance(candidate_link, str)
+                            and ensure_link_id(candidate_link) == order_link_id
+                        ):
+                            return True, False
+
+                    if order_id:
+                        candidate_id = row.get("orderId")
+                        if (
+                            isinstance(candidate_id, (str, int))
+                            and str(candidate_id).strip() == order_id
+                        ):
+                            return True, False
+
+            next_cursor_raw = orders_source.get("nextPageCursor") if isinstance(orders_source, Mapping) else None
+            if not isinstance(next_cursor_raw, str):
+                break
+
+            next_cursor = next_cursor_raw.strip()
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        return False, False
 
     def _self_check_order_action(
         self,
@@ -1469,81 +1687,13 @@ class BybitAPI:
                 return False, False
 
             def _search_open_orders() -> tuple[bool, bool]:
-                params: dict[str, object] = {"category": category_for_check, "openOnly": 1}
-                if symbol:
-                    params["symbol"] = symbol
-                if order_link_id:
-                    params["orderLinkId"] = order_link_id
-                if order_id:
-                    params["orderId"] = order_id
-
-                cursor: str | None = None
-                seen_cursors: set[str] = set()
-                max_pages = 5
-
-                for _ in range(max_pages):
-                    if cursor:
-                        params["cursor"] = cursor
-                    elif "cursor" in params:
-                        params.pop("cursor", None)
-
-                    try:
-                        orders_payload = self._safe_req(
-                            "GET",
-                            "/v5/order/realtime",
-                            params=params,
-                            signed=True,
-                        )
-                    except Exception as exc:  # pragma: no cover - network/runtime errors
-                        log(
-                            f"order.self_check.{action}.error",
-                            category=category_for_check,
-                            symbol=symbol,
-                            orderLinkId=order_link_id,
-                            orderId=order_id,
-                            err=str(exc),
-                        )
-                        return False, True
-
-                    orders_source = (orders_payload or {}).get("result") if isinstance(orders_payload, Mapping) else None
-                    orders = orders_source.get("list") if isinstance(orders_source, Mapping) else []
-
-                    if isinstance(orders, Iterable):
-                        for row in orders:
-                            if not isinstance(row, Mapping):
-                                continue
-
-                            if order_link_id:
-                                candidate_link = row.get("orderLinkId")
-                                if (
-                                    isinstance(candidate_link, str)
-                                    and ensure_link_id(candidate_link) == order_link_id
-                                ):
-                                    return True, False
-
-                            if order_id:
-                                candidate_id = row.get("orderId")
-                                if (
-                                    isinstance(candidate_id, (str, int))
-                                    and str(candidate_id).strip() == order_id
-                                ):
-                                    return True, False
-
-                    next_cursor_raw = orders_source.get("nextPageCursor") if isinstance(orders_source, Mapping) else None
-                    if not isinstance(next_cursor_raw, str):
-                        break
-
-                    next_cursor = next_cursor_raw.strip()
-                    if not next_cursor:
-                        break
-
-                    if next_cursor in seen_cursors:
-                        break
-
-                    seen_cursors.add(next_cursor)
-                    cursor = next_cursor
-
-                return False, False
+                return self._order_present_in_open_orders(
+                    category=category_for_check,
+                    symbol=symbol,
+                    order_link_id=order_link_id,
+                    order_id=order_id,
+                    log_prefix=f"order.self_check.{action}",
+                )
 
             search_fn = _search_realtime_orders if action == "place" else _search_open_orders
 
