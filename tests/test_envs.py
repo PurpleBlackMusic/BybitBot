@@ -90,6 +90,12 @@ def _read_settings_file(settings_file: Path) -> dict:
     return json.loads(settings_file.read_text(encoding="utf-8"))
 
 
+def _read_secrets_file(secrets_file: Path) -> dict:
+    if not secrets_file.exists():
+        return {}
+    return json.loads(secrets_file.read_text(encoding="utf-8"))
+
+
 def test_update_settings_disables_dry_run_when_keys_supplied(isolated_settings: Path):
     envs.update_settings(api_key="KEY", api_secret="SECRET")
     settings = envs.get_settings(force_reload=True)
@@ -297,19 +303,22 @@ def test_legacy_config_migrates_on_save(isolated_settings: Path) -> None:
     envs._invalidate_cache()
     settings = envs.get_settings(force_reload=True)
 
-    assert settings.get_api_key(testnet=True) == ""
-    assert settings.get_api_secret(testnet=True) == ""
+    assert settings.get_api_key(testnet=True) == "LEGACY"
+    assert settings.get_api_secret(testnet=True) == "SECRET"
     assert settings.get_dry_run(testnet=True) is False
     assert settings.get_dry_run(testnet=False) is False
 
     envs.update_settings()
     migrated = _read_settings_file(isolated_settings)
+    secrets_payload = _read_secrets_file(envs.SETTINGS_SECRETS_FILE)
 
     assert "api_key_testnet" not in migrated
     assert "api_secret_testnet" not in migrated
     assert migrated["dry_run_testnet"] is False
     assert "api_key" not in migrated
     assert "dry_run" not in migrated
+    assert secrets_payload["api_key_testnet"] == "LEGACY"
+    assert secrets_payload["api_secret_testnet"] == "SECRET"
 
 
 def test_validate_runtime_credentials_raises_without_keys(

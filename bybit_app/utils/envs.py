@@ -863,6 +863,9 @@ def _load_file() -> Dict[str, Any]:
                     payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
                     cleaned = _scrub_sensitive(payload)
                     if cleaned != payload:
+                        secrets_payload = _secret_payload_from(payload)
+                        if secrets_payload:
+                            _persist_secrets_payload(secrets_payload)
                         _write_secure_json(SETTINGS_FILE, cleaned)
                     return cleaned
         except FileLockTimeout:
@@ -873,10 +876,45 @@ def _load_file() -> Dict[str, Any]:
             if SETTINGS_FILE.exists():
                 _secure_path(SETTINGS_FILE)
                 payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-                return _scrub_sensitive(payload)
+                cleaned = _scrub_sensitive(payload)
+                if cleaned != payload:
+                    secrets_payload = _secret_payload_from(payload)
+                    if secrets_payload:
+                        _persist_secrets_payload(secrets_payload)
+                return cleaned
     except Exception:
         pass
     return {}
+
+
+def _load_secrets() -> Dict[str, Any]:
+    path = SETTINGS_SECRETS_FILE
+    try:
+        lock_file = _lock_path(path)
+        try:
+            with acquire_lock(lock_file, timeout=2.0):
+                if path.exists():
+                    _secure_path(path)
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    return {
+                        k: v for k, v in payload.items() if k in _SENSITIVE_FIELDS
+                    }
+        except FileLockTimeout:
+            log("envs.settings.secrets.lock_timeout", path=str(path))
+            if path.exists():
+                _secure_path(path)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return {k: v for k, v in payload.items() if k in _SENSITIVE_FIELDS}
+    except Exception:
+        pass
+    return {}
+
+
+def _load_settings_payload() -> Dict[str, Any]:
+    public_payload = _load_file()
+    secrets_payload = _load_secrets()
+    combined = _merge(public_payload, secrets_payload)
+    return _migrate_legacy_payload(combined)
 
 
 def _profile_settings_file(testnet: bool) -> Path:
@@ -1266,6 +1304,7 @@ def _current_file_signature() -> FileSignature:
         _file_mtime(SETTINGS_SECRETS_FILE),
         _file_mtime(SETTINGS_TESTNET_FILE),
         _file_mtime(SETTINGS_MAINNET_FILE),
+        _file_mtime(SETTINGS_SECRETS_FILE),
     )
 
 
@@ -1466,6 +1505,7 @@ def update_settings(**kwargs) -> Settings:
         for k, v in current.items()
         if k not in _SENSITIVE_FIELDS and k not in {"profile_testnet", "profile_mainnet"}
     }
+    secrets_payload = _secret_payload_from(current)
     lock_file = _lock_path(SETTINGS_FILE)
     with acquire_lock(lock_file, timeout=5.0):
         _write_secure_json(SETTINGS_FILE, persistable)
