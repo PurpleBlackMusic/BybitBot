@@ -20,6 +20,18 @@ from .ws_limits import reserve_ws_connection_slot
 _CONNECTION_FLAG_CACHE_TTL = 2.5
 
 
+_CONNECTION_FLAG_CACHE_LOCK = threading.Lock()
+_CONNECTION_FLAG_CACHE_VALUE: tuple[bool, int] | None = None
+_CONNECTION_FLAG_CACHE_EXPIRY = 0.0
+
+
+def _reset_connection_flag_cache() -> None:
+    global _CONNECTION_FLAG_CACHE_VALUE, _CONNECTION_FLAG_CACHE_EXPIRY
+    with _CONNECTION_FLAG_CACHE_LOCK:
+        _CONNECTION_FLAG_CACHE_VALUE = None
+        _CONNECTION_FLAG_CACHE_EXPIRY = 0.0
+
+
 DEFAULT_TOPICS: tuple[str, ...] = (
     "order.spot",
     "execution.spot",
@@ -50,9 +62,6 @@ class WSPrivateV5:
         self._authenticated = False
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
-        self._connection_flags_lock = threading.Lock()
-        self._cached_connection_flags: tuple[bool, int] | None = None
-        self._connection_flags_expiry = 0.0
 
     def _emit_to_callback(self, payload: Mapping[str, Any]) -> None:
         try:
@@ -81,9 +90,11 @@ class WSPrivateV5:
         return max(1000, min(window, 120000))
 
     def _cache_connection_flags(self, verify_ssl: bool, recv_window_ms: int) -> tuple[bool, int]:
-        with self._connection_flags_lock:
-            self._cached_connection_flags = (verify_ssl, recv_window_ms)
-            self._connection_flags_expiry = time.monotonic() + _CONNECTION_FLAG_CACHE_TTL
+        expiry = time.monotonic() + _CONNECTION_FLAG_CACHE_TTL
+        global _CONNECTION_FLAG_CACHE_VALUE, _CONNECTION_FLAG_CACHE_EXPIRY
+        with _CONNECTION_FLAG_CACHE_LOCK:
+            _CONNECTION_FLAG_CACHE_VALUE = (verify_ssl, recv_window_ms)
+            _CONNECTION_FLAG_CACHE_EXPIRY = expiry
         return verify_ssl, recv_window_ms
 
     def _derive_connection_flags(
@@ -104,9 +115,9 @@ class WSPrivateV5:
             return self._cache_connection_flags(verify_ssl, recv_window_ms)
 
         now = time.monotonic()
-        with self._connection_flags_lock:
-            cached = self._cached_connection_flags
-            expiry = self._connection_flags_expiry
+        with _CONNECTION_FLAG_CACHE_LOCK:
+            cached = _CONNECTION_FLAG_CACHE_VALUE
+            expiry = _CONNECTION_FLAG_CACHE_EXPIRY
 
         if cached and not force_refresh and now < expiry:
             return cached

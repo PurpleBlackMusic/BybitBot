@@ -21,6 +21,13 @@ def _patch_time_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_connection_flag_cache() -> None:
+    ws_private_v5._reset_connection_flag_cache()
+    yield
+    ws_private_v5._reset_connection_flag_cache()
+
+
 class _ImmediateThread:
     """Thread stub that runs the target synchronously for deterministic tests."""
 
