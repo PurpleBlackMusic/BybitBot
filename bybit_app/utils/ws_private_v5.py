@@ -66,7 +66,45 @@ class WSPrivateV5:
             return API_TEST
         return API_MAIN
 
-    def _auth_args(self, key: str, secret: str, *, leeway: float | None = None) -> tuple[str, str, str]:
+    @staticmethod
+    def _clamp_recv_window(value: Any, default: int = 15000) -> int:
+        try:
+            window = int(value)
+        except (TypeError, ValueError):
+            window = default
+        return max(1000, min(window, 120000))
+
+    def _derive_connection_flags(
+        self,
+        settings: Any | None = None,
+    ) -> tuple[bool, int]:
+        verify_ssl = True
+        recv_window_ms = 15000
+
+        if settings is None:
+            try:
+                settings = get_settings()
+            except Exception:
+                settings = None
+
+        if settings is not None:
+            verify_ssl = bool(getattr(settings, "verify_ssl", True))
+            recv_window_ms = self._clamp_recv_window(
+                getattr(settings, "recv_window_ms", recv_window_ms),
+                default=recv_window_ms,
+            )
+
+        return verify_ssl, recv_window_ms
+
+    def _auth_args(
+        self,
+        key: str,
+        secret: str,
+        *,
+        leeway: float | None = None,
+        verify_ssl: bool | None = None,
+        recv_window_ms: int | None = None,
+    ) -> tuple[str, str, str]:
         """Prepare authentication arguments for the `auth` request.
 
         Bybit expects the "expires" timestamp (in ms) to be slightly in the future.
@@ -74,23 +112,11 @@ class WSPrivateV5:
         clock skew or scheduling delays causing an immediate "Params Error".
         """
 
-        settings = None
-        try:
-            settings = get_settings()
-        except Exception:
-            settings = None
-
-        verify_ssl = True
-        recv_window_ms = 15000
-        if settings is not None:
-            verify_ssl = bool(getattr(settings, "verify_ssl", True))
-            raw_window = getattr(settings, "recv_window_ms", None)
-            try:
-                recv_window_ms = int(raw_window) if raw_window is not None else recv_window_ms
-            except (TypeError, ValueError):
-                recv_window_ms = 15000
-
-        recv_window_ms = max(1000, min(int(recv_window_ms), 120000))
+        if recv_window_ms is None or verify_ssl is None:
+            verify_ssl, recv_window_ms = self._derive_connection_flags()
+        else:
+            verify_ssl = bool(verify_ssl)
+            recv_window_ms = self._clamp_recv_window(recv_window_ms)
         if leeway is None:
             window_seconds = recv_window_ms / 1000.0
             leeway = max(3.0, min(window_seconds * 0.8, 55.0))
@@ -242,7 +268,7 @@ class WSPrivateV5:
             log("ws.private.disabled", reason="missing credentials")
             return False
 
-        verify_ssl = bool(getattr(settings, "verify_ssl", True))
+        verify_ssl, recv_window_ms = self._derive_connection_flags(settings)
 
         try:
             import websocket  # type: ignore
@@ -251,7 +277,12 @@ class WSPrivateV5:
             return False
 
         base_url = self._rest_base()
-        auth_args = self._auth_args(api_key, api_secret)
+        auth_args = self._auth_args(
+            api_key,
+            api_secret,
+            verify_ssl=verify_ssl,
+            recv_window_ms=recv_window_ms,
+        )
         auth = {"op": "auth", "args": list(auth_args)}
         self._set_topics(topics)
         with self._topics_lock:
@@ -262,7 +293,9 @@ class WSPrivateV5:
             import ssl
             import websocket  # type: ignore
 
+            nonlocal verify_ssl, recv_window_ms
             backoff = 1.0
+            first_attempt = True
             ping_thread: threading.Thread | None = None
             ping_stop: threading.Event | None = None
 
@@ -323,6 +356,7 @@ class WSPrivateV5:
                     start_ping_loop(ws)
 
             def handle_message(ws, message: str) -> None:
+                nonlocal verify_ssl, recv_window_ms
                 payload: Any
                 try:
                     payload = json.loads(message)
@@ -350,7 +384,15 @@ class WSPrivateV5:
                             )
                             if ret_code in (10002, "10002"):
                                 invalidate_synced_clock(base_url)
-                                retry_args = self._auth_args(api_key, api_secret)
+                                fresh_verify, fresh_window = self._derive_connection_flags()
+                                retry_args = self._auth_args(
+                                    api_key,
+                                    api_secret,
+                                    verify_ssl=fresh_verify,
+                                    recv_window_ms=fresh_window,
+                                )
+                                verify_ssl = fresh_verify
+                                recv_window_ms = fresh_window
                                 auth.update({"args": list(retry_args)})
                                 try:
                                     ws.send(json.dumps(auth))
@@ -426,6 +468,10 @@ class WSPrivateV5:
                 stop_ping_loop()
 
             while not self._stop:
+                if first_attempt:
+                    first_attempt = False
+                else:
+                    verify_ssl, recv_window_ms = self._derive_connection_flags()
                 reserve_ws_connection_slot()
                 ws = websocket.WebSocketApp(
                     self.url,
@@ -461,7 +507,15 @@ class WSPrivateV5:
                 log("ws.private.reconnect.wait", seconds=round(sleep_for, 2))
                 time.sleep(sleep_for)
                 backoff = min(backoff * 2.0, 60.0)
-                retry_args = self._auth_args(api_key, api_secret)
+                fresh_verify, fresh_window = self._derive_connection_flags()
+                retry_args = self._auth_args(
+                    api_key,
+                    api_secret,
+                    verify_ssl=fresh_verify,
+                    recv_window_ms=fresh_window,
+                )
+                verify_ssl = fresh_verify
+                recv_window_ms = fresh_window
                 auth.update({"args": list(retry_args)})
 
             self._thread = None
