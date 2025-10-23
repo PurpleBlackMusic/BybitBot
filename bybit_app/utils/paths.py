@@ -74,3 +74,4 @@ for d in (DATA_DIR, LOG_DIR, CACHE_DIR, RUNTIME_DIR):
 SETTINGS_FILE = RUNTIME_DIR / "settings.json"
 SETTINGS_TESTNET_FILE = RUNTIME_DIR / "settings.testnet.json"
 SETTINGS_MAINNET_FILE = RUNTIME_DIR / "settings.mainnet.json"
+SETTINGS_SECRETS_FILE = RUNTIME_DIR / "settings.secrets.json"
