@@ -66,7 +66,7 @@ class WSPrivateV5:
             return API_TEST
         return API_MAIN
 
-    def _auth_args(self, key: str, secret: str, *, leeway: float = 10.0) -> tuple[str, str, str]:
+    def _auth_args(self, key: str, secret: str, *, leeway: float | None = None) -> tuple[str, str, str]:
         """Prepare authentication arguments for the `auth` request.
 
         Bybit expects the "expires" timestamp (in ms) to be slightly in the future.
@@ -81,8 +81,19 @@ class WSPrivateV5:
             settings = None
 
         verify_ssl = True
+        recv_window_ms = 15000
         if settings is not None:
             verify_ssl = bool(getattr(settings, "verify_ssl", True))
+            raw_window = getattr(settings, "recv_window_ms", None)
+            try:
+                recv_window_ms = int(raw_window) if raw_window is not None else recv_window_ms
+            except (TypeError, ValueError):
+                recv_window_ms = 15000
+
+        recv_window_ms = max(1000, min(int(recv_window_ms), 120000))
+        if leeway is None:
+            window_seconds = recv_window_ms / 1000.0
+            leeway = max(3.0, min(window_seconds * 0.8, 55.0))
 
         base_url = self._rest_base()
         try:

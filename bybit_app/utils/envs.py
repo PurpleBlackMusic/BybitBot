@@ -439,9 +439,9 @@ class Settings:
     profile_mainnet: Dict[str, Any] = field(default_factory=dict, repr=False)
 
     # safety
-    dry_run: bool = True
-    dry_run_mainnet: bool = True
-    dry_run_testnet: bool = True
+    dry_run: Optional[bool] = None
+    dry_run_mainnet: bool = False
+    dry_run_testnet: bool = False
     spot_cash_only: bool = True  # запрет заимствований на споте
     order_time_in_force: str = 'GTC'
     allow_partial_fills: bool = True
@@ -561,6 +561,8 @@ class Settings:
             if field.name not in _SETTINGS_BOOL_FIELDS:
                 continue
             current = getattr(self, field.name)
+            if current is None:
+                continue
             coerced = _coerce_bool(current)
             setattr(self, field.name, coerced)
 
@@ -639,8 +641,7 @@ class Settings:
             object.__setattr__(self, key_field, self.api_key)
         if self.api_secret and not getattr(self, secret_field):
             object.__setattr__(self, secret_field, self.api_secret)
-        if self.dry_run is not None and getattr(self, dry_field) is True:
-            # allow explicit False legacy value to override defaults
+        if self.dry_run is not None:
             object.__setattr__(self, dry_field, _coerce_bool(self.dry_run))
 
         # keep legacy fields in sync with active network values
@@ -784,7 +785,7 @@ def _auto_disable_dry_run(
         payload[dry_field] = False
 
 
-def _prune_empty_dry_flags(payload: Dict[str, Any]) -> None:
+def _prune_empty_dry_flags(payload: Dict[str, Any], *, explicit: bool = False) -> None:
     for network_flag in (True, False):
         key_name = _network_field("api_key", network_flag)
         secret_name = _network_field("api_secret", network_flag)
@@ -793,8 +794,9 @@ def _prune_empty_dry_flags(payload: Dict[str, Any]) -> None:
             not payload.get(key_name)
             and not payload.get(secret_name)
             and payload.get(dry_name) is True
-        ):
-            payload.pop(dry_name, None)
+            ):
+            if not explicit:
+                payload.pop(dry_name, None)
 
 
 def _apply_active_profile_fields(
@@ -1255,6 +1257,11 @@ def get_settings(force_reload: bool = False) -> Settings:
         raw_env=raw_env,
         explicit_dry_run=False,
     )
+    dry_field = _network_field("dry_run", active_testnet)
+    if _is_dry_run_configured(dry_field, file_payload, env_overrides, raw_env):
+        merged["dry_run"] = merged.get(dry_field)
+    else:
+        merged["dry_run"] = None
     filtered = _filter_fields(merged)
     settings = Settings(**filtered)
     return _set_cache(settings, key)
@@ -1312,6 +1319,9 @@ def update_settings(**kwargs) -> Settings:
         elif key == "dry_run":
             field_name = _network_field("dry_run", target_testnet)
             updates[field_name] = value
+            other_field = _network_field("dry_run", not target_testnet)
+            if other_field not in updates:
+                updates[other_field] = value
             explicit_dry_run = True
         elif key in {"dry_run_mainnet", "dry_run_testnet"}:
             updates[key] = value
@@ -1371,7 +1381,7 @@ def update_settings(**kwargs) -> Settings:
         explicit_dry_run=explicit_dry_run,
     )
 
-    _prune_empty_dry_flags(current)
+    _prune_empty_dry_flags(current, explicit=explicit_dry_run)
 
     for legacy in ("api_key", "api_secret", "dry_run"):
         current.pop(legacy, None)
@@ -1558,4 +1568,4 @@ def active_dry_run(settings: Any) -> bool:
     getter = getattr(settings, "get_dry_run", None)
     if callable(getter):
         return bool(getter())
-    return bool(getattr(settings, "dry_run", True))
+    return bool(getattr(settings, "dry_run", False))

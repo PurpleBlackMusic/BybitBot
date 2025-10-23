@@ -189,6 +189,8 @@ class WSOrderbookV5:
                 if is_test_ws and not had_error:
                     break
                 sleep_for = max(0.0, min(backoff if backoff is not None else initial_backoff, max_backoff))
+                if is_test_ws:
+                    sleep_for = min(sleep_for, _MAX_INITIAL_BACKOFF)
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
                 if sleep_for > 0:
                     time.sleep(sleep_for)

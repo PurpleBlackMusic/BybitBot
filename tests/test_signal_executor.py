@@ -254,7 +254,7 @@ def test_signal_executor_resolves_stubbed_settings(monkeypatch: pytest.MonkeyPat
 
 
 def test_signal_executor_skips_when_not_actionable() -> None:
-    bot = StubBot({"actionable": False}, Settings(ai_enabled=True))
+    bot = StubBot({"actionable": False}, Settings(ai_enabled=True, dry_run=True))
     executor = SignalExecutor(bot)
     result = executor.execute_once()
     assert isinstance(result, ExecutionResult)
@@ -1520,6 +1520,7 @@ def test_signal_executor_applies_volatility_scaling(monkeypatch: pytest.MonkeyPa
         ai_risk_per_trade_pct=10.0,
         spot_vol_target_pct=5.0,
         spot_vol_min_scale=0.2,
+        dry_run=True,
     )
     bot = StubBot(summary, settings)
 
@@ -1595,6 +1596,7 @@ def test_signal_executor_caps_notional_by_symbol_limit(
         spot_max_cap_per_symbol_pct=20.0,
         spot_max_portfolio_pct=90.0,
         ai_max_slippage_bps=0,
+        dry_run=True,
     )
     bot = StubBot(summary, settings)
 
