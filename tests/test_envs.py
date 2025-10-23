@@ -48,14 +48,17 @@ def isolated_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     settings_file = tmp_path / "settings.json"
+    secrets_file = tmp_path / "settings.secrets.json"
 
     monkeypatch.setattr(envs, "DATA_DIR", data_dir)
     monkeypatch.setattr(envs, "SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(envs, "SETTINGS_SECRETS_FILE", secrets_file)
 
     from bybit_app.utils import paths
 
     monkeypatch.setattr(paths, "DATA_DIR", data_dir)
     monkeypatch.setattr(paths, "SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(paths, "SETTINGS_SECRETS_FILE", secrets_file)
 
     tracked_env = (
         "BYBIT_API_KEY",
@@ -107,6 +110,63 @@ def test_update_settings_disables_dry_run_when_keys_supplied(isolated_settings: 
     assert os.getenv("BYBIT_API_SECRET_TESTNET") == "SECRET"
     assert os.getenv("BYBIT_API_KEY") == "KEY"
     assert os.getenv("BYBIT_API_SECRET") == "SECRET"
+
+
+def test_sensitive_fields_persist_across_reload(
+    isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    envs.update_settings(api_key="KEY", api_secret="SECRET")
+    settings = envs.get_settings(force_reload=True)
+
+    assert settings.get_api_key(testnet=True) == "KEY"
+    assert settings.get_api_secret(testnet=True) == "SECRET"
+
+    public_payload = _read_settings_file(isolated_settings)
+    assert "api_key_testnet" not in public_payload
+    assert "api_secret_testnet" not in public_payload
+
+    secrets_payload = _read_settings_file(envs.SETTINGS_SECRETS_FILE)
+    assert secrets_payload["api_key_testnet"] == "KEY"
+    assert secrets_payload["api_secret_testnet"] == "SECRET"
+
+    for key in (
+        "BYBIT_API_KEY",
+        "BYBIT_API_SECRET",
+        "BYBIT_API_KEY_TESTNET",
+        "BYBIT_API_SECRET_TESTNET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    envs._invalidate_cache()
+    reloaded = envs.get_settings(force_reload=True)
+
+    assert reloaded.get_api_key(testnet=True) == "KEY"
+    assert reloaded.get_api_secret(testnet=True) == "SECRET"
+
+
+def test_sensitive_fields_removed_when_cleared(
+    isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    envs.update_settings(api_key="KEY", api_secret="SECRET")
+    envs.update_settings(api_key="", api_secret="")
+
+    secrets_payload = _read_settings_file(envs.SETTINGS_SECRETS_FILE)
+    assert secrets_payload == {}
+    assert not envs.SETTINGS_SECRETS_FILE.exists()
+
+    for key in (
+        "BYBIT_API_KEY",
+        "BYBIT_API_SECRET",
+        "BYBIT_API_KEY_TESTNET",
+        "BYBIT_API_SECRET_TESTNET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    envs._invalidate_cache()
+    reloaded = envs.get_settings(force_reload=True)
+
+    assert reloaded.get_api_key(testnet=True) == ""
+    assert reloaded.get_api_secret(testnet=True) == ""
 
 
 def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):
