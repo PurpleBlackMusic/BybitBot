@@ -17,6 +17,9 @@ from .time_sync import invalidate_synced_clock, synced_timestamp_ms
 from .ws_limits import reserve_ws_connection_slot
 
 
+_CONNECTION_FLAG_CACHE_TTL = 2.5
+
+
 DEFAULT_TOPICS: tuple[str, ...] = (
     "order.spot",
     "execution.spot",
@@ -47,6 +50,9 @@ class WSPrivateV5:
         self._authenticated = False
         self._ws_lock = threading.Lock()
         self._reconnect = reconnect
+        self._connection_flags_lock = threading.Lock()
+        self._cached_connection_flags: tuple[bool, int] | None = None
+        self._connection_flags_expiry = 0.0
 
     def _emit_to_callback(self, payload: Mapping[str, Any]) -> None:
         try:
@@ -74,27 +80,51 @@ class WSPrivateV5:
             window = default
         return max(1000, min(window, 120000))
 
+    def _cache_connection_flags(self, verify_ssl: bool, recv_window_ms: int) -> tuple[bool, int]:
+        with self._connection_flags_lock:
+            self._cached_connection_flags = (verify_ssl, recv_window_ms)
+            self._connection_flags_expiry = time.monotonic() + _CONNECTION_FLAG_CACHE_TTL
+        return verify_ssl, recv_window_ms
+
     def _derive_connection_flags(
         self,
         settings: Any | None = None,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[bool, int]:
         verify_ssl = True
         recv_window_ms = 15000
 
-        if settings is None:
-            try:
-                settings = get_settings()
-            except Exception:
-                settings = None
-
         if settings is not None:
-            verify_ssl = bool(getattr(settings, "verify_ssl", True))
+            verify_ssl = bool(getattr(settings, "verify_ssl", verify_ssl))
             recv_window_ms = self._clamp_recv_window(
                 getattr(settings, "recv_window_ms", recv_window_ms),
                 default=recv_window_ms,
             )
+            return self._cache_connection_flags(verify_ssl, recv_window_ms)
 
-        return verify_ssl, recv_window_ms
+        now = time.monotonic()
+        with self._connection_flags_lock:
+            cached = self._cached_connection_flags
+            expiry = self._connection_flags_expiry
+
+        if cached and not force_refresh and now < expiry:
+            return cached
+
+        fetched_settings: Any | None
+        try:
+            fetched_settings = get_settings(force_reload=force_refresh)
+        except Exception:
+            fetched_settings = None
+
+        if fetched_settings is not None:
+            verify_ssl = bool(getattr(fetched_settings, "verify_ssl", verify_ssl))
+            recv_window_ms = self._clamp_recv_window(
+                getattr(fetched_settings, "recv_window_ms", recv_window_ms),
+                default=recv_window_ms,
+            )
+
+        return self._cache_connection_flags(verify_ssl, recv_window_ms)
 
     def _auth_args(
         self,
@@ -384,7 +414,9 @@ class WSPrivateV5:
                             )
                             if ret_code in (10002, "10002"):
                                 invalidate_synced_clock(base_url)
-                                fresh_verify, fresh_window = self._derive_connection_flags()
+                                fresh_verify, fresh_window = self._derive_connection_flags(
+                                    force_refresh=True
+                                )
                                 retry_args = self._auth_args(
                                     api_key,
                                     api_secret,
