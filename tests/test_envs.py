@@ -118,24 +118,61 @@ def test_update_settings_disables_dry_run_when_keys_supplied(isolated_settings: 
     assert os.getenv("BYBIT_API_SECRET") == "SECRET"
 
 
-def test_update_settings_persists_secrets_across_processes(
+def test_sensitive_fields_persist_across_reload(
     isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     envs.update_settings(api_key="KEY", api_secret="SECRET")
-
-    secrets_payload = _read_secrets_file(envs.SETTINGS_SECRETS_FILE)
-    assert secrets_payload["api_key_testnet"] == "KEY"
-    assert secrets_payload["api_secret_testnet"] == "SECRET"
-
-    for key in envs._ENV_MAP.values():
-        monkeypatch.delenv(key, raising=False)
-
-    envs._invalidate_cache()
-
     settings = envs.get_settings(force_reload=True)
 
     assert settings.get_api_key(testnet=True) == "KEY"
     assert settings.get_api_secret(testnet=True) == "SECRET"
+
+    public_payload = _read_settings_file(isolated_settings)
+    assert "api_key_testnet" not in public_payload
+    assert "api_secret_testnet" not in public_payload
+
+    secrets_payload = _read_settings_file(envs.SETTINGS_SECRETS_FILE)
+    assert secrets_payload["api_key_testnet"] == "KEY"
+    assert secrets_payload["api_secret_testnet"] == "SECRET"
+
+    for key in (
+        "BYBIT_API_KEY",
+        "BYBIT_API_SECRET",
+        "BYBIT_API_KEY_TESTNET",
+        "BYBIT_API_SECRET_TESTNET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    envs._invalidate_cache()
+    reloaded = envs.get_settings(force_reload=True)
+
+    assert reloaded.get_api_key(testnet=True) == "KEY"
+    assert reloaded.get_api_secret(testnet=True) == "SECRET"
+
+
+def test_sensitive_fields_removed_when_cleared(
+    isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    envs.update_settings(api_key="KEY", api_secret="SECRET")
+    envs.update_settings(api_key="", api_secret="")
+
+    secrets_payload = _read_settings_file(envs.SETTINGS_SECRETS_FILE)
+    assert secrets_payload == {}
+    assert not envs.SETTINGS_SECRETS_FILE.exists()
+
+    for key in (
+        "BYBIT_API_KEY",
+        "BYBIT_API_SECRET",
+        "BYBIT_API_KEY_TESTNET",
+        "BYBIT_API_SECRET_TESTNET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    envs._invalidate_cache()
+    reloaded = envs.get_settings(force_reload=True)
+
+    assert reloaded.get_api_key(testnet=True) == ""
+    assert reloaded.get_api_secret(testnet=True) == ""
 
 
 def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):

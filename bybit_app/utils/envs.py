@@ -5,10 +5,13 @@ from pydantic.dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple
 
-CacheKey = Tuple[
-    Tuple[Optional[float], Optional[float], Optional[float], Optional[float]],
-    Tuple[Tuple[str, Any], ...],
+FileSignature = Tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
 ]
+CacheKey = Tuple[FileSignature, Tuple[Tuple[str, Any], ...]]
 
 from .file_io import atomic_write_text
 from .locks import FileLockTimeout, acquire_lock
@@ -836,57 +839,18 @@ def _filter_profile_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in payload.items() if _is_profile_field(k)}
 
 
-def _secret_payload_from(
-    source: Mapping[str, Any], *, include_empty: bool = False
-) -> Dict[str, Any]:
-    if not source:
+def _filter_secret_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    if not payload:
         return {}
-
-    secret_payload: Dict[str, Any] = {}
-    for key in _SENSITIVE_FIELDS:
-        if key not in source:
-            continue
-
-        value = source.get(key)
-        if value is None:
-            continue
-
-        if isinstance(value, str):
-            if value.strip():
-                secret_payload[key] = value
-            elif include_empty:
-                secret_payload[key] = value
-            continue
-
-        secret_payload[key] = value
-
-    return secret_payload
+    return {k: v for k, v in payload.items() if k in _SENSITIVE_FIELDS}
 
 
-def _persist_secrets_payload(payload: Mapping[str, Any]) -> None:
-    filtered = {
-        k: v
-        for k, v in payload.items()
-        if k in _SENSITIVE_FIELDS
-        and v is not None
-        and (not isinstance(v, str) or v.strip())
-    }
-
-    path = SETTINGS_SECRETS_FILE
-    try:
-        lock_file = _lock_path(path)
-        with acquire_lock(lock_file, timeout=5.0):
-            if filtered:
-                _write_secure_json(path, filtered)
-            elif path.exists():
-                path.unlink()
-    except FileLockTimeout:
-        log(
-            "envs.settings.secrets.lock_timeout",
-            path=str(path),
-        )
-    except Exception:
-        log("envs.settings.secrets.persist_error", exc_info=True)
+def _normalise_secret_value(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
 
 
 def _load_file() -> Dict[str, Any]:
@@ -977,6 +941,33 @@ def _load_profile_payload(testnet: bool) -> Dict[str, Any]:
     return {}
 
 
+def _load_secrets() -> Dict[str, Any]:
+    try:
+        lock_file = _lock_path(SETTINGS_SECRETS_FILE)
+        try:
+            with acquire_lock(lock_file, timeout=2.0):
+                if SETTINGS_SECRETS_FILE.exists():
+                    _secure_path(SETTINGS_SECRETS_FILE)
+                    payload = json.loads(
+                        SETTINGS_SECRETS_FILE.read_text(encoding="utf-8")
+                    )
+                    return _filter_secret_fields(payload)
+        except FileLockTimeout:
+            log(
+                "envs.settings.secrets.lock_timeout",
+                path=str(SETTINGS_SECRETS_FILE),
+            )
+            if SETTINGS_SECRETS_FILE.exists():
+                _secure_path(SETTINGS_SECRETS_FILE)
+                payload = json.loads(
+                    SETTINGS_SECRETS_FILE.read_text(encoding="utf-8")
+                )
+                return _filter_secret_fields(payload)
+    except Exception:
+        pass
+    return {}
+
+
 def _persist_profile_payload(testnet: bool, payload: Mapping[str, Any]) -> None:
     cleaned = _filter_profile_fields(dict(payload))
     path = _profile_settings_file(testnet)
@@ -993,6 +984,23 @@ def _persist_profile_payload(testnet: bool, payload: Mapping[str, Any]) -> None:
             exc_info=True,
             testnet=testnet,
         )
+
+
+def _persist_secrets(payload: Mapping[str, Any]) -> None:
+    cleaned = {
+        k: v
+        for k, v in _filter_secret_fields(payload).items()
+        if _normalise_secret_value(v) is not None
+    }
+    try:
+        lock_file = _lock_path(SETTINGS_SECRETS_FILE)
+        with acquire_lock(lock_file, timeout=5.0):
+            if cleaned:
+                _write_secure_json(SETTINGS_SECRETS_FILE, cleaned)
+            elif SETTINGS_SECRETS_FILE.exists():
+                SETTINGS_SECRETS_FILE.unlink()
+    except Exception:
+        log("envs.settings.secrets.persist_error", exc_info=True)
 
 _ENV_MAP = {
     "api_key": "BYBIT_API_KEY",
@@ -1290,11 +1298,10 @@ def _file_mtime(path: Path) -> Optional[float]:
         return None
 
 
-def _current_file_signature() -> Tuple[
-    Optional[float], Optional[float], Optional[float], Optional[float]
-]:
+def _current_file_signature() -> FileSignature:
     return (
         _file_mtime(SETTINGS_FILE),
+        _file_mtime(SETTINGS_SECRETS_FILE),
         _file_mtime(SETTINGS_TESTNET_FILE),
         _file_mtime(SETTINGS_MAINNET_FILE),
         _file_mtime(SETTINGS_SECRETS_FILE),
@@ -1302,7 +1309,7 @@ def _current_file_signature() -> Tuple[
 
 
 def _cache_key(
-    file_signature: Tuple[Optional[float], Optional[float], Optional[float]],
+    file_signature: FileSignature,
     env_sig: Tuple[Tuple[str, Any], ...],
 ) -> CacheKey:
     return (file_signature, env_sig)
@@ -1331,13 +1338,15 @@ def get_settings(force_reload: bool = False) -> Settings:
         return cached
 
     base = asdict(Settings())
-    file_payload = _load_settings_payload()
+    file_payload = _migrate_legacy_payload(_load_file())
+    secrets_payload = _load_secrets()
+    merged_file_payload = _merge(file_payload, secrets_payload)
     profile_payloads = {
         True: _filter_profile_fields(_load_profile_payload(True)),
         False: _filter_profile_fields(_load_profile_payload(False)),
     }
 
-    merged_base = _merge(base, file_payload)
+    merged_base = _merge(base, merged_file_payload)
     merged_env = _merge(merged_base, env_overrides)
     active_testnet = _coerce_bool(merged_env.get("testnet"))
 
@@ -1350,13 +1359,15 @@ def get_settings(force_reload: bool = False) -> Settings:
     _auto_disable_dry_run(
         merged,
         target_network=active_testnet,
-        file_payload=file_payload,
+        file_payload=merged_file_payload,
         env_overrides=env_overrides,
         raw_env=raw_env,
         explicit_dry_run=False,
     )
     dry_field = _network_field("dry_run", active_testnet)
-    if _is_dry_run_configured(dry_field, file_payload, env_overrides, raw_env):
+    if _is_dry_run_configured(
+        dry_field, merged_file_payload, env_overrides, raw_env
+    ):
         merged["dry_run"] = merged.get(dry_field)
     else:
         merged["dry_run"] = None
@@ -1368,7 +1379,9 @@ def update_settings(**kwargs) -> Settings:
     current_settings = get_settings()
     previous_snapshot = _critical_snapshot(current_settings)
     current = asdict(current_settings)
-    file_payload = _load_settings_payload()
+    file_payload = _migrate_legacy_payload(_load_file())
+    secrets_payload = _load_secrets()
+    merged_file_payload = _merge(file_payload, secrets_payload)
     raw_env = _read_env()
     env_overrides, _ = _env_overrides(raw_env)
 
@@ -1473,7 +1486,7 @@ def update_settings(**kwargs) -> Settings:
     _auto_disable_dry_run(
         current,
         target_network=target_testnet,
-        file_payload=file_payload,
+        file_payload=merged_file_payload,
         env_overrides=env_overrides,
         raw_env=raw_env,
         explicit_dry_run=explicit_dry_run,
@@ -1496,7 +1509,15 @@ def update_settings(**kwargs) -> Settings:
     lock_file = _lock_path(SETTINGS_FILE)
     with acquire_lock(lock_file, timeout=5.0):
         _write_secure_json(SETTINGS_FILE, persistable)
-    _persist_secrets_payload(secrets_payload)
+    if sensitive_updates:
+        secrets_state = dict(secrets_payload)
+        for key, value in sensitive_updates.items():
+            normalised = _normalise_secret_value(value)
+            if normalised is None:
+                secrets_state.pop(key, None)
+            else:
+                secrets_state[key] = normalised
+        _persist_secrets(secrets_state)
     _invalidate_cache()
     try:
         from .bybit_api import clear_api_cache  # local import to avoid cycle
