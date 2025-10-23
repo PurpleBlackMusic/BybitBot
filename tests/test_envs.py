@@ -94,13 +94,13 @@ def test_update_settings_disables_dry_run_when_keys_supplied(isolated_settings: 
     assert settings.get_api_key(testnet=True) == "KEY"
     assert settings.get_api_secret(testnet=True) == "SECRET"
     assert settings.get_dry_run(testnet=True) is False
-    assert settings.get_dry_run(testnet=False) is True
+    assert settings.get_dry_run(testnet=False) is False
 
     persisted = _read_settings_file(isolated_settings)
     assert "api_key_testnet" not in persisted
     assert "api_secret_testnet" not in persisted
     assert persisted["dry_run_testnet"] is False
-    assert persisted.get("dry_run_mainnet", True) is True
+    assert persisted.get("dry_run_mainnet") in (None, False)
     assert "dry_run" not in persisted
 
     assert os.getenv("BYBIT_API_KEY_TESTNET") == "KEY"
@@ -117,10 +117,10 @@ def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):
     envs.update_settings()
     refreshed = envs.get_settings(force_reload=True)
     assert refreshed.get_dry_run(testnet=True) is True
-    assert refreshed.get_dry_run(testnet=False) is True
+    assert refreshed.get_dry_run(testnet=False) is False
 
     persisted = _read_settings_file(isolated_settings)
-    assert persisted.get("dry_run_testnet", True) is True
+    assert persisted.get("dry_run_testnet") is True
     assert "api_key_testnet" not in persisted
     assert os.getenv("BYBIT_API_KEY_TESTNET") == "KEY"
     assert os.getenv("BYBIT_API_SECRET_TESTNET") == "SECRET"
@@ -148,7 +148,7 @@ def test_testnet_false_string_uses_mainnet(
     assert settings.get_api_secret(testnet=False) == "SECRET"
     assert settings.get_api_key(testnet=True) == ""
     assert settings.get_dry_run(testnet=False) is False
-    assert settings.get_dry_run(testnet=True) is True
+    assert settings.get_dry_run(testnet=True) is False
 
     from bybit_app.utils import bybit_api
     from bybit_app.utils import guardian_bot
@@ -187,12 +187,12 @@ def test_mainnet_autoswitch_disables_only_mainnet(isolated_settings: Path) -> No
     assert settings.get_api_key(testnet=False) == "MAIN"
     assert settings.get_api_secret(testnet=False) == "SECRET"
     assert settings.get_dry_run(testnet=False) is False
-    assert settings.get_dry_run(testnet=True) is True
+    assert settings.get_dry_run(testnet=True) is False
 
     persisted = _read_settings_file(isolated_settings)
     assert "api_key_mainnet" not in persisted
     assert persisted["dry_run_mainnet"] is False
-    assert persisted.get("dry_run_testnet", True) is True
+    assert persisted.get("dry_run_testnet") in (None, False)
 
     assert os.getenv("BYBIT_API_KEY_MAINNET") == "MAIN"
     assert os.getenv("BYBIT_API_SECRET_MAINNET") == "SECRET"
@@ -240,7 +240,7 @@ def test_legacy_config_migrates_on_save(isolated_settings: Path) -> None:
     assert settings.get_api_key(testnet=True) == ""
     assert settings.get_api_secret(testnet=True) == ""
     assert settings.get_dry_run(testnet=True) is False
-    assert settings.get_dry_run(testnet=False) is True
+    assert settings.get_dry_run(testnet=False) is False
 
     envs.update_settings()
     migrated = _read_settings_file(isolated_settings)

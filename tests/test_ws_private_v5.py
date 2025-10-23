@@ -21,6 +21,13 @@ def _patch_time_sync(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _reset_connection_flag_cache() -> None:
+    ws_private_v5._reset_connection_flag_cache()
+    yield
+    ws_private_v5._reset_connection_flag_cache()
+
+
 class _ImmediateThread:
     """Thread stub that runs the target synchronously for deterministic tests."""
 
@@ -191,6 +198,47 @@ def test_ws_private_v5_start_supports_keywordless_stubs(
 
     assert all(event != "ws.private.disabled" for event, _ in events)
     assert any(json.loads(msg).get("op") == "auth" for msg in sent)
+
+
+def test_ws_private_v5_caches_connection_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[bool] = []
+    settings_values = [
+        SimpleNamespace(verify_ssl=True, recv_window_ms=11111),
+        SimpleNamespace(verify_ssl=True, recv_window_ms=22222),
+        SimpleNamespace(verify_ssl=False, recv_window_ms=33333),
+    ]
+
+    def fake_get_settings(force_reload: bool = False):
+        calls.append(force_reload)
+        index = min(len(calls) - 1, len(settings_values) - 1)
+        return settings_values[index]
+
+    monkeypatch.setattr(ws_private_v5, "get_settings", fake_get_settings)
+
+    timeline = {"value": 0.0}
+
+    def fake_monotonic() -> float:
+        return timeline["value"]
+
+    monkeypatch.setattr(ws_private_v5.time, "monotonic", fake_monotonic)
+
+    client = WSPrivateV5()
+
+    first = client._derive_connection_flags()
+    timeline["value"] += ws_private_v5._CONNECTION_FLAG_CACHE_TTL / 2
+    second = client._derive_connection_flags()
+
+    assert first == second == (True, 11111)
+    assert calls == [False]
+
+    timeline["value"] += ws_private_v5._CONNECTION_FLAG_CACHE_TTL + 0.01
+    third = client._derive_connection_flags()
+    assert third == (True, 22222)
+    assert calls == [False, False]
+
+    forced = client._derive_connection_flags(force_refresh=True)
+    assert forced == (False, 33333)
+    assert calls == [False, False, True]
 
 
 def test_ws_private_v5_handles_decode_and_callback_errors(monkeypatch: pytest.MonkeyPatch) -> None:
