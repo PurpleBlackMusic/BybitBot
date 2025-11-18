@@ -47,7 +47,7 @@ def _bootstrap_profile_dir(base: Path, target: Path) -> None:
 def _resolve_data_dir() -> tuple[Path, str | None]:
     override = os.environ.get("BYBITBOT_DATA_DIR")
     if override:
-        candidate = Path(override).expanduser()
+        candidate = Path(override).expanduser().resolve()
         return candidate, None
 
     profile = _slugify_profile(os.environ.get("BYBITBOT_ENV") or os.environ.get("BYBITBOT_PROFILE"))
