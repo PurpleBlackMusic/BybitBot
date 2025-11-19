@@ -845,6 +845,36 @@ def _filter_secret_fields(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in payload.items() if k in _SENSITIVE_FIELDS}
 
 
+def _secret_payload_from(payload: Mapping[str, Any] | None) -> Dict[str, Any]:
+    if not payload:
+        return {}
+
+    extracted: Dict[str, Any] = {}
+    for key in _SENSITIVE_FIELDS:
+        if key not in payload:
+            continue
+        normalised = _normalise_secret_value(payload.get(key))
+        if normalised is not None:
+            extracted[key] = normalised
+
+    # Promote legacy aliases into per-network fields to avoid ambiguity on reload.
+    legacy_key = extracted.get("api_key")
+    legacy_secret = extracted.get("api_secret")
+    testnet_raw = payload.get("testnet")
+    target_flag = True if testnet_raw is None else _coerce_bool(testnet_raw)
+
+    if legacy_key is not None:
+        extracted.pop("api_key", None)
+        target_field = _network_field("api_key", target_flag)
+        extracted.setdefault(target_field, legacy_key)
+    if legacy_secret is not None:
+        extracted.pop("api_secret", None)
+        target_field = _network_field("api_secret", target_flag)
+        extracted.setdefault(target_field, legacy_secret)
+
+    return extracted
+
+
 def _normalise_secret_value(value: Any) -> Any | None:
     if value is None:
         return None
@@ -1001,6 +1031,11 @@ def _persist_secrets(payload: Mapping[str, Any]) -> None:
                 SETTINGS_SECRETS_FILE.unlink()
     except Exception:
         log("envs.settings.secrets.persist_error", exc_info=True)
+
+
+def _persist_secrets_payload(payload: Mapping[str, Any]) -> None:
+    _persist_secrets(payload or {})
+
 
 _ENV_MAP = {
     "api_key": "BYBIT_API_KEY",
@@ -1338,9 +1373,7 @@ def get_settings(force_reload: bool = False) -> Settings:
         return cached
 
     base = asdict(Settings())
-    file_payload = _migrate_legacy_payload(_load_file())
-    secrets_payload = _load_secrets()
-    merged_file_payload = _merge(file_payload, secrets_payload)
+    merged_file_payload = _load_settings_payload()
     profile_payloads = {
         True: _filter_profile_fields(_load_profile_payload(True)),
         False: _filter_profile_fields(_load_profile_payload(False)),
@@ -1379,9 +1412,7 @@ def update_settings(**kwargs) -> Settings:
     current_settings = get_settings()
     previous_snapshot = _critical_snapshot(current_settings)
     current = asdict(current_settings)
-    file_payload = _migrate_legacy_payload(_load_file())
-    secrets_payload = _load_secrets()
-    merged_file_payload = _merge(file_payload, secrets_payload)
+    merged_file_payload = _load_settings_payload()
     raw_env = _read_env()
     env_overrides, _ = _env_overrides(raw_env)
 
