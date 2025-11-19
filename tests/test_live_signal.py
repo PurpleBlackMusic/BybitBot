@@ -360,3 +360,37 @@ def test_live_signal_fetcher_require_deepseek_cache_floor(monkeypatch, tmp_path)
 
     assert fetcher.cache_ttl == pytest.approx(30.0)
     assert fetcher.stale_grace >= 60.0
+
+
+def test_live_signal_scan_market_builds_universe_when_whitelist_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Ensure `_scan_market` can build a universe without raising NameError."""
+
+    settings = Settings(ai_live_only=False, ai_min_ev_bps=5.0)
+    fetcher = LiveSignalFetcher(settings=settings, data_dir=tmp_path, cache_ttl=0.0)
+
+    builder_calls: list[dict[str, object]] = []
+    captured_whitelist: dict[str, tuple[str, ...]] = {}
+
+    def fake_load_universe(**kwargs):
+        return []
+
+    def fake_build_universe(api, **kwargs):
+        builder_calls.append(kwargs)
+        return ["ALPHACOINUSDT"]
+
+    def fake_scan(api, **kwargs):
+        whitelist = kwargs.get("whitelist") or ()
+        captured_whitelist["value"] = tuple(whitelist)
+        return [_make_opportunity(tuple(whitelist)[0])]
+
+    monkeypatch.setattr(live_signal_module, "load_universe", fake_load_universe)
+    monkeypatch.setattr(live_signal_module, "build_universe", fake_build_universe)
+    monkeypatch.setattr(live_signal_module, "scan_market_opportunities", fake_scan)
+
+    opportunities = fetcher._scan_market(settings, api=SimpleNamespace())
+
+    assert builder_calls, "Universe builder was not invoked"
+    assert captured_whitelist.get("value") == ("ALPHACOINUSDT",)
+    assert opportunities[0]["symbol"] == "ALPHACOINUSDT"

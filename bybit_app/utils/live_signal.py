@@ -15,6 +15,7 @@ from .ai_thresholds import (
 from .envs import Settings, get_api_client, get_settings
 from .market_scanner import MIN_EV_CHANGE_PCT_FLOOR, scan_market_opportunities as _default_scan_market_opportunities
 from .strategies import StrategyContext, get_strategy
+from .universe import build_universe, load_universe
 
 scan_market_opportunities = _default_scan_market_opportunities
 from .paths import DATA_DIR
