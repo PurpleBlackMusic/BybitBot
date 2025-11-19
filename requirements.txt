@@ -8,7 +8,6 @@ joblib>=1.4.2,<1.5.0
 scikit-learn>=1.4.2,<1.5.0
 python-dotenv>=1.0.1,<2.0.0
 pydantic>=1.10.15,<1.11.0
-llama-cpp-python>=0.2.30
 pyarrow>=17.0.0,<18.0.0
 tenacity>=8.3.0,<9.0.0
 fastapi>=0.110.0,<0.112.0

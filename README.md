@@ -27,7 +27,7 @@ streamlit run app.py
    pip install -r requirements.txt
    ```
 
-   В файле уже закреплены версии (`streamlit>=1.37,<1.39`, `pandas`, `numpy`, `pyarrow`, `fastapi`, `uvicorn`, `llama-cpp-python` и др.), поэтому ничего дополнительно ставить не нужно.
+   В файле уже закреплены версии (`streamlit>=1.37,<1.39`, `pandas`, `numpy`, `pyarrow`, `fastapi`, `uvicorn` и др.), поэтому ничего дополнительно ставить не нужно. Зависимость `llama-cpp-python` вынесена в отдельный опциональный файл — она требуется только если вы планируете запускать DeepSeek локально через GGUF.
 
 3. **Скопируйте и заполните `.env`**:
 
@@ -137,7 +137,7 @@ python dev/seed_guardian_demo.py
 
 - **API-режим.** Адаптер `bybit_app/utils/ai/deepseek_adapter.py` использует переменную `DEEPSEEK_API_KEY` и обращается к `https://api.deepseek.com/chat/completions`. Добавьте ключ в `.env`, чтобы включить облачный режим.
 - **Локальный вес (GGUF).** Если задать `DEEPSEEK_GGUF_PATH`, `bybit_app/utils/ai/external.py` подключит соответствующий `.gguf`. Без переменной локальный вес ищется по умолчанию в `bybit_app/_data/ai/weights/DeepSeek-R1-Distill-Qwen-7B-Q5_K_M.gguf`. Если файл не найден и ключ отсутствует, функции DeepSeek отключатся, но остальной бот продолжит работу (UI покажет статус).
-- **Зависимости.** `bybit_app/utils/ai/deepseek_local.py` безопасно обрабатывает отсутствие `llama_cpp`: без библиотеки локальный адаптер просто недоступен.
+- **Зависимости.** `bybit_app/utils/ai/deepseek_local.py` безопасно обрабатывает отсутствие `llama_cpp`: без библиотеки локальный адаптер просто недоступен. Чтобы включить локальный режим, установите опциональную зависимость: `pip install llama-cpp-python` или `pip install -r requirements-deepseek.txt`. Для удалённого/API режима ничего дополнительно ставить не нужно — он продолжит работать сразу после `pip install -r requirements.txt`.
 
 ### Самопроверка и тесты
 
