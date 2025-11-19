@@ -1693,11 +1693,15 @@ def main() -> None:
             value=active_dry_run(settings),
             help="В тестовом режиме сделки не отправляются на биржу.",
         )
+        st.caption("DRY-RUN ведёт только локальный журнал и безопасен для проверки сигналов без риска для депозита.")
         network_value = st.selectbox(
             "Сеть",
             ["Testnet", "Mainnet"],
             index=0 if settings.testnet else 1,
             help="Выберите торговую среду: тестовую или основную.",
+        )
+        st.caption(
+            "Testnet — биржевой полигон без реальных средств, Mainnet — рабочие ордера на живом счёте."
         )
 
         st.subheader("Интерфейс")
