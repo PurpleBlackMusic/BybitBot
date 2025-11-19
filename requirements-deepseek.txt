@@ -1,0 +1,2 @@
+# Optional dependency for local DeepSeek GGUF inference
+llama-cpp-python>=0.2.30
