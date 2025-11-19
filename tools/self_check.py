@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
@@ -22,7 +23,7 @@ def check(title, ok, msg_ok="OK", msg_fail="FAIL"):
 def _candidate_settings_paths() -> list[pathlib.Path]:
     candidates: list[pathlib.Path] = []
     try:
-        from bybit_app.utils import paths as path_utils  # type: ignore
+        path_utils = importlib.import_module("bybit_app.utils.paths")  # type: ignore
     except Exception:
         fallback = pathlib.Path("bybit_app/_data/settings.json")
         candidates.append(fallback)
