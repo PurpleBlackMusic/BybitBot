@@ -7,6 +7,7 @@ import time
 from collections import OrderedDict
 from threading import Lock
 from typing import Any, Mapping
+from urllib.parse import parse_qsl, quote, urlencode
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from enum import Enum
@@ -345,20 +346,26 @@ async def verify_backend_auth(
 
     body = await request.body()
     method = request.method
-    raw_path = request.scope.get("raw_path")
-    query_string = request.scope.get("query_string", b"")
+    prefix = getattr(settings, "backend_path_prefix", "").strip()
+    path = request.url.path
+    if prefix:
+        if not prefix.startswith("/"):
+            prefix = f"/{prefix}"
+        if path.startswith(prefix):
+            path = path[len(prefix) :] or "/"
+    normalized_path = quote(path, safe="/-._~") or "/"
 
-    if isinstance(raw_path, (bytes, bytearray)):
-        path = raw_path.decode("latin-1")
-    else:
-        path = raw_path or request.url.path
-
+    query_string = request.url.query
+    normalized_query = ""
     if query_string:
-        query = query_string.decode("latin-1") if isinstance(query_string, (bytes, bytearray)) else str(query_string)
-        if "?" not in path:
-            path = f"{path}?{query}"
+        query_params = parse_qsl(query_string, keep_blank_values=True)
+        normalized_query = urlencode(query_params, doseq=True, safe="-._~")
 
-    payload = f"{timestamp}.{method}.{path}.".encode() + body
+    signable_path = normalized_path
+    if normalized_query:
+        signable_path = f"{normalized_path}?{normalized_query}"
+
+    payload = f"{timestamp}.{method}.{signable_path}.".encode() + body
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
         _maybe_throttle()

@@ -464,8 +464,7 @@ class Settings:
     api_secret_testnet: str = ""
     testnet: bool = True
     backend_auth_token: str = ""
-    trusted_proxy_hosts: str = ""
-    trust_proxy_headers: bool = False
+    backend_path_prefix: str = ""
     recv_window_ms: int = 15000
     http_timeout_ms: int = 10000
     verify_ssl: bool = True
@@ -1073,8 +1072,7 @@ _ENV_MAP = {
     "api_secret_testnet": "BYBIT_API_SECRET_TESTNET",
     "testnet": "BYBIT_TESTNET",
     "backend_auth_token": "BACKEND_AUTH_TOKEN",
-    "trusted_proxy_hosts": "BACKEND_TRUSTED_PROXIES",
-    "trust_proxy_headers": "BACKEND_TRUST_PROXY_HEADERS",
+    "backend_path_prefix": "BACKEND_PATH_PREFIX",
     "recv_window_ms": "BYBIT_RECV_WINDOW_MS",
     "http_timeout_ms": "BYBIT_HTTP_TIMEOUT_MS",
     "verify_ssl": "BYBIT_VERIFY_SSL",

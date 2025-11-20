@@ -18,8 +18,7 @@ def reset_backend_auth(monkeypatch):
     yield
     envs._invalidate_cache()
     monkeypatch.delenv("BACKEND_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("BACKEND_TRUSTED_PROXIES", raising=False)
-    monkeypatch.delenv("BACKEND_TRUST_PROXY_HEADERS", raising=False)
+    monkeypatch.delenv("BACKEND_PATH_PREFIX", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -44,10 +43,17 @@ def reset_failure_tracker(monkeypatch):
     )
 
 
-def _client(monkeypatch: pytest.MonkeyPatch, secret: str = "shhh") -> TestClient:
+def _client(
+    monkeypatch: pytest.MonkeyPatch, secret: str = "shhh", prefix: str | None = None
+) -> TestClient:
     monkeypatch.setenv("BACKEND_AUTH_TOKEN", secret)
+    if prefix is not None:
+        monkeypatch.setenv("BACKEND_PATH_PREFIX", prefix)
+    client_kwargs = {}
+    if prefix:
+        client_kwargs["root_path"] = prefix if prefix.startswith("/") else f"/{prefix}"
     envs._invalidate_cache()
-    return TestClient(backend_app.create_app())
+    return TestClient(backend_app.create_app(), **client_kwargs)
 
 
 def _patch_order_client(monkeypatch: pytest.MonkeyPatch, response_factory: Callable[[], dict]):
@@ -151,6 +157,31 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "signed"
+    assert payload["symbol"] == "ETHUSDT"
+    assert payload["side"] == "Sell"
+
+
+def test_signature_accepts_prefixed_path(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    prefix = "/proxy"
+    body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\", \"qty\": 1}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "prefixed"})
+    client = _client(monkeypatch, secret=secret, prefix=prefix)
+
+    response = client.post(
+        f"{prefix}/orders/place?note=hello%2Bworld&empty=",
+        data=body,
+        headers=_signature_headers(
+            secret,
+            body=body,
+            path="/orders/place?note=hello%2Bworld&empty=",
+        ),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "prefixed"
     assert payload["symbol"] == "ETHUSDT"
     assert payload["side"] == "Sell"
 
@@ -416,6 +447,27 @@ def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPat
     assert payload["status"] == "signed"
     assert payload["symbol"] == "BTCUSDT"
     assert payload["side"] == "Buy"
+
+
+def test_signature_accepts_prefix_without_leading_slash(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    prefix = "nested/proxy"
+    _patch_order_client(monkeypatch, lambda: {"status": "ok"})
+    client = _client(monkeypatch, secret=secret, prefix=prefix)
+
+    timestamp = str(int(time.time()))
+    signature = _signature(secret, timestamp, b"", method="GET", path="/health")
+
+    response = client.get(
+        f"/{prefix}/health",
+        headers={
+            backend_app.SIGNATURE_HEADER: signature,
+            backend_app.TIMESTAMP_HEADER: timestamp,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
 
 
 def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
