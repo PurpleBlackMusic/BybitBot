@@ -111,7 +111,7 @@ FastAPI-бэкенд (`bybit_app/backend/app.py`) закрывает чувст�
 
 2. Клиент может аутентифицироваться двумя способами:
    - **Bearer токен.** Передавайте `Authorization: Bearer <BACKEND_AUTH_TOKEN>` в каждом запросе.
-   - **Подпись HMAC.** Отправляйте заголовки `X-Bybit-Timestamp` (произвольная метка времени/nonce) и `X-Bybit-Signature`. Подпись вычисляется как `hex(hmac_sha256(BACKEND_AUTH_TOKEN, f"<timestamp>.<body>"))`, где `<body>` — исходное тело запроса в байтах (для GET может быть пустым). Пример на curl:
+   - **Подпись HMAC.** Отправляйте заголовки `X-Bybit-Timestamp` (произвольная метка времени/nonce) и `X-Bybit-Signature`. Подпись вычисляется как `hex(hmac_sha256(BACKEND_AUTH_TOKEN, f"<timestamp>.<method>.<path>.<body>"))`, где `<body>` — исходное тело запроса в байтах (для GET может быть пустым). Пример на curl:
 
    ```bash
    TIMESTAMP=$(date +%s)
@@ -121,7 +121,9 @@ import hashlib, hmac, os
 secret = os.environ['BACKEND_AUTH_TOKEN'].encode()
 timestamp = os.environ['TIMESTAMP']
 body = os.environ['BODY'].encode()
-payload = f"{timestamp}.".encode() + body
+method = "POST"
+path = "/orders/place"
+payload = f"{timestamp}.{method}.{path}.".encode() + body
 print(hmac.new(secret, payload, hashlib.sha256).hexdigest())
 PY
 )

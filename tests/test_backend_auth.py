@@ -43,8 +43,8 @@ def _patch_order_client(monkeypatch: pytest.MonkeyPatch, response_factory: Calla
     monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
 
 
-def _signature(secret: str, timestamp: str, body: bytes) -> str:
-    payload = f"{timestamp}.".encode() + body
+def _signature(secret: str, timestamp: str, body: bytes, *, method: str, path: str) -> str:
+    payload = f"{timestamp}.{method}.{path}.".encode() + body
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
@@ -106,7 +106,7 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
     body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\"}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "signed"})
     client = _client(monkeypatch, secret=secret)
@@ -132,7 +132,7 @@ def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPat
     secret = "signed"
     timestamp = str(int(time.time()))
     body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "signed"})
     client = _client(monkeypatch, secret=secret)
@@ -159,7 +159,7 @@ def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time() - 400))
     body = b"{}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "too_old"})
     client = _client(monkeypatch, secret=secret)
@@ -182,7 +182,7 @@ def test_signature_allows_slightly_future_timestamp(monkeypatch: pytest.MonkeyPa
     secret = "signed"
     timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS - 1))
     body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "future-within-grace"})
     client = _client(monkeypatch, secret=secret)
@@ -205,7 +205,7 @@ def test_signature_rejects_future_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS + 5))
     body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "future"})
     client = _client(monkeypatch, secret=secret)
@@ -228,7 +228,7 @@ def test_signature_rejects_replay(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
     body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
-    signature = _signature(secret, timestamp, body)
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     calls = {"count": 0}
 
@@ -264,6 +264,49 @@ def test_signature_rejects_replay(monkeypatch: pytest.MonkeyPatch):
 
     assert replay.status_code == 403
     assert replay.json()["detail"] == "Duplicate signature detected"
+
+
+def test_signature_rejects_path_reuse(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{}"
+    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
+
+    _patch_order_client(monkeypatch, lambda: {"status": "ok"})
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/kill-switch/pause",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid signature"
+
+
+def test_signature_rejects_method_reuse(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b""
+    signature = _signature(secret, timestamp, body, method="POST", path="/state/summary")
+
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.get(
+        "/state/summary",
+        headers={
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid signature"
 
 
 def test_state_endpoints_require_auth(monkeypatch: pytest.MonkeyPatch):

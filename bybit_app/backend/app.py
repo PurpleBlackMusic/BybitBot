@@ -161,7 +161,9 @@ async def verify_backend_auth(
         )
 
     body = await request.body()
-    payload = f"{timestamp}.".encode() + body
+    method = request.method
+    path = request.url.path
+    payload = f"{timestamp}.{method}.{path}.".encode() + body
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
         raise HTTPException(
