@@ -160,22 +160,22 @@ async def verify_backend_auth(
             detail="Timestamp is too old",
         )
 
+    body = await request.body()
+    payload = f"{timestamp}.".encode() + body
+    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid signature",
+        )
+
     if _signature_cache.is_replay(signature, now=now):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Duplicate signature detected",
         )
 
-    body = await request.body()
-    payload = f"{timestamp}.".encode() + body
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    if hmac.compare_digest(signature, expected):
-        return
-
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Invalid signature",
-    )
+    return
 
 
 @app.get("/health")
