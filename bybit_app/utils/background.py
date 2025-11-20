@@ -55,6 +55,8 @@ class BackgroundServices:
         self._automation_last_cycle: float = 0.0
         self._automation_restart_count: int = 0
         self._automation_stale_after = max(float(automation_stale_after), 0.0)
+        self._automation_private_blocked = False
+        self._automation_private_blocked_at = 0.0
         self._executor_state: Dict[str, Any] = {}
         self._automation_sweeper: Dict[str, Any] = {}
 
@@ -109,6 +111,7 @@ class BackgroundServices:
     def ensure_started(self) -> None:
         ws_ok = self.ensure_ws_started()
         if not ws_ok:
+            self._ensure_watchdog()
             return
 
         self._run_startup_hygiene()
@@ -116,11 +119,36 @@ class BackgroundServices:
         self._run_preflight_healthcheck()
 
         if not self._await_private_ready():
+            self._mark_waiting_on_private()
+            self._ensure_watchdog()
             return
 
+        self._clear_waiting_on_private()
         self.ensure_automation_loop()
         self.ensure_guardian_worker()
         self._ensure_watchdog()
+
+    def _mark_waiting_on_private(self) -> None:
+        with self._automation_lock:
+            self._automation_private_blocked = True
+            self._automation_private_blocked_at = time.time()
+            self._automation_error = "waiting_for_private_websocket"
+
+        log(
+            "background.automation.private_unavailable",
+            blocked_since=round(self._automation_private_blocked_at, 3),
+        )
+
+    def _clear_waiting_on_private(self) -> None:
+        with self._automation_lock:
+            was_blocked = self._automation_private_blocked
+            self._automation_private_blocked = False
+            self._automation_private_blocked_at = 0.0
+            if self._automation_error == "waiting_for_private_websocket":
+                self._automation_error = None
+
+        if was_blocked:
+            log("background.automation.private_restored")
 
     def _await_private_ready(self, timeout: float | None = None) -> bool:
         """Wait until the private websocket reports a fresh heartbeat."""
@@ -129,11 +157,14 @@ class BackgroundServices:
             return True
 
         start_wait = time.time()
-        deadline = start_wait + (
-            float(timeout)
-            if isinstance(timeout, (int, float)) and float(timeout) > 0
-            else min(self._ws_private_stale_after, 15.0)
-        )
+        if isinstance(timeout, (int, float)):
+            timeout_value = float(timeout)
+            if timeout_value > 0:
+                deadline = start_wait + timeout_value
+            else:
+                deadline = start_wait
+        else:
+            deadline = start_wait + min(self._ws_private_stale_after, 15.0)
 
         def _coerce_float(value: object | None) -> float | None:
             try:
@@ -599,13 +630,29 @@ class BackgroundServices:
             if not ws_ok:
                 log("background.watchdog.ws_unhealthy")
 
-        try:
-            automation_ok = self.ensure_automation_loop()
-        except Exception as exc:  # pragma: no cover - defensive guard
-            log("background.watchdog.automation_error", err=str(exc))
-        else:
-            if not automation_ok:
-                log("background.watchdog.automation_unhealthy")
+        private_ready = True
+        if self._automation_private_blocked:
+            try:
+                private_ready = self._await_private_ready(timeout=0.0)
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("background.watchdog.private_check_error", err=str(exc))
+                private_ready = False
+            if not private_ready:
+                log(
+                    "background.watchdog.automation_waiting_private",
+                    blocked_since=self._automation_private_blocked_at or None,
+                )
+            else:
+                self._clear_waiting_on_private()
+
+        if private_ready:
+            try:
+                automation_ok = self.ensure_automation_loop()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                log("background.watchdog.automation_error", err=str(exc))
+            else:
+                if not automation_ok:
+                    log("background.watchdog.automation_unhealthy")
 
         try:
             self.ensure_guardian_worker()
@@ -756,6 +803,8 @@ class BackgroundServices:
             restart_count = self._automation_restart_count
             stale_after = self._automation_stale_after
             sweeper_snapshot = copy.deepcopy(self._automation_sweeper)
+            private_blocked = self._automation_private_blocked
+            private_blocked_at = self._automation_private_blocked_at
 
         snapshot: Dict[str, Any] = {
             "thread_alive": bool(thread and thread.is_alive()),
@@ -776,6 +825,9 @@ class BackgroundServices:
             )
         if sweeper_snapshot:
             snapshot["sweeper"] = sweeper_snapshot
+        snapshot["waiting_on_private"] = bool(private_blocked)
+        if private_blocked_at:
+            snapshot["waiting_on_private_since"] = private_blocked_at
         last_ts = snapshot.get("last_run_at")
         if not last_ts and last_cycle:
             last_ts = last_cycle
