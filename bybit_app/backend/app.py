@@ -168,6 +168,11 @@ class _FailureTracker:
                 self._attempts.popitem(last=False)
             return count >= self.max_attempts
 
+    def clear(self, key: str, *, now: float) -> None:
+        with self._lock:
+            self._purge_expired(now)
+            self._attempts.pop(key, None)
+
 
 _failure_tracker = _FailureTracker(
     ttl_seconds=FAILURE_TRACKER_TTL_SECONDS,
@@ -225,8 +230,10 @@ async def verify_backend_auth(
             return f"sig:{signature}"
         return "ip:unknown"
 
+    failure_key = _failure_key()
+
     def _maybe_throttle() -> None:
-        if _failure_tracker.register_failure(_failure_key(), now=time.time()):
+        if _failure_tracker.register_failure(failure_key, now=time.time()):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Too many failed authentication attempts",
@@ -234,6 +241,7 @@ async def verify_backend_auth(
 
     if authorization and authorization.lower().startswith("bearer "):
         if _match_bearer(authorization):
+            _failure_tracker.clear(failure_key, now=time.time())
             return
         _maybe_throttle()
         logger.warning(
@@ -320,6 +328,7 @@ async def verify_backend_auth(
             detail="Duplicate signature detected",
         )
 
+    _failure_tracker.clear(failure_key, now=now)
     return
 
 
