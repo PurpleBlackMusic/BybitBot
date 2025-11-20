@@ -162,7 +162,19 @@ async def verify_backend_auth(
 
     body = await request.body()
     method = request.method
-    path = request.url.path
+    raw_path = request.scope.get("raw_path")
+    query_string = request.scope.get("query_string", b"")
+
+    if isinstance(raw_path, (bytes, bytearray)):
+        path = raw_path.decode("latin-1")
+    else:
+        path = raw_path or request.url.path
+
+    if query_string:
+        query = query_string.decode("latin-1") if isinstance(query_string, (bytes, bytearray)) else str(query_string)
+        if "?" not in path:
+            path = f"{path}?{query}"
+
     payload = f"{timestamp}.{method}.{path}.".encode() + body
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
