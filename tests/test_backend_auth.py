@@ -370,3 +370,25 @@ def test_state_endpoints_require_auth(monkeypatch: pytest.MonkeyPatch):
     response = client.get("/state/summary")
 
     assert response.status_code in {401, 403}
+
+
+def test_health_endpoint_requires_auth(monkeypatch: pytest.MonkeyPatch):
+    client = _client(monkeypatch)
+
+    response = client.get("/health")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication credentials were not provided"
+
+
+def test_health_endpoint_allows_authorized_access(monkeypatch: pytest.MonkeyPatch):
+    secret = "health-check"
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.get("/health", headers={"Authorization": f"Bearer {secret}"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert isinstance(payload["killSwitch"], dict)
+    assert "paused" in payload["killSwitch"]

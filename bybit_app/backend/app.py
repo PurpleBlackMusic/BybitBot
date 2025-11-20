@@ -180,7 +180,7 @@ async def verify_backend_auth(
     return
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(verify_backend_auth)])
 def health() -> Mapping[str, Any]:
     state = get_kill_switch_state()
     return {
