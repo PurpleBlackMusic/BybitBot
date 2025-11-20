@@ -39,7 +39,7 @@ class OrderRequest(BaseModel):
     timeInForce: str | None = None
 
     class Config:
-        extra = "allow"
+        extra = "forbid"
 
 
 class _SignatureLRU:
@@ -240,7 +240,18 @@ def place_order(request: OrderRequest) -> Mapping[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive guard
         raise HTTPException(status_code=503, detail="API client unavailable") from exc
 
-    payload = request.dict(exclude_unset=True)
+    payload = {
+        "category": request.category,
+        "symbol": request.symbol,
+        "side": request.side,
+        "orderType": request.orderType,
+    }
+    if request.qty is not None:
+        payload["qty"] = request.qty
+    if request.price is not None:
+        payload["price"] = request.price
+    if request.timeInForce is not None:
+        payload["timeInForce"] = request.timeInForce
     try:
         result = client.place_order(**payload)
     except Exception as exc:
