@@ -414,6 +414,31 @@ class SignalExecutor(
                 reason=f"Режим {mode or 'wait'} не предполагает немедленного исполнения.",
             )
 
+        try:
+            max_concurrent = int(getattr(settings, "ai_max_concurrent", 0) or 0)
+        except Exception:
+            max_concurrent = 0
+
+        positions = self._collect_open_positions(
+            settings,
+            summary,
+            current_time=now,
+            summary_meta=summary_meta,
+            price_meta=price_meta,
+        )
+        position_count = len(positions)
+        effective_limit = max(max_concurrent, position_count)
+
+        if max_concurrent <= 0 or position_count >= max_concurrent:
+            return self._decision(
+                "skipped",
+                reason="max_concurrent_reached",
+                context={
+                    "open_positions": position_count,
+                    "limit": effective_limit,
+                },
+            )
+
         symbol, symbol_meta = self._select_symbol(summary, settings)
         if symbol is None:
             reason = "Не удалось определить инструмент для сделки."
