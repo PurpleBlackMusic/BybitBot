@@ -200,6 +200,60 @@ def _ensure_mapping(payload: Mapping[str, Any] | Any) -> Mapping[str, Any]:
         return {}
 
 
+def _strip_port(host: str | None) -> str:
+    if not host:
+        return ""
+    host = host.strip().strip("\"")
+    if not host:
+        return ""
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+        return host
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host
+
+
+def _trusted_proxy_hosts(settings: Any) -> set[str]:
+    raw = getattr(settings, "trusted_proxy_hosts", "") or ""
+    hosts = {_strip_port(item).lower() for item in str(raw).split(",") if _strip_port(item)}
+    return hosts
+
+
+def _forwarded_client_host(request: Request) -> str | None:
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
+    if x_forwarded_for:
+        for part in x_forwarded_for.split(","):
+            cleaned = _strip_port(part)
+            if cleaned:
+                return cleaned
+
+    forwarded = request.headers.get("Forwarded")
+    if forwarded:
+        for entry in forwarded.split(","):
+            for segment in entry.split(";"):
+                segment = segment.strip()
+                if segment.lower().startswith("for="):
+                    candidate = segment.split("=", 1)[1].strip().strip("\"")
+                    cleaned = _strip_port(candidate)
+                    if cleaned:
+                        return cleaned
+    return None
+
+
+def _client_host(request: Request, settings: Any) -> str:
+    direct_host = _strip_port(request.client.host if request.client else "")
+    trust_all = bool(getattr(settings, "trust_proxy_headers", False))
+    trusted = _trusted_proxy_hosts(settings)
+
+    if trust_all or (direct_host and direct_host.lower() in trusted):
+        forwarded = _forwarded_client_host(request)
+        if forwarded:
+            return forwarded
+
+    return direct_host or "unknown"
+
+
 async def verify_backend_auth(
     request: Request,
     authorization: str | None = Header(default=None, alias=AUTH_HEADER),
@@ -208,6 +262,7 @@ async def verify_backend_auth(
 ) -> None:
     settings = get_settings()
     secret = getattr(settings, "backend_auth_token", "").strip()
+    client_host = _client_host(request, settings)
 
     if not secret:
         raise HTTPException(
@@ -224,8 +279,7 @@ async def verify_backend_auth(
         return hmac.compare_digest(provided, secret)
 
     def _failure_key() -> str:
-        client_host = request.client.host if request.client else "unknown"
-        if client_host:
+        if client_host and client_host != "unknown":
             return f"ip:{client_host}"
         if signature:
             return f"sig:{signature}"
@@ -249,7 +303,7 @@ async def verify_backend_auth(
             "backend_auth_invalid_token",
             extra={
                 "event": "backend_auth_invalid_token",
-                "client": request.client.host if request.client else "unknown",
+                "client": client_host,
             },
         )
         raise HTTPException(
@@ -319,7 +373,7 @@ async def verify_backend_auth(
             "backend_auth_invalid_signature",
             extra={
                 "event": "backend_auth_invalid_signature",
-                "client": request.client.host if request.client else "unknown",
+                "client": client_host,
                 "method": method,
                 "path": path,
             },

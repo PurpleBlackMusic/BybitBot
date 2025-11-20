@@ -343,6 +343,7 @@ _SETTINGS_BOOL_FIELDS = {
     "ws_watchdog_enabled",
     "ws_autostart",
     "freqai_enabled",
+    "trust_proxy_headers",
 }
 
 _PROFILE_ALLOWED_PREFIXES = ("ai_", "spot_", "twap_")
@@ -368,6 +369,7 @@ _BOOL_ENV_KEYS: Tuple[str, ...] = (
     "ws_autostart",
     "spot_server_tpsl",
     "spot_cash_only",
+    "trust_proxy_headers",
 )
 
 _INT_ENV_KEYS: Tuple[str, ...] = (
