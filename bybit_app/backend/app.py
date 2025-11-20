@@ -18,6 +18,7 @@ AUTH_HEADER = "Authorization"
 SIGNATURE_HEADER = "X-Bybit-Signature"
 TIMESTAMP_HEADER = "X-Bybit-Timestamp"
 TIMESTAMP_WINDOW_SECONDS = 300
+FUTURE_TIMESTAMP_GRACE_SECONDS = 10
 SIGNATURE_CACHE_SIZE = 1024
 
 app = FastAPI(title="BybitBot Backend", version="1.0.0")
@@ -147,7 +148,7 @@ async def verify_backend_auth(
         ) from None
 
     now = time.time()
-    if timestamp_value > now:
+    if timestamp_value - now > FUTURE_TIMESTAMP_GRACE_SECONDS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Timestamp cannot be in the future",

@@ -178,10 +178,33 @@ def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
     assert response.json()["detail"] == "Timestamp is too old"
 
 
+def test_signature_allows_slightly_future_timestamp(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS - 1))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    signature = _signature(secret, timestamp, body)
+
+    _patch_order_client(monkeypatch, lambda: {"status": "future-within-grace"})
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "future-within-grace"
+
+
 def test_signature_rejects_future_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
-    timestamp = str(int(time.time() + 10))
-    body = b"{}"
+    timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS + 5))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
     signature = _signature(secret, timestamp, body)
 
     _patch_order_client(monkeypatch, lambda: {"status": "future"})
