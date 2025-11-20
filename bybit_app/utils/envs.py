@@ -35,6 +35,7 @@ _SENSITIVE_FIELDS = {
     "api_secret_testnet",
     "telegram_token",
     "telegram_chat_id",
+    "backend_auth_token",
 }
 
 _PLACEHOLDER_VALUES = {
@@ -439,6 +440,7 @@ class Settings:
     api_key_testnet: str = ""
     api_secret_testnet: str = ""
     testnet: bool = True
+    backend_auth_token: str = ""
     recv_window_ms: int = 15000
     http_timeout_ms: int = 10000
     verify_ssl: bool = True
@@ -1045,6 +1047,7 @@ _ENV_MAP = {
     "api_key_testnet": "BYBIT_API_KEY_TESTNET",
     "api_secret_testnet": "BYBIT_API_SECRET_TESTNET",
     "testnet": "BYBIT_TESTNET",
+    "backend_auth_token": "BACKEND_AUTH_TOKEN",
     "recv_window_ms": "BYBIT_RECV_WINDOW_MS",
     "http_timeout_ms": "BYBIT_HTTP_TIMEOUT_MS",
     "verify_ssl": "BYBIT_VERIFY_SSL",

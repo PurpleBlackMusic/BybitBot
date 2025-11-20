@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import time
 from typing import Any, Mapping
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
 from bybit_app.utils.ai.kill_switch import clear_pause, get_state as get_kill_switch_state, set_pause
 from bybit_app.utils.background import get_guardian_state, get_preflight_snapshot, get_ws_snapshot
-from bybit_app.utils.envs import get_api_client
+from bybit_app.utils.envs import get_api_client, get_settings
+
+AUTH_HEADER = "Authorization"
+SIGNATURE_HEADER = "X-Bybit-Signature"
+TIMESTAMP_HEADER = "X-Bybit-Timestamp"
 
 app = FastAPI(title="BybitBot Backend", version="1.0.0")
 
@@ -49,6 +55,51 @@ def _ensure_mapping(payload: Mapping[str, Any] | Any) -> Mapping[str, Any]:
         return {}
 
 
+async def verify_backend_auth(
+    request: Request,
+    authorization: str | None = Header(default=None, alias=AUTH_HEADER),
+    signature: str | None = Header(default=None, alias=SIGNATURE_HEADER),
+    timestamp: str | None = Header(default=None, alias=TIMESTAMP_HEADER),
+) -> None:
+    settings = get_settings()
+    secret = getattr(settings, "backend_auth_token", "").strip()
+
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Backend authentication is not configured",
+        )
+
+    if not authorization and not (signature and timestamp):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were not provided",
+        )
+
+    def _match_bearer(token: str | None) -> bool:
+        if not token:
+            return False
+        if not token.lower().startswith("bearer "):
+            return False
+        provided = token.split(" ", 1)[1].strip()
+        return hmac.compare_digest(provided, secret)
+
+    if _match_bearer(authorization):
+        return
+
+    if signature and timestamp:
+        body = await request.body()
+        payload = f"{timestamp}.".encode() + body
+        expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(signature, expected):
+            return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Invalid or missing authentication",
+    )
+
+
 @app.get("/health")
 def health() -> Mapping[str, Any]:
     state = get_kill_switch_state()
@@ -64,22 +115,22 @@ def health() -> Mapping[str, Any]:
     }
 
 
-@app.get("/state/guardian")
+@app.get("/state/guardian", dependencies=[Depends(verify_backend_auth)])
 def guardian_state() -> Mapping[str, Any]:
     return _ensure_mapping(get_guardian_state())
 
 
-@app.get("/state/ws")
+@app.get("/state/ws", dependencies=[Depends(verify_backend_auth)])
 def websocket_state() -> Mapping[str, Any]:
     return _ensure_mapping(get_ws_snapshot())
 
 
-@app.get("/state/preflight")
+@app.get("/state/preflight", dependencies=[Depends(verify_backend_auth)])
 def preflight_state() -> Mapping[str, Any]:
     return _ensure_mapping(get_preflight_snapshot())
 
 
-@app.get("/state/summary")
+@app.get("/state/summary", dependencies=[Depends(verify_backend_auth)])
 def state_summary() -> Mapping[str, Any]:
     return {
         "guardian": guardian_state(),
@@ -89,20 +140,20 @@ def state_summary() -> Mapping[str, Any]:
     }
 
 
-@app.post("/kill-switch/pause")
+@app.post("/kill-switch/pause", dependencies=[Depends(verify_backend_auth)])
 def pause_kill_switch(request: KillSwitchRequest) -> Mapping[str, Any]:
     reason = (request.reason or "Paused via API").strip() or "Paused via API"
     until = set_pause(request.minutes, reason)
     return {"status": "paused", "until": until, "reason": reason}
 
 
-@app.post("/kill-switch/resume")
+@app.post("/kill-switch/resume", dependencies=[Depends(verify_backend_auth)])
 def resume_kill_switch() -> Mapping[str, Any]:
     clear_pause()
     return {"status": "resumed"}
 
 
-@app.post("/orders/place")
+@app.post("/orders/place", dependencies=[Depends(verify_backend_auth)])
 def place_order(request: OrderRequest) -> Mapping[str, Any]:
     try:
         client = get_api_client()
