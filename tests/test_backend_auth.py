@@ -18,6 +18,15 @@ def reset_backend_auth(monkeypatch):
     monkeypatch.delenv("BACKEND_AUTH_TOKEN", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def reset_signature_cache(monkeypatch):
+    monkeypatch.setattr(
+        backend_app,
+        "_signature_cache",
+        backend_app._SignatureLRU(ttl_seconds=backend_app.TIMESTAMP_WINDOW_SECONDS),
+    )
+
+
 def _client(monkeypatch: pytest.MonkeyPatch, secret: str = "shhh") -> TestClient:
     monkeypatch.setenv("BACKEND_AUTH_TOKEN", secret)
     envs._invalidate_cache()
@@ -117,6 +126,33 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     assert payload["status"] == "signed"
     assert payload["symbol"] == "ETHUSDT"
     assert payload["side"] == "Sell"
+
+
+def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    signature = _signature(secret, timestamp, body)
+
+    _patch_order_client(monkeypatch, lambda: {"status": "signed"})
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Basic something",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "signed"
+    assert payload["symbol"] == "BTCUSDT"
+    assert payload["side"] == "Buy"
 
 
 def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
