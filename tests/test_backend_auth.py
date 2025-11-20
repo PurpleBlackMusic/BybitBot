@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import time
 from typing import Callable
 
 import pytest
@@ -94,7 +95,7 @@ def test_orders_accept_bearer_token(monkeypatch: pytest.MonkeyPatch):
 
 def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
-    timestamp = "1700000000"
+    timestamp = str(int(time.time()))
     body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\"}"
     signature = _signature(secret, timestamp, body)
 
@@ -116,6 +117,94 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     assert payload["status"] == "signed"
     assert payload["symbol"] == "ETHUSDT"
     assert payload["side"] == "Sell"
+
+
+def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time() - 400))
+    body = b"{}"
+    signature = _signature(secret, timestamp, body)
+
+    _patch_order_client(monkeypatch, lambda: {"status": "too_old"})
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Timestamp is too old"
+
+
+def test_signature_rejects_future_timestamp(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time() + 10))
+    body = b"{}"
+    signature = _signature(secret, timestamp, body)
+
+    _patch_order_client(monkeypatch, lambda: {"status": "future"})
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Timestamp cannot be in the future"
+
+
+def test_signature_rejects_replay(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    signature = _signature(secret, timestamp, body)
+
+    calls = {"count": 0}
+
+    def _response() -> dict:
+        calls["count"] += 1
+        return {"status": f"call-{calls['count']}"}
+
+    _patch_order_client(monkeypatch, _response)
+    client = _client(monkeypatch, secret=secret)
+
+    first = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "call-1"
+
+    replay = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert replay.status_code == 403
+    assert replay.json()["detail"] == "Duplicate signature detected"
 
 
 def test_state_endpoints_require_auth(monkeypatch: pytest.MonkeyPatch):
