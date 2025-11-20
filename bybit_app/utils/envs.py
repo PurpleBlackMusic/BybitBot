@@ -69,14 +69,24 @@ def _set_env_value(field: str, value: Any) -> None:
         os.environ[env_key] = str(value)
 
 
-def _propagate_alias(field: str, value: Any, *, testnet: Optional[bool]) -> None:
+def _unset_env_value(field: str) -> None:
+    env_key = _ENV_MAP.get(field)
+    if env_key:
+        os.environ.pop(env_key, None)
+
+
+def _alias_field_name(field: str, testnet: Optional[bool]) -> Optional[str]:
     if testnet is None:
-        return
-    alias_field = None
+        return None
     if field == _network_field("api_key", testnet):
-        alias_field = "api_key"
-    elif field == _network_field("api_secret", testnet):
-        alias_field = "api_secret"
+        return "api_key"
+    if field == _network_field("api_secret", testnet):
+        return "api_secret"
+    return None
+
+
+def _propagate_alias(field: str, value: Any, *, testnet: Optional[bool]) -> None:
+    alias_field = _alias_field_name(field, testnet)
     if alias_field:
         _set_env_value(alias_field, value)
 
@@ -84,6 +94,15 @@ def _propagate_alias(field: str, value: Any, *, testnet: Optional[bool]) -> None
 def _apply_sensitive_update(field: str, value: Any, *, alias_network: Optional[bool] = None) -> None:
     if value is None:
         return
+
+    text = value if isinstance(value, str) else str(value)
+    if _is_placeholder(text):
+        _unset_env_value(field)
+        alias_field = _alias_field_name(field, alias_network)
+        if alias_field:
+            _unset_env_value(alias_field)
+        return
+
     _set_env_value(field, value)
     _propagate_alias(field, value, testnet=alias_network)
 
@@ -135,6 +154,8 @@ def _normalise_restart_text(value: Any) -> str:
         text = value
     else:
         text = str(value)
+    if _is_placeholder(text):
+        return ""
     return text.strip()
 
 
