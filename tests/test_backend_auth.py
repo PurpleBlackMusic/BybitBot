@@ -528,7 +528,7 @@ def test_signature_rejects_replay(monkeypatch: pytest.MonkeyPatch):
 def test_signature_rejects_path_reuse(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
-    body = b"{}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "ok"})
@@ -681,6 +681,7 @@ def test_logs_invalid_signature_warning(
     assert response.status_code == 403
     assert any(record.message == "backend_auth_invalid_signature" for record in caplog.records)
     assert any(getattr(record, "event", "") == "backend_auth_invalid_signature" for record in caplog.records)
+    assert any(getattr(record, "client", "") == "testclient" for record in caplog.records)
 
 
 def test_bearer_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
@@ -727,45 +728,67 @@ def test_signature_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
     assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
 
 
-def test_failure_counter_resets_after_success(monkeypatch: pytest.MonkeyPatch):
-    secret = "reset"
-    _patch_order_client(monkeypatch, lambda: {"status": "ok"})
+def test_signature_failures_share_counter_by_ip(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "blocked"})
     client = _client(monkeypatch, secret=secret)
-    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
 
-    for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS - 1):
-        response = client.post(
-            "/orders/place",
-            json=payload,
-            headers={"Authorization": "Bearer wrong"},
+    responses = []
+    for signature in ("bad-1", "bad-2", "bad-3"):
+        responses.append(
+            client.post(
+                "/orders/place",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Bybit-Signature": signature,
+                    "X-Bybit-Timestamp": timestamp,
+                },
+            )
         )
-        assert response.status_code == 403
 
+    assert [resp.status_code for resp in responses] == [403, 403, 429]
+    assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_signature_success_not_blocked_after_failures(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+
+    calls = {"count": 0}
+
+    def _response() -> dict:
+        calls["count"] += 1
+        return {"status": f"ok-{calls['count']}"}
+
+    _patch_order_client(monkeypatch, _response)
+    client = _client(monkeypatch, secret=secret)
+
+    for signature in ("bad-1", "bad-2"):
+        resp = client.post(
+            "/orders/place",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Bybit-Signature": signature,
+                "X-Bybit-Timestamp": timestamp,
+            },
+        )
+        assert resp.status_code == 403
+
+    valid_headers = _signature_headers(secret, timestamp=float(timestamp), body=body)
     success = client.post(
         "/orders/place",
-        json=payload,
-        headers={"Authorization": f"Bearer {secret}"},
+        data=body,
+        headers=valid_headers,
     )
+
     assert success.status_code == 200
-
-    next_failure = client.post(
-        "/orders/place",
-        json=payload,
-        headers={"Authorization": "Bearer wrong"},
-    )
-    assert next_failure.status_code == 403
-
-    more_failures = [
-        client.post(
-            "/orders/place",
-            json=payload,
-            headers={"Authorization": "Bearer wrong"},
-        )
-        for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS - 1)
-    ]
-
-    statuses = [next_failure.status_code] + [resp.status_code for resp in more_failures]
-    assert statuses == [403, 403, 429]
+    assert success.json()["status"] == "ok-1"
 
 
 def test_failure_tracker_evicts_oldest_entries():

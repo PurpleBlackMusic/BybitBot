@@ -224,9 +224,11 @@ async def verify_backend_auth(
 
     def _failure_key() -> str:
         client_host = request.client.host if request.client else "unknown"
+        if client_host:
+            return f"ip:{client_host}"
         if signature:
             return f"sig:{signature}"
-        return f"ip:{client_host}"
+        return "ip:unknown"
 
     failure_key = _failure_key()
 
