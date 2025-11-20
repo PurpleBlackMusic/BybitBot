@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
 from collections import OrderedDict
 from threading import Lock
@@ -20,8 +21,11 @@ TIMESTAMP_HEADER = "X-Bybit-Timestamp"
 TIMESTAMP_WINDOW_SECONDS = 300
 FUTURE_TIMESTAMP_GRACE_SECONDS = 10
 SIGNATURE_CACHE_SIZE = 1024
+FAILURE_TRACKER_TTL_SECONDS = 60
+FAILURE_TRACKER_MAX_ATTEMPTS = 3
 
 app = FastAPI(title="BybitBot Backend", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 
 class KillSwitchRequest(BaseModel):
@@ -78,6 +82,41 @@ class _SignatureLRU:
 _signature_cache = _SignatureLRU(ttl_seconds=TIMESTAMP_WINDOW_SECONDS)
 
 
+class _FailureTracker:
+    def __init__(self, ttl_seconds: float, max_attempts: int) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.max_attempts = max_attempts
+        self._attempts: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        self._lock = Lock()
+
+    def _purge_expired(self, now: float) -> None:
+        while self._attempts:
+            key, (_, expires_at) = next(iter(self._attempts.items()))
+            if expires_at < now:
+                self._attempts.popitem(last=False)
+            else:
+                break
+
+    def register_failure(self, key: str, *, now: float) -> bool:
+        with self._lock:
+            self._purge_expired(now)
+
+            count, expires_at = self._attempts.get(key, (0, now + self.ttl_seconds))
+            if now > expires_at:
+                count = 0
+                expires_at = now + self.ttl_seconds
+
+            count += 1
+            self._attempts[key] = (count, expires_at)
+            self._attempts.move_to_end(key)
+            return count >= self.max_attempts
+
+
+_failure_tracker = _FailureTracker(
+    ttl_seconds=FAILURE_TRACKER_TTL_SECONDS, max_attempts=FAILURE_TRACKER_MAX_ATTEMPTS
+)
+
+
 def _ensure_mapping(payload: Mapping[str, Any] | Any) -> Mapping[str, Any]:
     if isinstance(payload, Mapping):
         return payload
@@ -119,9 +158,30 @@ async def verify_backend_auth(
         provided = token.split(" ", 1)[1].strip()
         return hmac.compare_digest(provided, secret)
 
+    def _failure_key() -> str:
+        client_host = request.client.host if request.client else "unknown"
+        if signature:
+            return f"sig:{signature}"
+        return f"ip:{client_host}"
+
+    def _maybe_throttle() -> None:
+        if _failure_tracker.register_failure(_failure_key(), now=time.time()):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed authentication attempts",
+            )
+
     if authorization and authorization.lower().startswith("bearer "):
         if _match_bearer(authorization):
             return
+        _maybe_throttle()
+        logger.warning(
+            "backend_auth_invalid_token",
+            extra={
+                "event": "backend_auth_invalid_token",
+                "client": request.client.host if request.client else "unknown",
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid bearer token",
@@ -178,6 +238,16 @@ async def verify_backend_auth(
     payload = f"{timestamp}.{method}.{path}.".encode() + body
     expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected):
+        _maybe_throttle()
+        logger.warning(
+            "backend_auth_invalid_signature",
+            extra={
+                "event": "backend_auth_invalid_signature",
+                "client": request.client.host if request.client else "unknown",
+                "method": method,
+                "path": path,
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid signature",

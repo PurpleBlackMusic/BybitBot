@@ -27,6 +27,18 @@ def reset_signature_cache(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def reset_failure_tracker(monkeypatch):
+    monkeypatch.setattr(
+        backend_app,
+        "_failure_tracker",
+        backend_app._FailureTracker(
+            ttl_seconds=backend_app.FAILURE_TRACKER_TTL_SECONDS,
+            max_attempts=backend_app.FAILURE_TRACKER_MAX_ATTEMPTS,
+        ),
+    )
+
+
 def _client(monkeypatch: pytest.MonkeyPatch, secret: str = "shhh") -> TestClient:
     monkeypatch.setenv("BACKEND_AUTH_TOKEN", secret)
     envs._invalidate_cache()
@@ -435,3 +447,89 @@ def test_health_endpoint_allows_authorized_access(monkeypatch: pytest.MonkeyPatc
     assert payload["status"] == "ok"
     assert isinstance(payload["killSwitch"], dict)
     assert "paused" in payload["killSwitch"]
+
+
+def test_logs_invalid_token_warning(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    client = _client(monkeypatch)
+    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+
+    with caplog.at_level("WARNING"):
+        response = client.post(
+            "/orders/place",
+            json=payload,
+            headers={"Authorization": "Bearer wrong"},
+        )
+
+    assert response.status_code == 403
+    assert any(record.message == "backend_auth_invalid_token" for record in caplog.records)
+    assert any(getattr(record, "event", "") == "backend_auth_invalid_token" for record in caplog.records)
+
+
+def test_logs_invalid_signature_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "should-not-pass"})
+    client = _client(monkeypatch, secret=secret)
+
+    with caplog.at_level("WARNING"):
+        response = client.post(
+            "/orders/place",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Bybit-Signature": "invalid",
+                "X-Bybit-Timestamp": timestamp,
+            },
+        )
+
+    assert response.status_code == 403
+    assert any(record.message == "backend_auth_invalid_signature" for record in caplog.records)
+    assert any(getattr(record, "event", "") == "backend_auth_invalid_signature" for record in caplog.records)
+
+
+def test_bearer_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
+    client = _client(monkeypatch)
+    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+
+    responses = []
+    for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS):
+        responses.append(
+            client.post(
+                "/orders/place",
+                json=payload,
+                headers={"Authorization": "Bearer wrong"},
+            )
+        )
+
+    assert [resp.status_code for resp in responses] == [403, 403, 429]
+    assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_signature_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b"{}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "blocked"})
+    client = _client(monkeypatch, secret=secret)
+
+    responses = []
+    for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS):
+        responses.append(
+            client.post(
+                "/orders/place",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Bybit-Signature": "bad-signature",
+                    "X-Bybit-Timestamp": timestamp,
+                },
+            )
+        )
+
+    assert [resp.status_code for resp in responses] == [403, 403, 429]
+    assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
