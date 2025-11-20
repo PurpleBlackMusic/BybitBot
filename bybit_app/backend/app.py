@@ -9,7 +9,9 @@ from threading import Lock
 from typing import Any, Mapping
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from pydantic import BaseModel
+from enum import Enum
+
+from pydantic import BaseModel, root_validator, validator
 
 from bybit_app.utils.ai.kill_switch import clear_pause, get_state as get_kill_switch_state, set_pause
 from bybit_app.utils.background import get_guardian_state, get_preflight_snapshot, get_ws_snapshot
@@ -33,17 +35,67 @@ class KillSwitchRequest(BaseModel):
     reason: str | None = None
 
 
+class CategoryEnum(str, Enum):
+    SPOT = "spot"
+    LINEAR = "linear"
+    INVERSE = "inverse"
+    OPTION = "option"
+
+
+class SideEnum(str, Enum):
+    BUY = "Buy"
+    SELL = "Sell"
+
+
+class OrderTypeEnum(str, Enum):
+    MARKET = "Market"
+    LIMIT = "Limit"
+
+
+class TimeInForceEnum(str, Enum):
+    GTC = "GTC"
+    IOC = "IOC"
+    FOK = "FOK"
+    POST_ONLY = "PostOnly"
+
+
 class OrderRequest(BaseModel):
-    category: str = "spot"
+    category: CategoryEnum = CategoryEnum.SPOT
     symbol: str
-    side: str
-    orderType: str = "Market"
-    qty: float | None = None
+    side: SideEnum
+    orderType: OrderTypeEnum = OrderTypeEnum.MARKET
+    qty: float
     price: float | None = None
-    timeInForce: str | None = None
+    timeInForce: TimeInForceEnum | None = None
 
     class Config:
         extra = "forbid"
+
+    @validator("qty")
+    def _qty_required(cls, value: float) -> float:
+        if value is None:  # pragma: no cover - guarded by typing
+            raise ValueError("qty is required")
+        if value <= 0:
+            raise ValueError("qty must be positive")
+        return value
+
+    @validator("price")
+    def _positive_price(cls, value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("price must be positive")
+        return value
+
+    @root_validator
+    def _price_required_for_limit(cls, values: Mapping[str, Any]) -> Mapping[str, Any]:
+        order_type = values.get("orderType")
+        price = values.get("price")
+
+        if order_type == OrderTypeEnum.LIMIT and price is None:
+            raise ValueError("price is required for limit orders")
+
+        return values
 
 
 class _SignatureLRU:
