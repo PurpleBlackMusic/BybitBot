@@ -90,6 +90,8 @@ class TTLKV:
             ts = float(rec.get("ts", 0.0))
             now = time.time()
             if now - ts > ttl_sec:
+                del self._data[key]
+                self._flush()
                 return default
             return value
 
