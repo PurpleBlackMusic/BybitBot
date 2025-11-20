@@ -274,6 +274,40 @@ def test_signal_executor_respects_disabled_ai(monkeypatch: pytest.MonkeyPatch) -
     assert result.status == "disabled"
 
 
+def test_signal_executor_honors_max_concurrent_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
+    settings = Settings(ai_enabled=True, ai_max_concurrent=1)
+    bot = StubBot(summary, settings)
+
+    positions = {
+        "ETHUSDT": {
+            "qty": 1.0,
+            "avg_cost": 1000.0,
+            "realized_pnl": 0.0,
+            "price": 1000.0,
+            "pnl_value": 0.0,
+            "pnl_bps": 0.0,
+            "quote_notional": 1000.0,
+        }
+    }
+
+    monkeypatch.setattr(
+        signal_executor_module, "get_api_client", lambda: StubAPI(total=500.0, available=400.0)
+    )
+    monkeypatch.setattr(
+        signal_executor_module.SignalExecutor,
+        "_collect_open_positions",
+        lambda self, settings_obj, summary_obj, **_: positions,
+    )
+
+    executor = SignalExecutor(bot)
+    result = executor.execute_once()
+
+    assert result.status == "skipped"
+    assert result.reason == "max_concurrent_reached"
+    assert result.context == {"open_positions": 1, "limit": 1}
+
+
 def test_signal_executor_dry_run_preview(monkeypatch: pytest.MonkeyPatch) -> None:
     summary = {"actionable": True, "mode": "buy", "symbol": "ETHUSDT"}
     settings = Settings(ai_enabled=True, dry_run=True)
