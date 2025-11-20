@@ -219,9 +219,11 @@ async def verify_backend_auth(
 
     def _failure_key() -> str:
         client_host = request.client.host if request.client else "unknown"
+        if client_host:
+            return f"ip:{client_host}"
         if signature:
             return f"sig:{signature}"
-        return f"ip:{client_host}"
+        return "ip:unknown"
 
     def _maybe_throttle() -> None:
         if _failure_tracker.register_failure(_failure_key(), now=time.time()):
