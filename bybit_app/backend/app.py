@@ -118,7 +118,7 @@ async def verify_backend_auth(
         provided = token.split(" ", 1)[1].strip()
         return hmac.compare_digest(provided, secret)
 
-    if authorization:
+    if authorization and authorization.lower().startswith("bearer "):
         if _match_bearer(authorization):
             return
         raise HTTPException(
