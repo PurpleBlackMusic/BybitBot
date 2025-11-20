@@ -51,7 +51,7 @@ def _signature(secret: str, timestamp: str, body: bytes, *, method: str, path: s
 def test_reject_when_secret_missing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("BACKEND_AUTH_TOKEN", raising=False)
     envs._invalidate_cache()
-    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
 
     response = TestClient(backend_app.create_app()).post("/orders/place", json=payload)
 
@@ -61,7 +61,7 @@ def test_reject_when_secret_missing(monkeypatch: pytest.MonkeyPatch):
 
 def test_orders_require_auth(monkeypatch: pytest.MonkeyPatch):
     client = _client(monkeypatch)
-    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
 
     response = client.post("/orders/place", json=payload)
 
@@ -71,7 +71,7 @@ def test_orders_require_auth(monkeypatch: pytest.MonkeyPatch):
 
 def test_orders_reject_invalid_token(monkeypatch: pytest.MonkeyPatch):
     client = _client(monkeypatch)
-    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
 
     response = client.post(
         "/orders/place",
@@ -87,7 +87,7 @@ def test_orders_accept_bearer_token(monkeypatch: pytest.MonkeyPatch):
     secret = "topsecret"
     _patch_order_client(monkeypatch, lambda: {"status": "ok"})
     client = _client(monkeypatch, secret=secret)
-    payload = {"symbol": "BTCUSDT", "side": "Buy"}
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
 
     response = client.post(
         "/orders/place",
@@ -105,7 +105,7 @@ def test_orders_accept_bearer_token(monkeypatch: pytest.MonkeyPatch):
 def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
-    body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\"}"
+    body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "signed"})
@@ -137,7 +137,7 @@ def test_orders_reject_unknown_fields(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
     client = _client(monkeypatch, secret=secret)
-    payload = {"symbol": "BTCUSDT", "side": "Buy", "unexpected": "value"}
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1, "unexpected": "value"}
 
     response = client.post(
         "/orders/place",
@@ -162,7 +162,9 @@ def test_orders_forward_only_supported_fields(monkeypatch: pytest.MonkeyPatch):
     payload = {
         "symbol": "BTCUSDT",
         "side": "Buy",
+        "orderType": "Limit",
         "qty": 1.5,
+        "price": 100.0,
         "timeInForce": "GTC",
     }
 
@@ -177,16 +179,88 @@ def test_orders_forward_only_supported_fields(monkeypatch: pytest.MonkeyPatch):
         "category": "spot",
         "symbol": "BTCUSDT",
         "side": "Buy",
-        "orderType": "Market",
+        "orderType": "Limit",
         "qty": 1.5,
+        "price": 100.0,
         "timeInForce": "GTC",
     }
+
+
+def test_order_validation_requires_qty(monkeypatch: pytest.MonkeyPatch):
+    secret = "topsecret"
+
+    class DummyClient:
+        def place_order(self, **_kwargs):  # pragma: no cover - defensive
+            pytest.fail("place_order should not be called when validation fails")
+
+    monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        json={"symbol": "BTCUSDT", "side": "Buy"},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert any(err["loc"][-1] == "qty" for err in payload.get("detail", []))
+
+
+def test_order_validation_requires_price_for_limit(monkeypatch: pytest.MonkeyPatch):
+    secret = "topsecret"
+
+    class DummyClient:
+        def place_order(self, **_kwargs):  # pragma: no cover - defensive
+            pytest.fail("place_order should not be called when validation fails")
+
+    monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        json={"symbol": "BTCUSDT", "side": "Buy", "orderType": "Limit", "qty": 1},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert any("price is required" in err.get("msg", "") for err in payload.get("detail", []))
+
+
+def test_order_validation_rejects_invalid_values(monkeypatch: pytest.MonkeyPatch):
+    secret = "topsecret"
+
+    class DummyClient:
+        def place_order(self, **_kwargs):  # pragma: no cover - defensive
+            pytest.fail("place_order should not be called when validation fails")
+
+    monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        json={
+            "symbol": "BTCUSDT",
+            "side": "Hold",
+            "category": "unknown",
+            "orderType": "Market",
+            "qty": -1,
+            "timeInForce": "BAD",
+        },
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    assert response.status_code == 422
+    messages = ":".join(err.get("msg", "") for err in response.json().get("detail", []))
+    assert "value is not a valid enumeration member" in messages
+    assert "qty must be positive" in messages
 
 
 def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
-    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "signed"})
@@ -213,7 +287,7 @@ def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPat
 def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time() - 400))
-    body = b"{}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "too_old"})
@@ -236,7 +310,7 @@ def test_signature_rejects_old_timestamp(monkeypatch: pytest.MonkeyPatch):
 def test_signature_allows_slightly_future_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS - 1))
-    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "future-within-grace"})
@@ -259,7 +333,7 @@ def test_signature_allows_slightly_future_timestamp(monkeypatch: pytest.MonkeyPa
 def test_signature_rejects_future_timestamp(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS + 5))
-    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "future"})
@@ -282,7 +356,7 @@ def test_signature_rejects_future_timestamp(monkeypatch: pytest.MonkeyPatch):
 def test_signature_rejects_replay(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
-    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\"}"
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
     signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     calls = {"count": 0}
