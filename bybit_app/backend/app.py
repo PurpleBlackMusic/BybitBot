@@ -25,6 +25,7 @@ FUTURE_TIMESTAMP_GRACE_SECONDS = 10
 SIGNATURE_CACHE_SIZE = 1024
 FAILURE_TRACKER_TTL_SECONDS = 60
 FAILURE_TRACKER_MAX_ATTEMPTS = 3
+FAILURE_TRACKER_MAX_SIZE = 1024
 
 app = FastAPI(title="BybitBot Backend", version="1.0.0")
 logger = logging.getLogger(__name__)
@@ -135,9 +136,10 @@ _signature_cache = _SignatureLRU(ttl_seconds=TIMESTAMP_WINDOW_SECONDS)
 
 
 class _FailureTracker:
-    def __init__(self, ttl_seconds: float, max_attempts: int) -> None:
+    def __init__(self, ttl_seconds: float, max_attempts: int, max_items: int = FAILURE_TRACKER_MAX_SIZE) -> None:
         self.ttl_seconds = ttl_seconds
         self.max_attempts = max_attempts
+        self.max_items = max_items
         self._attempts: OrderedDict[str, tuple[int, float]] = OrderedDict()
         self._lock = Lock()
 
@@ -161,11 +163,16 @@ class _FailureTracker:
             count += 1
             self._attempts[key] = (count, expires_at)
             self._attempts.move_to_end(key)
+
+            if len(self._attempts) > self.max_items:
+                self._attempts.popitem(last=False)
             return count >= self.max_attempts
 
 
 _failure_tracker = _FailureTracker(
-    ttl_seconds=FAILURE_TRACKER_TTL_SECONDS, max_attempts=FAILURE_TRACKER_MAX_ATTEMPTS
+    ttl_seconds=FAILURE_TRACKER_TTL_SECONDS,
+    max_attempts=FAILURE_TRACKER_MAX_ATTEMPTS,
+    max_items=FAILURE_TRACKER_MAX_SIZE,
 )
 
 
