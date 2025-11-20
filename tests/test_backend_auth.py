@@ -60,6 +60,22 @@ def _signature(secret: str, timestamp: str, body: bytes, *, method: str, path: s
     return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
+def _signature_headers(
+    secret: str,
+    *,
+    timestamp: float | None = None,
+    body: bytes,
+    method: str = "POST",
+    path: str = "/orders/place",
+) -> dict[str, str]:
+    ts = str(int(timestamp if timestamp is not None else time.time()))
+    return {
+        "Content-Type": "application/json",
+        backend_app.SIGNATURE_HEADER: _signature(secret, ts, body, method=method, path=path),
+        backend_app.TIMESTAMP_HEADER: ts,
+    }
+
+
 def test_reject_when_secret_missing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("BACKEND_AUTH_TOKEN", raising=False)
     envs._invalidate_cache()
@@ -116,9 +132,7 @@ def test_orders_accept_bearer_token(monkeypatch: pytest.MonkeyPatch):
 
 def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
-    timestamp = str(int(time.time()))
     body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\", \"qty\": 1}"
-    signature = _signature(secret, timestamp, body, method="POST", path="/orders/place")
 
     _patch_order_client(monkeypatch, lambda: {"status": "signed"})
     client = _client(monkeypatch, secret=secret)
@@ -126,11 +140,7 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     response = client.post(
         "/orders/place",
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "X-Bybit-Signature": signature,
-            "X-Bybit-Timestamp": timestamp,
-        },
+        headers=_signature_headers(secret, body=body),
     )
 
     assert response.status_code == 200
@@ -196,6 +206,113 @@ def test_orders_forward_only_supported_fields(monkeypatch: pytest.MonkeyPatch):
         "price": 100.0,
         "timeInForce": "GTC",
     }
+
+
+def test_signature_requires_headers(monkeypatch: pytest.MonkeyPatch):
+    secret = "missing"
+    _patch_order_client(monkeypatch, lambda: {"status": "irrelevant"})
+    client = _client(monkeypatch, secret=secret)
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            backend_app.SIGNATURE_HEADER: _signature(secret, "0", body, method="POST", path="/orders/place"),
+        },
+    )
+
+    assert response.status_code == 401
+    assert (
+        response.json()["detail"]
+        == "Signature authentication requires X-Bybit-Signature and X-Bybit-Timestamp headers"
+    )
+
+
+def test_signature_rejects_invalid_value(monkeypatch: pytest.MonkeyPatch):
+    secret = "expected"
+    _patch_order_client(monkeypatch, lambda: {"status": "should-not-pass"})
+    client = _client(monkeypatch, secret=secret)
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers={
+            **_signature_headers("wrong-secret", body=body),
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid signature"
+
+
+def test_future_timestamp_rejected(monkeypatch: pytest.MonkeyPatch):
+    secret = "future"
+    _patch_order_client(monkeypatch, lambda: {"status": "future"})
+    client = _client(monkeypatch, secret=secret)
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+    future_ts = time.time() + backend_app.FUTURE_TIMESTAMP_GRACE_SECONDS + 5
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers=_signature_headers(secret, timestamp=future_ts, body=body),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Timestamp cannot be in the future"
+
+
+def test_expired_timestamp_rejected(monkeypatch: pytest.MonkeyPatch):
+    secret = "expired"
+    _patch_order_client(monkeypatch, lambda: {"status": "expired"})
+    client = _client(monkeypatch, secret=secret)
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+    old_ts = time.time() - backend_app.TIMESTAMP_WINDOW_SECONDS - 1
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers=_signature_headers(secret, timestamp=old_ts, body=body),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Timestamp is too old"
+
+
+def test_signature_replay_detection(monkeypatch: pytest.MonkeyPatch):
+    secret = "replay"
+    _patch_order_client(monkeypatch, lambda: {"status": "replayed"})
+    client = _client(monkeypatch, secret=secret)
+    body = b"{\"symbol\": \"BTCUSDT\", \"side\": \"Buy\", \"qty\": 1}"
+    headers = _signature_headers(secret, body=body)
+
+    first = client.post("/orders/place", data=body, headers=headers)
+    assert first.status_code == 200
+
+    replay = client.post("/orders/place", data=body, headers=headers)
+    assert replay.status_code == 403
+    assert replay.json()["detail"] == "Duplicate signature detected"
+
+
+def test_throttles_after_repeated_invalid_tokens(monkeypatch: pytest.MonkeyPatch):
+    secret = "limit"
+    client = _client(monkeypatch, secret=secret)
+
+    for attempt in range(1, backend_app.FAILURE_TRACKER_MAX_ATTEMPTS + 1):
+        response = client.get(
+            "/health",
+            headers={"Authorization": "Bearer wrong"},
+        )
+
+        if attempt < backend_app.FAILURE_TRACKER_MAX_ATTEMPTS:
+            assert response.status_code == 403
+            assert response.json()["detail"] == "Invalid bearer token"
+        else:
+            assert response.status_code == 429
+            assert response.json()["detail"] == "Too many failed authentication attempts"
 
 
 def test_order_validation_requires_qty(monkeypatch: pytest.MonkeyPatch):
