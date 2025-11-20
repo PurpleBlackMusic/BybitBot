@@ -13,9 +13,13 @@ from bybit_app.utils import envs
 @pytest.fixture(autouse=True)
 def reset_backend_auth(monkeypatch):
     envs._invalidate_cache()
+    monkeypatch.delenv("BACKEND_TRUSTED_PROXIES", raising=False)
+    monkeypatch.delenv("BACKEND_TRUST_PROXY_HEADERS", raising=False)
     yield
     envs._invalidate_cache()
     monkeypatch.delenv("BACKEND_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("BACKEND_TRUSTED_PROXIES", raising=False)
+    monkeypatch.delenv("BACKEND_TRUST_PROXY_HEADERS", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -751,6 +755,72 @@ def test_signature_failures_share_counter_by_ip(monkeypatch: pytest.MonkeyPatch)
         )
 
     assert [resp.status_code for resp in responses] == [403, 403, 429]
+    assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_forwarded_headers_ignored_without_trust(monkeypatch: pytest.MonkeyPatch):
+    client = _client(monkeypatch)
+
+    responses = []
+    for forwarded in ("203.0.113.1", "198.51.100.2", "203.0.113.1"):
+        responses.append(
+            client.get(
+                "/health",
+                headers={
+                    "Authorization": "Bearer wrong",
+                    "X-Forwarded-For": forwarded,
+                },
+            )
+        )
+
+    assert [resp.status_code for resp in responses] == [403, 403, 429]
+    assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_forwarded_headers_used_for_trusted_proxy(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("BACKEND_TRUSTED_PROXIES", "testclient")
+    envs._invalidate_cache()
+    client = _client(monkeypatch)
+
+    attempts = []
+    for forwarded in ("203.0.113.10", "203.0.113.10", "198.51.100.20", "203.0.113.10"):
+        attempts.append(
+            client.get(
+                "/health",
+                headers={
+                    "Authorization": "Bearer wrong",
+                    "X-Forwarded-For": forwarded,
+                },
+            )
+        )
+
+    assert [resp.status_code for resp in attempts] == [403, 403, 403, 429]
+    assert attempts[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_forwarded_header_allowed_via_trust_flag(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("BACKEND_TRUST_PROXY_HEADERS", "1")
+    envs._invalidate_cache()
+    client = _client(monkeypatch)
+
+    responses = []
+    for forwarded in (
+        "for=203.0.113.50:1234;proto=https",
+        "for=203.0.113.50;host=example.com",
+        "for=198.51.100.77",
+        "for=203.0.113.50",
+    ):
+        responses.append(
+            client.get(
+                "/health",
+                headers={
+                    "Authorization": "Bearer wrong",
+                    "Forwarded": forwarded,
+                },
+            )
+        )
+
+    assert [resp.status_code for resp in responses] == [403, 403, 403, 429]
     assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
 
 
