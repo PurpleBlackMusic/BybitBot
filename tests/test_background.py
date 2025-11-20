@@ -527,6 +527,55 @@ def test_ensure_started_skips_automation_without_private(monkeypatch: pytest.Mon
     assert svc._automation_restart_count == 0
 
 
+def test_ensure_started_recovers_after_private_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = {"value": False}
+
+    ws_stub = SimpleNamespace(
+        start=lambda *_, **__: True,
+        start_private=lambda: True,
+        status=lambda: {
+            "public": {"running": True, "age_seconds": 0.0},
+            "private": {"running": ready["value"], "age_seconds": 0.0},
+        },
+        stop_all=lambda: None,
+        stop_private=lambda: None,
+        force_public_fallback=lambda *_, **__: False,
+        latest_order_update=lambda: {},
+        latest_execution=lambda: {},
+        private_events=lambda *args, **kwargs: [],
+        private_event_stats=lambda: {"latest_id": 0, "size": 0, "dropped": 0},
+    )
+
+    svc = _make_service(monkeypatch, ws_stub=ws_stub)
+    svc._watchdog_interval = 0.05
+    svc._await_private_ready = lambda timeout=None: bool(ready["value"])  # type: ignore[assignment]
+
+    svc.ensure_started()
+
+    assert svc._automation_private_blocked is True
+    assert svc._watchdog_thread is not None and svc._watchdog_thread.is_alive()
+
+    ready["value"] = True
+    start = time.time()
+    while time.time() - start < 2.0:
+        if svc._automation_restart_count > 0:
+            break
+        time.sleep(0.05)
+
+    assert svc._automation_restart_count > 0
+    assert svc._automation_private_blocked is False
+
+    stop_event = svc._automation_stop_event
+    thread = svc._automation_thread
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None:
+        thread.join(timeout=1.0)
+    svc.shutdown(timeout=1.0)
+
+
 def test_ws_events_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     svc = _make_service(monkeypatch)
     reset_event_queue()
