@@ -175,6 +175,36 @@ def test_sensitive_fields_removed_when_cleared(
     assert reloaded.get_api_secret(testnet=True) == ""
 
 
+@pytest.mark.parametrize("placeholder", ["demo_key", "   "])
+def test_placeholders_do_not_trigger_restarts(
+    placeholder: str, isolated_settings: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = {"ws": 0, "guardian": 0, "automation": 0}
+
+    from bybit_app.utils import background
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(
+        background, "restart_websockets", lambda: calls.__setitem__("ws", calls["ws"] + 1)
+    )
+    monkeypatch.setattr(
+        background, "restart_guardian", lambda: calls.__setitem__("guardian", calls["guardian"] + 1)
+    )
+    monkeypatch.setattr(
+        background, "restart_automation", lambda: calls.__setitem__(
+            "automation", calls["automation"] + 1
+        )
+    )
+
+    envs.update_settings(api_key=placeholder, api_secret=placeholder)
+
+    assert os.getenv("BYBIT_API_KEY_TESTNET") is None
+    assert os.getenv("BYBIT_API_SECRET_TESTNET") is None
+    assert os.getenv("BYBIT_API_KEY") is None
+    assert os.getenv("BYBIT_API_SECRET") is None
+    assert calls == {"ws": 0, "guardian": 0, "automation": 0}
+
+
 def test_explicit_dry_run_prevents_auto_disable(isolated_settings: Path):
     envs.update_settings(api_key="KEY", api_secret="SECRET", dry_run=True)
     settings = envs.get_settings(force_reload=True)
