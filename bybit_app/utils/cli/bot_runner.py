@@ -173,7 +173,14 @@ class BotCLI:
 
     # ------------------------------------------------------------------
     # configuration helpers
-    def load_env_file(self, path: str | os.PathLike[str] | None) -> None:
+    def _strict_env_permissions_enabled(self, cli_choice: bool | None) -> bool:
+        env_value = os.getenv("BYBITBOT_STRICT_ENV_PERMISSIONS", "").strip().lower()
+        env_choice = env_value in {"1", "true", "yes", "on"}
+        return env_choice if cli_choice is None else bool(cli_choice)
+
+    def load_env_file(
+        self, path: str | os.PathLike[str] | None, *, strict: bool | None
+    ) -> None:
         """Populate :mod:`os.environ` from a dotenv file, if available."""
 
         try:
@@ -195,15 +202,20 @@ class BotCLI:
             self._logger("bot.env.missing", path=str(dotenv_path))
 
         load_dotenv(dotenv_path, override=False)
-        self._harden_env_permissions(dotenv_path)
+        strict_mode = self._strict_env_permissions_enabled(strict)
+        self._harden_env_permissions(dotenv_path, strict=strict_mode)
 
-    def _harden_env_permissions(self, dotenv_path: Path) -> None:
+    def _harden_env_permissions(self, dotenv_path: Path, *, strict: bool) -> None:
         if not dotenv_path.exists():
             return
 
         try:
             mode = stat.S_IMODE(dotenv_path.stat().st_mode)
-        except OSError:
+        except OSError as exc:
+            if strict:
+                raise RuntimeError(
+                    f"Cannot read permissions for {dotenv_path}: {exc}"  # pragma: no cover - error message
+                ) from exc
             return
 
         insecure_mask = stat.S_IRWXG | stat.S_IRWXO
@@ -216,12 +228,16 @@ class BotCLI:
 
         try:
             os.chmod(dotenv_path, secure_mode)
-        except OSError:
+        except OSError as exc:
             self._logger(
                 "bot.env.permissions_warning",
                 path=str(dotenv_path),
                 previous_mode=oct(mode),
             )
+            if strict:
+                raise RuntimeError(
+                    f"Failed to harden permissions for {dotenv_path}: {exc}"  # pragma: no cover - error message
+                ) from exc
         else:
             try:
                 new_mode = stat.S_IMODE(dotenv_path.stat().st_mode)
@@ -426,7 +442,19 @@ class BotCLI:
             "--config",
             help="Путь к JSON-файлу с настройками CLI по умолчанию.",
         )
-        parser.set_defaults(dry_run=None)
+        parser.add_argument(
+            "--strict-env-permissions",
+            dest="strict_env_permissions",
+            action="store_true",
+            help="Прерывать запуск, если права доступа к .env не получается ужесточить.",
+        )
+        parser.add_argument(
+            "--lenient-env-permissions",
+            dest="strict_env_permissions",
+            action="store_false",
+            help="Не завершать процесс при сбое ужесточения прав доступа к .env.",
+        )
+        parser.set_defaults(dry_run=None, strict_env_permissions=None)
         return parser
 
     def apply_config_defaults(
@@ -499,7 +527,9 @@ class BotCLI:
 
         if not namespace.no_env_file:
             if self.should_load_env_file(namespace.env_file):
-                self.load_env_file(namespace.env_file)
+                self.load_env_file(
+                    namespace.env_file, strict=namespace.strict_env_permissions
+                )
             else:
                 self._logger("bot.env.skip", reason="disabled_or_production")
 

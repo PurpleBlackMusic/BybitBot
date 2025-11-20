@@ -9,6 +9,7 @@ import pytest
 
 import bot
 from bybit_app.utils import envs
+from bybit_app.utils.cli import BotCLI, bot_runner
 
 
 class DummySettings:
@@ -196,6 +197,46 @@ def test_cli_invokes_background_loop_with_arguments(monkeypatch: pytest.MonkeyPa
     assert result == 7
     assert called == {"poll": 7.5, "once": True}
     assert os.getenv("BYBIT_TESTNET") == "1"
+
+
+def test_harden_env_permissions_lenient_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_path.write_text("TEST=1", encoding="utf-8")
+    env_path.chmod(0o666)
+
+    events: list[tuple[str, dict]] = []
+
+    def _log(event: str, **payload: dict) -> None:
+        events.append((event, payload))
+
+    runner = BotCLI(logger=_log)
+    monkeypatch.setattr(bot_runner, "permissions_too_permissive", lambda path: False)
+    monkeypatch.setattr(bot_runner.os, "chmod", lambda path, mode: (_ for _ in ()).throw(OSError("boom")))
+
+    runner.load_env_file(env_path, strict=False)
+
+    warning = next((payload for event, payload in events if event == "bot.env.permissions_warning"), None)
+    assert warning is not None
+    assert warning["path"] == str(env_path)
+
+
+def test_strict_env_permissions_env_var(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    env_path = tmp_path / "strict.env"
+    env_path.write_text("X=1", encoding="utf-8")
+    env_path.chmod(0o666)
+
+    monkeypatch.setattr(bot_runner, "permissions_too_permissive", lambda path: False)
+
+    def _raise_chmod(path: Path, mode: int) -> None:
+        raise OSError("cannot chmod")
+
+    monkeypatch.setattr(bot_runner.os, "chmod", _raise_chmod)
+    monkeypatch.setenv("BYBITBOT_STRICT_ENV_PERMISSIONS", "1")
+
+    runner = BotCLI()
+
+    with pytest.raises(RuntimeError):
+        runner.load_env_file(env_path, strict=None)
 
 
 def test_cli_config_file_applies_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
