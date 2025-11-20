@@ -364,6 +364,49 @@ def test_signature_rejects_method_reuse(monkeypatch: pytest.MonkeyPatch):
     assert response.json()["detail"] == "Invalid signature"
 
 
+def test_signature_rejects_query_tampering(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b""
+    signature = _signature(
+        secret, timestamp, body, method="GET", path="/state/summary?foo=bar"
+    )
+
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.get(
+        "/state/summary?foo=baz",
+        headers={
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid signature"
+
+
+def test_signature_accepts_query_in_payload(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+    body = b""
+    path = "/state/summary?foo=bar&baz=1"
+    signature = _signature(secret, timestamp, body, method="GET", path=path)
+
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.get(
+        path,
+        headers={
+            "X-Bybit-Signature": signature,
+            "X-Bybit-Timestamp": timestamp,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "guardian" in response.json()
+
+
 def test_state_endpoints_require_auth(monkeypatch: pytest.MonkeyPatch):
     client = _client(monkeypatch)
 
