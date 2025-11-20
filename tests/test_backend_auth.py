@@ -727,6 +727,47 @@ def test_signature_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
     assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
 
 
+def test_failure_counter_resets_after_success(monkeypatch: pytest.MonkeyPatch):
+    secret = "reset"
+    _patch_order_client(monkeypatch, lambda: {"status": "ok"})
+    client = _client(monkeypatch, secret=secret)
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "qty": 1}
+
+    for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS - 1):
+        response = client.post(
+            "/orders/place",
+            json=payload,
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert response.status_code == 403
+
+    success = client.post(
+        "/orders/place",
+        json=payload,
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert success.status_code == 200
+
+    next_failure = client.post(
+        "/orders/place",
+        json=payload,
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert next_failure.status_code == 403
+
+    more_failures = [
+        client.post(
+            "/orders/place",
+            json=payload,
+            headers={"Authorization": "Bearer wrong"},
+        )
+        for _ in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS - 1)
+    ]
+
+    statuses = [next_failure.status_code] + [resp.status_code for resp in more_failures]
+    assert statuses == [403, 403, 429]
+
+
 def test_failure_tracker_evicts_oldest_entries():
     tracker = backend_app._FailureTracker(
         ttl_seconds=backend_app.FAILURE_TRACKER_TTL_SECONDS,
