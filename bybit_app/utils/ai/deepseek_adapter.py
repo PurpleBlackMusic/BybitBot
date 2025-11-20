@@ -51,6 +51,14 @@ class DeepSeekSignal:
         }
 
 
+class DeepSeekAPIError(RuntimeError):
+    """Raised when DeepSeek API requests fail."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class DeepSeekAdapter:
     """Small helper around the DeepSeek REST API with on-disk caching."""
 
@@ -219,7 +227,7 @@ class DeepSeekAdapter:
                     self._local_model_missing_logged = True
         if not self.api_key:
             log("deepseek.api.missing_key")
-            return None
+            raise DeepSeekAPIError("missing_key", "DeepSeek API key is not configured")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -233,19 +241,46 @@ class DeepSeekAdapter:
             )
         except requests.RequestException as exc:
             log("deepseek.api.request_failed", error=str(exc))
-            return None
+            raise DeepSeekAPIError("request_failed", str(exc))
         if response.status_code >= 400:
             log(
                 "deepseek.api.http_error",
                 status=int(response.status_code),
                 body=response.text[:500],
             )
-            return None
+            raise DeepSeekAPIError(
+                "http_error", f"HTTP {response.status_code} from DeepSeek"
+            )
         try:
             return response.json()
-        except ValueError:
+        except ValueError as exc:
             log("deepseek.api.invalid_json")
-            return None
+            raise DeepSeekAPIError("invalid_json", str(exc))
+
+    def _default_features(self, symbol: str, *, error: Mapping[str, str] | None = None) -> Dict[str, Any]:
+        base = DeepSeekSignal(symbol=symbol, direction="neutral", confidence=0.0)
+        return self._merge_error(base, error)
+
+    def _merge_error(
+        self, signal: DeepSeekSignal, error: Mapping[str, str] | None
+    ) -> Dict[str, Any]:
+        features = signal.to_features()
+        features.update(
+            {
+                "deepseek_error": False,
+                "deepseek_error_reason": None,
+                "deepseek_error_message": None,
+            }
+        )
+        if error:
+            features.update(
+                {
+                    "deepseek_error": True,
+                    "deepseek_error_reason": error.get("reason"),
+                    "deepseek_error_message": error.get("message"),
+                }
+            )
+        return features
 
     def _extract_message(self, payload: Mapping[str, Any]) -> Optional[str]:
         choices = payload.get("choices") if isinstance(payload, Mapping) else None
@@ -307,29 +342,42 @@ class DeepSeekAdapter:
         key = symbol.upper()
         cached = self._read_cached(key)
         if cached is not None:
-            return cached.to_features()
+            return self._merge_error(cached, None)
 
         payload = self._request_payload(key)
-        raw_response = self._perform_request(key, payload)
+        try:
+            raw_response = self._perform_request(key, payload)
+        except DeepSeekAPIError as exc:
+            return self._default_features(
+                key, error={"reason": exc.reason, "message": str(exc)}
+            )
         if not raw_response:
-            return DeepSeekSignal(symbol=key, direction="neutral", confidence=0.0).to_features()
+            return self._default_features(
+                key, error={"reason": "empty_response", "message": "No data returned"}
+            )
         message = self._extract_message(raw_response)
         if not message:
-            return DeepSeekSignal(symbol=key, direction="neutral", confidence=0.0).to_features()
+            return self._default_features(
+                key,
+                error={"reason": "empty_message", "message": "No message content"},
+            )
         try:
             parsed = json.loads(message)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             log("deepseek.api.parse_error", sample=message[:200])
-            parsed = {
-                "direction": "neutral",
-                "confidence": 0.0,
-                "summary": message.strip() or None,
-            }
+            return self._default_features(
+                key,
+                error={"reason": "parse_error", "message": str(exc)},
+            )
         signal = self._coerce_signal(key, parsed)
         if signal is None:
-            signal = DeepSeekSignal(symbol=key, direction="neutral", confidence=0.0, summary=None)
-        self._store_cache(key, signal, raw=parsed if isinstance(parsed, Mapping) else {"raw": parsed})
-        return signal.to_features()
+            signal = DeepSeekSignal(
+                symbol=key, direction="neutral", confidence=0.0, summary=None
+            )
+        self._store_cache(
+            key, signal, raw=parsed if isinstance(parsed, Mapping) else {"raw": parsed}
+        )
+        return self._merge_error(signal, None)
 
 
 __all__ = ["DeepSeekAdapter", "DeepSeekSignal"]
