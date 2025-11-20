@@ -128,6 +128,61 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     assert payload["side"] == "Sell"
 
 
+def test_orders_reject_unknown_fields(monkeypatch: pytest.MonkeyPatch):
+    secret = "topsecret"
+
+    class DummyClient:
+        def place_order(self, **_kwargs):  # pragma: no cover - defensive
+            pytest.fail("place_order should not be called when validation fails")
+
+    monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
+    client = _client(monkeypatch, secret=secret)
+    payload = {"symbol": "BTCUSDT", "side": "Buy", "unexpected": "value"}
+
+    response = client.post(
+        "/orders/place",
+        json=payload,
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_orders_forward_only_supported_fields(monkeypatch: pytest.MonkeyPatch):
+    secret = "topsecret"
+    captured: dict[str, object] = {}
+
+    class DummyClient:
+        def place_order(self, **kwargs):
+            captured.update(kwargs)
+            return {"status": "ok"}
+
+    monkeypatch.setattr(backend_app, "get_api_client", lambda: DummyClient())
+    client = _client(monkeypatch, secret=secret)
+    payload = {
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "qty": 1.5,
+        "timeInForce": "GTC",
+    }
+
+    response = client.post(
+        "/orders/place",
+        json=payload,
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "orderType": "Market",
+        "qty": 1.5,
+        "timeInForce": "GTC",
+    }
+
+
 def test_signature_allows_non_bearer_authorization(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
