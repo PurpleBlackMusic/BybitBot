@@ -35,6 +35,7 @@ def reset_failure_tracker(monkeypatch):
         backend_app._FailureTracker(
             ttl_seconds=backend_app.FAILURE_TRACKER_TTL_SECONDS,
             max_attempts=backend_app.FAILURE_TRACKER_MAX_ATTEMPTS,
+            max_items=backend_app.FAILURE_TRACKER_MAX_SIZE,
         ),
     )
 
@@ -724,3 +725,21 @@ def test_signature_failures_rate_limited(monkeypatch: pytest.MonkeyPatch):
 
     assert [resp.status_code for resp in responses] == [403, 403, 429]
     assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
+def test_failure_tracker_evicts_oldest_entries():
+    tracker = backend_app._FailureTracker(
+        ttl_seconds=backend_app.FAILURE_TRACKER_TTL_SECONDS,
+        max_attempts=backend_app.FAILURE_TRACKER_MAX_ATTEMPTS,
+        max_items=5,
+    )
+    now = time.time()
+
+    for index in range(5):
+        tracker.register_failure(f"key-{index}", now=now)
+
+    tracker.register_failure("key-5", now=now)
+
+    assert len(tracker._attempts) == 5
+    assert "key-0" not in tracker._attempts
+    assert "key-5" in tracker._attempts
