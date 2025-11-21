@@ -526,10 +526,9 @@ class BackgroundServices:
                 args=(stop_event, executor),
                 daemon=True,
             )
+            thread.start()
             self._automation_thread = thread
             self._automation_restart_count += 1
-
-        thread.start()
         return True
 
     def restart_automation_loop(self) -> bool:

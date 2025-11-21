@@ -505,6 +505,10 @@ def log(
 ) -> None:
     """Append a JSON record with ``event`` and ``payload`` to the log file."""
 
+    is_default_log_path = LOG_FILE == LOG_DIR / "app.log"
+    if not is_default_log_path and threading.current_thread().daemon:
+        return
+
     context, remaining_payload = _split_structured_payload(payload)
     context = _sanitize_mapping(context)
     remaining_payload = _sanitize_mapping(remaining_payload)
