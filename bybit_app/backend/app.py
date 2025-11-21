@@ -279,11 +279,8 @@ async def verify_backend_auth(
         return hmac.compare_digest(provided, secret)
 
     def _failure_key() -> str:
-        if client_host and client_host != "unknown":
-            return f"ip:{client_host}"
-        if signature:
-            return f"sig:{signature}"
-        return "ip:unknown"
+        host = client_host or "unknown"
+        return f"ip:{host}"
 
     failure_key = _failure_key()
 

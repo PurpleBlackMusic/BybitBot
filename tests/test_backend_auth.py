@@ -876,6 +876,29 @@ def test_forwarded_header_allowed_via_trust_flag(monkeypatch: pytest.MonkeyPatch
     assert responses[-1].json()["detail"] == "Too many failed authentication attempts"
 
 
+def test_throttles_invalid_signatures_with_changing_values(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    timestamp = str(int(time.time()))
+
+    monkeypatch.setattr(backend_app, "_client_host", lambda _req, _settings: "unknown")
+    client = _client(monkeypatch, secret=secret)
+
+    attempts = []
+    for idx in range(backend_app.FAILURE_TRACKER_MAX_ATTEMPTS):
+        attempts.append(
+            client.get(
+                "/health",
+                headers={
+                    backend_app.SIGNATURE_HEADER: f"invalid-{idx}",
+                    backend_app.TIMESTAMP_HEADER: timestamp,
+                },
+            )
+        )
+
+    assert [resp.status_code for resp in attempts] == [403, 403, 429]
+    assert attempts[-1].json()["detail"] == "Too many failed authentication attempts"
+
+
 def test_signature_success_not_blocked_after_failures(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     timestamp = str(int(time.time()))
