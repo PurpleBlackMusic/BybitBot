@@ -27,6 +27,7 @@ SIGNATURE_CACHE_SIZE = 1024
 FAILURE_TRACKER_TTL_SECONDS = 60
 FAILURE_TRACKER_MAX_ATTEMPTS = 3
 FAILURE_TRACKER_MAX_SIZE = 1024
+MAX_BACKEND_BODY_BYTES = 5 * 1024 * 1024
 
 app = FastAPI(title="BybitBot Backend", version="1.0.0")
 logger = logging.getLogger(__name__)
@@ -200,6 +201,44 @@ def _ensure_mapping(payload: Mapping[str, Any] | Any) -> Mapping[str, Any]:
         return {}
 
 
+async def _read_request_body(request: Request) -> bytes:
+    header_value = request.headers.get("content-length")
+    if header_value is not None:
+        try:
+            content_length = int(header_value)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Content-Length header",
+            ) from None
+        if content_length < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Content-Length header",
+            )
+        if content_length > MAX_BACKEND_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Request body too large",
+            )
+
+    body_chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BACKEND_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Request body too large",
+            )
+        body_chunks.append(chunk)
+
+    body = b"".join(body_chunks)
+    request._body = body  # type: ignore[attr-defined]
+    request._stream_consumed = True  # type: ignore[attr-defined]
+    return body
+
+
 def _strip_port(host: str | None) -> str:
     if not host:
         return ""
@@ -344,7 +383,7 @@ async def verify_backend_auth(
             detail="Timestamp is too old",
         )
 
-    body = await request.body()
+    body = await _read_request_body(request)
     method = request.method
     prefix = getattr(settings, "backend_path_prefix", "").strip()
     path = request.url.path

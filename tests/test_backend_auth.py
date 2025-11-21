@@ -161,6 +161,44 @@ def test_signature_auth(monkeypatch: pytest.MonkeyPatch):
     assert payload["side"] == "Sell"
 
 
+def test_rejects_body_over_limit_from_content_length(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    body = b"{\"symbol\": \"ETHUSDT\", \"side\": \"Sell\", \"qty\": 1}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "should-not-run"})
+    client = _client(monkeypatch, secret=secret)
+
+    headers = _signature_headers(secret, body=body)
+    headers["Content-Length"] = str(backend_app.MAX_BACKEND_BODY_BYTES + 1)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers=headers,
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body too large"
+
+
+def test_rejects_body_over_limit_when_streaming(monkeypatch: pytest.MonkeyPatch):
+    secret = "signed"
+    body = b"{\"payload\": \"" + b"x" * 200 + b"\"}"
+
+    _patch_order_client(monkeypatch, lambda: {"status": "should-not-run"})
+    monkeypatch.setattr(backend_app, "MAX_BACKEND_BODY_BYTES", 100)
+    client = _client(monkeypatch, secret=secret)
+
+    response = client.post(
+        "/orders/place",
+        data=body,
+        headers=_signature_headers(secret, body=body),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body too large"
+
+
 def test_signature_accepts_prefixed_path(monkeypatch: pytest.MonkeyPatch):
     secret = "signed"
     prefix = "/proxy"
