@@ -192,6 +192,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback path
 from .envs import get_settings
 from .log import log
 
+_DEFAULT_SHUTDOWN_TIMEOUT = 1.0
+
 
 class _RetryableTelegramError(RuntimeError):
     """Internal marker indicating a transient Telegram delivery failure."""
@@ -301,9 +303,20 @@ class TelegramDispatcher:
         if not thread:
             return
 
+        join_timeout = timeout if timeout is not None else _DEFAULT_SHUTDOWN_TIMEOUT
+
         self._stop_event.set()
         self._put_with_overflow_handling(None, record_overflow=False, allow_drop=False)
-        thread.join(timeout=timeout)
+        thread.join(timeout=join_timeout)
+
+        if thread.is_alive():  # pragma: no cover - defensive
+            log(
+                "telegram.dispatcher.shutdown_timeout",
+                timeout=join_timeout,
+                pending=self._queue.qsize(),
+            )
+        else:
+            self._thread = None
 
     def _ensure_thread(self) -> None:
         with self._lock:
@@ -477,8 +490,14 @@ class TelegramHeartbeat:
         thread = self._thread
         if not thread:
             return
+        join_timeout = timeout if timeout is not None else _DEFAULT_SHUTDOWN_TIMEOUT
         self._stop_event.set()
-        thread.join(timeout=timeout)
+        thread.join(timeout=join_timeout)
+
+        if thread.is_alive():  # pragma: no cover - defensive
+            self._log("telegram.heartbeat.shutdown_timeout", timeout=join_timeout)
+        else:
+            self._thread = None
 
     def run_cycle(self) -> float:
         settings = self._safe_settings()

@@ -29,6 +29,16 @@ class _DummyWebSocketApp:
         pass
 
 
+class _RecordingEvent(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.wait_calls: list[float | None] = []
+
+    def wait(self, timeout=None):  # type: ignore[override]
+        self.wait_calls.append(timeout)
+        return super().wait(timeout=timeout)
+
+
 @pytest.mark.parametrize(
     "raw_value, expected",
     [
@@ -111,17 +121,12 @@ def test_ws_orderbook_v5_reconnects_until_stopped(monkeypatch):
     first_attempt = threading.Event()
     second_attempt = threading.Event()
     stop_event = threading.Event()
-    sleep_calls: list[float] = []
-
-    def fake_sleep(duration: float):
-        sleep_calls.append(duration)
-
-    monkeypatch.setattr(ws_orderbook_v5.time, "sleep", fake_sleep)
+    recording_stop_event = _RecordingEvent()
 
     _FailingWebSocketApp.instances.clear()
     _FailingWebSocketApp.run_calls = 0
 
-    ob = WSOrderbookV5()
+    ob = WSOrderbookV5(stop_event_factory=lambda: recording_stop_event)
 
     assert ob.start(["BTCUSDT"]) is True
 
@@ -140,8 +145,9 @@ def test_ws_orderbook_v5_reconnects_until_stopped(monkeypatch):
     assert not thread.is_alive()
     assert ob._ws is None
     assert stop_event.is_set()
-    assert sleep_calls, "backoff sleep was not invoked"
-    assert sleep_calls[0] < 1.0
+    assert recording_stop_event.wait_calls, "backoff sleep was not invoked"
+    assert recording_stop_event.wait_calls[0] is not None
+    assert recording_stop_event.wait_calls[0] < 1.0
 
 
 def test_ws_orderbook_v5_updates_topics_without_restarting(monkeypatch):

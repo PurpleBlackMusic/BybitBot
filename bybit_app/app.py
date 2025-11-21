@@ -1555,9 +1555,10 @@ def main() -> None:
         "min_probability": _state_float("signals_min_probability", 0.0),
     }
 
-    tabs = st.tabs(["Обзор", "Сигналы", "Ордера", "Кошелёк", "Настройки", "Логи"])
+    render_header()
 
-    with tabs[0]:
+    st.markdown("### Обзор")
+    with st.container(border=True):
         st.markdown("<div id='status-bar'></div>", unsafe_allow_html=True)
         status_bar(
             settings,
@@ -1571,43 +1572,36 @@ def main() -> None:
             st.info(
                 "Фоновые службы подготавливают данные бота — свежая сводка появится через несколько секунд."
             )
-        render_shortcuts(shortcuts)
-        st.markdown("<div id='quick-actions'></div>", unsafe_allow_html=True)
-        st.markdown("### Быстрые действия")
-        if actions:
-            for action in actions:
-                icon = str(action.get("icon") or "").strip()
-                title = str(action.get("title") or "").strip()
-                description = str(action.get("description") or "").strip()
-                tone = str(action.get("tone") or "info").lower()
-                message = " ".join(part for part in (icon, f"**{title}**", description) if part).strip()
-                if tone == "danger":
-                    st.error(message)
-                elif tone == "warning":
-                    st.warning(message)
-                elif tone == "success":
-                    st.success(message)
-                else:
-                    st.info(message)
-                page = action.get("page")
-                if isinstance(page, str) and page:
-                    navigation_link(
-                        page,
-                        label=action.get("page_label") or "Открыть раздел",
-                        key=f"action_link_{page}_{title}",
-                    )
-        else:
-            st.success("Все проверки зелёные — можно сосредоточиться на торговле.")
-        if watchlist:
-            st.markdown("### Наблюдаемые активы")
-            st.dataframe(
-                arrow_safe(pd.DataFrame(watchlist)),
-                hide_index=True,
-                use_container_width=True,
-                key="dashboard_watchlist",
-            )
 
-    with tabs[1]:
+    summary_cols = st.columns([1.5, 1.2, 1.1])
+    with summary_cols[0]:
+        render_signal_brief(
+            brief_payload,
+            report.get("score") if isinstance(report, Mapping) else {},
+            settings=settings,
+        )
+    with summary_cols[1]:
+        render_user_actions(settings, brief_payload, health, watchlist)
+        render_data_health(health)
+    with summary_cols[2]:
+        render_status(settings)
+        render_ws_telemetry(ws_snapshot)
+        render_shortcuts(shortcuts)
+
+    if watchlist:
+        render_market_watchlist(watchlist)
+
+    render_hidden_tools()
+
+    plan_steps = report.get("plan_steps") if isinstance(report, Mapping) else None
+    safety_notes = report.get("safety_notes") if isinstance(report, Mapping) else None
+    risk_summary = report.get("risk_summary") if isinstance(report, Mapping) else None
+    render_guides(settings, plan_steps, safety_notes, risk_summary, brief_payload)
+
+    detail_tabs = st.tabs(["Торговля", "Кошелёк", "Настройки", "Логи"])
+
+    with detail_tabs[0]:
+        st.markdown("#### Сигналы и сделки")
         signals_table(
             report.get("symbol_plan") if isinstance(report, Mapping) else {},
             filters=signal_filters,
@@ -1618,127 +1612,124 @@ def main() -> None:
             caution = str(brief_payload.get("caution") or "").strip()
         if caution:
             st.warning(caution)
-        if watchlist:
-            st.divider()
-            st.markdown("**Watchlist**")
-            st.dataframe(
-                arrow_safe(pd.DataFrame(watchlist)),
-                hide_index=True,
-                use_container_width=True,
-                key="signals_watchlist",
+
+        st.divider()
+        trade_cols = st.columns([1.4, 1])
+        with trade_cols[0]:
+            orders_table(report, state=state)
+        with trade_cols[1]:
+            trade_ticket(
+                settings,
+                client_factory=cached_api_client,
+                state=state,
+                on_success=[lambda: _trigger_refresh(delay=1.0)],
             )
 
-    with tabs[2]:
-        orders_table(report, state=state)
-
-        trade_ticket(
-            settings,
-            client_factory=cached_api_client,
-            state=state,
-            on_success=[lambda: _trigger_refresh(delay=1.0)],
-        )
-
-    with tabs[3]:
+    with detail_tabs[1]:
         wallet_overview(report)
 
-    with tabs[4]:
-        st.subheader("Стратегия")
+    with detail_tabs[2]:
+        st.subheader("Стратегия и среда")
         buy_threshold = float(getattr(settings, "ai_buy_threshold", 0.52) * 100.0)
         sell_threshold = float(getattr(settings, "ai_sell_threshold", 0.42) * 100.0)
         min_ev = float(getattr(settings, "ai_min_ev_bps", 12.0))
         kill_streak = int(getattr(settings, "ai_kill_switch_loss_streak", 0) or 0)
         kill_cooldown = float(getattr(settings, "ai_kill_switch_cooldown_min", 60.0) or 0.0)
+        refresh_interval = int(state.get("refresh_interval", BASE_SESSION_STATE.get("refresh_interval", 12)))
+        theme_name = str(state.get("ui_theme", "dark")).lower()
 
-        buy_value = st.slider(
-            "Порог покупки (%)",
-            min_value=40.0,
-            max_value=90.0,
-            value=buy_threshold,
-            step=0.5,
-            help="Если вероятность сигнала превышает порог, бот готов рассматривать покупку.",
-        )
-        sell_value = st.slider(
-            "Порог продажи (%)",
-            min_value=10.0,
-            max_value=60.0,
-            value=sell_threshold,
-            step=0.5,
-            help="Если вероятность падает ниже порога, бот готов закрывать позицию.",
-        )
-        ev_value = st.number_input(
-            "Минимальная выгода (bps)",
-            min_value=0.0,
-            value=min_ev,
-            step=1.0,
-            help="Минимальная ожидаемая выгода в базисных пунктах (1 б.п. = 0.01%).",
-        )
-        kill_streak_value = st.number_input(
-            "Kill-switch: серия убыточных сделок",
-            min_value=0,
-            value=kill_streak,
-            step=1,
-            help="После скольких убыточных сделок подряд включать аварийную паузу.",
-        )
-        kill_cooldown_value = st.number_input(
-            "Kill-switch: пауза (мин)",
-            min_value=0.0,
-            value=kill_cooldown,
-            step=5.0,
-            help="Сколько минут ждать перед возобновлением после срабатывания kill-switch.",
-        )
-
-        st.subheader("Режим работы")
-        dry_run_value = st.toggle(
-            "Учебный режим (DRY-RUN)",
-            value=active_dry_run(settings),
-            help="В тестовом режиме сделки не отправляются на биржу.",
-        )
-        st.caption("DRY-RUN ведёт только локальный журнал и безопасен для проверки сигналов без риска для депозита.")
-        network_value = st.selectbox(
-            "Сеть",
-            ["Testnet", "Mainnet"],
-            index=0 if settings.testnet else 1,
-            help="Выберите торговую среду: тестовую или основную.",
-        )
-        st.caption(
-            "Testnet — биржевой полигон без реальных средств, Mainnet — рабочие ордера на живом счёте."
-        )
-
-        st.subheader("Интерфейс")
-        refresh_slider = st.slider("Интервал автообновления (сек)", min_value=5, max_value=120, value=refresh_interval, key="settings_refresh_interval")
-        if refresh_slider != state.get("refresh_interval"):
-            state["refresh_interval"] = refresh_slider
-        theme_options = [("dark", "Тёмная тема"), ("light", "Светлая тема")]
-        current_theme_index = next((index for index, (value, _) in enumerate(theme_options) if value == theme_name), 0)
-        selected_theme = st.selectbox(
-            "Тема интерфейса",
-            theme_options,
-            index=current_theme_index,
-            format_func=lambda item: item[1],
-        )
-        if isinstance(selected_theme, tuple):
-            chosen_theme = selected_theme[0]
-        else:
-            chosen_theme = theme_name
-        if chosen_theme != theme_name:
-            state["ui_theme"] = chosen_theme
-            st.experimental_rerun()
-
-        if st.button("Сохранить настройки"):
-            update_settings(
-                ai_buy_threshold=buy_value / 100.0,
-                ai_sell_threshold=sell_value / 100.0,
-                ai_min_ev_bps=ev_value,
-                ai_kill_switch_loss_streak=kill_streak_value,
-                ai_kill_switch_cooldown_min=kill_cooldown_value,
-                dry_run=dry_run_value,
-                testnet=(network_value == "Testnet"),
+        with st.form("strategy_settings"):
+            st.markdown("#### Пороговые значения")
+            buy_value = st.number_input(
+                "Порог покупки (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=buy_threshold,
+                step=0.5,
+                help="Минимальная вероятность для входа в сделку.",
             )
-            settings = get_settings(force_reload=True)
-            clear_data_caches()
-            st.success("Настройки сохранены.")
+            sell_value = st.number_input(
+                "Порог продажи (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=sell_threshold,
+                step=0.5,
+                help="Максимальная вероятность, ниже которой бот закрывает позицию.",
+            )
+            ev_value = st.number_input(
+                "Минимальная выгода (bps)",
+                min_value=0.0,
+                value=min_ev,
+                step=1.0,
+                help="Минимальная ожидаемая выгода в базисных пунктах (1 б.п. = 0.01%).",
+            )
+            kill_streak_value = st.number_input(
+                "Kill-switch: серия убыточных сделок",
+                min_value=0,
+                value=kill_streak,
+                step=1,
+                help="После скольких убыточных сделок подряд включать аварийную паузу.",
+            )
+            kill_cooldown_value = st.number_input(
+                "Kill-switch: пауза (мин)",
+                min_value=0.0,
+                value=kill_cooldown,
+                step=5.0,
+                help="Сколько минут ждать перед возобновлением после срабатывания kill-switch.",
+            )
 
-    with tabs[5]:
+            st.subheader("Режим работы")
+            dry_run_value = st.toggle(
+                "Учебный режим (DRY-RUN)",
+                value=active_dry_run(settings),
+                help="В тестовом режиме сделки не отправляются на биржу.",
+            )
+            st.caption("DRY-RUN ведёт только локальный журнал и безопасен для проверки сигналов без риска для депозита.")
+            network_value = st.selectbox(
+                "Сеть",
+                ["Testnet", "Mainnet"],
+                index=0 if settings.testnet else 1,
+                help="Выберите торговую среду: тестовую или основную.",
+            )
+            st.caption(
+                "Testnet — биржевой полигон без реальных средств, Mainnet — рабочие ордера на живом счёте."
+            )
+
+            st.subheader("Интерфейс")
+            refresh_slider = st.slider("Интервал автообновления (сек)", min_value=5, max_value=120, value=refresh_interval, key="settings_refresh_interval")
+            if refresh_slider != state.get("refresh_interval"):
+                state["refresh_interval"] = refresh_slider
+            theme_options = [("dark", "Тёмная тема"), ("light", "Светлая тема")]
+            current_theme_index = next((index for index, (value, _) in enumerate(theme_options) if value == theme_name), 0)
+            selected_theme = st.selectbox(
+                "Тема интерфейса",
+                theme_options,
+                index=current_theme_index,
+                format_func=lambda item: item[1],
+            )
+            if isinstance(selected_theme, tuple):
+                chosen_theme = selected_theme[0]
+            else:
+                chosen_theme = theme_name
+            if chosen_theme != theme_name:
+                state["ui_theme"] = chosen_theme
+                st.experimental_rerun()
+
+            if st.button("Сохранить настройки"):
+                update_settings(
+                    ai_buy_threshold=buy_value / 100.0,
+                    ai_sell_threshold=sell_value / 100.0,
+                    ai_min_ev_bps=ev_value,
+                    ai_kill_switch_loss_streak=kill_streak_value,
+                    ai_kill_switch_cooldown_min=kill_cooldown_value,
+                    dry_run=dry_run_value,
+                    testnet=(network_value == "Testnet"),
+                )
+                settings = get_settings(force_reload=True)
+                clear_data_caches()
+                st.success("Настройки сохранены.")
+
+    with detail_tabs[3]:
         log_path = Path(__file__).resolve().parent / "_data" / "logs" / "app.log"
         log_viewer(log_path, state=state)
 

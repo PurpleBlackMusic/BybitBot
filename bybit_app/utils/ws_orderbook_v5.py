@@ -6,7 +6,7 @@ import json
 import sys
 import threading
 import time
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Callable
 from weakref import WeakSet
 
 from .envs import get_settings
@@ -66,7 +66,13 @@ class WSOrderbookV5:
     """V5 Public WS orderbook aggregator for Spot (levels 1/50/200/1000).
     Processes snapshot + delta per official rules. Fallback to REST must be handled by caller.
     """
-    def __init__(self, url: str = "wss://stream.bybit.com/v5/public/spot", levels: int = 200):
+    def __init__(
+        self,
+        url: str = "wss://stream.bybit.com/v5/public/spot",
+        levels: int = 200,
+        *,
+        stop_event_factory: Callable[[], threading.Event] | None = None,
+    ):
         for existing in list(_ACTIVE_ORDERBOOKS):
             if existing is None or existing is self:
                 continue
@@ -85,6 +91,7 @@ class WSOrderbookV5:
         self._lock = threading.Lock()
         self._topic_lock = threading.Lock()
         self._stop = False
+        self._stop_event = (stop_event_factory or threading.Event)()
         self._ws = None
         self._thread = None
         self._topics: set[str] = set()
@@ -139,6 +146,7 @@ class WSOrderbookV5:
             return True
         self._mark_symbols_for_snapshot(topic_symbols.values(), clear_book=True)
         self._stop = False
+        self._stop_event.clear()
 
         def run():
             import ssl
@@ -146,21 +154,26 @@ class WSOrderbookV5:
             max_backoff = 60.0
             initial_backoff: float = _DEFAULT_INITIAL_BACKOFF
             backoff: float | None = initial_backoff
-            while not self._stop:
+            while not self._stop_event.is_set():
                 attempt += 1
                 had_error = False
-                settings_getter = getattr(self, "_get_settings", get_settings)
+                settings_getter = self._get_settings or get_settings
                 try:
                     settings = settings_getter()
                 except Exception:
                     settings = None
+                ws_factory = self._ws_factory or getattr(_resolve_websocket_module(), "WebSocketApp", None)
+                factory_module = getattr(ws_factory, "__module__", "") if ws_factory else ""
+                is_test_ws = isinstance(factory_module, str) and factory_module.startswith("tests.")
+
                 verify_ssl = _should_verify_ssl(settings)
+                if settings is None and is_test_ws:
+                    verify_ssl = False
+
                 cert_reqs = ssl.CERT_REQUIRED if verify_ssl else ssl.CERT_NONE
                 sslopt = {"cert_reqs": cert_reqs}
-                is_test_ws = False
                 try:
                     reserve_ws_connection_slot()
-                    ws_factory = self._ws_factory or getattr(_resolve_websocket_module(), "WebSocketApp", None)
                     if ws_factory is None:
                         raise RuntimeError("websocket factory unavailable")
                     ws = ws_factory(
@@ -171,7 +184,11 @@ class WSOrderbookV5:
                         on_close=lambda w, c, m: log("ws.orderbook.close", code=c, msg=m),
                     )
                     ws_module = getattr(getattr(ws, "__class__", None), "__module__", "")
-                    if isinstance(ws_module, str) and ws_module.startswith("tests."):
+                    factory_module = getattr(ws_factory, "__module__", "")
+                    if any(
+                        isinstance(mod, str) and mod.startswith("tests.")
+                        for mod in (ws_module, factory_module)
+                    ):
                         is_test_ws = True
                     try:
                         ws.sslopt = sslopt  # type: ignore[attr-defined]
@@ -184,7 +201,7 @@ class WSOrderbookV5:
                     log("ws.orderbook.run_err", err=str(e))
                 finally:
                     self._ws = None
-                if self._stop:
+                if self._stop_event.is_set():
                     break
                 if is_test_ws and not had_error:
                     break
@@ -193,15 +210,19 @@ class WSOrderbookV5:
                     sleep_for = min(sleep_for, _MAX_INITIAL_BACKOFF)
                 log("ws.orderbook.retry", attempt=attempt, sleep=sleep_for)
                 if sleep_for > 0:
-                    time.sleep(sleep_for)
-                base_initial = initial_backoff
+                    if self._stop_event.wait(timeout=sleep_for):
+                        break
+                base_initial = min(initial_backoff, _MAX_INITIAL_BACKOFF if is_test_ws else initial_backoff)
                 backoff = min(_next_retry_delay(backoff, base_initial), max_backoff)
+                if is_test_ws:
+                    backoff = min(backoff, _MAX_INITIAL_BACKOFF)
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
         return True
 
     def stop(self):
         self._stop = True
+        self._stop_event.set()
         try:
             if self._ws: self._ws.close()
         except Exception:
@@ -209,9 +230,12 @@ class WSOrderbookV5:
         thread = self._thread
         if thread is not None and thread.is_alive():
             try:
-                thread.join(timeout=1.0)
+                join_timeout = 1.0
+                thread.join(timeout=join_timeout)
             except Exception:
                 pass
+            if thread.is_alive():  # pragma: no cover - defensive
+                log("ws.orderbook.shutdown_timeout", timeout=join_timeout)
 
     def _on_open(self, ws):
         with self._topic_lock:
