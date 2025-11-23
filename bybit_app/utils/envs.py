@@ -1642,7 +1642,15 @@ def _store_api_client_error(message: str | None) -> None:
     _CACHE["api_error"] = str(message) if message else None
 
 
-def last_api_client_error() -> Optional[str]:
+def last_api_client_error(settings: "Settings" | None = None) -> Optional[str]:
+    """Return the last recorded Bybit API client error.
+
+    The optional ``settings`` argument keeps compatibility with callers that
+    already pass the current settings object. It is intentionally unused
+    because errors are stored globally, but accepting it prevents runtime
+    type errors when the function is invoked with a positional parameter.
+    """
+
     error = _CACHE.get("api_error")
     if not error:
         return None
