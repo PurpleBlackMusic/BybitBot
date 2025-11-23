@@ -150,6 +150,13 @@ class WSOrderbookV5:
         self._stop = False
         self._stop_event.clear()
 
+        settings_getter = getattr(self, "_get_settings", get_settings)
+        initial_settings: Any | None = None
+        try:
+            initial_settings = settings_getter()
+        except Exception:
+            initial_settings = None
+
         def run():
             import ssl
             attempt = 0
@@ -159,11 +166,13 @@ class WSOrderbookV5:
             while not self._stop_event.is_set():
                 attempt += 1
                 had_error = False
-                settings_getter = self._get_settings or get_settings
+                settings = None
                 try:
                     settings = settings_getter()
                 except Exception:
-                    settings = None
+                    settings = initial_settings
+                if settings is None:
+                    settings = initial_settings
                 ws_factory = self._ws_factory or getattr(_resolve_websocket_module(), "WebSocketApp", None)
                 factory_module = getattr(ws_factory, "__module__", "") if ws_factory else ""
                 is_test_ws = isinstance(factory_module, str) and factory_module.startswith("tests.")
