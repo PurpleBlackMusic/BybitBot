@@ -102,6 +102,215 @@ def _render_badge_grid(badges: Sequence[StatusBadge], *, columns: int = 4) -> No
                 st.markdown(badge.render(), unsafe_allow_html=True)
 
 
+def render_connection_gate(
+    settings: Any,
+    *,
+    missing_fields: Sequence[str],
+    validation_error: str | None = None,
+    key: str = "connection_gate",
+) -> None:
+    """Gate the dashboard until both API credentials are present and validated."""
+
+    key_present = bool(active_api_key(settings))
+    secret_present = bool(active_api_secret(settings))
+    missing = [field for field in missing_fields]
+    validation_issue = bool(validation_error)
+    network = "Testnet" if getattr(settings, "testnet", True) else "Mainnet"
+    dry_run = active_dry_run(settings)
+    ready_count = int(key_present) + int(secret_present)
+    readiness_pct = int((ready_count / 2) * 100)
+    ready = readiness_pct == 100 and not validation_issue
+    api_error = last_api_client_error(settings)
+
+    tone = "ok" if ready else "danger"
+    hint = (
+        "Проверка не пройдена, исправьте ключи"
+        if validation_issue
+        else "Осталось добавить секрет"
+        if key_present and not secret_present
+        else "Заполните ключ и секрет"
+    )
+    missing_text = (
+        ", ".join(missing)
+        if missing
+        else "ничего — требуется перепроверка" if validation_issue else "ничего — можно запускать"
+    )
+    error_reason = validation_error or api_error
+    error_text = str(error_reason) if error_reason else "Ошибок подключения не обнаружено"
+    error_tone = "danger" if error_reason else "muted"
+    status_label = (
+        "Готов к запуску"
+        if ready
+        else "Требуется проверка" if validation_issue else "Заполните ключи"
+    )
+
+    st.markdown("<div class='gate gate--panel'>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class='gate__head'>
+            <span class='gate__pill'>🔒 Доступ закрыт до ввода ключей</span>
+            <h2 class='gate__title'>Один маршрут подключения</h2>
+            <p class='gate__lede'>Ключ и секрет вводятся на странице подключения. После валидации мы автоматически поднимаем Guardian, WebSocket и автообновление.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns([1.2, 1])
+
+    with cols[0]:
+        st.markdown(
+            """
+            <div class='gate__progress gate__progress--wide'>
+                <div class='gate__progress-head'>
+                    <div class='gate__progress-meta'>
+                        <span class='gate__badge gate__badge--muted'>Готовность</span>
+                        <span class='gate__progress-score'>{ready}/{total}</span>
+                    </div>
+                    <span class='gate__badge gate__badge--status gate__badge--{tone}'>{status}</span>
+                </div>
+                <div class='gate__progress-bar'>
+                    <span class='gate__progress-fill gate__progress-fill--{tone}' style='width:{pct}%;'></span>
+                </div>
+                <div class='gate__progress-caption'>{pct}% · {hint}</div>
+                <div class='gate__steps'>
+                    <div class='gate__step gate__step--{key_tone}'>
+                        <div class='gate__step-title'>API Key</div>
+                        <div class='gate__step-status'>{key_emoji} {key_status}</div>
+                    </div>
+                    <div class='gate__step gate__step--{secret_tone}'>
+                        <div class='gate__step-title'>API Secret</div>
+                        <div class='gate__step-status'>{secret_emoji} {secret_status}</div>
+                    </div>
+                </div>
+            </div>
+            """.format(
+                tone=tone,
+                pct=readiness_pct,
+                hint=hint,
+                status=status_label,
+                ready=ready_count,
+                total=2,
+                key_tone="ok" if key_present else "danger",
+                secret_tone="ok" if secret_present else "danger",
+                key_emoji="✅" if key_present else "⚠️",
+                secret_emoji="✅" if secret_present else "⚠️",
+                key_status="Есть" if key_present else "Отсутствует",
+                secret_status="Есть" if secret_present else "Отсутствует",
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            """
+            <div class='gate__card gate__card--list'>
+                <div class='gate__card-title'>Что нужно заполнить</div>
+                <ul class='gate__list'>
+                    <li class='gate__item gate__item--{key_tone}'><span>API Key</span><span class='gate__badge gate__badge--{key_tone}'>{key_status}</span></li>
+                    <li class='gate__item gate__item--{secret_tone}'><span>API Secret</span><span class='gate__badge gate__badge--{secret_tone}'>{secret_status}</span></li>
+                </ul>
+                <p class='gate__note'>Заполняется один раз: placeholders показывают, что данные сохранены.</p>
+                <p class='gate__note'>Отсутствует: {missing}</p>
+            </div>
+            """.format(
+                key_tone="ok" if key_present else "danger",
+                secret_tone="ok" if secret_present else "danger",
+                key_status="Есть" if key_present else "Отсутствует",
+                secret_status="Есть" if secret_present else "Отсутствует",
+                missing=missing_text,
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            """
+            <div class='gate__cta'>
+                <div>
+                    <div class='gate__cta-title'>Один клик к подключению</div>
+                    <p class='gate__note'>После сохранения ключей фоновые службы стартуют автоматически.</p>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        navigation_link(
+            "pages/00_connection_status.py",
+            label="🔑 Перейти к настройке API",
+            icon=None,
+            key=f"{key}_cta",
+        )
+
+    with cols[1]:
+        st.markdown(
+            """
+            <div class='gate__card gate__card--meta'>
+                <div class='gate__card-title'>Профиль окружения</div>
+                <div class='gate__meta-row'>
+                    <span>Сеть</span>
+                    <span class='gate__badge gate__badge--muted'>{network}</span>
+                </div>
+                <div class='gate__meta-row'>
+                    <span>Режим</span>
+                    <span class='gate__badge gate__badge--muted'>{mode}</span>
+                </div>
+                <div class='gate__meta-row gate__meta-row--strong'>
+                    <span>Доступ к боту</span>
+                    <span class='gate__badge gate__badge--{tone}'>{status}</span>
+                </div>
+                <div class='gate__meta-row gate__meta-row--ghost'>
+                    <span>API проверка</span>
+                    <span class='gate__badge gate__badge--{error_tone}'>{error_label}</span>
+                </div>
+                <p class='gate__hint'>Креды проверяются сразу; запуск фоновых служб происходит автоматически после подтверждения.</p>
+                <div class='gate__hint gate__hint--inline'>{error_text}</div>
+            </div>
+            """.format(
+                network=network,
+                mode="DRY-RUN" if dry_run else "Live",
+                tone=tone,
+                status="Разблокирован" if ready else "Заблокирован",
+                error_tone=error_tone,
+                error_label="Ошибка" if error_reason else "Ошибок нет",
+                error_text=error_text,
+            ),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            """
+            <div class='gate__card gate__card--services'>
+                <div class='gate__card-title'>Что разблокируется</div>
+                <div class='gate__services'>
+                    <div class='gate__service'>
+                        <div class='gate__service-icon'>🛡️</div>
+                        <div>
+                            <div class='gate__service-title'>Guardian</div>
+                            <div class='gate__service-note'>Мониторинг сигналов и авто-перезапуск.</div>
+                        </div>
+                    </div>
+                    <div class='gate__service'>
+                        <div class='gate__service-icon'>🌐</div>
+                        <div>
+                            <div class='gate__service-title'>WebSocket</div>
+                            <div class='gate__service-note'>Потоки цен и ордеров для дашборда.</div>
+                        </div>
+                    </div>
+                    <div class='gate__service'>
+                        <div class='gate__service-icon'>⚡</div>
+                        <div>
+                            <div class='gate__service-title'>Автообновление</div>
+                            <div class='gate__service-note'>Фоновые рефреши без ручных перезагрузок.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 def command_palette(
     shortcuts: Sequence[tuple[str, str, str]], *, key: str = "command_palette"
 ) -> None:
@@ -769,7 +978,46 @@ def status_bar(
     )
 
     _ensure_status_badge_css()
-    _render_badge_grid(context.badges(), columns=4)
+    with st.container(border=True):
+        meta_cols = st.columns(4)
+        with meta_cols[0]:
+            st.caption("Режим")
+            mode = "Тестнет" if context.testnet else "Основной"
+            st.markdown(
+                build_pill(mode, tone="info" if context.testnet else "success"),
+                unsafe_allow_html=True,
+            )
+        with meta_cols[1]:
+            st.caption("DRY-RUN")
+            st.markdown(
+                build_pill(
+                    "Включен" if context.dry_run else "Выключен",
+                    tone="warning" if context.dry_run else "neutral",
+                ),
+                unsafe_allow_html=True,
+            )
+        with meta_cols[2]:
+            st.caption("Баланс")
+            balance_text = (
+                format_money(context.equity, currency="USD")
+                if context.equity is not None
+                else "—"
+            )
+            st.markdown(build_pill(balance_text, tone="neutral"), unsafe_allow_html=True)
+        with meta_cols[3]:
+            st.caption("Доступно")
+            available_text = (
+                format_money(context.available, currency="USD")
+                if context.available is not None
+                else "—"
+            )
+            st.markdown(
+                build_pill(available_text, tone="neutral"),
+                unsafe_allow_html=True,
+            )
+
+        st.caption("Показатели стабильности")
+        _render_badge_grid(context.badges(), columns=4)
 
     has_keys = bool(active_api_key(settings) and active_api_secret(settings))
     if not has_keys:
@@ -825,14 +1073,22 @@ def metrics_strip(report: Mapping[str, Any]) -> None:
     )
     pnl = totals.get("realized_pnl") if isinstance(totals, Mapping) else None
 
-    cols = st.columns(4)
-    cols[0].metric("Actionable", actionable)
-    cols[1].metric("Ready", ready)
-    cols[2].metric("Positions", positions, f"Limit {limit}" if limit else None)
-    if equity is not None:
-        cols[3].metric("Equity", f"{_num(equity):,.2f}")
-    else:
-        cols[3].metric("Realized PnL", f"{_num(pnl):,.2f}")
+    with st.container(border=True):
+        cols = st.columns(4)
+        cols[0].metric("Actionable", actionable)
+        cols[1].metric("Ready", ready)
+        cols[2].metric("Positions", positions, f"Limit {limit}" if limit else None)
+        if equity is not None:
+            cols[3].metric("Equity", f"{_num(equity):,.2f}")
+        else:
+            cols[3].metric("Realized PnL", f"{_num(pnl):,.2f}")
+
+        if limit:
+            utilisation = max(0.0, min(1.0, positions / limit)) if limit else 0.0
+            st.progress(
+                utilisation,
+                text=f"Использование лимита: {positions}/{limit}",
+            )
 
 
 def _normalise_priority_table(plan: Mapping[str, Any] | None) -> list[dict[str, Any]]:

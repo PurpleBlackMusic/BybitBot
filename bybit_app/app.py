@@ -58,11 +58,13 @@ from bybit_app.ui.state import (
     ensure_keys,
 )
 from bybit_app.ui.components import (
+    _StatusBarContext,
     command_palette,
     log_viewer,
     metrics_strip,
     orders_table,
     show_error_banner,
+    render_connection_gate,
     signals_table,
     status_bar,
     trade_ticket,
@@ -109,6 +111,26 @@ def _normalise_tone(value: object) -> str:
 
 def _tone_priority(tone: str) -> int:
     return {"danger": 0, "warning": 1, "info": 2, "success": 3}.get(tone, 1)
+
+
+def _freshness_fill(value: float | None, *, warn_after: float, danger_after: float) -> float:
+    """Return a visual fill percentage for freshness bars.
+
+    Fresh data stays near 100%, warning decays to ~40%, danger clamps lower for quick scanning.
+    """
+
+    if value is None:
+        return 100.0
+
+    if value <= warn_after:
+        return 100.0
+
+    if value >= danger_after:
+        return 30.0
+
+    span = max(danger_after - warn_after, 1.0)
+    decay = (value - warn_after) / span
+    return max(30.0, 100.0 - decay * 60.0)
 
 
 def _normalise_brief(raw: Mapping[str, object] | None) -> dict[str, object]:
@@ -167,24 +189,212 @@ def render_navigation_grid(
                 st.caption(description)
 
 
-def render_header() -> None:
-    st.title("Bybit Spot Guardian")
-    st.caption(
-        "Центр управления умным спотовым ботом: статус подключения, аналитика и тихие помощники."
+def render_header(
+    settings: Any,
+    *,
+    report: Mapping[str, Any] | None = None,
+    guardian_snapshot: Mapping[str, Any] | None = None,
+    ws_snapshot: Mapping[str, Any] | None = None,
+    kill_switch: Any | None = None,
+) -> None:
+    def _as_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    def _tone_from_age(value: float | None, *, warn_after: float, danger_after: float) -> str:
+        if value is None:
+            return "muted"
+        if value >= danger_after:
+            return "danger"
+        if value >= warn_after:
+            return "warn"
+        return "ok"
+
+    context = _StatusBarContext.from_inputs(
+        settings,
+        _as_mapping(guardian_snapshot),
+        _as_mapping(ws_snapshot),
+        _as_mapping(report),
+        kill_switch,
     )
-    theses = (
-        ("Контроль рисков", "🛡"),
-        ("Быстрый запуск", "⚡"),
-        ("Чёткий статус", "📊"),
-    )
-    pills = "\n".join(
-        build_pill(label, icon=icon)
-        for label, icon in theses
-    )
+
+    stats = _as_mapping(_as_mapping(report).get("statistics"))
+    plan = _as_mapping(_as_mapping(report).get("symbol_plan"))
+    portfolio = _as_mapping(_as_mapping(report).get("portfolio"))
+    totals = _as_mapping(portfolio.get("totals"))
+    brief = _normalise_brief(_as_mapping(_as_mapping(report).get("brief")))
+
+    actionable = int(_safe_float(stats.get("actionable_count"), 0.0) or 0)
+    ready = int(_safe_float(stats.get("ready_count"), 0.0) or 0)
+    positions = int(_safe_float(stats.get("position_count"), 0.0) or 0)
+    tracked_pairs = len(plan)
+    equity_value = _safe_float(totals.get("total_equity") or totals.get("equity"))
+    available_value = _safe_float(totals.get("available_balance") or totals.get("available"))
+    equity_text = f"{equity_value:,.2f}" if equity_value is not None else "—"
+    available_text = f"{available_value:,.2f}" if available_value is not None else "—"
+    readiness_pct = 0.0 if actionable <= 0 else (ready / max(actionable, 1)) * 100
+    readiness_tone = "danger" if readiness_pct < 40 else ("warn" if readiness_pct < 75 else "ok")
+    signal_fill = _freshness_fill(context.signal_age, warn_after=120.0, danger_after=300.0)
+    ws_fill = _freshness_fill(context.ws_worst_age, warn_after=60.0, danger_after=90.0)
+    status_age_text = _format_seconds_ago(brief.get("status_age"))
+
+    mode_tag = "Тестнет" if context.testnet else "Основной режим"
+    run_tag = "DRY-RUN" if context.dry_run else "Боевой режим"
+    kill_tag = "На паузе" if context.kill_switch.paused else "Готово"
+
+    signal_tone = _tone_from_age(context.signal_age, warn_after=120.0, danger_after=300.0)
+    ws_tone = _tone_from_age(context.ws_worst_age, warn_after=60.0, danger_after=90.0)
+    auto_tone = "ok" if context.automation_ok else "warn"
+    kill_tone = "danger" if context.kill_switch.paused else "ok"
+    realtime_tone = "ok" if context.realtime_ok else "danger"
+
     st.markdown(
         f"""
-        <div class="pill-row">
-            {pills}
+        <div class="app-hero">
+            <div class="app-hero__title">
+                <div class="app-hero__eyebrow-row">
+                    <p class="app-hero__eyebrow">Bybit Spot Guardian</p>
+                    <span class="app-hero__tag">Обзор · {mode_tag}</span>
+                    <span class="app-hero__tag app-hero__tag--accent">{run_tag}</span>
+                    <span class="app-hero__tag app-hero__tag--muted">{kill_tag}</span>
+                </div>
+                <h1>Центр решений по споту</h1>
+                <p class="app-hero__lede">
+                    Единая панель для режима, свежести сигналов и автоматизации. Сразу видно, готов ли бот к запуску и где сосредоточить внимание.
+                </p>
+                <div class="app-hero__toolbar">
+                    <div class="app-hero__chip app-hero__chip--accent">{mode_tag}</div>
+                    <div class="app-hero__chip app-hero__chip--ghost">{run_tag}</div>
+                    <div class="app-hero__chip app-hero__chip--{kill_tone}">Kill-Switch: {kill_tag}</div>
+                    <div class="app-hero__chip app-hero__chip--muted">Последний сигнал: {context.signal_caption or '—'}</div>
+                </div>
+                <ul class="app-hero__bullets">
+                    <li>Подключение, защита и авто-режим сведены в верхние карточки — видно, что готово.</li>
+                    <li>Свежесть сигналов и потоков маркируется прогрессом, подсвечивая устаревание.</li>
+                    <li>Сигналы, позиции и трекинг пар вынесены в стат-блоки для быстрых решений.</li>
+                </ul>
+                <div class="app-hero__meta-row">
+                    <div class="app-hero__meta-card app-hero__meta-card--soft">
+                        <div class="app-hero__meta-label">Свежесть потоков</div>
+                        <div class="app-hero__meta-value">{context.signal_caption or '—'}</div>
+                        <p class="app-hero__meta-note">Сигналы и WebSocket: {context.ws_caption or '—'}</p>
+                    </div>
+                    <div class="app-hero__meta-card">
+                        <div class="app-hero__meta-label">Защита</div>
+                        <div class="app-hero__meta-value">Kill-Switch: {kill_tag}</div>
+                        <p class="app-hero__meta-note">Авто-режим: {context.automation_caption}</p>
+                    </div>
+                    <div class="app-hero__meta-card">
+                        <div class="app-hero__meta-label">Баланс</div>
+                        <div class="app-hero__meta-value">{equity_text} / {available_text}</div>
+                        <p class="app-hero__meta-note">Equity · Доступно (USD)</p>
+                    </div>
+                    <div class="app-hero__meta-card app-hero__meta-card--ghost">
+                        <div class="app-hero__meta-label">Guardian</div>
+                        <div class="app-hero__meta-value">{context.guardian_caption or '—'}</div>
+                        <p class="app-hero__meta-note">Мониторинг и рестарты</p>
+                    </div>
+                </div>
+                <div class="app-hero__meters">
+                    <div class="app-hero__meter">
+                        <div class="app-hero__meter-head">
+                            <span>Сигналы</span>
+                            <span class="app-hero__meter-chip app-hero__meter-chip--{signal_tone}">{context.signal_caption or '—'}</span>
+                        </div>
+                        <div class="app-hero__meter-bar">
+                            <span class="app-hero__meter-fill app-hero__meter-fill--{signal_tone}" style="width:{signal_fill:.0f}%"></span>
+                        </div>
+                        <p class="app-hero__meter-caption">Свежесть отчёта guardian с учётом последнего сигнала.</p>
+                    </div>
+                    <div class="app-hero__meter">
+                        <div class="app-hero__meter-head">
+                            <span>WebSocket</span>
+                            <span class="app-hero__meter-chip app-hero__meter-chip--{ws_tone}">{context.ws_caption or 'Нет данных'}</span>
+                        </div>
+                        <div class="app-hero__meter-bar">
+                            <span class="app-hero__meter-fill app-hero__meter-fill--{ws_tone}" style="width:{ws_fill:.0f}%"></span>
+                        </div>
+                        <p class="app-hero__meter-caption">Пульс pub/priv каналов — падение покажет устаревание.</p>
+                    </div>
+                </div>
+                <div class="app-hero__hints">
+                    <span class="app-hero__hint app-hero__hint--{realtime_tone}">Биржа: {context.realtime_caption}</span>
+                    <span class="app-hero__hint app-hero__hint--{auto_tone}">Авто: {context.automation_caption}</span>
+                    <span class="app-hero__hint app-hero__hint--{kill_tone}">Kill-Switch: {context.kill_caption}</span>
+                </div>
+                <div class="app-hero__health-grid">
+                    <div class="app-hero__health app-hero__health--{signal_tone}">
+                        <div class="app-hero__health-label">Сигналы</div>
+                        <div class="app-hero__health-value">{context.signal_caption or '—'}</div>
+                        <div class="app-hero__health-caption">Возраст обновления</div>
+                    </div>
+                    <div class="app-hero__health app-hero__health--{ws_tone}">
+                        <div class="app-hero__health-label">WebSocket</div>
+                        <div class="app-hero__health-value">{context.ws_caption or 'Нет данных'}</div>
+                        <div class="app-hero__health-caption">pub/priv канал</div>
+                    </div>
+                    <div class="app-hero__health app-hero__health--{realtime_tone}">
+                        <div class="app-hero__health-label">Биржа</div>
+                        <div class="app-hero__health-value">{context.realtime_caption}</div>
+                        <div class="app-hero__health-caption">Статус API</div>
+                    </div>
+                    <div class="app-hero__health app-hero__health--{auto_tone}">
+                        <div class="app-hero__health-label">Авто-режим</div>
+                        <div class="app-hero__health-value">{context.automation_caption}</div>
+                        <div class="app-hero__health-caption">{'Готов к действию' if context.automation_ready else 'Статус автоматики'}</div>
+                    </div>
+                </div>
+                <div class="app-hero__progress">
+                    <div class="app-hero__progress-header">
+                        <span>Готовность сигналов</span>
+                        <span>{ready}/{actionable} · {readiness_pct:.0f}%</span>
+                    </div>
+                    <div class="app-hero__progress-bar">
+                        <span class="app-hero__progress-fill app-hero__progress-fill--{readiness_tone}" style="width:{min(readiness_pct, 100):.0f}%"></span>
+                    </div>
+                    <p class="app-hero__progress-caption">Готовые сигналы выходят сразу на авто-процессы, остальным нужны правки.</p>
+                </div>
+                <div class="app-hero__digest">
+                    <div class="app-hero__digest-label">Следующее действие</div>
+                    <div class="app-hero__digest-headline">{brief.get('headline') or 'Нет активных подсказок'}</div>
+                    <div class="app-hero__digest-flags">
+                        <span class="app-hero__flag app-hero__flag--accent">{brief.get('ev_text') or 'EV обновится после оценки'}</span>
+                        <span class="app-hero__flag app-hero__flag--muted">{brief.get('updated_text') or 'Ожидаем новое обновление'}</span>
+                    </div>
+                    <div class="app-hero__digest-meta">
+                        <span>Пара: {brief.get('symbol')}</span>
+                        <span>{brief.get('action_text') or '—'}</span>
+                        <span>{brief.get('confidence_text') or ''}</span>
+                        <span>Обновлено: {status_age_text}</span>
+                    </div>
+                    <p class="app-hero__digest-body">{brief.get('analysis') or 'План обновится, когда появится новый сигнал или рекомендации от стража.'}</p>
+                    {f"<div class='app-hero__digest-note'>⚠️ {brief.get('caution')}</div>" if brief.get('caution') else ''}
+                </div>
+            </div>
+            <div class="app-hero__panel">
+                <div class="app-hero__panel-heading">Быстрый обзор</div>
+                <div class="app-hero__panel-grid">
+                    <div class="app-hero__stat">
+                        <div class="app-hero__stat-label">Готово к действию</div>
+                        <div class="app-hero__stat-value">{ready}/{actionable}</div>
+                        <small>сигналов готовы без правок</small>
+                    </div>
+                    <div class="app-hero__stat">
+                        <div class="app-hero__stat-label">Активные позиции</div>
+                        <div class="app-hero__stat-value">{positions}</div>
+                        <small>слежение за открытыми сделками</small>
+                    </div>
+                    <div class="app-hero__stat">
+                        <div class="app-hero__stat-label">Отслеживаемые пары</div>
+                        <div class="app-hero__stat-value">{tracked_pairs}</div>
+                        <small>в планах сигнала</small>
+                    </div>
+                </div>
+                <div class="app-hero__panel-footer">
+                    <div class="app-hero__pill">💰 Equity: {equity_text} USD</div>
+                    <div class="app-hero__pill">📥 Доступно: {available_text} USD</div>
+                    <div class="app-hero__pill app-hero__pill--muted">⏱ Kill-Switch: {context.kill_caption}</div>
+                </div>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1121,9 +1331,6 @@ def main() -> None:
     ensure_keys()
     state = st.session_state
 
-    if state.pop("_api_prompt_success", False):
-        st.success("API ключи сохранены. Фоновые сервисы перезапущены.")
-
     theme_dir = Path(__file__).resolve().parent / "ui"
     theme_files = {"dark": "theme.css", "light": "theme_light.css"}
     theme_name = str(state.get("ui_theme", "dark")).lower()
@@ -1139,10 +1346,33 @@ def main() -> None:
     # Ensure numeric values line up across tables and metrics.
     st.markdown(tabular_numeric_css(), unsafe_allow_html=True)
 
+    settings = get_settings()
+
+    key_present = bool(active_api_key(settings))
+    secret_present = bool(active_api_secret(settings))
+    if not (key_present and secret_present):
+        missing_fields = []
+        if not key_present:
+            missing_fields.append("API Key")
+        if not secret_present:
+            missing_fields.append("API Secret")
+        show_error_banner(
+            "API ключ и секрет не указаны. Добавьте их на странице подключения, чтобы запустить бота.",
+            title="Требуется подключение",
+        )
+        render_connection_gate(settings, missing_fields=missing_fields)
+        st.stop()
+
     try:
         validate_runtime_credentials()
     except CredentialValidationError as cred_err:
         show_error_banner(str(cred_err), title="Проверка ключей")
+        render_connection_gate(
+            settings,
+            missing_fields=[],
+            validation_error=str(cred_err),
+        )
+        st.stop()
 
     ensure_background_services()
 
@@ -1158,7 +1388,6 @@ def main() -> None:
             time.sleep(delay)
         st.experimental_rerun()
 
-    settings = get_settings()
     shortcuts = primary_shortcuts()
     in_page_shortcuts = [
         ("🟢 Обзор: статус", "#status-bar", "Прокрутить к статус-бару здоровья бота."),
@@ -1166,52 +1395,6 @@ def main() -> None:
         ("🚀 Обзор: онбординг", "#onboarding", "Шаги быстрого запуска и подсказки."),
     ]
     command_palette(shortcuts + in_page_shortcuts)
-
-    def _render_missing_keys_prompt(current_settings) -> None:
-        has_keys = bool(active_api_key(current_settings) and active_api_secret(current_settings))
-        if has_keys:
-            return
-
-        st.info(
-            "Чтобы бот мог размещать ордера, добавьте API ключ и секрет. "
-            "Можно открыть форму ниже или воспользоваться страницей \"✅ Подключение и состояние\"."
-        )
-        with st.expander("🔐 Добавить API ключи", expanded=True):
-            with st.form("inline_api_credentials"):
-                st.caption("Ключи сохраняются в зашифрованном виде в настройках приложения.")
-                network_options = ("Testnet", "Mainnet")
-                default_index = 0 if getattr(current_settings, "testnet", True) else 1
-                selected_network = st.radio(
-                    "Сеть для сохранения ключей",
-                    network_options,
-                    index=default_index,
-                    key="inline_api_network",
-                    horizontal=True,
-                )
-                api_key_input = st.text_input("API Key", type="password", key="inline_api_key")
-                api_secret_input = st.text_input("API Secret", type="password", key="inline_api_secret")
-                submitted = st.form_submit_button("💾 Сохранить ключи")
-                if submitted:
-                    api_key_value = api_key_input.strip()
-                    api_secret_value = api_secret_input.strip()
-                    if not api_key_value or not api_secret_value:
-                        st.error("Укажите и ключ, и секрет, чтобы продолжить.")
-                    else:
-                        target_testnet = selected_network == "Testnet"
-                        update_settings(
-                            api_key=api_key_value,
-                            api_secret=api_secret_value,
-                            testnet=target_testnet,
-                        )
-                        clear_data_caches()
-                        restart_websockets()
-                        restart_guardian()
-                        restart_automation()
-                        ensure_background_services()
-                        state["_api_prompt_success"] = True
-                        st.experimental_rerun()
-
-    _render_missing_keys_prompt(settings)
 
     with st.sidebar:
         st.header("🚀 Быстрый ордер")
@@ -1555,7 +1738,13 @@ def main() -> None:
         "min_probability": _state_float("signals_min_probability", 0.0),
     }
 
-    render_header()
+    render_header(
+        settings,
+        report=report,
+        guardian_snapshot=guardian_snapshot,
+        ws_snapshot=ws_snapshot,
+        kill_switch=kill_state,
+    )
 
     st.markdown("### Обзор")
     with st.container(border=True):
