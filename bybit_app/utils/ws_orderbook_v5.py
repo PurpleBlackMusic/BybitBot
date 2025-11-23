@@ -92,7 +92,9 @@ class WSOrderbookV5:
         self._topic_lock = threading.Lock()
         self._stop = False
         self._stop_event = (stop_event_factory or threading.Event)()
+        self._ws_lock = threading.Lock()
         self._ws = None
+        self._last_ws = None
         self._thread = None
         self._topics: set[str] = set()
         self._ws_factory: Any | None = None
@@ -194,13 +196,16 @@ class WSOrderbookV5:
                         ws.sslopt = sslopt  # type: ignore[attr-defined]
                     except Exception:  # pragma: no cover - defensive
                         pass
-                    self._ws = ws
+                    with self._ws_lock:
+                        self._ws = ws
+                        self._last_ws = ws
                     ws.run_forever(sslopt=sslopt)
                 except Exception as e:
                     had_error = True
                     log("ws.orderbook.run_err", err=str(e))
                 finally:
-                    self._ws = None
+                    with self._ws_lock:
+                        self._ws = None
                 if self._stop_event.is_set():
                     break
                 if is_test_ws and not had_error:
@@ -224,7 +229,12 @@ class WSOrderbookV5:
         self._stop = True
         self._stop_event.set()
         try:
-            if self._ws: self._ws.close()
+            with self._ws_lock:
+                ws = self._ws or self._last_ws
+                self._ws = None
+                self._last_ws = None if ws is not None else self._last_ws
+            if ws:
+                ws.close()
         except Exception:
             pass
         thread = self._thread

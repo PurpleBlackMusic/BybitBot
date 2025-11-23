@@ -152,12 +152,18 @@ def evaluate_indicator_parameters(
     *,
     deepseek_threshold: float = 0.0,
     deepseek_column: str = "deepseek_score",
+    working_frame: pd.DataFrame | None = None,
 ) -> Dict[str, BacktestMetrics]:
-    if frame.empty:
+    source = working_frame if working_frame is not None else frame
+    if source.empty:
         empty = BacktestMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0)
         return {"baseline": empty, "deepseek": empty}
 
-    working = frame.sort_values("timestamp").reset_index(drop=True)
+    working = (
+        source
+        if working_frame is not None
+        else source.sort_values("timestamp").reset_index(drop=True)
+    )
     close = working["close"].astype(float)
 
     sma_fast = close.rolling(window=params.sma_fast, min_periods=params.sma_fast).mean()
@@ -174,11 +180,12 @@ def evaluate_indicator_parameters(
         & (rsi <= params.rsi_buy)
     )
 
-    returns = working.loc[base_signal.fillna(False), "return_pct"].to_numpy(dtype=float)
+    base_mask = base_signal.fillna(False)
+    returns = working.loc[base_mask, "return_pct"].to_numpy(dtype=float)
     baseline_metrics = _equity_curve_metrics(returns)
 
     if deepseek_column in working.columns:
-        deepseek_scores = working.loc[base_signal.fillna(False), deepseek_column].astype(float)
+        deepseek_scores = working.loc[base_mask, deepseek_column].astype(float)
         filtered_returns = returns[deepseek_scores >= float(deepseek_threshold)]
     else:
         filtered_returns = np.array([], dtype=float)
@@ -201,6 +208,10 @@ def optimise_indicator_grid(
     macd_signal: Sequence[int],
     deepseek_thresholds: Sequence[float],
 ) -> List[Dict[str, object]]:
+    if frame.empty:
+        return []
+
+    working_frame = frame.sort_values("timestamp").reset_index(drop=True)
     results: List[Dict[str, object]] = []
     for combo in product(
         sma_fast,
@@ -230,6 +241,7 @@ def optimise_indicator_grid(
             frame,
             params,
             deepseek_threshold=threshold,
+            working_frame=working_frame,
         )
         results.append(
             {
