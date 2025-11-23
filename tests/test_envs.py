@@ -369,6 +369,22 @@ def test_validate_runtime_credentials_allows_dry_run(isolated_settings: Path) ->
     envs.validate_runtime_credentials(settings)
 
 
+def test_validate_runtime_credentials_allows_inactive_network_missing_creds(
+    isolated_settings: Path,
+) -> None:
+    envs.update_settings(
+        testnet=True,
+        dry_run_testnet=False,
+        dry_run_mainnet=False,
+        api_key_testnet="KEY",
+        api_secret_testnet="SECRET",
+    )
+    settings = envs.get_settings(force_reload=True)
+
+    # Should only validate credentials for the active network (testnet).
+    envs.validate_runtime_credentials(settings)
+
+
 def test_get_async_api_client_wraps_sync_client(monkeypatch: pytest.MonkeyPatch) -> None:
     sync_client = bybit_api_module.BybitAPI(
         bybit_api_module.BybitCreds(key="key", secret="sec", testnet=True)
