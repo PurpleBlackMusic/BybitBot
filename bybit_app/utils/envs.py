@@ -1606,9 +1606,13 @@ def validate_runtime_credentials(settings: Optional[Settings] = None) -> None:
     """Ensure live trading credentials are present before enabling live mode."""
 
     settings = settings or get_settings()
+    active_network = bool(getattr(settings, "testnet", False))
     problems: list[str] = []
 
     for network_flag, label in ((True, "Testnet"), (False, "Mainnet")):
+        if network_flag is not active_network:
+            continue
+
         if settings.get_dry_run(testnet=network_flag):
             continue
 
